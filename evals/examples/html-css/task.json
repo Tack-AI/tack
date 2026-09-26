@@ -1,0 +1,6 @@
+{
+  "name": "html-css",
+  "prompt": "Build a small web page in this directory consisting of index.html and style.css. Requirements: index.html links style.css with a <link rel=\"stylesheet\"> tag; the page has exactly one <h1> containing the text \"Pi Eval\"; there is a paragraph with class \"intro\"; there is a <ul id=\"langs\"> containing exactly 3 <li> items. style.css must contain a rule for the .intro class that sets its color, and a rule that sets the h1 font-size.",
+  "verify": "test -f index.html && test -f style.css && grep -Eiq 'rel=.stylesheet' index.html && grep -q 'Pi Eval' index.html && grep -Eiq 'class=.intro' index.html && grep -Eiq 'id=.langs' index.html && test \"$(grep -o '<li[ >]' index.html | wc -l)\" -eq 3 && grep -Eq '\\.intro' style.css && grep -Eiq 'color' style.css && grep -Eiq 'h1' style.css && grep -Eiq 'font-size' style.css",
+  "timeoutSecs": 300
+}

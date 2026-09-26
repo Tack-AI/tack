@@ -1,0 +1,7 @@
+{
+  "name": "config-tune",
+  "setup": "printf '{\\n  \"app\": \"billing\",\\n  \"log_level\": \"info\",\\n  \"retries\": 3,\\n  \"endpoints\": {\\n    \"api\": \"http://localhost:8080\",\\n    \"auth\": \"http://localhost:8081\"\\n  }\\n}\\n' > settings.json && cp settings.json .settings.orig",
+  "prompt": "In settings.json, change the value of \"log_level\" from \"info\" to \"debug\". Do not change anything else: every other byte of the file (whitespace, key order, formatting) must remain identical.",
+  "verify": "python3 -c \"import json; orig=open('.settings.orig').read(); cur=open('settings.json').read(); assert cur != orig, 'file unchanged'; assert json.loads(cur)['log_level'] == 'debug'; assert cur == orig.replace(': \\\"info\\\"', ': \\\"debug\\\"'), 'bytes other than log_level changed'\"",
+  "timeoutSecs": 300
+}

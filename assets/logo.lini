@@ -1,0 +1,16 @@
+// tack logo: a pushpin — the product's namesake.
+//
+// Flat silhouette in Ferris orange (#F74C00): domed head, a capsule brim
+// at its base, and a tapered pin, tilted 35° like the 📌 emoji.
+//
+// Build: lini --static assets/logo.lini -o assets/logo.svg
+// Raster: resvg -w 512 assets/logo.svg assets/logo.png
+{
+  layout: stack; padding: 24; fill: none;
+  --ferris: #F74C00;
+}
+
+|path#pin| {
+  fill: --ferris; stroke: none; rotate: 35; translate: -4 6;
+  path: "M -87.9 -76.9 A 89.9 89.9 0 0 1 87.9 -76.9 L 89.9 -76.9 A 18.9 18.9 0 0 1 89.9 -39.2 L 17.4 -39.2 L 0 127.6 L -17.4 -39.2 L -89.9 -39.2 A 18.9 18.9 0 0 1 -89.9 -76.9 Z";
+}

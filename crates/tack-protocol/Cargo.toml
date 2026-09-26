@@ -1,0 +1,29 @@
+[package]
+name = "tack-protocol"
+description = "Transport-neutral CBOR protocol for remote tack sessions (wire-compatible with @earendil-works/pi-protocol v1)"
+version.workspace = true
+edition.workspace = true
+# 1.85 is truthful for this crate (its dependency cone builds there); it is
+# what the CI `msrv` job verifies. Other crates cannot claim it — see the
+# rust-version note in the workspace Cargo.toml.
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ciborium = "0.2"
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "cbor_framing"
+harness = false
+
+[lints]
+workspace = true

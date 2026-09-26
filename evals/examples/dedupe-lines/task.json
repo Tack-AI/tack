@@ -1,0 +1,7 @@
+{
+  "name": "dedupe-lines",
+  "setup": "printf 'go\\nrust\\ngo\\npython\\nrust\\n' > langs.txt",
+  "prompt": "Remove duplicate lines from langs.txt while preserving the first-appearance order (go, rust, python).",
+  "verify": "test \"$(sort langs.txt | uniq -d | wc -l)\" -eq 0 && grep -qx go langs.txt && grep -qx rust langs.txt && grep -qx python langs.txt && test \"$(wc -l < langs.txt)\" -eq 3",
+  "timeoutSecs": 300
+}

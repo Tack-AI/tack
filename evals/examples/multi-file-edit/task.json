@@ -1,0 +1,7 @@
+{
+  "name": "multi-file-edit",
+  "setup": "printf 'def total(a, b):\\n    return a + b\\n' > math_utils.py && printf 'from math_utils import total\\n\\nprint(total(100, 200))\\n' > app.py && printf 'from math_utils import total\\n\\ndef invoice():\\n    return total(50, 25)\\n' > report.py",
+  "prompt": "Change the function total() in math_utils.py to take three parameters (a, b, tax) and return (a + b) * (1 + tax). Update both call sites (app.py and report.py) to pass a tax argument, so that `python3 app.py` and importing report still work.",
+  "verify": "grep -Eq 'def total\\(a, b, tax\\)' math_utils.py && grep -Eq 'total\\([^,()]+,[^,()]+,[^,()]+\\)' app.py && grep -Eq 'total\\([^,()]+,[^,()]+,[^,()]+\\)' report.py && python3 app.py > /dev/null && python3 -c 'import report; report.invoice()'",
+  "timeoutSecs": 300
+}

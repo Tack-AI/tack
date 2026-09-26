@@ -1,0 +1,105 @@
+name: Bug report
+description: Report a defect or unexpected behavior in tack
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill in as much of
+        the form as you can — the `tack doctor` output in particular saves
+        a lot of back-and-forth.
+
+  - type: input
+    id: version
+    attributes:
+      label: tack version
+      description: Output of `tack --version`.
+      placeholder: e.g. tack 1.0.0
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and terminal
+      description: |
+        OS (including version/distro) and the terminal emulator you run
+        tack in. On Windows, also note whether you use Git Bash.
+      placeholder: e.g. macOS 15.6, Ghostty / Windows 11, Git Bash in Windows Terminal
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The smallest set of steps/commands that triggers the issue.
+      placeholder: |
+        1. Run `tack ...`
+        2. Ask the agent to ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What actually happened? Include error messages verbatim.
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`tack doctor` output"
+      description: |
+        Run `tack doctor` and paste the **complete** output here. It checks
+        your environment (auth, providers, sandbox support, paths) and is the
+        fastest way for us to spot misconfiguration.
+
+        Alternatively attach a bundle: `tack doctor --bundle` writes a
+        timestamped tar.gz with the report (text + JSON), a **redacted**
+        copy of settings.json, and crash.log if present. Review the contents
+        before attaching — paths and usernames are included as-is.
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: provider
+    attributes:
+      label: Provider and model
+      description: Which LLM provider and model were in use when the issue occurred, if relevant.
+      placeholder: e.g. anthropic / claude-sonnet-4-5
+    validations:
+      required: false
+
+  - type: textarea
+    id: crashlog
+    attributes:
+      label: Crash log excerpt (optional)
+      description: |
+        If tack panicked, relevant excerpts from `~/.tack/agent/crash.log`
+        (panics are recorded there automatically). Please redact any sensitive
+        paths or content before pasting.
+      render: text
+    validations:
+      required: false

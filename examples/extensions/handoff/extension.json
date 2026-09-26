@@ -1,0 +1,5 @@
+{
+  "name": "handoff",
+  "command": "node",
+  "args": ["plugin.js"]
+}

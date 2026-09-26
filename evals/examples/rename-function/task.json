@@ -1,0 +1,7 @@
+{
+  "name": "rename-function",
+  "setup": "printf 'def calc_total(items):\\n    return sum(items)\\n' > billing.py && printf 'from billing import calc_total\\n\\nprint(calc_total([1, 2, 3]))\\n' > main.py",
+  "prompt": "Rename the function calc_total to compute_total in billing.py and update its caller in main.py. The program must still work.",
+  "verify": "grep -q compute_total billing.py && grep -q compute_total main.py && ! grep -q calc_total billing.py main.py",
+  "timeoutSecs": 300
+}

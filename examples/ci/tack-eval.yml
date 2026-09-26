@@ -1,0 +1,50 @@
+# Regression gate for agent behavior changes: run the eval suite and fail
+# when pass rates drop vs the committed baseline.
+#
+# Usage:
+#   1. Copy this file to .github/workflows/tack-eval.yml in your repo.
+#   2. Put your tasks in evals/ (task.json dirs; see tack/evals/examples/).
+#   3. Commit a baseline: run `tack eval evals --runs 3 --report eval-baseline.json`
+#      once locally and commit the report.
+#   4. Add ANTHROPIC_API_KEY (or your provider key) to the repo secrets.
+
+name: agent-eval
+
+on:
+  push:
+    paths: ["tack/**", "evals/**", "eval-baseline.json"]
+  workflow_dispatch:
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tack
+        run: |
+          # Prebuilt release binaries (see tack release CI), or:
+          # cargo install --path tack
+          curl -sSfL https://github.com/sufar/tack/releases/latest/download/tack-x86_64-unknown-linux-gnu.tar.gz | tar xz
+          sudo install tack /usr/local/bin/tack
+
+      - name: Run eval suite
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          tack eval evals --runs 3 --report eval-report.json --baseline eval-baseline.json | tee eval-output.txt
+
+      - name: Regression gate
+        run: |
+          # Fail the job when any task's pass rate dropped vs baseline.
+          if grep -q "▼" eval-output.txt; then
+            echo "eval regression detected (▼ entries above)"
+            exit 1
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: eval-report.json

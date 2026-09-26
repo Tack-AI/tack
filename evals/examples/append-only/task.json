@@ -1,0 +1,7 @@
+{
+  "name": "append-only",
+  "setup": "printf '# Changelog\\n\\nv1.0 - initial release\\nv1.0.1 - docs update\\n' > CHANGELOG.txt && cp CHANGELOG.txt .changelog.orig && printf 'v1.1 - fixed crash on startup\\n' > pending_entry.txt",
+  "prompt": "pending_entry.txt contains a new changelog entry. Append it to the end of CHANGELOG.txt as a new line. Strictly append-only: every existing byte of CHANGELOG.txt must stay exactly as it is — do not rewrite, reorder, or reformat the existing lines.",
+  "verify": "python3 -c \"orig=open('.changelog.orig','rb').read(); cur=open('CHANGELOG.txt','rb').read(); assert cur.startswith(orig), 'existing content modified'; assert b'v1.1 - fixed crash on startup' in cur[len(orig):], 'entry not appended'\"",
+  "timeoutSecs": 300
+}

@@ -1,0 +1,57 @@
+# Weekly microbenchmark run. criterion restores its previous baseline
+# (target/criterion cache) and reports week-over-week changes; the trimmed
+# results land in the job summary, full output in an artifact.
+#
+# No hard regression gate: shared-runner timing is far noisier than any
+# threshold we could pick. Treat criterion's "change" lines as a signal —
+# a sustained regression across two runs warrants a local `cargo bench`
+# comparison before/after the suspect commit.
+#
+# Benches are compile-guarded on every PR already: ci.yml's clippy job runs
+# with --all-targets, which includes bench targets.
+
+name: Benchmarks
+
+on:
+  schedule:
+    - cron: "37 5 * * 1" # Mondays 05:37 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Restore criterion baselines
+        uses: actions/cache@v4
+        with:
+          path: target/criterion
+          key: criterion-baseline-${{ github.run_id }}
+          restore-keys: criterion-baseline-
+      - uses: Swatinem/rust-cache@v2
+      # Explicit --bench targets: plain `cargo bench --workspace` would also
+      # run libtest bench harnesses, which reject criterion's CLI flags if any
+      # are ever added here.
+      - name: Run benches
+        run: |
+          cargo bench --locked --workspace \
+            --bench session_parse --bench cbor_framing --bench render \
+            2>&1 | tee bench-output.txt
+      - name: Publish job summary
+        run: |
+          {
+            echo '# Benchmark results'
+            echo '```'
+            grep -E '^(session_jsonl|cbor_snapshot|tui_render)|time:|thrpt:|change:' bench-output.txt \
+              || tail -60 bench-output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-output
+          path: bench-output.txt
+          retention-days: 90

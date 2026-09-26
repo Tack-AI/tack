@@ -1,0 +1,47 @@
+[package]
+name = "tack-ext-wasm"
+description = "Tack extension host: sandboxed WASM (wasmtime / WASI p1) carrier for the tack-ext NDJSON plugin protocol"
+version.workspace = true
+edition.workspace = true
+# wasmtime 48 declares rust-version 1.95 — that is this crate's real floor.
+rust-version = "1.95"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tack-ext.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# Trimmed feature set: tack-ext-wasm runs WASI p1 core modules with fuel and
+# epoch interruption only. Dropped from wasmtime defaults: the gc/*
+# proposals, threads, stack-switching, pooling-allocator, coredump,
+# profiling, debug/debug-builtins, wit-parser and compile-time-builtins
+# (the last one alone drags in the whole wasm-compose chain). `async` and
+# `component-model` are forced by wasmtime-wasi's p1 → p2 chain and are
+# declared explicitly to document that.
+wasmtime = { version = "48", default-features = false, features = [
+    "addr2line",
+    "anyhow",
+    "async",
+    "backtrace",
+    # Store call hooks, used to replenish the guest's fuel budget on every
+    # guest→host call (no transitive dependencies).
+    "call-hook",
+    "component-model",
+    "cranelift",
+    "demangle",
+    "parallel-compilation",
+    "runtime",
+    "std",
+    "wat",
+] }
+wasmtime-wasi = { version = "48", features = ["p1"] }
+
+[dev-dependencies]
+# Temp directories for preopen-grant tests (host side of the fs fixtures).
+tempfile.workspace = true
+
+[lints]
+workspace = true

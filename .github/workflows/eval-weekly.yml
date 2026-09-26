@@ -1,0 +1,128 @@
+# Weekly agent-behavior regression: run the eval suite (evals/examples) with
+# a real model and compare against the committed baseline. Model/prompt/tool
+# changes degrade agent behavior slowly and silently; this makes the decay
+# visible instead of discovered by users.
+#
+# Cost control: weekly, not per-PR. For a pre-release gate run it manually
+# (workflow_dispatch) with --runs 5 and regenerate the baseline per
+# evals/examples/README.md.
+#
+# Provider configuration (provider-agnostic):
+#   - Secret: the provider's own API key env var (any of ANTHROPIC_API_KEY,
+#     KIMI_API_KEY, MOONSHOT_API_KEY, OPENAI_API_KEY — the step passes them
+#     all through and tack picks the one its provider definition expects).
+#   - Repository variable EVAL_PROVIDER: provider id (default "anthropic").
+#     For Kimi: set EVAL_PROVIDER=kimi-coding (or "moonshotai" for the
+#     api.moonshot.ai endpoint family).
+#   - Repository variable EVAL_MODEL: model id (empty = provider default;
+#     for reproducible trends set it explicitly, e.g. kimi-for-coding).
+#   workflow_dispatch inputs override the variables for one-off runs.
+# On forks without any provider secret the job skips itself successfully.
+#
+# The binary is built in debug on purpose: eval time is dominated by model
+# latency, and a full release build (thin LTO, CGU=1) costs more CI time
+# than it adds fidelity.
+
+name: Agent eval
+
+on:
+  schedule:
+    - cron: "11 2 * * 0" # Sundays 02:11 UTC
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Runs per task (pass rate denominator)"
+        default: "3"
+      provider:
+        description: "Provider id override (empty = EVAL_PROVIDER variable or anthropic)"
+        default: ""
+      model:
+        description: "Model id override (empty = EVAL_MODEL variable or provider default)"
+        default: ""
+      filter:
+        description: "Task name substring filter (empty = all)"
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+      MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      # Resolved once at job level so every step (including the summary)
+      # sees the same values. workflow_dispatch inputs beat repo variables.
+      RUNS: ${{ inputs.runs || '3' }}
+      PROVIDER: ${{ inputs.provider || vars.EVAL_PROVIDER || 'anthropic' }}
+      MODEL: ${{ inputs.model || vars.EVAL_MODEL || '' }}
+      FILTER: ${{ inputs.filter || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check for provider credentials
+        id: auth
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$KIMI_API_KEY" ] && \
+             [ -z "$MOONSHOT_API_KEY" ] && [ -z "$OPENAI_API_KEY" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no provider API key secret set — skipping eval (expected on forks)."
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build tack
+        if: steps.auth.outputs.present == 'true'
+        run: cargo build --locked -p tack-app
+
+      - name: Run eval suite
+        if: steps.auth.outputs.present == 'true'
+        run: |
+          # --provider/--model are top-level clap flags: they must precede
+          # the subcommand.
+          global_args=(--provider "$PROVIDER")
+          [ -n "$MODEL" ] && global_args+=(--model "$MODEL")
+          args=(eval evals/examples --runs "$RUNS" --report eval-report.json)
+          [ -n "$FILTER" ] && args+=(--filter "$FILTER")
+          gate=0
+          if [ -f eval-baseline.json ]; then
+            args+=(--baseline eval-baseline.json)
+            gate=1
+          else
+            echo "::notice::no eval-baseline.json committed — informational run (see evals/examples/README.md for how to commit one)"
+          fi
+          echo "running: ./target/debug/tack ${global_args[*]} ${args[*]}"
+          ./target/debug/tack "${global_args[@]}" "${args[@]}" 2>&1 | tee eval-output.txt
+          # diff_baseline prints ▼ for any task whose pass rate dropped.
+          if [ "$gate" = 1 ] && grep -q "▼" eval-output.txt; then
+            echo "::error::eval pass rate regressed vs baseline"
+            exit 1
+          fi
+
+      - name: Publish job summary
+        if: steps.auth.outputs.present == 'true'
+        run: |
+          {
+            echo '# Agent eval results'
+            echo ''
+            echo "- provider: \`${{ env.PROVIDER }}\`"
+            echo "- model: \`${{ env.MODEL }}\`"
+            echo '```'
+            cat eval-output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.auth.outputs.present == 'true'
+        with:
+          name: eval-report
+          path: |
+            eval-report.json
+            eval-output.txt
+          retention-days: 90

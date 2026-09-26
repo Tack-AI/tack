@@ -1,0 +1,7 @@
+{
+  "name": "sort-lines",
+  "setup": "printf 'cherry\\napple\\nbanana\\ndate\\n' > fruits.txt",
+  "prompt": "Sort the lines in fruits.txt alphabetically. Keep exactly the same four lines, one per line.",
+  "verify": "sort -c fruits.txt && test \"$(wc -l < fruits.txt)\" -eq 4",
+  "timeoutSecs": 300
+}

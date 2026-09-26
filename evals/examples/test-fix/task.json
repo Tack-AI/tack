@@ -1,0 +1,7 @@
+{
+  "name": "test-fix",
+  "setup": "printf 'def is_even(n):\\n    return n %% 2 == 1\\n\\n\\ndef clamp(x, lo, hi):\\n    if x < lo:\\n        return lo\\n    return x\\n' > calc.py && printf 'import unittest\\n\\nfrom calc import clamp, is_even\\n\\n\\nclass TestCalc(unittest.TestCase):\\n    def test_is_even(self):\\n        self.assertTrue(is_even(4))\\n        self.assertFalse(is_even(3))\\n\\n    def test_clamp(self):\\n        self.assertEqual(clamp(5, 0, 3), 3)\\n        self.assertEqual(clamp(-1, 0, 3), 0)\\n        self.assertEqual(clamp(2, 0, 3), 2)\\n\\n\\nif __name__ == \"__main__\":\\n    unittest.main()\\n' > test_calc.py && cp test_calc.py .test_calc.py.orig",
+  "prompt": "The test suite in test_calc.py fails (run `python3 -m unittest -v` to see it). Fix the bug(s) in calc.py so every test passes. Do not modify test_calc.py.",
+  "verify": "python3 -m unittest > /dev/null 2>&1 && cmp -s test_calc.py .test_calc.py.orig",
+  "timeoutSecs": 300
+}

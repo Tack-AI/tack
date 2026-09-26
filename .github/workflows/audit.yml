@@ -1,0 +1,23 @@
+# Weekly supply-chain audit. The `deny` job in ci.yml only runs on push/PR,
+# so a RustSec advisory disclosed *after* the last commit would go unnoticed
+# until someone pushes again. This job re-checks the current tree against the
+# live advisory database every week.
+
+name: Security audit
+
+on:
+  schedule:
+    - cron: "23 3 * * 1" # Mondays 03:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources

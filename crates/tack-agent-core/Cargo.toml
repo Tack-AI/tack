@@ -1,0 +1,26 @@
+[package]
+name = "tack-agent-core"
+description = "Agent runtime with tool calling and state management (Rust port of @earendil-works/pi-agent-core)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+indexmap = { version = "2", features = ["serde"] }
+tack-ai.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+# default-features off: defaults pull reqwest for remote-$ref resolution;
+# tool schemas are validated locally via validator_for only.
+jsonschema = { version = "0.33", default-features = false }
+
+[lints]
+workspace = true

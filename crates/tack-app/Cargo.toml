@@ -1,0 +1,91 @@
+[package]
+name = "tack-app"
+description = "Tack: headless coding agent CLI with print and ACP modes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "tack"
+path = "src/main.rs"
+
+[features]
+default = ["ext", "wasm"]
+# tack-ext plugin host (subprocess NDJSON protocol + TUI widget/autocomplete
+# surface). Off: no extension machinery at all; CLI `ext` subcommands fail
+# with a clear error and ```mermaid blocks are unaffected.
+ext = ["dep:tack-ext"]
+# WASI plugin carrier (wasmtime, ~300-crate dependency cone). Slim builds
+# can drop it: `cargo build --no-default-features` — manifests declaring
+# `carrier: "wasm"` are then skipped with a warning.
+wasm = ["ext", "dep:tack-ext-wasm"]
+# Mermaid diagram rendering (mermaid-rs-renderer → resvg/usvg/fontdb), OFF
+# by default: the ~50-crate rasterizer+font stack is the single most
+# expensive optional feature (~59% of a clean `cargo check`), so builds
+# opt in with `--features mermaid`. Without it ```mermaid blocks render
+# as plain code blocks (same as the `mermaid = "off"` setting).
+mermaid = ["dep:mermaid-rs-renderer"]
+
+[dependencies]
+tack-ai.workspace = true
+tack-agent-core.workspace = true
+tack-session.workspace = true
+tack-tools.workspace = true
+tack-ext = { workspace = true, optional = true }
+tempfile.workspace = true
+tack-ext-wasm = { workspace = true, optional = true }
+tack-protocol.workspace = true
+tack-tui.workspace = true
+crossterm.workspace = true
+arboard.workspace = true
+image.workspace = true
+base64.workspace = true
+pulldown-cmark.workspace = true
+ignore.workspace = true
+serde.workspace = true
+schemars.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+clap.workspace = true
+agent-client-protocol = { version = "0.10", features = ["unstable_session_model", "unstable_session_usage", "unstable_session_info_update"] }
+dirs.workspace = true
+dunce.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+reqwest.workspace = true
+tar.workspace = true
+flate2.workspace = true
+zip.workspace = true
+mermaid-rs-renderer = { version = "0.3.1", default-features = false, features = ["png"], optional = true }
+rmcp = { workspace = true, features = ["client", "server", "macros", "transport-io", "auth"] }
+rand.workspace = true
+globset.workspace = true
+regex.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls-pemfile = "2"
+rcgen = "0.13"
+webpki-roots = "1"
+# default-features off: defaults pull oauth2's own reqwest 0.12 HTTP client;
+# only TokenResponse/types are used (rmcp's auth does its own transport).
+oauth2 = { version = "5", default-features = false }
+keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
+sha2.workspace = true
+# Marketplace catalog signature verification (TOFU-pinned ed25519 keys).
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+chrono.workspace = true
+cron = "0.15"
+# WebSocket transport for `serve --listen ws:` (server handshake + framing;
+# "connect" used by integration tests). No TLS features: wss:// is expected
+# behind a reverse proxy.
+tokio-tungstenite = { workspace = true, features = [
+    "connect",
+    "handshake",
+]}
+
+[lints]
+workspace = true

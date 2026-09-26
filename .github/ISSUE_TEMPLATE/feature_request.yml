@@ -1,0 +1,43 @@
+name: Feature request
+description: Suggest an idea or improvement for tack
+title: "[feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea! The more concrete the motivation and proposal,
+        the easier it is to evaluate and implement.
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation / problem
+      description: |
+        What problem does this solve for you? Describe the workflow or
+        limitation that prompted the request. Concrete examples (what you
+        tried, what fell short) are very helpful.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: |
+        What would you like tack to do? Include UX details where relevant —
+        e.g. a new slash command, a settings key and its default, or a CLI
+        flag.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: |
+        Other approaches you considered (including workarounds you use
+        today, or how upstream TS pi handles this, if applicable), and why
+        they are not sufficient.
+    validations:
+      required: false

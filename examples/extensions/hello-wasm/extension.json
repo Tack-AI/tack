@@ -1,0 +1,6 @@
+{
+  "name": "hello-wasm",
+  "carrier": "wasm",
+  "module": "plugin.wat",
+  "limits": { "maxFuel": 100000000, "maxMemoryBytes": 16777216 }
+}

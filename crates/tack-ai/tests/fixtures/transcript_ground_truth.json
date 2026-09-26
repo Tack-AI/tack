@@ -1,0 +1,175 @@
+{
+  "initial": {
+    "role": "system",
+    "content": "You are helpful.",
+    "toolsAdded": [
+      {
+        "name": "read",
+        "description": "read tool",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "q": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    ],
+    "timestamp": 0
+  },
+  "initialEmpty": null,
+  "currentSystem": {
+    "role": "system",
+    "content": "base prompt\n\nextra instructions",
+    "sections": {
+      "preamble": "P",
+      "cwd": "/repo"
+    },
+    "toolsAdded": [
+      {
+        "name": "read",
+        "description": "read tool",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "q": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    ],
+    "timestamp": 1000
+  },
+  "currentTools": [
+    {
+      "name": "read",
+      "description": "read tool",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "q": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  ],
+  "currentPrompt": "base prompt\n\nextra instructions\n\nP\n\n/repo",
+  "collapsed": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "base prompt\n\nextra instructions",
+        "sections": {
+          "preamble": "P",
+          "cwd": "/repo"
+        },
+        "toolsAdded": [
+          {
+            "name": "read",
+            "description": "read tool",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "q": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ],
+        "timestamp": 1000
+      },
+      {
+        "role": "user",
+        "content": "hi",
+        "timestamp": 2000
+      }
+    ]
+  },
+  "changes": {
+    "toolsAdded": [
+      {
+        "name": "read",
+        "description": "read v2",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "q": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "edit",
+        "description": "edit tool",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "q": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    ],
+    "toolsRemoved": [
+      {
+        "name": "read"
+      },
+      {
+        "name": "bash"
+      }
+    ]
+  },
+  "withChanges": {
+    "role": "system",
+    "content": "",
+    "timestamp": 5000,
+    "toolsAdded": [
+      {
+        "name": "read",
+        "description": "read v2",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "q": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "edit",
+        "description": "edit tool",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "q": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    ],
+    "toolsRemoved": [
+      {
+        "name": "read"
+      },
+      {
+        "name": "bash"
+      }
+    ]
+  },
+  "withChangesEmpty": {
+    "role": "system",
+    "content": "x",
+    "sections": {
+      "a": "1"
+    },
+    "timestamp": 6000
+  }
+}

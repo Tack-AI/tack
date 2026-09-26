@@ -1,0 +1,7 @@
+{
+  "name": "markdown-rewrite",
+  "setup": "printf '## Overview\\n\\nThis project does things. See https://example.com for details.\\n\\n## Usage\\n\\n### Install\\n\\nRun the installer. Homepage: https://example.org\\n\\n## License\\n\\nMIT\\n' > doc.md && cp doc.md .doc.orig",
+  "prompt": "Rewrite doc.md with two mechanical transformations: promote every heading by one level (## becomes #, ### becomes ##), and wrap every bare URL in angle brackets (https://x becomes <https://x>). Keep all other text and the line order unchanged.",
+  "verify": "! grep -Eq '^#{3,} ' doc.md && grep -qx '# Overview' doc.md && grep -qx '# Usage' doc.md && grep -qx '## Install' doc.md && grep -q '<https://example.com>' doc.md && grep -q '<https://example.org>' doc.md && grep -q 'Run the installer.' doc.md && grep -qx 'MIT' doc.md && test \"$(wc -l < doc.md)\" -eq \"$(wc -l < .doc.orig)\"",
+  "timeoutSecs": 300
+}

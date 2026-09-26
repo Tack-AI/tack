@@ -1,0 +1,9 @@
+{
+  "name": "hello-wasm-caps",
+  "carrier": "wasm",
+  "module": "plugin.wat",
+  "limits": { "maxFuel": 100000000, "maxMemoryBytes": 16777216 },
+  "capabilities": {
+    "fs": [{ "host": "data", "guest": "/data", "access": "read-only" }]
+  }
+}

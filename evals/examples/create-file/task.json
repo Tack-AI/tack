@@ -1,0 +1,6 @@
+{
+  "name": "create-file",
+  "prompt": "Create a file called hello.txt containing exactly the text: hello pi",
+  "verify": "grep -q 'hello pi' hello.txt",
+  "timeoutSecs": 300
+}

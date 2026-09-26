@@ -1,0 +1,64 @@
+# 每周自动生成「上游增量审阅报告」（scripts/upstream-delta.sh），并维护一个
+# 标题含 [upstream-delta] 的跟踪 issue：有新增 commit 时把报告追加为评论
+# （尚无 issue 则新建），完整报告同时存为 workflow artifact。
+# 手工审阅流程见 docs/upstream-alignment.md。
+
+name: Upstream delta
+
+on:
+  schedule:
+    - cron: "17 4 * * 1" # Mondays 04:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # UPSTREAM_REPO 用脚本默认值（https://github.com/earendil-works/pi.git），
+      # 基线从 docs/upstream-alignment.md 解析。
+      - name: Generate delta report
+        run: scripts/upstream-delta.sh -o delta.md
+
+      - name: Post to tracking issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if grep -q '无增量' delta.md; then
+            echo "上游无增量，跳过 issue 更新。"
+            exit 0
+          fi
+          # gh issue body 上限约 64KiB，超长时截断并指向 artifact 里的完整报告
+          body=delta.md
+          if [ "$(wc -c < delta.md)" -gt 60000 ]; then
+            head -c 60000 delta.md > body.md
+            printf '\n\n---\n_报告过长已截断，完整报告见本次 workflow 运行的 artifact `upstream-delta`。_\n' >> body.md
+            body=body.md
+          fi
+          n=$(sed -n 's/^- commit 总数：\([0-9][0-9]*\).*/\1/p' delta.md | head -n 1)
+          base_short=$(sed -n 's/^- 基线：`\([0-9a-f]\{40\}\)`.*/\1/p' delta.md | head -n 1 | cut -c 1-9)
+          title="[upstream-delta] 上游增量：${n:-?} commits since ${base_short:-unknown}"
+          existing=$(gh issue list --state open --limit 100 --json number,title \
+            --jq '[.[] | select(.title | contains("[upstream-delta]")) | .number][0] // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file "$body"
+            gh issue edit "$existing" --title "$title"
+            echo "已把报告追加到既有 issue #$existing"
+          else
+            # label upstream-sync 可能不存在：带 label 创建失败则不带 label 重试
+            gh issue create --title "$title" --body-file "$body" --label upstream-sync \
+              || gh issue create --title "$title" --body-file "$body" || true
+            echo "已创建新跟踪 issue"
+          fi
+
+      - name: Upload full report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-delta
+          path: delta.md

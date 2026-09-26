@@ -1,0 +1,7 @@
+{
+  "name": "run-and-fix",
+  "setup": "printf 'def divide(a, b):\\n    return a + b  # bug\\n\\nassert divide(6, 3) == 2\\nprint(\"ok\")\\n' > app.py",
+  "prompt": "app.py currently fails. Run it, find the bug, fix it, and run it again until it prints ok.",
+  "verify": "python3 app.py",
+  "timeoutSecs": 300
+}

@@ -1,0 +1,5 @@
+{
+  "name": "git-checkpoint",
+  "command": "node",
+  "args": ["plugin.js"]
+}

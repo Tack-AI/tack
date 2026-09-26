@@ -1,0 +1,7 @@
+{
+  "name": "regex-replace",
+  "setup": "printf 'Meeting on 03/15/2024 with Bob\\nDeadline is 12/01/2023, do not miss it\\nShip date: 07/04/2024 (tentative)\\nNo dates in this line\\n' > dates.txt",
+  "prompt": "dates.txt contains dates in MM/DD/YYYY format. Convert every one of them to ISO format YYYY-MM-DD with a scripted batch replacement (e.g. sed or python with a regex — do not retype each line by hand). Leave all other text and the line order untouched.",
+  "verify": "! grep -Eq '[0-9]{2}/[0-9]{2}/[0-9]{4}' dates.txt && grep -q '2024-03-15' dates.txt && grep -q '2023-12-01' dates.txt && grep -q '2024-07-04' dates.txt && grep -qx 'No dates in this line' dates.txt && test \"$(wc -l < dates.txt)\" -eq 4",
+  "timeoutSecs": 300
+}

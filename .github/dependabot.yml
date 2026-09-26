@@ -1,0 +1,28 @@
+# Automated dependency update PRs. Cargo: weekly grouped patch/minor bumps so
+# the 600+ package tree does not go stale between manual passes; major bumps
+# still arrive as individual PRs for review. Actions: keep workflow pins fresh.
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      patch-minor:
+        update-types: ["patch", "minor"]
+  # fuzz/ is a separate cargo-fuzz workspace (libfuzzer-sys + path deps).
+  - package-ecosystem: cargo
+    directory: "/fuzz"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3

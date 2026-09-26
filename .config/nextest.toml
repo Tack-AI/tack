@@ -1,0 +1,14 @@
+# nextest profile for CI: name and bound slow/wedged tests instead of
+# letting one stall the job in silence. The ubuntu check job repeatedly
+# hung with zero diagnostics under libtest (which has no per-test
+# timeout); nextest runs each test in its own process, so a wedge is
+# reported SLOW, then killed and attributed to a named test.
+[profile.ci]
+# One wedged/failed test must not hide the rest of the suite.
+fail-fast = false
+# Normal tests finish in seconds; the slowest (mock-CLI e2e, editor
+# budgets) stay under ~10s even on loaded runners. Report SLOW after
+# 60s without completion, SIGKILL after 3 periods (180s) + a grace
+# window for the test to notice its cancellation. Any recurrence of a
+# silent wedge now fails as a named test within ~3 minutes.
+slow-timeout = { period = "60s", terminate-after = 3, grace-period = "10s" }

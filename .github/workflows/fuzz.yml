@@ -1,0 +1,45 @@
+# Weekly fuzz smoke: each target runs briefly against the sanitizers. This
+# catches "malformed input panics the parser" regressions without pretending
+# to be exhaustive — for deep runs, pull the repo and let
+# `cargo +nightly fuzz run <target>` run for hours locally.
+#
+# A crash makes the job fail and uploads the reproducer artifact; minimize
+# it with `cargo fuzz tmin <target> fuzz/artifacts/<target>/<file>` and turn
+# it into a regression test.
+
+name: Fuzz smoke
+
+on:
+  schedule:
+    - cron: "53 6 * * 1" # Mondays 06:53 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [session_line, cbor_payload, json_repair, ext_envelope]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz-${{ matrix.target }}
+      - name: Fuzz ${{ matrix.target }}
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300 -timeout=10 -rss_limit_mb=4096
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/
+          retention-days: 30

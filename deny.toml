@@ -1,0 +1,153 @@
+# cargo-deny configuration — CI runs `cargo deny check advisories bans licenses sources`.
+
+[advisories]
+# Known vulnerabilities always fail the check (cargo-deny 0.20 removed the
+# `vulnerability` key; deny is the only behavior). cargo-deny 0.20 also has
+# no warn level for unmaintained advisories (scope enum only, "all" =
+# error), so specific unmaintained notices are downgraded via `ignore` with
+# reasons to keep the pre-0.20 non-blocking intent.
+unmaintained = "all"
+yanked = "warn"
+ignore = [
+    # rsa enters via jsonwebtoken (tack-ai, sign/verify only — no RSA
+    # decryption path); the Marvin timing sidechannel has no patched release.
+    { id = "RUSTSEC-2023-0071", reason = "rsa via jsonwebtoken (sign/verify only, no decryption); no patched release exists" },
+    # Unmaintained but load-bearing; replacements are follow-ups, kept
+    # non-blocking (pre-0.20 warn-level intent).
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.x via transitive deps; unmaintained, no vulnerability" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is a direct dep of tack-app (TLS server); unmaintained, replacement tracked" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser via mermaid-rs-renderer; unmaintained, no vulnerability" },
+    { id = "RUSTSEC-2026-0206", reason = "rustybuzz via mermaid-rs-renderer; unmaintained, no vulnerability" },
+    { id = "RUSTSEC-2024-0320", reason = "yaml-rust via syntect; unmaintained, no vulnerability" },
+]
+
+[bans]
+# Every known duplicate is pinned in `skip` below with a reason; anything
+# NEW failing this check means a dependency introduced an unvetted second
+# version — converge or document it here.
+multiple-versions = "deny"
+wildcards = "warn"
+highlight = "all"
+# The whole tree is rustls-only; keep it that way.
+deny = [
+    { crate = "openssl", reason = "workspace is rustls-only" },
+    { crate = "openssl-sys", reason = "workspace is rustls-only" },
+]
+skip = [
+    # rmcp 3.1.4 still depends on reqwest 0.13 while the workspace is on
+    # 0.12 — tracked; align when rmcp is upgraded.
+    { crate = "reqwest@0.13" },
+    # rmcp 3.1.4 uses base64 0.23; the workspace pins 0.22. Converges on the
+    # next workspace base64 upgrade.
+    { crate = "base64@0.23" },
+    # jsonwebtoken 10 (tack-ai, normal dep) and the dev-only rand08 alias in
+    # tack-ai still pull rand 0.8; the workspace is on 0.9.
+    { crate = "rand@0.8" },
+    # tungstenite 0.30 (via tokio-tungstenite) moved to rand 0.10 while the
+    # workspace is on 0.9.
+    { crate = "rand@0.10" },
+    # oauth2 5 and wasmtime's witx still use thiserror 1; the workspace is
+    # on thiserror 2.
+    { crate = "thiserror@1" },
+    { crate = "thiserror-impl@1" },
+    # tokio-tungstenite 0.30's rustls-tls-webpki-roots feature pins
+    # webpki-roots 0.26; tack-app uses 1.0 directly for its TLS server.
+    { crate = "webpki-roots@0.26" },
+    # digest 0.11 chain comes from sha1 0.11 (tungstenite 0.30 WebSocket
+    # handshake, matched by the workspace sha1 pin); the workspace crypto
+    # stack (sha2/hmac/aes-gcm) still pins digest 0.10. Converges when the
+    # RustCrypto hashes move to digest 0.11.
+    { crate = "digest@0.11" },
+    { crate = "crypto-common@0.2" },
+    { crate = "block-buffer@0.12" },
+    { crate = "const-oid@0.10" },
+    # chacha20 0.10 (rand 0.10 chain via tungstenite) uses cpufeatures 0.3;
+    # sha2 and the digest 0.10 stack use 0.2.
+    { crate = "cpufeatures@0.3" },
+    # rand 0.8/0.9/0.10 each pin their own rand_core/rand_chacha/getrandom.
+    { crate = "rand_core@0.6" },
+    { crate = "rand_core@0.10" },
+    { crate = "rand_chacha@0.3" },
+    { crate = "getrandom@0.2" },
+    { crate = "getrandom@0.4" },
+    # wasmtime 48 internal: the `wat` feature pins wat 1.258 (wast 258 /
+    # wasm-encoder 0.258) while wiggle (wasmtime-wasi) still uses wast 35
+    # and wasmtime-environ pins wasm-encoder 0.254.
+    { crate = "wasm-encoder@0.258" },
+    { crate = "wast@258" },
+    # wasmtime 48 (wit-bindgen) uses hashbrown 0.17; the rest of the tree is
+    # on 0.16.
+    { crate = "hashbrown@0.17" },
+    # wasmtime 48's io-lifetimes 2 coexists with rustix 1's io-lifetimes 3.
+    { crate = "io-lifetimes@2" },
+    # async-trait 0.1.92+ is on syn 3; the rest of the proc-macro ecosystem
+    # is still on syn 2.
+    { crate = "syn@3" },
+    # mermaid-rs-renderer stack: fontconfig-parser 0.5.8 pins roxmltree 0.20,
+    # usvg 0.47 uses 0.21.
+    { crate = "roxmltree@0.20" },
+    # proptest (dev) uses quick-error 1; image-webp (tack-tools webp support)
+    # uses quick-error 2.
+    { crate = "quick-error@1" },
+    # -- windows-sys version ladder (surfaced when cargo-deny 0.19.1 fixed
+    # krates graph pruning; all entries below pre-date the fix).
+    # 0.61 is canonical (tack-tools pins it directly; tokio/rustix/wasmtime
+    # agree). Older versions are pinned by stacks we cannot move:
+    #   0.52 <- ring 0.17 (rustls ring provider; ring has not moved)
+    #   0.59 <- fs-set-times/winx (wasmtime 48 WASI stack)
+    #   0.60 <- arboard 3.6, keyring 3.6, io-extras 0.19 (cap-std 4 chain)
+    { crate = "windows-sys@0.52" },
+    { crate = "windows-sys@0.59" },
+    { crate = "windows-sys@0.60" },
+    # windows-targets 0.52.6 (+ its per-arch import crates) only exists for
+    # the windows-sys <0.61 chain above; 0.53 serves windows-sys 0.61.
+    { crate = "windows-targets@0.52.6" },
+    { crate = "windows_aarch64_gnullvm@0.52.6" },
+    { crate = "windows_aarch64_msvc@0.52.6" },
+    { crate = "windows_i686_gnu@0.52.6" },
+    { crate = "windows_i686_gnullvm@0.52.6" },
+    { crate = "windows_i686_msvc@0.52.6" },
+    { crate = "windows_x86_64_gnu@0.52.6" },
+    { crate = "windows_x86_64_gnullvm@0.52.6" },
+    { crate = "windows_x86_64_msvc@0.52.6" },
+    # miniz_oxide 0.8 comes from png 0.18 (image/tiny-skia); flate2 1.1 and
+    # the rest of the tree are on 0.9.
+    { crate = "miniz_oxide@0.8" },
+    # r-efi tracks getrandom: 5.x via getrandom 0.3, 6.x via getrandom 0.4
+    # (both getrandom versions already skipped above).
+    { crate = "r-efi@5" },
+    # macOS keychain/TLS stack: keyring 3.6 still pulls security-framework 2
+    # (with core-foundation 0.9) while rustls-platform-verifier (reqwest)
+    # uses security-framework 3 (core-foundation 0.10).
+    { crate = "security-framework@2" },
+    { crate = "core-foundation@0.9" },
+]
+
+# Allowlist derived from `cargo metadata` license fields across the full
+# dependency tree (every license expression in the tree resolves to at least
+# one allowed term). If cargo-deny flags a crate this list missed, prefer
+# narrowing the dependency over widening the list.
+[licenses]
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    # wasmtime/cranelift stack is Apache-2.0 WITH LLVM-exception.
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-3.0",       # icu4x / unicode-ident
+    "Unlicense",         # regex/ignore stack (dual with MIT)
+    "CC0-1.0",           # dunce (dual with MIT-0/Apache-2.0)
+    "MPL-2.0",           # option-ext (via dirs-sys) — weak copyleft, file-level
+    "CDLA-Permissive-2.0",  # webpki-roots root store data
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

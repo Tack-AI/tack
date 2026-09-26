@@ -1,0 +1,198 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # Bound the whole job: a wedged test must fail loudly with logs
+    # instead of burning the 6h default (a cancelled/timed-out step
+    # preserves logs; a runner lost-comms death does not).
+    # Cold builds are this job's real enemy: the cache only saves on
+    # success, and a string of failed/cancelled runs left it stale, so
+    # every run downloaded+compiled the whole tree (wasmtime-scale) on
+    # 4 vCPU/16GB until the VM thrashed. Give cold builds room to
+    # finish once; afterwards the warmed cache keeps runs at ~10 min.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        # GH ubuntu runners have ~14GB free; this workspace's full debug
+        # build (wasmtime-scale test binaries, ~800MB each at debug=2)
+        # needs several times that. Reclaim the image's unused tool
+        # caches (~20-30GB).
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/powershell /usr/share/swift || true
+          df -h / | tail -1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Save even when tests fail: a failed run still completed most
+          # of the build — without this the cache can never warm back up
+          # after one red run (cold-build → timeout → no save → cold).
+          cache-on-failure: true
+      - name: Format
+        run: cargo fmt --all -- --check
+      # The tree is clippy-clean; keep it that way.
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Test
+        env:
+          # 4 vCPU/16GB runner: cap rustc/link parallelism and drop
+          # debuginfo entirely — the ~800MB-per-test-binary DWARF is
+          # what makes the build exceed the runner's 14GB disk (and
+          # thrash its RAM on parallel links). Panic/assert messages
+          # still carry static file:line for triage.
+          CARGO_BUILD_JOBS: "3"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        # nextest runs each test in its own process with a per-test
+        # timeout (.config/nextest.toml): a wedged test is reported SLOW,
+        # then killed and attributed by name. Doctests are not covered by
+        # nextest; they run via plain cargo test below.
+        # The workload runs inside Docker with hard cgroup limits
+        # (memory/cpus/pids): bare-metal runs of this suite repeatedly
+        # killed the whole runner VM with the workload, losing every log.
+        # Inside a container a resource bomb OOMs/throttles the CONTAINER
+        # while the runner agent survives to stream the failure out. git
+        # is installed with --no-install-recommends: git Recommends
+        # ca-certificates, whose postinst writes to the read-only host
+        # certs mount and fails dpkg. Output is teed to a log uploaded
+        # below with if: always() — do NOT cancel this job manually:
+        # cancellation discards the whole job's logs.
+        run: |
+          command -v cargo-nextest >/dev/null || exit 1
+          [ -x /home/runner/.cargo/bin/cargo-nextest ] || cp "$(command -v cargo-nextest)" /home/runner/.cargo/bin/
+          docker pull -q ubuntu:24.04
+          rc=0
+          docker run --rm --name ci-tests \
+            --memory=12g --memory-swap=20g --cpus=3.5 --pids-limit=2048 \
+            -e HOME=/home/runner -e CARGO_HOME=/home/runner/.cargo -e RUSTUP_HOME=/home/runner/.rustup \
+            -e PATH=/home/runner/.cargo/bin:/usr/local/bin:/usr/bin:/bin \
+            -e CARGO_BUILD_JOBS -e CARGO_PROFILE_DEV_DEBUG -e CARGO_TERM_COLOR \
+            -v /home/runner/.cargo:/home/runner/.cargo \
+            -v /home/runner/.rustup:/home/runner/.rustup \
+            -v /etc/ssl/certs:/etc/ssl/certs:ro \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -w "$GITHUB_WORKSPACE" \
+            ubuntu:24.04 \
+            bash -c 'set -e; apt-get update -qq; apt-get install -y -qq --no-install-recommends git build-essential pkg-config; cargo nextest run --locked --workspace --profile ci; cargo test --locked --workspace --doc' \
+            2>&1 | tee test-output.log || rc=$?
+          exit "$rc"
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-test-log
+          path: test-output.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Docs build warning-free (intra-doc links, broken markdown); keep it enforced.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Doc
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps --workspace
+
+  # MSRV: workspace.package.rust-version is 1.85 (edition 2024 floor; no newer
+  # language features are used in our code). The full workspace cannot be
+  # checked at 1.85 because pinned dependencies have higher floors — verified
+  # with cargo +1.85: wasmtime 48 → 1.95; syntect→time and image/globset/
+  # jsonwebtoken → 1.88. Until those floors allow it, this job checks the
+  # crates whose dependency cone still builds at 1.85 (currently tack-protocol
+  # and everything it pulls). `--ignore-rust-version` skips cargo's dep-floor
+  # gate so actual compilation is the check. Widen back to --workspace when
+  # dependency MSRVs permit.
+  # `cargo +1.85` is REQUIRED: rust-toolchain.toml pins stable, and a
+  # rust-toolchain.toml channel beats the dtolnay action's default — without
+  # the `+1.85` prefix this job silently ran the pinned stable toolchain.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +1.85 check --locked --ignore-rust-version -p tack-protocol
+
+  # Tests also run on Windows/macOS — the crate has platform-specific code
+  # (windows-sys, seatbelt/bwrap sandboxing) that a Linux-only suite misses.
+  test-cross:
+    runs-on: ${{ matrix.os }}
+    # The mock-CLI e2e suites (codebuddy, etc.) can wedge on a platform's
+    # pipe/process handling; bound the whole job so a hang fails loudly
+    # instead of burning CI hours.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Windows-specific code paths (windows-sys sandbox, path handling) drift
+      # easily; lint them on the platform they compile for. Hard-fail like the
+      # Linux gate — if this exposes pre-existing platform-gated warnings, fix
+      # them rather than downgrading back to warn-level.
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      # libtest runs a crate's whole suite in ONE process: a platform crash
+      # (2026-09-24: silent SIGABRT inside tack-app --lib on macOS) kills the
+      # binary unattributed — the crashing test is never named, and both its
+      # captured output and the still-buffered stdout die with the process.
+      # nextest isolates each test in its own process (same setup as the
+      # Linux check job), so a crash/abort is reported as a named failing
+      # test with its output, and a wedge hits the per-test timeout in
+      # .config/nextest.toml instead of the job timeout. Doctests are not
+      # covered by nextest; they run via plain cargo test below.
+      - name: Test
+        run: |
+          cargo nextest run --locked --workspace --profile ci
+          cargo test --locked --workspace --doc
+
+  # Supply-chain gate: RustSec advisories, duplicate-version bans, license
+  # allowlist, source allowlist. deny.toml targets cargo-deny 0.20 schema;
+  # the licenses allowlist is verified against the current lockfile — if a
+  # new dep trips it, prefer narrowing the dependency over widening the list.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+  # Bidirectional self-test of the eval suite — pure shell + python3, no
+  # model and no network needed (see evals/selftest.sh).
+  # Docs/code drift self-audit — grep-level, no model/network. Fails when a
+  # documented settings key / hook event / CLI flag / feature gate does not
+  # exist in code (the implemented-but-undocumented direction only warns).
+  evals-selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: evals/selftest.sh
+      - run: evals/docs-audit/static_check.sh

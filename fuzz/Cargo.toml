@@ -1,0 +1,50 @@
+[package]
+name = "tack-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Fuzz the crate-under-test's *public* parsing surfaces: anything reachable
+# from a session file, a remote peer, a plugin, or a model's output. A panic
+# in any of these is a real robustness bug.
+[dependencies]
+libfuzzer-sys = "0.4"
+tack-session = { path = "../crates/tack-session" }
+tack-protocol = { path = "../crates/tack-protocol" }
+tack-ai = { path = "../crates/tack-ai" }
+tack-ext = { path = "../crates/tack-ext" }
+serde_json = "1"
+
+# Prevent this workspace from inheriting the root one.
+[workspace]
+
+[[bin]]
+name = "session_line"
+path = "fuzz_targets/session_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cbor_payload"
+path = "fuzz_targets/cbor_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json_repair"
+path = "fuzz_targets/json_repair.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ext_envelope"
+path = "fuzz_targets/ext_envelope.rs"
+test = false
+doc = false
+bench = false

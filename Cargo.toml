@@ -1,0 +1,160 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tack-ai",
+    "crates/tack-agent-core",
+    "crates/tack-session",
+    "crates/tack-tools",
+    "crates/tack-app",
+    "crates/tack-protocol",
+    "crates/tack-tui",
+    "crates/tack-ext",
+    "crates/tack-ext-wasm",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+# Edition 2024 requires rustc 1.85; no newer language features are used.
+# rust-version is only inherited by tack-protocol (the crate the CI msrv job
+# can actually verify at 1.85). The rest of the workspace has higher
+# effective floors from pinned dependencies (wasmtime 48 needs 1.95,
+# syntect→time and image/globset/jsonwebtoken need 1.88), so those crates
+# declare nothing rather than an unverifiable number; tack-ext-wasm declares
+# its real wasmtime-driven floor.
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/sufar/tack"
+
+[workspace.dependencies]
+# internal
+tack-ai = { path = "crates/tack-ai" }
+tack-agent-core = { path = "crates/tack-agent-core" }
+tack-session = { path = "crates/tack-session" }
+tack-tools = { path = "crates/tack-tools" }
+tack-protocol = { path = "crates/tack-protocol" }
+tack-tui = { path = "crates/tack-tui" }
+tack-ext = { path = "crates/tack-ext" }
+tack-ext-wasm = { path = "crates/tack-ext-wasm" }
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+
+# async
+tokio = { version = "1", features = ["sync", "time", "macros", "process", "fs", "io-util", "io-std", "rt-multi-thread", "net", "signal"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+async-trait = "0.1"
+futures-util = "0.3"
+futures-core = "0.3"
+
+# http / sse
+# 0.13 aligns with rmcp 3.1's pinned reqwest — one HTTP/TLS stack workspace-
+# wide (0.12 + 0.13 duplicated hyper/rustls and two webpki-roots copies).
+# rustls-no-provider: reqwest 0.13's `rustls` feature forces the aws-lc-rs
+# C build; we install the ring provider at startup instead (tack_ai::tls).
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream", "json", "form", "query"] }
+eventsource-stream = "0.2"
+# WebSocket (tack-ai codex client, tack-app serve). Single version workspace-wide;
+# crates opt into connect/handshake/TLS features additively.
+tokio-tungstenite = { version = "0.30", default-features = false }
+# MCP SDK (client in tack-tools, client+server in tack-app); crates add features.
+rmcp = { version = "3.1.4" }
+globset = "0.4"
+
+# errors / logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# tools
+ignore = "0.4"
+regex = "1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+similar = "2"
+dunce = "1"
+
+# managed binary downloads (fd/rg installer)
+tar = "0.4"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
+
+# session
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+rand = "0.9"
+uuid = { version = "1", features = ["v4"] }
+dirs = "6"
+
+# crypto (OAuth PKCE / AWS SigV4 / Vertex SA-JWT)
+sha2 = "0.10"
+# Keep on 0.11 to match tungstenite 0.30's sha1 (WebSocket handshake);
+# downgrading would only add a second sha1 without removing the digest 0.11
+# chain (sha2/hmac/aes-gcm still pin digest 0.10).
+sha1 = "0.11"
+hmac = "0.12"
+base64 = "0.22"
+crc32fast = "1"
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
+
+# TLS provider: reqwest is rustls-no-provider, so the ring CryptoProvider
+# must be installed process-wide before any TLS client is built (tack_ai::tls).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+
+# tui
+crossterm = { version = "0.29" }
+unicode-width = "0.2"
+unicode-segmentation = "1"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+arboard = "3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# app
+clap = { version = "4", features = ["derive"] }
+
+# dev
+proptest = "1"
+tempfile = "3"
+# Microbenchmarks (criterion 0.5 without plotters: text output only, keeps
+# the dep cone small; CI smoke-compiles benches, trends run weekly).
+criterion = { version = "0.5", default-features = false, features = [
+    "cargo_bench_support",
+] }
+
+# Release tuning. NO panic = "abort": code relies on catch_unwind
+# (unwinding) for plugin/tool isolation.
+# NOTE: CGU=1 + thin LTO makes even one-line rebuilds take minutes (single-
+# threaded codegen of a large bin crate + a full LTO pass over ~1000 deps).
+# Use this profile only for dist binaries; for local optimized builds use
+# `cargo build --profile release-fast`.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+# Keep line tables so release backtraces still map to source lines.
+debug = "line-tables-only"
+
+# Fast local optimized builds: same opt-level as release but parallel
+# codegen, no LTO, and incremental — rebuilds after small edits are seconds
+# instead of minutes. `cargo build --profile release-fast -p tack-app`.
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+debug = false
+strip = false
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+# Deny in production code (priority 1 so it beats the group `all` level);
+# test modules opt back in with `#![allow(clippy::unwrap_used)]` (already
+# the repo-wide convention).
+unwrap_used = { level = "deny", priority = 1 }

@@ -1,0 +1,6 @@
+# Artifacts produced when `tack eval evals/docs-audit` runs setup in-place
+# (doc/source snapshots, the computed oracle, the agent's report).
+audit-report.json
+.expected
+doc_*.md
+impl_*.rs

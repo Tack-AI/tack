@@ -1,0 +1,7 @@
+{
+  "name": "fix-typo",
+  "setup": "printf 'teh quick brown fox' > a.txt",
+  "prompt": "Fix the typo in a.txt (teh -> the). Do not change anything else.",
+  "verify": "grep -q 'the quick brown fox' a.txt",
+  "timeoutSecs": 300
+}

@@ -1,0 +1,941 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tack · remote session</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d; --fg: #c9d1d9;
+    --dim: #8b949e; --green: #3fb950; --yellow: #d29922; --red: #f85149;
+    --blue: #58a6ff; --purple: #bc8cff;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; gap: 8px; align-items: center; padding: 6px 10px;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  header .brand { color: var(--blue); font-weight: bold; margin-right: 4px; }
+  #status { width: 9px; height: 9px; border-radius: 50%; background: var(--red); flex: none; }
+  #status.on { background: var(--green); }
+  input, select, button, textarea {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 4px; font: inherit; padding: 3px 8px;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--dim); }
+  button:disabled { opacity: .45; cursor: default; }
+  #session-bar {
+    display: flex; gap: 8px; align-items: center; padding: 5px 10px;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  #sessions { min-width: 220px; }
+  #models { max-width: 260px; }
+  #phase { color: var(--dim); margin-left: auto; }
+  #phase.turn { color: var(--yellow); }
+  #perm-dialog {
+    display: none; position: fixed; left: 50%; bottom: 70px; transform: translateX(-50%);
+    width: min(560px, 92vw); background: var(--panel); border: 1px solid var(--yellow);
+    border-radius: 6px; padding: 10px 12px; z-index: 10;
+    box-shadow: 0 6px 24px rgba(0,0,0,.5);
+  }
+  #perm-dialog.open { display: block; }
+  #perm-title { color: var(--yellow); font-weight: bold; margin-bottom: 6px; }
+  #perm-input {
+    margin: 0 0 8px; padding: 6px 8px; max-height: 160px; overflow: auto;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    white-space: pre-wrap; word-break: break-word; color: var(--dim);
+  }
+  #perm-dialog .row { display: flex; gap: 8px; }
+  #perm-once { border-color: var(--green); }
+  #perm-always { border-color: var(--blue); }
+  #perm-deny { border-color: var(--red); margin-left: auto; }
+  main { flex: 1; overflow-y: auto; padding: 10px 12px; }
+  .msg { margin: 0 0 10px; white-space: pre-wrap; word-break: break-word; }
+  .msg.user { color: var(--green); }
+  .msg.user::before { content: "> "; color: var(--dim); }
+  .msg.assistant { color: var(--fg); }
+  .msg.thinking { color: var(--dim); font-style: italic; }
+  .msg.system { color: var(--dim); }
+  .msg.error { color: var(--red); }
+  /* Streaming tool-call arguments (raw JSON until the call is complete
+     enough to render as a tool card). */
+  .msg.toolargs { color: var(--dim); font-size: 12px; }
+  .msg.toolargs::before { content: "⚙ "; color: var(--yellow); }
+  .tool { margin: 0 0 10px; border: 1px solid var(--border); border-radius: 4px; }
+  .tool summary {
+    cursor: pointer; padding: 3px 8px; color: var(--yellow);
+    background: var(--panel); border-radius: 4px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .tool.error summary { color: var(--red); }
+  .tool pre { margin: 0; padding: 6px 8px; max-height: 240px; overflow: auto;
+    white-space: pre-wrap; word-break: break-word; color: var(--dim); }
+  #jump-bottom {
+    display: none; position: fixed; right: 18px; bottom: 82px; z-index: 5;
+    border-color: var(--blue); box-shadow: 0 2px 10px rgba(0,0,0,.4);
+  }
+  #stats-bar {
+    display: none; padding: 3px 10px; background: var(--panel);
+    border-top: 1px solid var(--border); color: var(--dim);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #stats-bar.warn { color: var(--yellow); }
+  #stats-bar.crit { color: var(--red); }
+  footer {
+    display: flex; gap: 8px; padding: 8px 10px;
+    background: var(--panel); border-top: 1px solid var(--border);
+  }
+  #input { flex: 1; resize: none; height: 3.2em; }
+  footer .col { display: flex; flex-direction: column; gap: 4px; }
+  .hint { color: var(--dim); font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">π Tack</span>
+  <span id="status"></span>
+  <span id="ws-url" class="hint"></span>
+  <input id="token" type="password" placeholder="auth token (if required)" size="28">
+  <button id="connect">Connect</button>
+  <span id="conn-msg" class="hint"></span>
+</header>
+<div id="session-bar">
+  <select id="sessions" disabled></select>
+  <button id="new-session" disabled>New session</button>
+  <button id="attach" disabled>Attach</button>
+  <label class="hint">mode <select id="mode" disabled>
+    <option value="ask">ask</option>
+    <option value="acceptEdits">acceptEdits</option>
+    <option value="plan">plan</option>
+    <option value="bypass">bypass</option>
+  </select></label>
+  <select id="models" disabled title="model"></select>
+  <select id="thinking" disabled title="thinking level">
+    <option value="off">off</option>
+    <option value="minimal">minimal</option>
+    <option value="low">low</option>
+    <option value="medium">medium</option>
+    <option value="high">high</option>
+    <option value="xhigh">xhigh</option>
+    <option value="max">max</option>
+  </select>
+  <span id="phase"></span>
+</div>
+<div id="perm-dialog">
+  <div id="perm-title"></div>
+  <pre id="perm-input"></pre>
+  <div class="row">
+    <button id="perm-once">Allow once</button>
+    <button id="perm-always">Always allow</button>
+    <button id="perm-deny">Deny</button>
+  </div>
+</div>
+<main id="log"></main>
+<button id="jump-bottom" title="back to bottom">↓</button>
+<div id="stats-bar"></div>
+<footer>
+  <textarea id="input" placeholder="prompt… (Enter to send, Shift+Enter for newline)" disabled></textarea>
+  <div class="col">
+    <button id="send" disabled>Send</button>
+    <div style="display:flex; gap:4px">
+      <button id="steer" disabled title="queue as steering input">Steer</button>
+      <button id="abort" disabled>Abort</button>
+    </div>
+  </div>
+</footer>
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ */
+/* Minimal CBOR codec: only what pi protocol v1 uses — definite-length */
+/* maps, arrays, utf8 strings, byte strings, ints, floats, bool, null. */
+/* ------------------------------------------------------------------ */
+
+function cborEncode(value) {
+  const out = [];
+  encodeValue(value, out);
+  let len = 0;
+  for (const p of out) len += p.length;
+  const buf = new Uint8Array(len);
+  let off = 0;
+  for (const p of out) { buf.set(p, off); off += p.length; }
+  return buf;
+}
+
+function head(major, n) {
+  // major type + argument, shortest form (n is a non-negative safe integer)
+  const m = major << 5;
+  if (n < 24) return [m | n];
+  if (n < 0x100) return [m | 24, n];
+  if (n < 0x10000) return [m | 25, n >> 8, n & 0xff];
+  if (n < 0x100000000) return [m | 26, (n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff];
+  // 64-bit: split into two 32-bit halves (n < 2^53 so this is exact)
+  const hi = Math.floor(n / 0x100000000), lo = n >>> 0;
+  return [m | 27, (hi >>> 24) & 0xff, (hi >>> 16) & 0xff, (hi >>> 8) & 0xff, hi & 0xff,
+          (lo >>> 24) & 0xff, (lo >>> 16) & 0xff, (lo >>> 8) & 0xff, lo & 0xff];
+}
+
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
+function encodeValue(v, out) {
+  if (v === null || v === undefined) { out.push([0xf6]); return; }
+  if (v === false) { out.push([0xf4]); return; }
+  if (v === true) { out.push([0xf5]); return; }
+  if (typeof v === "number") {
+    if (Number.isSafeInteger(v)) {
+      out.push(v >= 0 ? head(0, v) : head(1, -1 - v));
+    } else {
+      const b = new Uint8Array(9);
+      b[0] = 0xfb;
+      new DataView(b.buffer).setFloat64(1, v, false);
+      out.push(b);
+    }
+    return;
+  }
+  if (typeof v === "bigint") {
+    if (v >= 0n) { out.push(headBig(0, v)); return; }
+    out.push(headBig(1, -1n - v)); return;
+  }
+  if (typeof v === "string") {
+    const bytes = textEncoder.encode(v);
+    out.push(head(3, bytes.length), bytes);
+    return;
+  }
+  if (v instanceof Uint8Array) { out.push(head(2, v.length), v); return; }
+  if (Array.isArray(v)) {
+    out.push(head(4, v.length));
+    for (const item of v) encodeValue(item, out);
+    return;
+  }
+  if (typeof v === "object") {
+    const keys = Object.keys(v);
+    out.push(head(5, keys.length));
+    for (const k of keys) { encodeValue(k, out); encodeValue(v[k], out); }
+    return;
+  }
+  throw new Error("cbor: cannot encode " + typeof v);
+}
+
+function headBig(major, n) {
+  // bigint argument, always 8-byte form (only reachable beyond 2^53)
+  const b = new Uint8Array(9);
+  b[0] = (major << 5) | 27;
+  new DataView(b.buffer).setBigUint64(1, n, false);
+  return b;
+}
+
+function cborDecode(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let pos = 0;
+  function read(n) {
+    if (pos + n > bytes.byteLength) throw new Error("cbor: truncated");
+    const r = new Uint8Array(bytes.buffer, bytes.byteOffset + pos, n);
+    pos += n;
+    return r;
+  }
+  function argument(info) {
+    if (info < 24) return info;
+    if (info === 24) return view.getUint8(pos++);
+    if (info === 25) { const v = view.getUint16(pos, false); pos += 2; return v; }
+    if (info === 26) { const v = view.getUint32(pos, false); pos += 4; return v; }
+    if (info === 27) {
+      const v = view.getBigUint64(pos, false); pos += 8;
+      return v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : v;
+    }
+    throw new Error("cbor: indefinite lengths not supported");
+  }
+  function decode() {
+    const b = view.getUint8(pos++);
+    const major = b >> 5, info = b & 31;
+    switch (major) {
+      case 0: return argument(info);
+      case 1: {
+        const n = argument(info);
+        return typeof n === "bigint" ? -1n - n : -1 - n;
+      }
+      case 2: return read(argument(info));
+      case 3: return textDecoder.decode(read(argument(info)));
+      case 4: {
+        const n = argument(info), arr = new Array(n);
+        for (let i = 0; i < n; i++) arr[i] = decode();
+        return arr;
+      }
+      case 5: {
+        const n = argument(info), obj = {};
+        for (let i = 0; i < n; i++) { const k = decode(); obj[k] = decode(); }
+        return obj;
+      }
+      case 6: argument(info); return decode(); // tag: ignore semantics
+      case 7:
+        if (info === 20) return false;
+        if (info === 21) return true;
+        if (info === 22 || info === 23) return null;
+        if (info === 25) { // float16
+          const h = view.getUint16(pos, false); pos += 2;
+          const s = (h & 0x8000) ? -1 : 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
+          if (e === 0) return s * m * Math.pow(2, -24);
+          if (e === 31) return m ? NaN : s * Infinity;
+          return s * (1 + m / 1024) * Math.pow(2, e - 15);
+        }
+        if (info === 26) { const v = view.getFloat32(pos, false); pos += 4; return v; }
+        if (info === 27) { const v = view.getFloat64(pos, false); pos += 8; return v; }
+        throw new Error("cbor: unsupported simple value " + info);
+    }
+    throw new Error("cbor: bad major type");
+  }
+  const value = decode();
+  if (pos !== bytes.byteLength) throw new Error("cbor: trailing bytes");
+  return value;
+}
+
+/* ------------------------------------------------------------------ */
+/* Protocol client                                                     */
+/* ------------------------------------------------------------------ */
+
+const PROTOCOL_VERSION = 1;
+const $ = id => document.getElementById(id);
+const log = $("log");
+
+let ws = null;
+let reqSeq = 0;
+const pending = new Map();      // request id -> {resolve, reject}
+let sessionId = null;           // attached session
+let lastSession = null;         // last snapshot of the attached session
+let lastRevision = 0;           // last session revision seen in a snapshot
+let renderedItems = 0;          // transcript items currently on screen
+let sessionPhase = "idle";
+const openBlocks = new Map();   // "msgId:kind:contentIndex" -> {el, node, buf}
+const toolBlocks = new Map();   // toolCallId -> {root, out, summary, title}
+const dirtyBlocks = new Set();  // streaming blocks with unflushed text
+let flushScheduled = false;
+let pinned = true;              // autoscroll only while the user is at the bottom
+const NEAR_BOTTOM = 40;         // px tolerance for "at the bottom"
+
+/* Session stats (TUI footer equivalent): cumulative usage + context fill. */
+let stats = null;               // {input, output, cacheRead, cacheWrite, cost, contextTokens}
+let liveChars = 0;              // streamed output chars of the in-flight message
+const modelMeta = new Map();    // "provider/id" -> ModelMetadata
+
+function wsUrl() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  return proto + "//" + location.host + "/";
+}
+$("ws-url").textContent = wsUrl();
+
+function setConnected(on) {
+  $("status").classList.toggle("on", on);
+  $("connect").textContent = on ? "Disconnect" : "Connect";
+  for (const id of ["sessions", "new-session", "attach", "input", "send", "steer", "abort",
+                    "mode", "models", "thinking"])
+    $(id).disabled = !on;
+  if (!on) {
+    sessionId = null; lastSession = null; stats = null; liveChars = 0;
+    lastRevision = 0; renderedItems = 0;
+    pinned = true;
+    $("jump-bottom").style.display = "none";
+    updatePhase(null);
+    updateStatsBar();
+    permActive = null; permQueue.length = 0;
+    $("perm-dialog").classList.remove("open");
+  }
+}
+
+function sysLine(text, cls) {
+  const el = document.createElement("div");
+  el.className = "msg " + (cls || "system");
+  el.textContent = text;
+  log.appendChild(el);
+  scrollPinned();
+}
+
+function sendRequest(command) {
+  return new Promise((resolve, reject) => {
+    const id = "web-" + (++reqSeq);
+    pending.set(id, { resolve, reject });
+    ws.send(cborEncode({ type: "request", id: id, request: command }));
+  });
+}
+
+function connect() {
+  if (ws) { ws.close(); return; }
+  const token = $("token").value;
+  $("conn-msg").textContent = "connecting…";
+  ws = new WebSocket(wsUrl());
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => {
+    const hello = { type: "hello", version: PROTOCOL_VERSION };
+    if (token) hello.token = token;
+    ws.send(cborEncode(hello));
+  };
+  ws.onclose = () => {
+    ws = null;
+    pending.forEach(p => p.reject(new Error("connection closed")));
+    pending.clear();
+    setConnected(false);
+    sysLine("— disconnected —");
+  };
+  ws.onerror = () => { $("conn-msg").textContent = "connection error"; };
+  ws.onmessage = ev => {
+    let msg;
+    try { msg = cborDecode(new Uint8Array(ev.data)); }
+    catch (e) { sysLine("bad frame: " + e.message, "error"); return; }
+    handleServerMessage(msg);
+  };
+}
+
+function handleServerMessage(msg) {
+  switch (msg.type) {
+    case "hello":
+      $("conn-msg").textContent = msg.connectionId;
+      setConnected(true);
+      refreshSessions(msg.snapshot.sessions);
+      if (msg.snapshot.models && msg.snapshot.models.length) refreshModels(msg.snapshot.models);
+      sendRequest({ command: "list_models" }).catch(() => {});
+      sysLine("connected to " + msg.snapshot.serverId + " (protocol v" + msg.version + ")");
+      break;
+    case "hello_error":
+      sysLine("auth failed: " + msg.error.message, "error");
+      $("conn-msg").textContent = msg.error.message;
+      ws.close();
+      break;
+    case "response": {
+      const p = pending.get(msg.id);
+      if (p) {
+        pending.delete(msg.id);
+        if (msg.ok) p.resolve(msg.result); else p.reject(new Error(msg.error.message));
+      }
+      if (msg.ok && msg.result) handleCommandResult(msg.result);
+      if (!msg.ok && msg.error) sysLine("error: " + msg.error.message, "error");
+      break;
+    }
+    case "event":
+      handleEvent(msg.event);
+      break;
+  }
+}
+
+function refreshSessions(list) {
+  const sel = $("sessions");
+  sel.innerHTML = "";
+  for (const s of list) {
+    const opt = document.createElement("option");
+    opt.value = s.id;
+    opt.textContent = (s.sessionName || s.id.slice(0, 8)) + (s.cwd ? " · " + s.cwd : "");
+    sel.appendChild(opt);
+  }
+  if (sessionId) sel.value = sessionId;
+}
+
+function refreshModels(list) {
+  const sel = $("models");
+  const current = sel.value;
+  sel.innerHTML = "";
+  for (const m of list || []) {
+    modelMeta.set(m.provider + "/" + m.id, m);
+    const opt = document.createElement("option");
+    opt.value = m.provider + "/" + m.id;
+    opt.textContent = m.provider + "/" + m.id + (m.authenticated ? "" : " (no auth)");
+    sel.appendChild(opt);
+  }
+  if (current) sel.value = current;
+  syncControls();
+  updateStatsBar();
+}
+
+/* Reflect the attached session's mode/model/thinking in the selectors. */
+function syncControls(session) {
+  if (session) lastSession = session;
+  const s = session || lastSession;
+  if (!s) return;
+  if (s.mode) $("mode").value = s.mode;
+  const mref = s.model.provider + "/" + s.model.id;
+  const msel = $("models");
+  if ([...msel.options].some(o => o.value === mref)) msel.value = mref;
+  if (s.thinkingLevel) $("thinking").value = s.thinkingLevel;
+  updateStatsBar();
+}
+
+/* Permission prompts (ask/acceptEdits modes): queued, one dialog at a time. */
+const permQueue = [];
+let permActive = null;
+
+function showNextPermission() {
+  if (permActive || !permQueue.length) return;
+  permActive = permQueue.shift();
+  $("perm-title").textContent = "⚠ " + (permActive.title || permActive.toolName);
+  $("perm-input").textContent = JSON.stringify(permActive.input, null, 2);
+  $("perm-dialog").classList.add("open");
+}
+
+function answerPermission(decision) {
+  if (!permActive) return;
+  const req = permActive;
+  permActive = null;
+  $("perm-dialog").classList.remove("open");
+  sendRequest({ command: "permission_response", requestId: req.requestId, decision: decision })
+    .catch(e => sysLine("permission_response failed: " + e.message, "error"));
+  showNextPermission();
+}
+
+async function handleCommandResult(result) {
+  switch (result.command) {
+    case "create": case "attach": case "abort":
+      if (result.session) attachTo(result.session);
+      break;
+    case "prompt": case "steer":
+      if (result.session) updatePhase(result.session.phase);
+      break;
+    case "set_model": case "set_thinking": case "set_mode":
+      if (result.session) syncControls(result.session);
+      break;
+    case "list":
+      refreshSessions(result.sessions);
+      break;
+    case "list_models":
+      refreshModels(result.models);
+      break;
+  }
+}
+
+function handleEvent(event) {
+  switch (event.type) {
+    case "server_snapshot":
+      refreshSessions(event.snapshot.sessions);
+      break;
+    case "session_snapshot":
+      if (event.snapshot.id === sessionId) {
+        updatePhase(event.snapshot.phase);
+        syncControls(event.snapshot);
+        handleSnapshotTranscript(event.snapshot);
+      }
+      break;
+    case "session_progress":
+      if (event.sessionId !== sessionId) return;
+      renderProgress(event.progress);
+      break;
+    case "session_removed":
+      if (event.sessionId === sessionId) { sessionId = null; sysLine("session removed"); updateStatsBar(); }
+      break;
+    case "permission_request":
+      if (event.sessionId !== sessionId) return;
+      permQueue.push(event);
+      showNextPermission();
+      break;
+  }
+}
+
+/* Snapshots carry the authoritative transcript. Normally it matches what
+   streaming rendered; after compaction it SHRINKS — re-render then so the
+   view (and the context stats) reflect the rewritten history. */
+function handleSnapshotTranscript(snapshot) {
+  if (snapshot.revision === lastRevision) return;
+  const shrank = snapshot.transcript.length < renderedItems;
+  lastRevision = snapshot.revision;
+  if (shrank) {
+    log.innerHTML = "";
+    openBlocks.clear();
+    dirtyBlocks.clear();
+    toolBlocks.clear();
+    renderTranscript(snapshot.transcript);
+  }
+  stats = computeStats(snapshot.transcript);
+  updateStatsBar();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scrolling: follow the stream only while the user is pinned to the   */
+/* bottom; scrolling up releases the pin (a jump button re-pins).      */
+/* ------------------------------------------------------------------ */
+
+function nearBottom() {
+  return log.scrollTop + log.clientHeight >= log.scrollHeight - NEAR_BOTTOM;
+}
+
+function scrollToBottom() {
+  log.scrollTop = log.scrollHeight;
+  pinned = true;
+  $("jump-bottom").style.display = "none";
+}
+
+function scrollPinned() {
+  if (pinned) {
+    log.scrollTop = log.scrollHeight;
+  } else {
+    $("jump-bottom").style.display = "block";
+  }
+}
+
+log.addEventListener("scroll", () => {
+  pinned = nearBottom();
+  $("jump-bottom").style.display = pinned ? "none" : "block";
+});
+
+$("jump-bottom").onclick = scrollToBottom;
+
+/* ------------------------------------------------------------------ */
+/* Rendering                                                           */
+/* ------------------------------------------------------------------ */
+
+/* Deltas are buffered per block and flushed once per animation frame:
+   textNode.appendData() is O(delta) (unlike `textContent +=`, which
+   rewrites the whole block) and one scroll per frame avoids forcing a
+   synchronous layout per WebSocket message — this is what keeps long
+   thinking streams responsive. */
+function scheduleFlush() {
+  if (flushScheduled) return;
+  flushScheduled = true;
+  requestAnimationFrame(flushBlocks);
+}
+
+function flushBlocks() {
+  flushScheduled = false;
+  for (const b of dirtyBlocks) {
+    if (b.buf) { b.node.appendData(b.buf); b.buf = ""; }
+  }
+  dirtyBlocks.clear();
+  updateStatsBar(); // live output estimate
+  scrollPinned();
+}
+
+function appendBlock(key, cls) {
+  let b = openBlocks.get(key);
+  if (!b) {
+    const el = document.createElement("div");
+    el.className = "msg " + cls;
+    const node = document.createTextNode("");
+    el.appendChild(node);
+    log.appendChild(el);
+    b = { el, node, buf: "" };
+    openBlocks.set(key, b);
+    scrollPinned();
+  }
+  return b;
+}
+
+function textOfContent(content) {
+  return (content || []).map(c =>
+    c.type === "text" ? c.text :
+    c.type === "image" ? "[image " + c.mimeType + "]" : "").join("");
+}
+
+/* One-line summary of a tool call (port of the TUI's tool_title): the
+   interesting argument inline — bash command, file path, pattern. */
+function toolTitle(name, input) {
+  const short = key => {
+    const v = input && typeof input === "object" ? input[key] : null;
+    return typeof v === "string" ? v.replace(/[\n\r]+/g, " ") : "";
+  };
+  let full;
+  switch (name) {
+    case "bash": full = "$ " + short("command"); break;
+    case "read": full = "read " + short("path"); break;
+    case "write": full = "write " + short("path"); break;
+    case "edit": full = "edit " + short("path"); break;
+    case "grep": full = "grep " + short("pattern"); break;
+    case "find": full = "find " + short("pattern"); break;
+    case "ls": full = "ls " + short("path"); break;
+    default: {
+      let compact = "";
+      try { compact = JSON.stringify(input) || ""; } catch (e) { /* ignore */ }
+      full = compact && compact !== "null" ? name + " " + compact : name;
+    }
+  }
+  return full.length > 160 ? full.slice(0, 159) + "…" : full;
+}
+
+function renderTranscript(items) {
+  for (const item of items || []) {
+    if (item.role === "user") {
+      const el = document.createElement("div");
+      el.className = "msg user";
+      el.textContent = textOfContent(item.content);
+      log.appendChild(el);
+    } else if (item.role === "assistant") {
+      for (const c of item.content || []) {
+        const el = document.createElement("div");
+        if (c.type === "text") { el.className = "msg assistant"; el.textContent = c.text; }
+        else if (c.type === "thinking") { el.className = "msg thinking"; el.textContent = c.thinking; }
+        else if (c.type === "toolCall") { toolStarted(item, c); continue; }
+        else continue;
+        log.appendChild(el);
+      }
+    } else if (item.role === "tool") {
+      toolFinished(item);
+    }
+  }
+  renderedItems = (items || []).length;
+  pinned = true;
+  scrollToBottom();
+}
+
+/* Tool card lifecycle: created either from the assistant item's toolCall
+   content (args complete) or from the tool item's start event; updated in
+   place by later events with the same toolCallId. */
+function toolStarted(parentItem, call) {
+  const toolCallId = call ? call.toolCallId : parentItem.toolCallId;
+  const toolName = call ? call.toolName : parentItem.toolName;
+  const input = call ? call.input : parentItem.input;
+  let b = toolBlocks.get(toolCallId);
+  if (!b) {
+    const root = document.createElement("details");
+    root.className = "tool";
+    const summary = document.createElement("summary");
+    const pre = document.createElement("pre");
+    root.appendChild(summary); root.appendChild(pre);
+    log.appendChild(root);
+    b = { root, out: pre, summary, title: toolName };
+    toolBlocks.set(toolCallId, b);
+    scrollPinned();
+  }
+  // ToolResult message events (MessageStart/End) re-announce the tool
+  // item with input:null — never let them downgrade a title already
+  // built from the real call arguments.
+  if (input && typeof input === "object" && Object.keys(input).length) {
+    b.title = toolTitle(toolName, input);
+    b.out.textContent = JSON.stringify(input, null, 2);
+  }
+  b.summary.textContent = "⚙ " + b.title + " (running…)";
+}
+
+function toolFinished(item) {
+  let b = toolBlocks.get(item.toolCallId);
+  if (!b) { toolStarted(item, null); b = toolBlocks.get(item.toolCallId); }
+  b.summary.textContent = "⚙ " + (b.title || item.toolName) + (item.isError ? " (error)" : " ✓");
+  if (item.isError) b.root.classList.add("error");
+  const out = textOfContent(item.content);
+  if (out) b.out.textContent = out;
+  scrollPinned();
+}
+
+/* The assistant message is complete: replace the raw-args streaming
+   blocks with proper tool cards, surface errors, fold usage stats. */
+function assistantFinished(item) {
+  for (const [key, b] of openBlocks) {
+    if (key.indexOf(":toolCall:") !== -1) { b.el.remove(); dirtyBlocks.delete(b); }
+  }
+  openBlocks.clear();
+  for (const c of item.content || []) {
+    if (c.type === "toolCall") toolStarted(item, c);
+  }
+  if (item.status === "error" || item.status === "aborted") {
+    if (item.errorMessage) sysLine(item.status + ": " + item.errorMessage, "error");
+  } else {
+    foldUsage(item.usage);
+  }
+  liveChars = 0;
+  updateStatsBar();
+  scrollPinned();
+}
+
+function renderProgress(p) {
+  switch (p.type) {
+    case "item_started":
+      if (p.item.role === "assistant") {
+        openBlocks.clear();
+      } else if (p.item.role === "tool") {
+        // ToolExecutionStart announces with status "running"; the persisted
+        // ToolResult message re-announces it already-finished — route that
+        // straight to the finished rendering (skips a bogus "(running…)").
+        if (p.item.status === "running") toolStarted(p.item, null);
+        else toolFinished(p.item);
+      } else if (p.item.role === "user") {
+        const el = document.createElement("div");
+        el.className = "msg user";
+        el.textContent = textOfContent(p.item.content);
+        log.appendChild(el);
+        scrollPinned();
+      }
+      break;
+    case "assistant_delta": {
+      // kind namespacing keeps text out of a thinking block sharing the
+      // same contentIndex; toolCall args stream into their own dim block.
+      const key = p.messageId + ":" + p.kind + ":" + p.contentIndex;
+      const cls = p.kind === "thinking" ? "thinking" :
+                  p.kind === "toolCall" ? "toolargs" : "assistant";
+      const b = appendBlock(key, cls);
+      b.buf += p.delta;
+      dirtyBlocks.add(b);
+      if (p.kind !== "thinking") liveChars += p.delta.length;
+      scheduleFlush();
+      break;
+    }
+    case "item_finished":
+      renderedItems++;
+      if (p.item.role === "tool") toolFinished(p.item);
+      else if (p.item.role === "assistant") assistantFinished(p.item);
+      break;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Stats bar (TUI footer equivalent): cumulative tokens/cost plus the  */
+/* context-window fill of the current request.                          */
+/* ------------------------------------------------------------------ */
+
+/* Cumulative usage over the transcript, mirroring session_totals():
+   assistant messages only, error/aborted turns excluded. The last
+   message's totalTokens approximates the current context size. */
+function computeStats(transcript) {
+  const s = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0 };
+  for (const item of transcript || []) {
+    if (item.role !== "assistant" || !item.usage) continue;
+    if (item.status === "error" || item.status === "aborted") continue;
+    foldUsageInto(s, item.usage);
+  }
+  return s;
+}
+
+function foldUsageInto(s, u) {
+  s.input += u.input || 0;
+  s.output += u.output || 0;
+  s.cacheRead += u.cacheRead || 0;
+  s.cacheWrite += u.cacheWrite || 0;
+  s.cost += (u.cost && u.cost.total) || 0;
+  if (u.totalTokens) s.contextTokens = u.totalTokens;
+}
+
+function foldUsage(u) {
+  if (!stats) stats = computeStats(null);
+  if (u) foldUsageInto(stats, u);
+}
+
+function contextWindow() {
+  const s = lastSession;
+  if (!s || !s.model) return 0;
+  const m = modelMeta.get(s.model.provider + "/" + s.model.id);
+  return m && m.contextWindow ? m.contextWindow : 0;
+}
+
+function updateStatsBar() {
+  const bar = $("stats-bar");
+  if (!sessionId || !stats) { bar.style.display = "none"; return; }
+  // Live output estimate while a message streams (chars/4, like the TUI's
+  // fold_run_stats fallback); replaced by real usage at item_finished.
+  const estOut = Math.floor(liveChars / 4);
+  let text = "↑" + stats.input + " ↓" + (stats.output + estOut);
+  if (stats.cacheRead > 0) text += " R" + stats.cacheRead;
+  if (stats.cacheWrite > 0) text += " W" + stats.cacheWrite;
+  if (stats.cacheRead > 0 || stats.cacheWrite > 0) {
+    const hit = stats.input + stats.cacheRead > 0
+      ? Math.round(stats.cacheRead * 100 / (stats.input + stats.cacheRead)) : 0;
+    text += " CH" + hit + "%";
+  }
+  text += " $" + stats.cost.toFixed(4);
+  const win = contextWindow();
+  bar.classList.remove("warn", "crit");
+  if (win > 0) {
+    const pct = Math.round((stats.contextTokens + estOut) * 100 / win);
+    text += "  " + pct + "%/" + Math.floor(win / 1000) + "k";
+    if (pct > 90) bar.classList.add("crit");
+    else if (pct > 70) bar.classList.add("warn");
+  }
+  bar.textContent = text;
+  bar.style.display = "block";
+}
+
+function attachTo(session) {
+  sessionId = session.id;
+  lastSession = session;
+  lastRevision = session.revision || 0;
+  liveChars = 0;
+  $("sessions").value = session.id;
+  log.innerHTML = "";
+  openBlocks.clear();
+  dirtyBlocks.clear();
+  toolBlocks.clear();
+  sysLine("session " + session.id + " · " + session.cwd +
+          " · " + session.model.provider + "/" + session.model.id +
+          (session.mode ? " · mode " + session.mode : ""));
+  stats = computeStats(session.transcript);
+  renderTranscript(session.transcript);
+  updatePhase(session.phase);
+  syncControls(session);
+  updateStatsBar();
+}
+
+function updatePhase(phase) {
+  sessionPhase = phase || "idle";
+  const el = $("phase");
+  el.textContent = sessionId ? sessionPhase : "";
+  el.classList.toggle("turn", sessionPhase !== "idle");
+}
+
+/* ------------------------------------------------------------------ */
+/* UI wiring                                                           */
+/* ------------------------------------------------------------------ */
+
+$("connect").onclick = connect;
+
+$("new-session").onclick = async () => {
+  try {
+    await sendRequest({ command: "create" });
+  } catch (e) { sysLine("create failed: " + e.message, "error"); }
+};
+
+$("attach").onclick = async () => {
+  const id = $("sessions").value;
+  if (!id) return;
+  try {
+    await sendRequest({ command: "attach", sessionId: id });
+  } catch (e) { sysLine("attach failed: " + e.message, "error"); }
+};
+
+function submit(command) {
+  const text = $("input").value.trim();
+  if (!text || !sessionId) return;
+  $("input").value = "";
+  sendRequest({ command: command, sessionId: sessionId, text: text })
+    .catch(e => sysLine(command + " failed: " + e.message, "error"));
+}
+
+$("send").onclick = () => submit(sessionPhase === "idle" ? "prompt" : "steer");
+$("steer").onclick = () => submit("steer");
+$("abort").onclick = () => {
+  if (!sessionId) return;
+  sendRequest({ command: "abort", sessionId: sessionId })
+    .catch(e => sysLine("abort failed: " + e.message, "error"));
+};
+
+$("mode").onchange = () => {
+  if (!sessionId) return;
+  sendRequest({ command: "set_mode", sessionId: sessionId, mode: $("mode").value })
+    .then(() => sysLine("mode → " + $("mode").value))
+    .catch(e => sysLine("set_mode failed: " + e.message, "error"));
+};
+
+$("models").onchange = () => {
+  if (!sessionId || !$("models").value) return;
+  const value = $("models").value;
+  const slash = value.indexOf("/");
+  const model = { provider: value.slice(0, slash), id: value.slice(slash + 1) };
+  sendRequest({ command: "set_model", sessionId: sessionId, model: model })
+    .then(() => sysLine("model → " + value))
+    .catch(e => sysLine("set_model failed: " + e.message, "error"));
+};
+
+$("thinking").onchange = () => {
+  if (!sessionId) return;
+  sendRequest({ command: "set_thinking", sessionId: sessionId, thinkingLevel: $("thinking").value })
+    .then(() => sysLine("thinking → " + $("thinking").value))
+    .catch(e => sysLine("set_thinking failed: " + e.message, "error"));
+};
+
+$("perm-once").onclick = () => answerPermission("allow_once");
+$("perm-always").onclick = () => answerPermission("allow_always");
+$("perm-deny").onclick = () => answerPermission("deny");
+$("input").addEventListener("keydown", ev => {
+  if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); $("send").click(); }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+{
+  "name": "hello-js",
+  "command": "node",
+  "args": ["plugin.js"]
+}

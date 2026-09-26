@@ -1,0 +1,7 @@
+{
+  "name": "extract-todos",
+  "setup": "printf '# app\\n# TODO: add logging\\ndef main():\\n    pass  # TODO: implement\\n' > app.py",
+  "prompt": "Collect every TODO comment in app.py into a new file TODO.md, one bullet per TODO (keep the text after 'TODO:'). Do not modify app.py.",
+  "verify": "grep -q 'add logging' TODO.md && grep -q 'implement' TODO.md && grep -q 'TODO: add logging' app.py && grep -q 'TODO: implement' app.py",
+  "timeoutSecs": 300
+}

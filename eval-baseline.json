@@ -1,0 +1,928 @@
+{
+  "model": "kimi-coding/k3",
+  "started_unix_ms": 1789791620131,
+  "tasks": [
+    {
+      "name": "append-only",
+      "pass_rate": 1.0,
+      "runs": [
+        {
+          "cost": 0.023403,
+          "duration_secs": 27.882438625,
+          "input_tokens": 3870,
+          "output_tokens": 607,
+          "pass": true,
+          "tool_calls": 4
+        },
+        {
+          "cost": 0.012999300000000002,
+          "duration_secs": 22.546757625,
+          "input_tokens": 941,
+          "output_tokens": 444,
+          "pass": true,
+          "tool_calls": 4
+        },
+        {
+          "cost": 0.009869099999999999,
+          "duration_secs": 15.103189042,
+          "input_tokens": 1011,
+          "output_tokens": 293,
+          "pass": true,
+          "tool_calls": 3
+        },
+        {
+          "cost": 0.0106701,
+          "duration_secs": 15.377094208,
+          "input_tokens": 898,
+          "output_tokens": 369,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0122259,
+          "duration_secs": 15.049975792,
+          "input_tokens": 1351,
+          "output_tokens": 377,
+          "pass": true,
+          "tool_calls": 2
+        }
+      ]
+    },
+    {
+      "name": "bash-pipeline",
+      "pass_rate": 1.0,
+      "runs": [
+        {
+          "cost": 0.011164799999999999,
+          "duration_secs": 11.762585208,
+          "input_tokens": 973,
+          "output_tokens": 391,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0106422,
+          "duration_secs": 13.166035041,
+          "input_tokens": 794,
+          "output_tokens": 388,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.008725199999999999,
+          "duration_secs": 8.459224209,
+          "input_tokens": 655,
+          "output_tokens": 288,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.009109200000000001,
+          "duration_secs": 8.179621334,
+          "input_tokens": 663,
+          "output_tokens": 312,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0118752,
+          "duration_secs": 13.547818208,
+          "input_tokens": 780,
+          "output_tokens": 473,
+          "pass": true,
+          "tool_calls": 2
+        }
+      ]
+    },
+    {
+      "name": "config-tune",
+      "pass_rate": 1.0,
+      "runs": [
+        {
+          "cost": 0.012481200000000001,
+          "duration_secs": 28.072424333,
+          "input_tokens": 1158,
+          "output_tokens": 324,
+          "pass": true,
+          "tool_calls": 4
+        },
+        {
+          "cost": 0.0130923,
+          "duration_secs": 16.739739542,
+          "input_tokens": 1723,
+          "output_tokens": 294,
+          "pass": true,
+          "tool_calls": 3
+        },
+        {
+          "cost": 0.0157041,
+          "duration_secs": 19.200768541,
+          "input_tokens": 1411,
+          "output_tokens": 423,
+          "pass": true,
+          "tool_calls": 5
+        },
+        {
+          "cost": 0.0189021,
+          "duration_secs": 28.362914042,
+          "input_tokens": 1438,
+          "output_tokens": 682,
+          "pass": true,
+          "tool_calls": 4
+        },
+        {
+          "cost": 0.029463299999999998,
+          "duration_secs": 46.278627625,
+          "input_tokens": 2975,
+          "output_tokens": 1007,
+          "pass": true,
+          "tool_calls": 5
+        }
+      ]
+    },
+    {
+      "name": "create-file",
+      "pass_rate": 1.0,
+      "runs": [
+        {
+          "cost": 0.0064968000000000005,
+          "duration_secs": 10.021263625,
+          "input_tokens": 527,
+          "output_tokens": 169,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.005129699999999999,
+          "duration_secs": 11.281837666,
+          "input_tokens": 89,
+          "output_tokens": 157,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0031329,
+          "duration_secs": 7.153678917,
+          "input_tokens": 0,
+          "output_tokens": 98,
+          "pass": true,
+          "tool_calls": 1
+        },
+        {
+          "cost": 0.0040076999999999995,
+          "duration_secs": 7.56231525,
+          "input_tokens": 273,
+          "output_tokens": 107,
+          "pass": true,
+          "tool_calls": 1
+        },
+        {
+          "cost": 0.0060015,
+          "duration_secs": 12.865317084,
+          "input_tokens": 361,
+          "output_tokens": 166,
+          "pass": true,
+          "tool_calls": 2
+        }
+      ]
+    },
+    {
+      "name": "dedupe-lines",
+      "pass_rate": 1.0,
+      "runs": [
+        {
+          "cost": 0.0065748000000000004,
+          "duration_secs": 12.342142166,
+          "input_tokens": 533,
+          "output_tokens": 173,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0063903,
+          "duration_secs": 11.146679625,
+          "input_tokens": 370,
+          "output_tokens": 190,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.006243299999999999,
+          "duration_secs": 10.926208916,
+          "input_tokens": 366,
+          "output_tokens": 181,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0061623,
+          "duration_secs": 10.884080625,
+          "input_tokens": 364,
+          "output_tokens": 176,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.006999300000000001,
+          "duration_secs": 12.071294375,
+          "input_tokens": 403,
+          "output_tokens": 224,
+          "pass": true,
+          "tool_calls": 2
+        }
+      ]
+    },
+    {
+      "name": "edit-constant",
+      "pass_rate": 1.0,
+      "runs": [
+        {
+          "cost": 0.009465600000000001,
+          "duration_secs": 14.392255667,
+          "input_tokens": 775,
+          "output_tokens": 261,
+          "pass": true,
+          "tool_calls": 3
+        },
+        {
+          "cost": 0.006653699999999999,
+          "duration_secs": 9.463374417,
+          "input_tokens": 413,
+          "output_tokens": 199,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0065817,
+          "duration_secs": 10.316345083,
+          "input_tokens": 409,
+          "output_tokens": 195,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0096795,
+          "duration_secs": 11.725347875,
+          "input_tokens": 650,
+          "output_tokens": 297,
+          "pass": true,
+          "tool_calls": 3
+        },
+        {
+          "cost": 0.0071847000000000005,
+          "duration_secs": 8.687397083,
+          "input_tokens": 445,
+          "output_tokens": 228,
+          "pass": true,
+          "tool_calls": 2
+        }
+      ]
+    },
+    {
+      "name": "error-diagnose",
+      "pass_rate": 1.0,
+      "runs": [
+        {
+          "cost": 0.0168492,
+          "duration_secs": 48.741782958,
+          "input_tokens": 1661,
+          "output_tokens": 489,
+          "pass": true,
+          "tool_calls": 7
+        },
+        {
+          "cost": 0.017860800000000003,
+          "duration_secs": 20.831354417,
+          "input_tokens": 1752,
+          "output_tokens": 524,
+          "pass": true,
+          "tool_calls": 8
+        },
+        {
+          "cost": 0.0157188,
+          "duration_secs": 22.338718666,
+          "input_tokens": 1361,
+          "output_tokens": 485,
+          "pass": true,
+          "tool_calls": 6
+        },
+        {
+          "cost": 0.016672199999999998,
+          "duration_secs": 17.7229555,
+          "input_tokens": 1507,
+          "output_tokens": 504,
+          "pass": true,
+          "tool_calls": 7
+        },
+        {
+          "cost": 0.0174492,
+          "duration_secs": 27.795370125,
+          "input_tokens": 1571,
+          "output_tokens": 543,
+          "pass": true,
+          "tool_calls": 7
+        }
+      ]
+    },
+    {
+      "name": "extract-todos",
+      "pass_rate": 1.0,
+      "runs": [
+        {
+          "cost": 0.010887599999999999,
+          "duration_secs": 19.576465375,
+          "input_tokens": 1024,
+          "output_tokens": 306,
+          "pass": true,
+          "tool_calls": 3
+        },
+        {
+          "cost": 0.0064065,
+          "duration_secs": 13.548491292,
+          "input_tokens": 419,
+          "output_tokens": 181,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0059307,
+          "duration_secs": 12.757978875,
+          "input_tokens": 142,
+          "output_tokens": 199,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0065655,
+          "duration_secs": 14.219129208,
+          "input_tokens": 432,
+          "output_tokens": 189,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.006898499999999999,
+          "duration_secs": 13.003554208,
+          "input_tokens": 433,
+          "output_tokens": 211,
+          "pass": true,
+          "tool_calls": 2
+        }
+      ]
+    },
+    {
+      "name": "fix-typo",
+      "pass_rate": 1.0,
+      "runs": [
+        {
+          "cost": 0.0065298,
+          "duration_secs": 17.454117292,
+          "input_tokens": 533,
+          "output_tokens": 170,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.006372000000000001,
+          "duration_secs": 13.455102209,
+          "input_tokens": 369,
+          "output_tokens": 189,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0064800000000000005,
+          "duration_secs": 14.348312458,
+          "input_tokens": 375,
+          "output_tokens": 195,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.008467800000000001,
+          "duration_secs": 16.801242125,
+          "input_tokens": 566,
+          "output_tokens": 233,
+          "pass": true,
+          "tool_calls": 3
+        },
+        {
+          "cost": 0.0061530000000000005,
+          "duration_secs": 12.899102833,
+          "input_tokens": 371,
+          "output_tokens": 174,
+          "pass": true,
+          "tool_calls": 2
+        }
+      ]
+    },
+    {
+      "name": "git-commit",
+      "pass_rate": 1.0,
+      "runs": [
+        {
+          "cost": 0.0068748,
+          "duration_secs": 18.699572958,
+          "input_tokens": 608,
+          "output_tokens": 178,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0067698,
+          "duration_secs": 13.092947958,
+          "input_tokens": 472,
+          "output_tokens": 195,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0074598,
+          "duration_secs": 15.902163042,
+          "input_tokens": 517,
+          "output_tokens": 232,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0061848,
+          "duration_secs": 6.988306708,
+          "input_tokens": 442,
+          "output_tokens": 162,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.006625799999999999,
+          "duration_secs": 11.130218792,
+          "input_tokens": 464,
+          "output_tokens": 187,
+          "pass": true,
+          "tool_calls": 2
+        }
+      ]
+    },
+    {
+      "name": "html-css",
+      "pass_rate": 1.0,
+      "runs": [
+        {
+          "cost": 0.011883,
+          "duration_secs": 18.338357791,
+          "input_tokens": 904,
+          "output_tokens": 509,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.009343500000000001,
+          "duration_secs": 9.483477291,
+          "input_tokens": 342,
+          "output_tokens": 442,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.010465499999999999,
+          "duration_secs": 10.477431708,
+          "input_tokens": 376,
+          "output_tokens": 510,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.012692700000000001,
+          "duration_secs": 13.633401916,
+          "input_tokens": 654,
+          "output_tokens": 608,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0095595,
+          "duration_secs": 11.31894075,
+          "input_tokens": 369,
+          "output_tokens": 451,
+          "pass": true,
+          "tool_calls": 2
+        }
+      ]
+    },
+    {
+      "name": "json-fix",
+      "pass_rate": 1.0,
+      "runs": [
+        {
+          "cost": 0.0234168,
+          "duration_secs": 45.248233458,
+          "input_tokens": 1812,
+          "output_tokens": 784,
+          "pass": true,
+          "tool_calls": 6
+        },
+        {
+          "cost": 0.0215886,
+          "duration_secs": 28.80185625,
+          "input_tokens": 1707,
+          "output_tokens": 731,
+          "pass": true,
+          "tool_calls": 5
+        },
+        {
+          "cost": 0.021182400000000004,
+          "duration_secs": 33.692482458,
+          "input_tokens": 1515,
+          "output_tokens": 814,
+          "pass": true,
+          "tool_calls": 4
+        },
+        {
+          "cost": 0.0219144,
+          "duration_secs": 35.14055325,
+          "input_tokens": 1548,
+          "output_tokens": 805,
+          "pass": true,
+          "tool_calls": 5
+        },
+        {
+          "cost": 0.0315534,
+          "duration_secs": 38.33833725,
+          "input_tokens": 2566,
+          "output_tokens": 988,
+          "pass": true,
+          "tool_calls": 8
+        }
+      ]
+    },
+    {
+      "name": "markdown-rewrite",
+      "pass_rate": 1.0,
+      "runs": [
+        {
+          "cost": 0.0106458,
+          "duration_secs": 8.963829042,
+          "input_tokens": 835,
+          "output_tokens": 384,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.007812900000000001,
+          "duration_secs": 7.50493675,
+          "input_tokens": 571,
+          "output_tokens": 244,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0076359,
+          "duration_secs": 7.311177375,
+          "input_tokens": 205,
+          "output_tokens": 299,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.009093899999999999,
+          "duration_secs": 8.681341208,
+          "input_tokens": 306,
+          "output_tokens": 376,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.008697900000000001,
+          "duration_secs": 7.377059125,
+          "input_tokens": 561,
+          "output_tokens": 305,
+          "pass": true,
+          "tool_calls": 2
+        }
+      ]
+    },
+    {
+      "name": "multi-file-edit",
+      "pass_rate": 1.0,
+      "runs": [
+        {
+          "cost": 0.0193302,
+          "duration_secs": 28.388898584,
+          "input_tokens": 1572,
+          "output_tokens": 749,
+          "pass": true,
+          "tool_calls": 7
+        },
+        {
+          "cost": 0.014210400000000002,
+          "duration_secs": 21.121903291,
+          "input_tokens": 1055,
+          "output_tokens": 512,
+          "pass": true,
+          "tool_calls": 5
+        },
+        {
+          "cost": 0.012856199999999998,
+          "duration_secs": 21.884798292,
+          "input_tokens": 728,
+          "output_tokens": 482,
+          "pass": true,
+          "tool_calls": 5
+        },
+        {
+          "cost": 0.018561599999999998,
+          "duration_secs": 30.05842725,
+          "input_tokens": 1622,
+          "output_tokens": 617,
+          "pass": true,
+          "tool_calls": 6
+        },
+        {
+          "cost": 0.0148794,
+          "duration_secs": 26.241487833,
+          "input_tokens": 1083,
+          "output_tokens": 551,
+          "pass": true,
+          "tool_calls": 5
+        }
+      ]
+    },
+    {
+      "name": "regex-replace",
+      "pass_rate": 1.0,
+      "runs": [
+        {
+          "cost": 0.0129054,
+          "duration_secs": 23.470344292,
+          "input_tokens": 946,
+          "output_tokens": 451,
+          "pass": true,
+          "tool_calls": 3
+        },
+        {
+          "cost": 0.0136839,
+          "duration_secs": 15.638412334,
+          "input_tokens": 840,
+          "output_tokens": 520,
+          "pass": true,
+          "tool_calls": 3
+        },
+        {
+          "cost": 0.0134469,
+          "duration_secs": 19.54704475,
+          "input_tokens": 846,
+          "output_tokens": 503,
+          "pass": true,
+          "tool_calls": 3
+        },
+        {
+          "cost": 0.008268000000000001,
+          "duration_secs": 10.267941041,
+          "input_tokens": 258,
+          "output_tokens": 330,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0148491,
+          "duration_secs": 20.491228042,
+          "input_tokens": 1129,
+          "output_tokens": 545,
+          "pass": true,
+          "tool_calls": 3
+        }
+      ]
+    },
+    {
+      "name": "rename-function",
+      "pass_rate": 1.0,
+      "runs": [
+        {
+          "cost": 0.012467399999999998,
+          "duration_secs": 17.927561916,
+          "input_tokens": 1000,
+          "output_tokens": 411,
+          "pass": true,
+          "tool_calls": 5
+        },
+        {
+          "cost": 0.014436300000000001,
+          "duration_secs": 23.822505333,
+          "input_tokens": 1082,
+          "output_tokens": 461,
+          "pass": true,
+          "tool_calls": 6
+        },
+        {
+          "cost": 0.0099813,
+          "duration_secs": 18.90991825,
+          "input_tokens": 153,
+          "output_tokens": 398,
+          "pass": true,
+          "tool_calls": 5
+        },
+        {
+          "cost": 0.012507299999999999,
+          "duration_secs": 23.030706292,
+          "input_tokens": 418,
+          "output_tokens": 452,
+          "pass": true,
+          "tool_calls": 6
+        },
+        {
+          "cost": 0.0134343,
+          "duration_secs": 22.321147583,
+          "input_tokens": 958,
+          "output_tokens": 419,
+          "pass": true,
+          "tool_calls": 5
+        }
+      ]
+    },
+    {
+      "name": "run-and-fix",
+      "pass_rate": 1.0,
+      "runs": [
+        {
+          "cost": 0.014473799999999998,
+          "duration_secs": 24.902228208,
+          "input_tokens": 1300,
+          "output_tokens": 367,
+          "pass": true,
+          "tool_calls": 5
+        },
+        {
+          "cost": 0.0143298,
+          "duration_secs": 27.240689083,
+          "input_tokens": 1120,
+          "output_tokens": 390,
+          "pass": true,
+          "tool_calls": 5
+        },
+        {
+          "cost": 0.0148383,
+          "duration_secs": 29.007132667,
+          "input_tokens": 977,
+          "output_tokens": 447,
+          "pass": true,
+          "tool_calls": 5
+        },
+        {
+          "cost": 0.012595199999999997,
+          "duration_secs": 21.446978208,
+          "input_tokens": 1109,
+          "output_tokens": 338,
+          "pass": true,
+          "tool_calls": 4
+        },
+        {
+          "cost": 0.0142398,
+          "duration_secs": 28.382159292,
+          "input_tokens": 1115,
+          "output_tokens": 385,
+          "pass": true,
+          "tool_calls": 5
+        }
+      ]
+    },
+    {
+      "name": "sort-lines",
+      "pass_rate": 1.0,
+      "runs": [
+        {
+          "cost": 0.0068958,
+          "duration_secs": 7.523876958,
+          "input_tokens": 555,
+          "output_tokens": 190,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0063606,
+          "duration_secs": 5.392577333,
+          "input_tokens": 385,
+          "output_tokens": 185,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0061956,
+          "duration_secs": 5.588329209,
+          "input_tokens": 375,
+          "output_tokens": 176,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0051830999999999995,
+          "duration_secs": 4.55895325,
+          "input_tokens": 0,
+          "output_tokens": 176,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0064926,
+          "duration_secs": 5.43809725,
+          "input_tokens": 389,
+          "output_tokens": 193,
+          "pass": true,
+          "tool_calls": 2
+        }
+      ]
+    },
+    {
+      "name": "sql-query",
+      "pass_rate": 1.0,
+      "runs": [
+        {
+          "cost": 0.0122646,
+          "duration_secs": 20.339471667,
+          "input_tokens": 1063,
+          "output_tokens": 390,
+          "pass": true,
+          "tool_calls": 3
+        },
+        {
+          "cost": 0.0077868,
+          "duration_secs": 12.119526542,
+          "input_tokens": 527,
+          "output_tokens": 251,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.008191799999999999,
+          "duration_secs": 12.53058925,
+          "input_tokens": 592,
+          "output_tokens": 265,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0078798,
+          "duration_secs": 12.786934041,
+          "input_tokens": 723,
+          "output_tokens": 218,
+          "pass": true,
+          "tool_calls": 2
+        },
+        {
+          "cost": 0.0121416,
+          "duration_secs": 19.024462208,
+          "input_tokens": 962,
+          "output_tokens": 398,
+          "pass": true,
+          "tool_calls": 3
+        }
+      ]
+    },
+    {
+      "name": "test-fix",
+      "pass_rate": 1.0,
+      "runs": [
+        {
+          "cost": 0.012974400000000002,
+          "duration_secs": 17.840526375,
+          "input_tokens": 1294,
+          "output_tokens": 386,
+          "pass": true,
+          "tool_calls": 4
+        },
+        {
+          "cost": 0.012496199999999999,
+          "duration_secs": 11.082853458,
+          "input_tokens": 798,
+          "output_tokens": 440,
+          "pass": true,
+          "tool_calls": 4
+        },
+        {
+          "cost": 0.0120522,
+          "duration_secs": 9.638728958,
+          "input_tokens": 730,
+          "output_tokens": 424,
+          "pass": true,
+          "tool_calls": 4
+        },
+        {
+          "cost": 0.014698499999999998,
+          "duration_secs": 9.90106975,
+          "input_tokens": 1393,
+          "output_tokens": 462,
+          "pass": true,
+          "tool_calls": 5
+        },
+        {
+          "cost": 0.015480299999999999,
+          "duration_secs": 12.496471791,
+          "input_tokens": 1278,
+          "output_tokens": 532,
+          "pass": true,
+          "tool_calls": 5
+        }
+      ]
+    }
+  ],
+  "total_cost": 1.1370621,
+  "total_pass_rate": 1.0
+}

@@ -1,0 +1,7 @@
+{
+  "name": "edit-constant",
+  "setup": "printf 'APP_NAME = \"demo\"\nVERSION = \"1.2.3\"\nDEBUG = True\n' > config.py",
+  "prompt": "Bump VERSION in config.py to \"2.0.0\". Change nothing else.",
+  "verify": "grep -q 'VERSION = \"2.0.0\"' config.py && ! grep -q '1.2.3' config.py && grep -q 'APP_NAME = \"demo\"' config.py && grep -q 'DEBUG = True' config.py",
+  "timeoutSecs": 300
+}

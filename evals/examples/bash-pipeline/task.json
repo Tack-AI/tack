@@ -1,0 +1,7 @@
+{
+  "name": "bash-pipeline",
+  "setup": "printf '2024-01-01 INFO boot ok\\n2024-01-01 ERROR disk full\\n2024-01-01 INFO request 200\\n2024-01-01 WARN slow query\\n2024-01-01 ERROR auth failed\\n2024-01-01 INFO request 200\\n2024-01-01 ERROR disk full\\n2024-01-01 INFO shutdown\\n2024-01-01 WARN retrying\\n' > server.log",
+  "prompt": "Using a shell pipeline (grep/awk/sort/uniq...), count the log lines per level in server.log and write the result to stats.txt: one line per level in alphabetical order, formatted exactly as LEVEL=count (for example ERROR=3).",
+  "verify": "printf 'ERROR=3\\nINFO=4\\nWARN=2\\n' | cmp - stats.txt",
+  "timeoutSecs": 300
+}

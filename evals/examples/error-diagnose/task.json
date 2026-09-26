@@ -1,0 +1,7 @@
+{
+  "name": "error-diagnose",
+  "setup": "printf 'def shout(message):\\n    return message.upper() + \"!\"\\n' > strings_util.py && printf 'import strings_util\\n\\n\\ndef render(name):\\n    return \"hello \" + strings_util.shoutt(name)\\n' > greeter.py && printf 'from greeter import render\\n\\nprint(render(\"pi\"))\\n' > main.py && { python3 main.py > error.txt 2>&1 || true; }",
+  "prompt": "`python3 main.py` crashes — the traceback is saved in error.txt. Read the error, locate the actual bug in this small project, and fix the source so that `python3 main.py` prints exactly: hello PI! — do not modify error.txt.",
+  "verify": "test \"$(python3 main.py)\" = \"hello PI!\" && grep -q Traceback error.txt",
+  "timeoutSecs": 300
+}

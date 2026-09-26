@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-165.1867 -176.8046 334.0414 348.9455" width="334.0414" height="348.9455" class="lini lini-scope-8b05f5c3">
+  <style>
+    .lini-scope-8b05f5c3 { font-family: "Google Sans", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; font-size: 15px; font-weight: 500; color: black; }
+    .lini-scope-8b05f5c3 .lini-block { fill: none; stroke: none; stroke-width: 2; stroke-dasharray: none; }
+    .lini-scope-8b05f5c3 .lini-path { fill: white; stroke: #444; stroke-width: 2; stroke-dasharray: none; }
+    .lini-scope-8b05f5c3 .lini-box { fill: white; stroke: #444; stroke-width: 2; }
+  </style>
+  <defs/>
+  <g class="lini-scene">
+    <g class="lini-node lini-rect lini-box lini-block" data-id="tile" style="stroke: none" transform="translate(0,0)">
+      <rect x="-160" y="-160" width="320" height="320" rx="70" ry="70"/>
+    </g>
+    <g class="lini-node lini-path" data-id="pin" style="fill: #F74C00; stroke: none" transform="translate(-4,6) rotate(35)">
+      <path d="M -87.9 -76.9 A 89.9 89.9 0 0 1 87.9 -76.9 L 89.9 -76.9 A 18.9 18.9 0 0 1 89.9 -39.2 L 17.4 -39.2 L 0 127.6 L -17.4 -39.2 L -89.9 -39.2 A 18.9 18.9 0 0 1 -89.9 -76.9 Z"/>
+    </g>
+  </g>
+  <g class="lini-links"/>
+</svg>

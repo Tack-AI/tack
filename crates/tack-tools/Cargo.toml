@@ -1,0 +1,50 @@
+[package]
+name = "tack-tools"
+description = "Built-in coding tools: read/bash/edit/write/grep/find/ls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tack-ai.workspace = true
+tack-agent-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+ignore.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
+similar.workspace = true
+dunce.workspace = true
+tracing.workspace = true
+globset.workspace = true
+dirs.workspace = true
+regex.workspace = true
+chrono.workspace = true
+grep-matcher = "0.1"
+base64.workspace = true
+rand.workspace = true
+nix = "0.31"
+image = { workspace = true, features = ["gif", "webp", "bmp"] }
+http = "1"
+reqwest.workspace = true
+futures-util.workspace = true
+rmcp = { workspace = true, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+rmcp = { workspace = true, features = ["client", "server", "macros", "elicitation", "transport-streamable-http-server", "transport-streamable-http-client-reqwest"] }
+axum = "0.8"
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[lints]
+workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }

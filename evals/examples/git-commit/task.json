@@ -1,0 +1,7 @@
+{
+  "name": "git-commit",
+  "setup": "git init -q . && git config user.email t@t.local && git config user.name t && printf 'hello\\n' > readme.md && git add -A",
+  "prompt": "Commit all staged changes in this repository with the commit message: add readme",
+  "verify": "test \"$(git log -1 --format=%s)\" = \"add readme\" && test -z \"$(git status --porcelain)\"",
+  "timeoutSecs": 300
+}

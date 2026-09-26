@@ -1,0 +1,209 @@
+# Cross-platform release packaging for the tack binary.
+#
+# Convention (consumed by `tack update`, see crates/tack-app/src/self_update.rs):
+#   tag:    tack-vX.Y.Z        (X.Y.Z must match workspace.package.version)
+#   assets: tack-<target-triple>.tar.gz   Linux/macOS, single `tack` binary
+#           tack-<target-triple>.zip      Windows, single `tack.exe`
+#           SHA256SUMS.txt
+#
+# Cut a release:
+#   1. bump `workspace.package.version` in Cargo.toml and commit
+#   2. git tag tack-vX.Y.Z && git push origin tack-vX.Y.Z
+# or run manually via workflow_dispatch with an existing tag.
+
+name: tack release
+
+on:
+  push:
+    tags:
+      - "tack-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish (tack-vX.Y.Z)"
+        required: true
+
+# Least privilege by default; jobs that need more declare it themselves.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  # Validate the tag against Cargo.toml and create the (draft) release first,
+  # so the parallel build legs only ever upload, never create. The release
+  # stays draft until every asset is up — `tack update` resolves by tag, so
+  # a partially built public release would serve half-built artifacts.
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # gh release create
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Verify tag matches workspace version
+        run: |
+          version="${TAG#tack-v}"
+          cargo_version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          echo "tag version: $version, Cargo.toml version: $cargo_version"
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::tag $TAG does not match workspace.package.version $cargo_version"
+            exit 1
+          fi
+      - name: Verify CHANGELOG has an entry for this version
+        run: |
+          version="${TAG#tack-v}"
+          if ! grep -q "^## \[$version\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$version]' entry"
+            exit 1
+          fi
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$TAG" --draft --title "tack ${TAG#tack-v}" --generate-notes --verify-tag
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          # Native ARM runner (free for public repos). For private repos,
+          # swap for ubuntu-latest + `cross build` or cargo-zigbuild.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          # macos-13 is retired; macos-15-intel is the current x86_64 runner.
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          # Cross-compiled on the x64 runner; windows-2022 images ship the
+          # ARM64 MSVC build tools.
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write      # actions/attest-build-provenance (OIDC)
+      attestations: write  # actions/attest-build-provenance
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      # Respect the pinned channel in rust-toolchain.toml: dtolnay/rust-toolchain
+      # would install the target into *its* toolchain while cargo actually runs
+      # the pinned one (directory override), which broke the cross-compiled
+      # aarch64-pc-windows-msvc leg with E0463 (can't find crate for `core`).
+      # `rustup show` installs the pinned toolchain; `rustup target add`
+      # resolves the same override, so the target lands on the toolchain cargo
+      # really uses. This also keeps release builds reproducible against the
+      # pinned toolchain rather than a moving stable.
+      - name: Install pinned toolchain and target
+        shell: bash
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.target }}
+      - name: Build tack
+        run: cargo build --release --locked --package tack-app --target ${{ matrix.target }}
+      - name: Package tar.gz
+        if: ${{ !contains(matrix.target, 'windows') }}
+        shell: bash
+        run: |
+          name="tack-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/tack" "dist/$name/tack"
+          tar -czf "dist/$name.tar.gz" -C "dist/$name" tack
+      - name: Package zip
+        if: contains(matrix.target, 'windows')
+        shell: pwsh
+        run: |
+          $name = "tack-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/tack.exe" "dist/$name/tack.exe"
+          Compress-Archive -Path "dist/$name/tack.exe" -DestinationPath "dist/$name.zip"
+      # Smoke test: unpack the exact release artifact and run it. Only
+      # possible where the runner executes the target natively.
+      - name: Smoke test (tar.gz)
+        if: ${{ !contains(matrix.target, 'windows') }}
+        shell: bash
+        run: |
+          name="tack-${{ matrix.target }}"
+          tmp="$(mktemp -d)"
+          tar -xzf "dist/$name.tar.gz" -C "$tmp"
+          "$tmp/tack" --version
+          "$tmp/tack" --help >/dev/null
+      - name: Smoke test (zip)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $name = "tack-${{ matrix.target }}"
+          $tmp = New-Item -ItemType Directory -Force "$env:TEMP/smoke-$name"
+          Expand-Archive -Path "dist/$name.zip" -DestinationPath $tmp -Force
+          & "$tmp/tack.exe" --version
+          & "$tmp/tack.exe" --help | Out-Null
+      # aarch64-pc-windows-msvc is cross-compiled on the x64 windows-latest
+      # runner, whose ARM64 emulation cannot be relied on in CI — the ARM64
+      # binary cannot be executed here, so the smoke test is skipped for this
+      # target.
+      - name: Smoke test skipped (cross-compiled)
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        run: Write-Host "skipping smoke test for ${{ matrix.target }} (cross-compiled, cannot run on x64 runner)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Publishing overwrites release assets (--clobber) and flips the draft
+    # public — gate it on the `release` environment so repo admins can
+    # require review for manual workflow_dispatch runs.
+    environment: release
+    permissions:
+      contents: write      # gh release upload / edit
+      id-token: write      # actions/attest-build-provenance (OIDC)
+      attestations: write  # actions/attest-build-provenance
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd assets
+          sha256sum *.tar.gz *.zip > SHA256SUMS.txt
+          # No checkout in this job: -R tells gh the repo without needing git.
+          gh release upload "$TAG" -R "${{ github.repository }}" --clobber *.tar.gz *.zip SHA256SUMS.txt
+      # The checksum file is part of the verification chain for `tack
+      # update` — it needs provenance just like the binaries.
+      - name: Attest checksums
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: assets/SHA256SUMS.txt
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$TAG" -R "${{ github.repository }}" --draft=false

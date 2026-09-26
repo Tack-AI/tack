@@ -1,0 +1,7 @@
+{
+  "name": "sql-query",
+  "setup": "python3 -c \"import sqlite3; c = sqlite3.connect('shop.db'); c.execute('create table orders(id integer primary key, customer text, amount integer)'); c.executemany('insert into orders(customer, amount) values (?, ?)', [('alice', 100), ('bob', 150), ('alice', 200), ('carol', 75), ('bob', 50)]); c.commit()\"",
+  "prompt": "shop.db is a SQLite database with a table orders(id, customer, amount). Write to result.txt the total amount per customer: one line per customer formatted `customer total` (space-separated, integer total), ordered by total descending (break ties by customer name ascending).",
+  "verify": "printf 'alice 300\\nbob 200\\ncarol 75\\n' | cmp - result.txt",
+  "timeoutSecs": 300
+}

@@ -1,0 +1,7 @@
+{
+  "name": "json-fix",
+  "setup": "printf '{\\n  \"name\": \"demo\",\\n  \"version\": \"0.1.0\"\\n  \"private\": true\\n}\\n' > manifest.json",
+  "prompt": "manifest.json is invalid JSON. Fix it so it parses, preserving all four keys and their values.",
+  "verify": "python3 -c \"import json; data = json.load(open('manifest.json')); assert data == {'name': 'demo', 'version': '0.1.0', 'private': True}\"",
+  "timeoutSecs": 300
+}

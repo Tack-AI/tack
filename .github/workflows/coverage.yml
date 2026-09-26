@@ -1,0 +1,56 @@
+# Weekly coverage trend. Test *count* says nothing about what is actually
+# covered; this tracks line coverage over time so newly landed code without
+# tests shows up as a downward drift in the weekly summary.
+#
+# Informational only (no hard floor yet — a floor needs a baseline first).
+# Codecov upload is opt-in: set the CODECOV_TOKEN secret to enable it.
+
+name: Coverage
+
+on:
+  schedule:
+    - cron: "41 3 * * 1" # Mondays 03:41 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - name: Collect coverage
+        run: |
+          cargo llvm-cov --locked --workspace \
+            --summary-only --lcov --output-path lcov.info \
+            2>&1 | tee coverage-summary.txt
+      - name: Publish job summary
+        run: |
+          {
+            echo '# Coverage summary'
+            echo '```'
+            tail -40 coverage-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+          retention-days: 90
+      - name: Upload to Codecov
+        if: env.CODECOV_TOKEN != ''
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
