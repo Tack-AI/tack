@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use tack_app::tui::chat::NoticeKind;
+use tack_app::tui::chat::{self, NoticeKind};
 use tack_app::tui::{TuiApp, TuiOptions};
 
 async fn test_app(cwd: &std::path::Path) -> TuiApp {
@@ -1389,19 +1389,6 @@ async fn perf_frame_render_long_transcript() {
     let mut app = test_app(cwd.path()).await;
     app.test_resize(160, 50);
 
-    // A long transcript: 400 entries with markdown-ish content.
-    for i in 0..200 {
-        app.on_submit(format!("question {i}")).await;
-        app.test_app_event(AppEvent::RunFinished).await;
-        // Each on_submit starts a run (mock provider fails async) — just
-        // push transcript mass directly through notices instead.
-    }
-    let big_md = (0..200)
-        .map(|i| format!("## Section {i}\n\nSome **bold** and `code` text with a [link](https://example.com).\n\n```rust\nfn f{i}() {{ let x = {i}; }}\n```\n"))
-        .collect::<String>();
-    app.run_command(&format!("echo {big_md}")).await;
-
-    // Streaming partial: 50KB of markdown.
     let model = tack_ai::Model {
         id: "mock".into(),
         name: "Mock".into(),
@@ -1418,13 +1405,45 @@ async fn perf_frame_render_long_transcript() {
         headers: None,
         compat: None,
     };
+
+    // A long transcript: 400 entries with markdown-ish content, pushed
+    // directly. The previous setup ran 200 real `on_submit` agent runs for
+    // mass — each spawning a real agent loop (real provider request with
+    // the fixture key!) whose events were never pumped — so the "render
+    // benchmark" was really O(minutes) of run/task/network churn on CI
+    // (>60s on Windows) while the frames it measured were microseconds.
+    for i in 0..200 {
+        app.test_push_chat(chat::ChatEntry::User {
+            text: format!("question {i}"),
+        });
+        let mut message = tack_ai::AssistantMessage::pending(&model);
+        message.content = vec![tack_ai::ContentBlock::Text {
+            text: format!(
+                "## Answer {i}\n\nSome **bold** and `code` text with a [link](https://example.com).\n\n```rust\nfn f{i}() {{ let x = {i}; }}\n```\n"
+            ),
+            text_signature: None,
+        }];
+        app.test_push_chat(chat::ChatEntry::Assistant {
+            message,
+            streaming: false,
+        });
+    }
+
+    // Streaming partial on top: ~50KB of markdown.
+    let big_md = (0..200)
+        .map(|i| format!("## Section {i}\n\nSome **bold** and `code` text with a [link](https://example.com).\n\n```rust\nfn f{i}() {{ let x = {i}; }}\n```\n"))
+        .collect::<String>();
     let mut partial = tack_ai::AssistantMessage::pending(&model);
     partial.content = vec![tack_ai::ContentBlock::Text {
-        text: big_md.repeat(2),
+        text: big_md,
         text_signature: None,
     }];
+    app.test_push_chat(chat::ChatEntry::Assistant {
+        message: partial,
+        streaming: true,
+    });
 
-    // Warm up.
+    // Warm up (first full parse fills the line cache).
     let mut out = Vec::new();
     app.render(&mut out).unwrap();
 
