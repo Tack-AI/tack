@@ -24,7 +24,7 @@ edition = "2024"
 # its real wasmtime-driven floor.
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/sufar/tack"
+repository = "https://github.com/Tack-AI/tack"
 
 [workspace.dependencies]
 # internal

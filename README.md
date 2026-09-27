@@ -36,7 +36,7 @@ an embedded browser client. Wire- and storage-compatible with the TypeScript pi.
 ### Prebuilt binaries
 
 Download `tack-<target-triple>.tar.gz` / `.zip` from the newest
-[GitHub release](https://github.com/sufar/tack/releases) (`tack-v*` tags;
+[GitHub release](https://github.com/Tack-AI/tack/releases) (`tack-v*` tags;
 windows x64/arm64, linux x64/arm64, macOS arm64/x64).
 
 > **macOS Gatekeeper**: the binaries are not Developer-ID signed, so a
@@ -46,7 +46,7 @@ windows x64/arm64, linux x64/arm64, macOS arm64/x64).
 ### Build from source
 
 ```bash
-git clone https://github.com/sufar/tack.git && cd tack
+git clone https://github.com/Tack-AI/tack.git && cd tack
 cargo build --release -p tack-app        # binary: target/release/tack
 ```
 
@@ -59,7 +59,7 @@ tack update          # fetch the latest release and atomically replace the binar
 tack update --check  # report only
 ```
 
-Repo resolution: `TACK_UPDATE_REPO` → settings `updateRepo` → `sufar/tack`.
+Repo resolution: `TACK_UPDATE_REPO` → settings `updateRepo` → `Tack-AI/tack`.
 In-process downloads never get the macOS quarantine flag, so self-updates are
 unaffected by Gatekeeper.
 

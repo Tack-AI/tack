@@ -32,7 +32,7 @@ TCP/WebSocket 远程会话。与 TypeScript pi 线上协议和存储格式兼容
 
 ### 预编译二进制
 
-从最新的 [GitHub release](https://github.com/sufar/tack/releases) 下载
+从最新的 [GitHub release](https://github.com/Tack-AI/tack/releases) 下载
 `tack-<target-triple>.tar.gz` / `.zip`（`tack-v*` tag；windows x64/arm64、
 linux x64/arm64、macOS arm64/x64）。
 
@@ -43,7 +43,7 @@ linux x64/arm64、macOS arm64/x64）。
 ### 源码构建
 
 ```bash
-git clone https://github.com/sufar/tack.git && cd tack
+git clone https://github.com/Tack-AI/tack.git && cd tack
 cargo build --release -p tack-app        # 二进制：target/release/tack
 ```
 
@@ -56,7 +56,7 @@ tack update          # 拉取最新 release 并原子替换二进制
 tack update --check  # 只检查不安装
 ```
 
-仓库解析顺序：`TACK_UPDATE_REPO` → settings `updateRepo` → `sufar/tack`。
+仓库解析顺序：`TACK_UPDATE_REPO` → settings `updateRepo` → `Tack-AI/tack`。
 进程内下载不带 macOS 隔离标志，所以自更新不受 Gatekeeper 影响。
 
 ## 快速上手

@@ -87,7 +87,7 @@ workflow_dispatch 会 checkout 该 tag 的代码进行构建，同样会校验�
 - `ubuntu-24.04-arm` 原生 ARM runner 仅对公共仓库免费。私有仓库需将其替换为
   `ubuntu-latest` + [`cross`](https://github.com/cross-rs/cross) 交叉编译，
   或改用 cargo-zigbuild。
-- `tack update` 默认从 `DEFAULT_UPDATE_REPO`（`sufar/tack`）拉取。
+- `tack update` 默认从 `DEFAULT_UPDATE_REPO`（`Tack-AI/tack`）拉取。
   fork 发布自己的包时，用户需通过环境变量 `TACK_UPDATE_REPO=<owner>/<repo>`
   或 settings 中的 `updateRepo` 指向 fork 仓库。
 

@@ -11,7 +11,7 @@
   16×16 viewBox、fill 改为 `currentColor`。
 - `tack/agent.json` — 条目草稿。平台键(registry 侧)与 target triple(release
   资产侧)的对应关系见下表;URL 模式:
-  `https://github.com/sufar/tack/releases/download/tack-vX.Y.Z/tack-<triple>.<tar.gz|zip>`
+  `https://github.com/Tack-AI/tack/releases/download/tack-vX.Y.Z/tack-<triple>.<tar.gz|zip>`
 
 | registry 平台键 | release 资产 triple | 格式 |
 |---|---|---|

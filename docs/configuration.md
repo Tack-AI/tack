@@ -192,7 +192,7 @@ Tack 从四级读取配置，**后加载的层级覆盖先加载的**（部分�
 | `cacheRetention` | `"short"` \| `"long"` \| `"off"` | `"short"` | 提示词缓存保留时长：`short`=5 分钟写入（提供商默认）；`long`=1 小时写入（OpenAI 为 24h，写入费更高；Kimi/Anthropic 协议发 `ttl:"1h"`，Moonshot OpenAI 协议发 `prompt_cache_options`）；`off`=不发缓存标记（支持处只读）。未设置时回退 `TACK_CACHE_RETENTION` 环境变量（`long` 生效），再回退 `short`。注意 Kimi 的缓存 TTL 首次写入后锁定，中途切换需等旧条目过期才生效 |
 | `enableSkillCommands` | bool | `true` | `/skill:<name>` 补全 |
 | `defaultTools` | string[] | `[]`（全部） | 内置工具 allowlist（与 features.* 取交集）。可选的 `powershell` 工具（Windows）默认关闭，仅在此显式列出时注册——如 `["read", "powershell", "edit", "write"]` 替换 bash，或同时列出两者。优先 `pwsh.exe`，回退 `powershell.exe`，启动参数 `-NoProfile -NonInteractive -ExecutionPolicy Bypass`；非 Windows 平台注册后执行会报错。权限规则写法 `PowerShell(...)`，通配语义同 `Bash(...)` |
-| `updateRepo` | string | `"sufar/tack"` | 自更新 GitHub 仓库 |
+| `updateRepo` | string | `"Tack-AI/tack"` | 自更新 GitHub 仓库 |
 | `updateCheck` | bool | `true` | TUI 启动时后台检查新版本（结果缓存 `update-check.json`，24h TTL），有更新在 footer 与聊天区提示。`--offline`/`TACK_OFFLINE` 时跳过；只检查不安装 |
 | `notifications` | bool | `true` | 桌面通知（OSC 9 / OSC 777 escape）：权限弹窗弹出、agent run 完成/出错、后台任务完成时通知（按事件源 5s 节流）。终端不支持则静默无效 |
 | `shellPath` | string | 自动探测 | bash 工具使用的 shell 路径覆盖（默认按 Git Bash → `where bash` 顺序探测，Windows） |

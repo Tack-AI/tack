@@ -25,7 +25,7 @@ jobs:
         run: |
           # Prebuilt release binaries (see tack release CI), or:
           # cargo install --path tack
-          curl -sSfL https://github.com/sufar/tack/releases/latest/download/tack-x86_64-unknown-linux-gnu.tar.gz | tar xz
+          curl -sSfL https://github.com/Tack-AI/tack/releases/latest/download/tack-x86_64-unknown-linux-gnu.tar.gz | tar xz
           sudo install tack /usr/local/bin/tack
 
       - name: Run eval suite

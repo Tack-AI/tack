@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 
 /// Fallback release repo (overridable; this repo must publish tack assets).
-pub const DEFAULT_UPDATE_REPO: &str = "sufar/tack";
+pub const DEFAULT_UPDATE_REPO: &str = "Tack-AI/tack";
 
 /// Checksum asset every tack release must carry (see the module docs).
 const CHECKSUMS_ASSET: &str = "SHA256SUMS.txt";

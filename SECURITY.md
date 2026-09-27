@@ -8,7 +8,7 @@ issues.**
 Report them privately through GitHub Security Advisories (private
 vulnerability reporting):
 
-<https://github.com/sufar/tack/security/advisories/new>
+<https://github.com/Tack-AI/tack/security/advisories/new>
 
 Include as much detail as you can: affected version(s), platform, a
 description of the issue and its impact, and steps to reproduce or a
