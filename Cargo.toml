@@ -18,7 +18,7 @@ edition = "2024"
 # Edition 2024 requires rustc 1.85; no newer language features are used.
 # rust-version is only inherited by tack-protocol (the crate the CI msrv job
 # can actually verify at 1.85). The rest of the workspace has higher
-# effective floors from pinned dependencies (wasmtime 48 needs 1.95,
+# effective floors from pinned dependencies (wasmtime 49 needs 1.96,
 # syntect→time and image/globset/jsonwebtoken need 1.88), so those crates
 # declare nothing rather than an unverifiable number; tack-ext-wasm declares
 # its real wasmtime-driven floor.

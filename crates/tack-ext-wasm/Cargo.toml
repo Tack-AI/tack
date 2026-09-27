@@ -3,8 +3,8 @@ name = "tack-ext-wasm"
 description = "Tack extension host: sandboxed WASM (wasmtime / WASI p1) carrier for the tack-ext NDJSON plugin protocol"
 version.workspace = true
 edition.workspace = true
-# wasmtime 48 declares rust-version 1.95 — that is this crate's real floor.
-rust-version = "1.95"
+# wasmtime 49 declares rust-version 1.96 — that is this crate's real floor.
+rust-version = "1.96"
 license.workspace = true
 repository.workspace = true
 
@@ -21,7 +21,7 @@ tracing.workspace = true
 # (the last one alone drags in the whole wasm-compose chain). `async` and
 # `component-model` are forced by wasmtime-wasi's p1 → p2 chain and are
 # declared explicitly to document that.
-wasmtime = { version = "48", default-features = false, features = [
+wasmtime = { version = "49", default-features = false, features = [
     "addr2line",
     "anyhow",
     "async",
@@ -37,7 +37,7 @@ wasmtime = { version = "48", default-features = false, features = [
     "std",
     "wat",
 ] }
-wasmtime-wasi = { version = "48", features = ["p1"] }
+wasmtime-wasi = { version = "49", features = ["p1"] }
 
 [dev-dependencies]
 # Temp directories for preopen-grant tests (host side of the fs fixtures).
