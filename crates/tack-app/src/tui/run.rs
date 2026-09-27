@@ -1140,7 +1140,8 @@ impl TuiApp {
 
     /// Open the dialog for the ask_user walk's current question:
     /// multiple-choice questions get a SelectDialog with a trailing
-    /// "Other…" escape, free-text questions (and the Other escape itself)
+    /// "Other…" escape (or a checkbox MultiSelectDialog for multi_select
+    /// questions), free-text questions (and the Other escape itself)
     /// an InputDialog.
     pub(crate) fn open_ask_user_dialog(&mut self, pending: &crate::ask_user::PendingAskUser) {
         use tack_tui::components::select_list::SelectItem;
@@ -1175,6 +1176,14 @@ impl TuiApp {
                 item
             })
             .collect();
+        // multi_select: checkbox dialog (space toggles, enter confirms).
+        // No "Other…" escape — a pick-several answer cannot mix in free text.
+        if question.multi_select == Some(true) {
+            self.dialog = Some(commands::Dialog::MultiSelect(
+                commands::MultiSelectDialog::new(title, items, self.theme),
+            ));
+            return;
+        }
         items.push(SelectItem::new(
             crate::i18n::tr("ask_user.other"),
             crate::ask_user::CUSTOM_ANSWER_VALUE,

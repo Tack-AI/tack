@@ -161,6 +161,10 @@ const EN: &[(&str, &str)] = &[
         " type to filter • ↑↓ select • enter confirm • esc cancel",
     ),
     ("dialog.hint.input", " enter confirm • esc cancel"),
+    (
+        "dialog.hint.multiselect",
+        " ↑↓ move • space toggle • enter confirm • esc cancel",
+    ),
     // -- ask_user tool dialogs --
     ("ask_user.step", " Question {step}/{total}:"),
     ("ask_user.other", "Other (type a custom answer)"),
@@ -1075,6 +1079,10 @@ const ZH: &[(&str, &str)] = &[
         " 输入过滤 • ↑↓ 选择 • 回车确认 • Esc 取消",
     ),
     ("dialog.hint.input", " 回车确认 • Esc 取消"),
+    (
+        "dialog.hint.multiselect",
+        " ↑↓ 移动 • 空格勾选 • 回车确认 • Esc 取消",
+    ),
     // -- ask_user 工具对话框 --
     ("ask_user.step", " 问题 {step}/{total}:"),
     ("ask_user.other", "其他（自定义回答）"),

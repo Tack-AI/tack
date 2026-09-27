@@ -10,11 +10,13 @@ use crate::tui::permission::PermissionDialog;
 use crate::tui::theme::Theme;
 
 mod model;
+mod multi_select;
 mod scoped_models;
 mod session;
 mod tree;
 
 pub use model::{ModelDialog, ModelEntry};
+pub use multi_select::MultiSelectDialog;
 pub use scoped_models::ScopedModelsDialog;
 pub use session::SessionDialog;
 pub use tree::{TreeDialog, TreeFilter, build_tree_items, build_tree_items_filtered};
@@ -24,6 +26,7 @@ pub use tree::{TreeDialog, TreeFilter, build_tree_items, build_tree_items_filter
 pub enum Dialog {
     Permission(PermissionDialog),
     Select(SelectDialog),
+    MultiSelect(MultiSelectDialog),
     Model(ModelDialog),
     ScopedModels(ScopedModelsDialog),
     Sessions(SessionDialog),
@@ -40,6 +43,7 @@ impl Dialog {
                 out
             }
             Dialog::Select(d) => d.render(width),
+            Dialog::MultiSelect(d) => d.render(width),
             Dialog::Model(d) => d.render(width),
             Dialog::ScopedModels(d) => d.render(width),
             Dialog::Sessions(d) => d.render(width),
@@ -53,6 +57,7 @@ impl Dialog {
         match self {
             Dialog::Permission(d) => d.handle_input(event),
             Dialog::Select(d) => d.handle_input(event),
+            Dialog::MultiSelect(d) => d.handle_input(event),
             Dialog::Model(d) => d.handle_input(event),
             Dialog::ScopedModels(d) => d.handle_input(event),
             Dialog::Sessions(d) => d.handle_input(event),
@@ -65,6 +70,7 @@ impl Dialog {
         match self {
             Dialog::Permission(d) => d.resolved(),
             Dialog::Select(d) => d.done,
+            Dialog::MultiSelect(d) => d.done,
             Dialog::Model(d) => d.done,
             Dialog::ScopedModels(d) => d.done,
             Dialog::Sessions(d) => d.done,
@@ -77,6 +83,10 @@ impl Dialog {
     pub fn take_result(&mut self) -> Option<(SelectPurpose, String, bool)> {
         match self {
             Dialog::Select(d) => d.on_confirm.take().map(|v| (d.purpose, v, d.save_default)),
+            Dialog::MultiSelect(d) => d
+                .on_confirm
+                .take()
+                .map(|v| (SelectPurpose::AskUser, v, false)),
             Dialog::Model(d) => d
                 .on_confirm
                 .take()
@@ -97,6 +107,7 @@ impl Dialog {
     pub fn cancelled(&self) -> bool {
         match self {
             Dialog::Select(d) => d.cancelled,
+            Dialog::MultiSelect(d) => d.cancelled,
             Dialog::Model(d) => d.cancelled,
             Dialog::Sessions(d) => d.cancelled,
             Dialog::Tree(d) => d.cancelled,

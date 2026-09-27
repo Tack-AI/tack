@@ -1,5 +1,6 @@
 //! The ask_user tool: let the agent pause mid-run and ask the user
-//! structured questions — multiple-choice (with an "Other" free-text
+//! structured questions — multiple-choice (single-pick by default, or
+//! multi-pick with `multi_select`; single-pick offers an "Other" free-text
 //! escape in the TUI) or plain free-text when no options are given.
 //!
 //! The tool itself is UI-agnostic: the host injects an [`AskUserHandler`]
@@ -29,10 +30,10 @@ pub const MAX_OPTIONS: usize = 4;
 
 const DESCRIPTION: &str = "Ask the user structured questions when you need a decision, clarification, \
 or preference only they can provide (ambiguous requirements, multiple viable approaches, destructive \
-choices). Present 1-4 questions; each is either multiple-choice (2-4 options, the user can also enter \
-a custom answer) or free-text (omit options). Do NOT use for things you can determine yourself from \
-the codebase, and never as a substitute for just doing the obvious thing. The answers are returned \
-as the tool result.";
+choices). Present 1-4 questions; each is either multiple-choice (2-4 options — single-pick by default, \
+the user can also enter a custom answer; set multi_select for pick-several questions) or free-text \
+(omit options). Do NOT use for things you can determine yourself from the codebase, and never as a \
+substitute for just doing the obvious thing. The answers are returned as the tool result.";
 
 /// In-band message when no interactive user exists (headless modes,
 /// subagents): the model must not retry — it should decide on its own.
@@ -64,6 +65,10 @@ pub struct AskUserQuestion {
     pub header: Option<String>,
     /// 2-4 choices for a multiple-choice question; omit for free-text.
     pub options: Option<Vec<AskUserOption>>,
+    /// Let the user pick several options (checkbox-style) instead of exactly
+    /// one; the answer is all selected labels. Requires `options` and has no
+    /// "Other" custom-answer escape — single-pick questions keep that one.
+    pub multi_select: Option<bool>,
 }
 
 /// One answered question (the question text echoes back for context).
@@ -95,6 +100,32 @@ struct AskUserParams {
     questions: Vec<AskUserQuestion>,
 }
 
+/// Argument leniency, run by the agent loop before schema validation
+/// (mirrors pi's `prepareEditArguments` policy): models sometimes send
+/// multiple-choice options as bare strings (`["A", "B"]`) instead of option
+/// objects (`[{"label": "A"}, ...]`). Rewrite string items into objects so a
+/// well-meant call is not rejected by the schema validator; anything else is
+/// left untouched for validation to report.
+fn normalize_arguments(input: Value) -> Value {
+    let Value::Object(mut args) = input else {
+        return input;
+    };
+    let Some(Value::Array(questions)) = args.get_mut("questions") else {
+        return Value::Object(args);
+    };
+    for question in questions.iter_mut() {
+        let Some(Value::Array(options)) = question.get_mut("options") else {
+            continue;
+        };
+        for option in options.iter_mut() {
+            if let Value::String(label) = option {
+                *option = json!({ "label": label });
+            }
+        }
+    }
+    Value::Object(args)
+}
+
 /// Semantic validation beyond the JSON schema (counts, non-empty texts,
 /// unique option labels). Pure, so both the tool and tests exercise it.
 pub fn validate_questions(questions: &[AskUserQuestion]) -> Result<(), String> {
@@ -107,6 +138,11 @@ pub fn validate_questions(questions: &[AskUserQuestion]) -> Result<(), String> {
     for (i, q) in questions.iter().enumerate() {
         if q.question.trim().is_empty() {
             return Err(format!("questions[{i}]: question text must not be empty"));
+        }
+        if q.multi_select == Some(true) && q.options.is_none() {
+            return Err(format!(
+                "questions[{i}]: multi_select requires options (omit options for a free-text answer)"
+            ));
         }
         if let Some(options) = &q.options {
             if options.len() < MIN_OPTIONS || options.len() > MAX_OPTIONS {
@@ -171,6 +207,10 @@ impl AgentTool for AskUserTool {
 
     fn constrained_sampling(&self) -> Option<tack_ai::constrained_sampling::ConstrainedSampling> {
         crate::prefer_strict_sampling()
+    }
+
+    fn prepare_arguments(&self, args: Value) -> Value {
+        normalize_arguments(args)
     }
 
     async fn execute(
@@ -257,7 +297,14 @@ mod tests {
                     })
                     .collect(),
             ),
+            multi_select: None,
         }
+    }
+
+    fn multi(question: &str, labels: &[&str]) -> AskUserQuestion {
+        let mut q = choice(question, labels);
+        q.multi_select = Some(true);
+        q
     }
 
     fn free_text(question: &str) -> AskUserQuestion {
@@ -265,6 +312,7 @@ mod tests {
             question: question.to_string(),
             header: None,
             options: None,
+            multi_select: None,
         }
     }
 
@@ -318,6 +366,60 @@ mod tests {
         // Empty / duplicate labels.
         assert!(validate_questions(&[choice("q", &["a", " "])]).is_err());
         assert!(validate_questions(&[choice("q", &["a", "a"])]).is_err());
+        // multi_select requires options; with options it validates like a
+        // regular multiple-choice question (2-4 options).
+        let mut no_options = free_text("q");
+        no_options.multi_select = Some(true);
+        assert!(validate_questions(&[no_options]).is_err());
+        assert!(validate_questions(&[multi("q", &["a", "b"])]).is_ok());
+        assert!(validate_questions(&[multi("q", &["only"])]).is_err());
+    }
+
+    #[test]
+    fn prepare_rewrites_string_options_into_objects() {
+        let tool = tool_with(None);
+        let prepared = tool.prepare_arguments(json!({ "questions": [
+            { "question": "which?", "options": ["A", { "label": "B" }] },
+            { "question": "free text?" }
+        ]}));
+        assert_eq!(
+            prepared["questions"][0]["options"],
+            json!([{ "label": "A" }, { "label": "B" }])
+        );
+        // Questions without options pass through untouched.
+        assert_eq!(
+            prepared["questions"][1],
+            json!({ "question": "free text?" })
+        );
+    }
+
+    #[test]
+    fn prepare_leaves_malformed_arguments_for_validation() {
+        let tool = tool_with(None);
+        for input in [
+            json!("not an object"),
+            json!({ "questions": { "nope": true } }),
+            json!({ "questions": [{ "question": "q", "options": "A" }] }),
+        ] {
+            assert_eq!(tool.prepare_arguments(input.clone()), input);
+        }
+    }
+
+    #[tokio::test]
+    async fn string_options_pass_preflight_and_reach_the_handler() {
+        // The agent loop runs prepare_arguments + validate_arguments in
+        // preflight; bare-string options must survive both (multi_select is
+        // the case models most often fumble).
+        let tool = tool_with(Some(AskUserResponse::Cancelled));
+        let params = tool.prepare_arguments(json!({ "questions": [
+            { "question": "which?", "multi_select": true, "options": ["A", "B"] }
+        ]}));
+        tool.validate_arguments(&params).unwrap();
+        let result = tool
+            .execute("c1", params, CancellationToken::new(), &|_| {})
+            .await
+            .unwrap();
+        assert!(result_text(&result).contains("declined to answer"));
     }
 
     #[tokio::test]

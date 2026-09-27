@@ -510,8 +510,9 @@ fn render_table(rows: &[Vec<String>], width: usize, theme: &MarkdownTheme, out: 
             col_widths[i] = col_widths[i].max(crate::line::grapheme_width(cell));
         }
     }
-    // Chrome: "│ " per column + trailing "│".
-    let chrome = cols * 2 + 1;
+    // Chrome: "│ " + (cols - 1) × " │ " + " │" = 3 × cols + 1 (TS pi
+    // borderOverhead) — cells are padded with a space on BOTH sides.
+    let chrome = cols * 3 + 1;
     let available = width.saturating_sub(chrome).max(cols * 3);
     let natural: usize = col_widths.iter().sum();
     if natural > available {
@@ -537,14 +538,29 @@ fn render_table(rows: &[Vec<String>], width: usize, theme: &MarkdownTheme, out: 
         }
         col_widths = widths;
     }
+    // Cells wrap at width >= 1; keep borders aligned with padded cells.
+    for w in &mut col_widths {
+        *w = (*w).max(1);
+    }
 
-    for (r, row) in rows.iter().enumerate() {
+    // Box-drawing borders like TS pi: ┌─┬─┐ / ├─┼─┤ / └─┴─┘, with a
+    // horizontal separator under the header and between every body row.
+    let border = |left: char, junction: char, right: char| -> Line {
+        let mut s = String::new();
+        s.push(left);
+        for (i, w) in col_widths.iter().enumerate() {
+            s.push_str(&"─".repeat(w + 2));
+            s.push(if i + 1 < cols { junction } else { right });
+        }
+        Line::styled(s, theme.quote_border)
+    };
+    let push_row = |out: &mut Vec<Line>, row: &[String], header: bool| {
         // Wrap each cell into its column; the row takes as many visual lines
         // as its tallest cell.
         let wrapped: Vec<Vec<Line>> = (0..cols)
             .map(|i| {
                 let cell = row.get(i).map(String::as_str).unwrap_or("");
-                let w = col_widths[i].max(1);
+                let w = col_widths[i];
                 let mut pieces = Line::plain(cell.to_string()).wrap(w);
                 for piece in &mut pieces {
                     piece.pad_right(w, Style::default());
@@ -555,9 +571,9 @@ fn render_table(rows: &[Vec<String>], width: usize, theme: &MarkdownTheme, out: 
         let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
         for sub in 0..height {
             let mut line = Line::new();
+            line.push(Span::styled("│ ", theme.quote_border));
             for (i, cell_lines) in wrapped.iter().enumerate() {
-                line.push(Span::styled("│ ", theme.quote_border));
-                let style = if r == 0 {
+                let style = if header {
                     Style::new().bold()
                 } else {
                     Style::default()
@@ -574,21 +590,31 @@ fn render_table(rows: &[Vec<String>], width: usize, theme: &MarkdownTheme, out: 
                     }
                     None => line.push(Span::plain(" ".repeat(col_widths[i]))),
                 }
+                line.push(Span::styled(
+                    if i + 1 < cols { " │ " } else { " │" },
+                    theme.quote_border,
+                ));
             }
-            line.push(Span::styled("│", theme.quote_border));
             out.push(line);
         }
-        if r == 0 {
-            out.push(Line::styled(
-                "─".repeat((chrome + col_widths.iter().sum::<usize>()).min(width)),
-                theme.quote_border,
-            ));
+    };
+
+    out.push(border('┌', '┬', '┐'));
+    push_row(out, &rows[0], true);
+    out.push(border('├', '┼', '┤'));
+    for (i, row) in rows.iter().enumerate().skip(1) {
+        if i > 1 {
+            out.push(border('├', '┼', '┤'));
         }
+        push_row(out, row, false);
     }
+    out.push(border('└', '┴', '┘'));
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
 
     #[test]
@@ -668,6 +694,39 @@ mod tests {
         assert!(texts.iter().any(|t| t.contains("☑ done")), "{texts:?}");
         assert!(texts.iter().any(|t| t.contains("☐ todo")), "{texts:?}");
         assert!(texts.iter().any(|t| t.contains("• plain")), "{texts:?}");
+    }
+
+    #[test]
+    fn table_draws_box_borders() {
+        // TS pi parity: full box with horizontal lines — top border, header
+        // separator, a separator between body rows, and a bottom border.
+        let lines = render_markdown(
+            "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n",
+            40,
+            &MarkdownTheme::default(),
+        );
+        let texts: Vec<String> = lines.iter().map(Line::text).collect();
+        assert!(texts.iter().any(|t| t == "┌───┬───┐"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "│ a │ b │"), "{texts:?}");
+        assert_eq!(
+            texts.iter().filter(|t| *t == "├───┼───┤").count(),
+            2,
+            "header + inter-row separators: {texts:?}"
+        );
+        assert!(texts.iter().any(|t| t == "└───┴───┘"), "{texts:?}");
+        // Border junctions align with the interior "│" of data rows
+        // (compare char positions, not bytes: "─" is 3 bytes, " " is 1).
+        let data = texts.iter().find(|t| t.contains('a')).unwrap();
+        let top = texts.iter().find(|t| t.starts_with('┌')).unwrap();
+        let data_bar = data
+            .chars()
+            .enumerate()
+            .filter(|(_, c)| *c == '│')
+            .nth(1)
+            .map(|(i, _)| i)
+            .unwrap();
+        let top_junction = top.chars().position(|c| c == '┬').unwrap();
+        assert_eq!(data_bar, top_junction, "{data} vs {top}");
     }
 
     #[test]

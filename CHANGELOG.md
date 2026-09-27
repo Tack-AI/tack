@@ -4,6 +4,30 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [Unreleased]
+
+### Added
+
+- `ask_user` multi-select questions: setting `multi_select: true` on a
+  multiple-choice question turns the TUI dialog into a pick-several
+  checkbox list (space toggles, enter confirms, at least one option
+  required; no "Other…" free-text escape). The tool result reports all
+  selected labels as the answer.
+
+### Fixed
+
+- `ask_user` now tolerates multiple-choice options sent as bare strings
+  (`["A", "B"]`): argument preparation rewrites them into option objects
+  (`[{"label": "A"}, ...]`) before schema validation, so a well-meant tool
+  call is no longer rejected with `"A" is not of type "object"`.
+- Markdown tables in the TUI now render with full box-drawing borders,
+  matching TS pi: a top border (`┌─┬─┐`), a horizontal separator under the
+  header and between every body row (`├─┼─┤`), and a bottom border
+  (`└─┴─┘`). Previously only vertical bars and a single plain rule under
+  the header were drawn, so tables had no horizontal lines. Cells are now
+  padded with a space on both sides (`│ cell │`), keeping the border
+  junctions aligned with the interior bars.
+
 ## [1.0.3] - 2026-09-27
 
 ### Added

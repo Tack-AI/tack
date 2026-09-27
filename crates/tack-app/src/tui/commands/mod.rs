@@ -8,8 +8,9 @@ use super::permission::PermissionMode;
 use super::{ChatEntry, NoticeKind, TuiApp, lock_recover};
 
 pub use super::dialogs::{
-    Dialog, InputDialog, ModelDialog, ModelEntry, ScopedModelsDialog, SelectDialog, SelectPurpose,
-    SessionDialog, TreeDialog, TreeFilter, build_tree_items, build_tree_items_filtered,
+    Dialog, InputDialog, ModelDialog, ModelEntry, MultiSelectDialog, ScopedModelsDialog,
+    SelectDialog, SelectPurpose, SessionDialog, TreeDialog, TreeFilter, build_tree_items,
+    build_tree_items_filtered,
 };
 pub use super::export::export_html;
 

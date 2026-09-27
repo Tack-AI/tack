@@ -736,13 +736,15 @@ definition edits needed.
   free, commands still ask), Always→bypass, No→stay in plan mode to revise.
 - **ask_user tool**: the agent can pause mid-run and ask the user structured
   questions (`ask_user`, 1–4 per call) — multiple-choice (2–4 options with
-  descriptions plus an "Other…" free-text escape) or plain free-text when
-  options are omitted. The TUI walks the questions one dialog at a time
-  (Esc dismisses the batch and the tool result tells the model to decide on
-  its own). Headless modes (print/rpc/acp/serve) and subagents register the
-  tool without an interactive handler: calling it returns an in-band "no
-  interactive user" message so the model proceeds with its best judgment
-  instead of blocking (same policy as MCP elicitation decline).
+  descriptions plus an "Other…" free-text escape; `multi_select: true` makes
+  it a pick-several checkbox dialog whose answer is all selected labels) or
+  plain free-text when options are omitted. The TUI walks the questions one
+  dialog at a time (Esc dismisses the batch and the tool result tells the
+  model to decide on its own). Headless modes (print/rpc/acp/serve) and
+  subagents register the tool without an interactive handler: calling it
+  returns an in-band "no interactive user" message so the model proceeds
+  with its best judgment instead of blocking (same policy as MCP elicitation
+  decline).
 - **Multi-workspace**: `--add-dir <path>` (repeatable) or `additionalDirs` —
   extra directories' AGENTS.md enter the context, the system prompt lists the
   in-scope directories, and the sandbox writable set is merged.

@@ -6,8 +6,9 @@
 //! execute future sends an [`AppEvent::AskUser`](crate::tui::AppEvent) and
 //! parks on a oneshot; the main loop opens a SelectDialog (multiple-choice,
 //! with a trailing "Other…" escape that re-asks the same question as
-//! free text) or an InputDialog (free-text question) and resolves the
-//! oneshot when the walk finishes or the user presses Esc.
+//! free text), a MultiSelectDialog (multi_select questions: checkbox picks,
+//! no Other escape) or an InputDialog (free-text question) and resolves
+//! the oneshot when the walk finishes or the user presses Esc.
 
 use tokio::sync::oneshot;
 
@@ -138,11 +139,13 @@ mod tests {
                         description: None,
                     },
                 ]),
+                multi_select: None,
             },
             AskUserQuestion {
                 question: "why?".into(),
                 header: None,
                 options: None,
+                multi_select: None,
             },
         ]
     }
