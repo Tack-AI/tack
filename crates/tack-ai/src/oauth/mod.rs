@@ -282,9 +282,8 @@ pub(crate) fn token_credential(
 
 /// Lowercase hex of N random bytes (OAuth `state` parameters).
 pub(crate) fn random_hex(bytes: usize) -> String {
-    use rand::RngCore;
     let mut buf = vec![0u8; bytes];
-    rand::rng().fill_bytes(&mut buf);
+    rand::fill(&mut buf[..]);
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 

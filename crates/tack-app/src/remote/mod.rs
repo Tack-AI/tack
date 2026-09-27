@@ -36,9 +36,8 @@ const MAX_CONNECTIONS: usize = 64;
 /// Generate a random shared auth token (ws listener with no configured
 /// token: the token is printed to stderr once at startup).
 fn generate_auth_token() -> String {
-    use rand::Rng as _;
-    let mut rng = rand::rng();
-    let bytes: [u8; 24] = rng.random();
+    let mut bytes = [0u8; 24];
+    rand::fill(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
