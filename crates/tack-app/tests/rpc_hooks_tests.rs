@@ -111,7 +111,8 @@ fn command(
 
 /// Send a prompt and read until BOTH the command response and the run's
 /// agent_end arrived (either order — a hook-blocked prompt emits its
-/// synthetic agent_end before the response).
+/// synthetic agent_end before the response), then wait for the agent to go
+/// fully idle.
 fn prompt_and_collect(
     agent: &mut RpcAgent,
     id: &str,
@@ -135,7 +136,40 @@ fn prompt_and_collect(
         }
         events.push(value);
     }
+    wait_until_idle(agent);
     (response.unwrap(), events)
+}
+
+/// Wait until the agent is fully idle: not streaming and nothing queued.
+///
+/// agent_end alone does NOT mean the agent accepts a fresh prompt: the pump
+/// runs Stop hooks AFTER the terminal event and only then clears
+/// is_streaming. A prompt sent in that window is queued as steering for a
+/// run that already ended — it never starts a run and never emits an
+/// agent_end (the client would hang on the next read). The Stop hook's
+/// marker-file write is visible even earlier (before the hook process exits),
+/// so file polling cannot close this race either; only the wire state can.
+fn wait_until_idle(agent: &mut RpcAgent) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    for n in 1.. {
+        let r = command(
+            agent,
+            &format!("idle-{n}"),
+            "get_state",
+            serde_json::json!({}),
+        );
+        if r["success"] == true
+            && r["data"]["isStreaming"] == false
+            && r["data"]["pendingMessageCount"] == 0
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "agent did not go idle"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
 
 /// Poll a marker file until it has `expected` lines (post-agent_end hooks
