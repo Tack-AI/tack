@@ -4,6 +4,24 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [1.0.2] - 2026-09-27
+
+Repository relocation release — no functional changes. The project moved
+from `sufar/tack` to `Tack-AI/tack` after the GitHub account rename.
+
+### Changed
+
+- `tack update` now defaults to the new `Tack-AI/tack` release repository
+  (`TACK_UPDATE_REPO` and the `updateRepo` setting still override). Older
+  binaries keep finding updates through GitHub's username-rename redirect.
+- All repository references — README, SECURITY.md, docs, ACP registry
+  metadata, CI examples — point at the new location.
+
+### Added
+
+- `AGENTS.md`: repo guidance for AI coding agents (layout, CI-matched
+  commands, testing rules, compatibility constraints).
+
 ## [1.0.1] - 2026-09-27
 
 v4 session storage upstream-alignment fixes and pi interoperability.
