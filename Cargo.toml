@@ -97,7 +97,7 @@ sha1 = "0.11"
 hmac = "0.12"
 base64 = "0.22"
 crc32fast = "1"
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
 
 # TLS provider: reqwest is rustls-no-provider, so the ring CryptoProvider
 # must be installed process-wide before any TLS client is built (tack_ai::tls).
