@@ -132,8 +132,8 @@ crates/tack-app/src/mcp_config.rs"
 echo "== check 1: settings.json keys (docs/configuration.md vs crates/tack-app)"
 
 # Documented keys: backticked first cells of the tables inside the
-# "## settings.json 全键参考" section, plus keys documented inline in prose.
-sed -n '/^## settings.json 全键参考/,/^## 环境变量/p' "$CONFIG_MD" \
+# "## settings.json full key reference" section, plus keys documented inline in prose.
+sed -n '/^## settings.json full key reference/,/^## Environment variables/p' "$CONFIG_MD" \
     | grep -oE '^\| `[A-Za-z][A-Za-z0-9.]*`' | sed 's/^| `//; s/`$//' > "$tmp/doc_keys"
 printf '%s\n' permissions.allow permissions.deny hooks managedHooksOnly mcpDeferThreshold >> "$tmp/doc_keys"
 sort -u "$tmp/doc_keys" > "$tmp/doc_keys.sorted" && mv "$tmp/doc_keys.sorted" "$tmp/doc_keys"

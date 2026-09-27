@@ -1,35 +1,37 @@
-# IntelliJ IDEA 接入 Tack ACP
+# Connecting IntelliJ IDEA to Tack ACP
 
-Tack 通过 [ACP (Agent Client Protocol)](https://agentclientprotocol.com) 在 stdio 上对外提供 agent 服务。JetBrains AI Assistant 原生支持 ACP，因此 IntelliJ IDEA(及 PyCharm、WebStorm 等全家桶)可以直接连接 Tack。
+**English | [简体中文](intellij-idea-acp.zh-CN.md)**
 
-由于 Tack 不在 JetBrains 的 ACP Registry 中，需走"自定义 agent"手动配置，共两步:**准备二进制** + **在 AI Assistant 中注册**。
+Tack exposes its agent service over stdio via [ACP (Agent Client Protocol)](https://agentclientprotocol.com). JetBrains AI Assistant natively supports ACP, so IntelliJ IDEA (and the rest of the family — PyCharm, WebStorm, etc.) can connect to Tack directly.
 
-## 前置条件
+Since Tack is not in JetBrains' ACP Registry, you need to configure it as a "custom agent" manually — two steps: **prepare the binary** + **register it in AI Assistant**.
 
-- 已安装并启用 **JetBrains AI Assistant** 插件(使用 ACP agent **不需要** JetBrains AI 订阅)。
-- 已知限制:JetBrains 的 ACP 支持**不适用于 WSL** 环境。
+## Prerequisites
 
-## 1. 准备 Tack 可执行文件
+- The **JetBrains AI Assistant** plugin installed and enabled (using an ACP agent does **not** require a JetBrains AI subscription).
+- Known limitation: JetBrains' ACP support **does not work in WSL** environments.
+
+## 1. Prepare the Tack executable
 
 ```bash
 cd tack
 cargo install --path crates/tack-app --locked
-# 产物:~/.cargo/bin/tack(Windows 为 %USERPROFILE%\.cargo\bin\tack.exe)
+# Artifact: ~/.cargo/bin/tack (Windows: %USERPROFILE%\.cargo\bin\tack.exe)
 ```
 
-也可以直接使用 GitHub release 的预编译包。
+You can also use a prebuilt package from GitHub releases.
 
-安装后先在终端验证 ACP 模式能正常启动:
+After installing, verify in a terminal that ACP mode starts correctly:
 
 ```bash
-tack acp   # 在 stdio 上运行 JSON-RPC,Ctrl+C 退出
+tack acp   # runs JSON-RPC over stdio; Ctrl+C to exit
 ```
 
-## 2. 在 IDEA 中注册 agent
+## 2. Register the agent in IDEA
 
-1. 打开 **AI Chat** 工具窗口。
-2. 点击工具窗口右上角的设置按钮,选择 **Add Custom Agent**。IDE 会创建并打开 `~/.jetbrains/acp.json`。
-3. 填入配置:
+1. Open the **AI Chat** tool window.
+2. Click the settings button in the top-right corner of the tool window and choose **Add Custom Agent**. The IDE will create and open `~/.jetbrains/acp.json`.
+3. Fill in the configuration:
 
 ```json
 {
@@ -45,28 +47,28 @@ tack acp   # 在 stdio 上运行 JSON-RPC,Ctrl+C 退出
 }
 ```
 
-配置要点:
+Configuration notes:
 
-- `command` 建议使用**完整路径**(Windows 下如 `C:/Users/<you>/.cargo/bin/tack.exe`),避免 PATH 解析问题。
-- `env` 放对应 provider 的 API key(`ANTHROPIC_API_KEY`、`OPENAI_API_KEY`、`CODEBUDDY_API_KEY` 等,取决于使用的 provider)。如果已在系统环境变量中配置,`env` 可省略。
-- 可同时配置多个 agent,`agent_servers` 下并列添加即可。
+- Use the **full path** for `command` (e.g. `C:/Users/<you>/.cargo/bin/tack.exe` on Windows) to avoid PATH resolution issues.
+- Put the API key for your provider in `env` (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CODEBUDDY_API_KEY`, etc., depending on the provider you use). If it's already configured in your system environment variables, `env` can be omitted.
+- You can configure multiple agents at once — just add more entries side by side under `agent_servers`.
 
-4. 保存后,Tack 立即出现在 AI Chat 的 agent 选择列表中,选中即可对话。
+4. After saving, Tack immediately appears in the AI Chat agent selection list; select it to start chatting.
 
-## Tack ACP 能力说明
+## Tack ACP capabilities
 
-Tack 实现的 ACP 接口在 IDEA 中的表现:
+How the ACP interfaces Tack implements show up in IDEA:
 
-- 流式输出:`agent_message_chunk` / `agent_thought_chunk`。
-- 权限提示:`session/request_permission`,带 allow-always 缓存。
-- **模式选择器**:`ask`(默认,编辑/命令需确认)、`acceptEdits`(文件编辑免确认)、`plan`(只读)、`bypass`(全部免确认)。
-- **模型选择器**:provider catalog 中的模型列表。
-- **思考强度选择器**:按模型的 `thinkingLevelMap` 提供。
-- 会话加载:`session/load` 支持历史回放。
+- Streaming output: `agent_message_chunk` / `agent_thought_chunk`.
+- Permission prompts: `session/request_permission`, with an allow-always cache.
+- **Mode selector**: `ask` (default; edits/commands require confirmation), `acceptEdits` (file edits skip confirmation), `plan` (read-only), `bypass` (everything skips confirmation).
+- **Model selector**: model list from the provider catalog.
+- **Thinking-effort selector**: provided per the model's `thinkingLevelMap`.
+- Session loading: `session/load` supports history replay.
 
-## MCP 集成(可选)
+## MCP integration (optional)
 
-若希望 Tack 使用 IDEA 中配置的 MCP server(包括 IntelliJ 内置 MCP Server),在 `acp.json` 中增加:
+If you want Tack to use the MCP servers configured in IDEA (including the IntelliJ built-in MCP Server), add this to `acp.json`:
 
 ```json
 {
@@ -80,19 +82,19 @@ Tack 实现的 ACP 接口在 IDEA 中的表现:
 }
 ```
 
-Tack 会从客户端传入的 `mcpServers` 中加载这些 MCP 配置。
+Tack will load these MCP configurations from the `mcpServers` passed in by the client.
 
-## 排障
+## Troubleshooting
 
-| 症状 | 处理 |
+| Symptom | Fix |
 | --- | --- |
-| agent 不出现在列表 | 检查 `acp.json` JSON 格式是否正确;重启 IDE |
-| agent 启动失败 | 确认 `command` 为完整路径;在终端手动运行 `tack acp` 验证 |
-| 需要查看详细日志 | AI Chat 右上角 → **Get ACP Logs**;更详细的请求/响应日志可在 Registry(`Shift` 双击 → 输入 Registry)中开启 `llm.agent.extended.logging` 后重启 IDE |
+| Agent doesn't appear in the list | Check that `acp.json` is valid JSON; restart the IDE |
+| Agent fails to start | Make sure `command` is a full path; run `tack acp` manually in a terminal to verify |
+| Need detailed logs | AI Chat top-right → **Get ACP Logs**; for even more detailed request/response logs, enable `llm.agent.extended.logging` in the Registry (double-press `Shift` → type Registry) and restart the IDE |
 
-> 注意:开启 `llm.agent.extended.logging` 后,日志可能包含对话内容等敏感信息,分享前请脱敏。
+> Note: with `llm.agent.extended.logging` enabled, logs may contain sensitive information such as conversation content — redact before sharing.
 
-## 参考
+## References
 
-- JetBrains 官方文档:[Agent Client Protocol (ACP)](https://www.jetbrains.com/help/ai-assistant/acp.html)
-- Zed 配置方式见 `README.md` 的 "Zed setup" 一节(配置格式与 `acp.json` 基本一致)。
+- JetBrains official docs: [Agent Client Protocol (ACP)](https://www.jetbrains.com/help/ai-assistant/acp.html)
+- For Zed setup, see the "Zed setup" section of `README.md` (the configuration format is essentially the same as `acp.json`).

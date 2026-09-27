@@ -79,8 +79,11 @@ cargo deny check                               # dependency policy (CI-enforced)
 - English for contributor-facing entry points: `README.md`, this file,
   `CONTRIBUTING.md`, `SECURITY.md`, rustdoc, code comments.
 - `README.zh-CN.md` mirrors `README.md` — update both in the same change.
-- Design docs under `docs/` are mostly Chinese; new Chinese design docs are
-  welcome there.
+- Every doc under `docs/` is bilingual: `foo.md` is the English canonical,
+  `foo.zh-CN.md` the Chinese version (same convention as the READMEs). Write
+  new docs in English, add the zh-CN translation in the same change, and keep
+  both in sync. In Chinese files, cross-doc links point to the `.zh-CN.md`
+  targets; in English files, to the canonical `.md` targets.
 
 ## Releasing
 

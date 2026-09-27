@@ -1,5 +1,7 @@
 # tack-ext: Dynamic Extensions (Subprocess Plugins)
 
+**English | [简体中文](extensions.zh-CN.md)**
+
 Tack runs dynamic extensions as **subprocess plugins**: any executable that
 speaks newline-delimited JSON (NDJSON) over stdio. One process per plugin,
 crash-isolated from the agent loop. Language-agnostic — plugins can be written

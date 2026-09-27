@@ -1,5 +1,7 @@
 # Telemetry & data collection: design decision
 
+**English | [简体中文](telemetry.zh-CN.md)**
+
 **Status: decided — Tack ships with no telemetry of any kind.**
 
 ## Decision

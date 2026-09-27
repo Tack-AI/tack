@@ -1,87 +1,102 @@
-# Message v4 JSONL 协议规范
+# Message v4 JSONL Protocol Specification
 
-本文档定义 **message v4** 会话文件的线格式（wire format），是读取方与
-写入方的一致性（conformance）依据。它只描述"一个合法 v4 文件长什么样、
-读写双方必须遵守什么"，不包含设计取舍（见
-`crates/tack-session/V4_NOTES.md`）与 legacy 格式迁移过程（§12 附录仅
-给出识别规则）。
+**English | [简体中文](session-v4-protocol.zh-CN.md)**
 
-- 格式版本：`v = 4`；存储布局版本：`storageVersion = 1`
-- 参考实现：`crates/tack-session/src/v4/{types,codec,store,fork}.rs`、
+This document defines the wire format of **message v4** session files and is
+the conformance reference for readers and writers. It describes only "what a
+valid v4 file looks like and what readers and writers must obey"; it does not
+cover design trade-offs (see `crates/tack-session/V4_NOTES.md`) or the
+legacy-format migration process (the §12 appendix gives only recognition
+rules).
+
+- Format version: `v = 4`; storage layout version: `storageVersion = 1`
+- Reference implementation: `crates/tack-session/src/v4/{types,codec,store,fork}.rs`,
   `crates/tack-session/src/fork_policy.rs`
 
 ---
 
-## 1. 术语与文件模型
+## 1. Terminology and File Model
 
-**会话文件**是按行组织的 JSONL 文本文件，UTF-8 编码。
+A **session file** is a line-oriented JSONL text file, UTF-8 encoded.
 
-文件在逻辑上是一份**事务日志（transaction log）**：
+Logically, the file is a **transaction log**:
 
-- 第 1 行为 **header**（§3）；
-- 其后每行为一个 **事务（transaction）**：一个 **write** 对象，或一个
-  由 write 组成的数组（数组内 write 属于同一事务，空数组合法）。
+- Line 1 is the **header** (§3);
+- each subsequent line is a **transaction**: either a single **write**
+  object, or an array of writes (all writes inside an array belong to the
+  same transaction; an empty array is legal).
 
-读取方通过**重放（replay）**从事务日志折叠出会话的当前状态：
+A reader folds the transaction log into the session's current state by
+**replay**:
 
-1. **entry 集合**：不可变事件（消息、压缩检查点……），以
-   `id`/`parentId` 构成一棵树（或多棵树的森林），全局以 `seq` 定序；
-2. **usage 账本**：usage 行的只追加序列；
-3. **scalar 当前值**：每个 `(namespace, key)` 地址的最新值；
-4. **list 当前内容**：每个 `(namespace, key)` 地址上，最后一次
-   `delete` 之后 `append` 的元素序列（按 `seq` 升序）。
+1. **entry set**: immutable events (messages, compaction checkpoints, …),
+   forming a tree (or a forest of trees) via `id`/`parentId`, globally
+   ordered by `seq`;
+2. **usage ledger**: the append-only sequence of usage rows;
+3. **scalar current values**: the latest value at each `(namespace, key)`
+   address;
+4. **list current contents**: at each `(namespace, key)` address, the
+   sequence of elements `append`ed after the last `delete` (ascending
+   `seq`).
 
-## 2. 行格式
+## 2. Line Format
 
-- 每行以 `\n` 终止。解析前可去掉行尾空白。
-- **撕裂尾（torn tail）**：文件最末一行缺少 `\n` 终止符时，该行必须被
-  丢弃，不参与重放（真实写入方总会终止行；该规则容忍崩溃截断）。
-- 除撕裂尾外，任何一行解析失败（非法 JSON、非法 write、校验违反）都
-  意味着**整个文件损坏**——读取方必须整体拒绝，不得跳过单行继续。
-- 空行（仅含空白）非法。
+- Every line is terminated by `\n`. Trailing whitespace may be stripped
+  before parsing.
+- **Torn tail**: if the final line of the file lacks the `\n` terminator,
+  that line must be discarded and excluded from replay (real writers always
+  terminate lines; this rule tolerates crash truncation).
+- Apart from the torn tail, any line that fails to parse (invalid JSON,
+  invalid write, validation violation) means **the entire file is
+  corrupt** — the reader must reject the file as a whole and must not skip
+  the line and continue.
+- Empty lines (whitespace only) are illegal.
 
 ## 3. Header
 
-第 1 行必须是 header 对象：
+Line 1 must be the header object:
 
 ```json
 {"v":4,"kind":"header","id":"s1","storageVersion":1,"createdAt":1767225600000,"cwd":"/work","parentSessionId":"s0","nextSeq":15}
 ```
 
-| 字段 | 类型 | 必填 | 约束与含义 |
+| Field | Type | Required | Constraints and meaning |
 |---|---|---|---|
-| `v` | int | ✓ | 恒为 `4` |
-| `kind` | string | ✓ | 恒为 `"header"` |
-| `id` | string | ✓ | 会话 id |
-| `storageVersion` | int | ✓ | ≥ 1；本规范仅定义 `1`，其他值必须拒绝打开 |
-| `createdAt` | int | ✓ | ≥ 0，创建时间（Unix 纪元毫秒） |
-| `cwd` | string | ✓ | 会话所属工作目录 |
-| `parentSessionId` | string | — | fork 来源会话 id |
-| `legacyParentSessionPath` | string | — | 父会话 id 不可解析时保留的文件路径（迁移兜底） |
-| `nextSeq` | int | — | ≥ 1；序列号高水位（§5.2） |
+| `v` | int | ✓ | Always `4` |
+| `kind` | string | ✓ | Always `"header"` |
+| `id` | string | ✓ | Session id |
+| `storageVersion` | int | ✓ | ≥ 1; this specification defines only `1`; other values must be refused on open |
+| `createdAt` | int | ✓ | ≥ 0, creation time (Unix epoch milliseconds) |
+| `cwd` | string | ✓ | Working directory the session belongs to |
+| `parentSessionId` | string | — | Source session id of a fork |
+| `legacyParentSessionPath` | string | — | File path retained when the parent session id is unresolvable (migration fallback) |
+| `nextSeq` | int | — | ≥ 1; sequence-number high-water mark (§5.2) |
 
-识别：`kind == "header" && v == 4` 且上表类型约束全部满足。**未识别字段
-必须被忽略**（前向兼容）。header 永远以明文出现（§10 加密仅作用于
-事务行）。
+Recognition: `kind == "header" && v == 4` and all type constraints in the
+table above hold. **Unrecognized fields must be ignored** (forward
+compatibility). The header always appears in plaintext (§10 encryption
+applies only to transaction lines).
 
-## 4. Write 类型
+## 4. Write Types
 
-每个 write 是一个 JSON 对象，以 `kind` 字段判别，共 4 种：`entry`、
-`usage`、`value`、`list`。未知 `kind` 属于文件损坏。
+Each write is a JSON object discriminated by the `kind` field; there are 4
+kinds: `entry`, `usage`, `value`, `list`. An unknown `kind` is file
+corruption.
 
-### 4.1 `entry` — 不可变事件
+### 4.1 `entry` — Immutable Events
 
-entry write 是拍平结构：`{kind:"entry", ...Entry}`。Entry 以 `type`
-判别，携带公共结构字段（`EntryBase`）：
+An entry write is a flattened structure: `{kind:"entry", ...Entry}`.
+Entries are discriminated by `type` and carry common structural fields
+(`EntryBase`):
 
-| 字段 | 类型 | 含义 |
+| Field | Type | Meaning |
 |---|---|---|
-| `id` | string | entry id（与 usage 行 id 同一命名空间） |
-| `parentId` | string \| null | 父 entry；`null` 表示树根 |
-| `seq` | int | 会话级序列号（§5.1） |
-| `timestamp` | int | ≥ 0，提交时间（纪元毫秒） |
+| `id` | string | entry id (same namespace as usage-row ids) |
+| `parentId` | string \| null | parent entry; `null` denotes a tree root |
+| `seq` | int | session-level sequence number (§5.1) |
+| `timestamp` | int | ≥ 0, commit time (epoch milliseconds) |
 
-未知 `type` 属于文件损坏。共 4 种 entry：
+An unknown `type` is file corruption. There are 4 entry types:
 
 #### 4.1.1 `message`
 
@@ -90,10 +105,10 @@ entry write 是拍平结构：`{kind:"entry", ...Entry}`。Entry 以 `type`
  "message":{"role":"user","content":"hi","timestamp":1767225600999}}
 ```
 
-| 字段 | 类型 | 含义 |
+| Field | Type | Meaning |
 |---|---|---|
-| `message` | AgentMessage | 消息载荷（见 §4.1.5） |
-| `terminate` | `true` | 可选；泳道终止标记，仅在 `true` 时出现 |
+| `message` | AgentMessage | message payload (see §4.1.5) |
+| `terminate` | `true` | optional; lane-termination marker, present only when `true` |
 
 #### 4.1.2 `compaction`
 
@@ -103,17 +118,17 @@ entry write 是拍平结构：`{kind:"entry", ...Entry}`。Entry 以 `type`
  "tokensBefore":12000,"fromHook":false}
 ```
 
-| 字段 | 类型 | 含义 |
+| Field | Type | Meaning |
 |---|---|---|
-| `summary` | string | 压缩摘要 |
-| `retainedTail` | AgentMessage[] | 物化的保留消息（检查点自足，读取方无需回查 entry 树） |
-| `tokensBefore` | int | 压缩前的上下文 token 数 |
-| `details` | any | 可选扩展载荷 |
-| `usage` | Usage | 可选；压缩这次 LLM 调用的用量（§4.2.1） |
-| `fromHook` | bool | 是否由 hook 产生 |
+| `summary` | string | compaction summary |
+| `retainedTail` | AgentMessage[] | materialized retained messages (the checkpoint is self-contained; readers need not consult the entry tree) |
+| `tokensBefore` | int | context token count before compaction |
+| `details` | any | optional extension payload |
+| `usage` | Usage | optional; usage of this compaction LLM call (§4.2.1) |
+| `fromHook` | bool | whether produced by a hook |
 
-上下文投影规则：`summary` 在前、`retainedTail` 随后，二者一起替代被
-压缩的历史。
+Context projection rule: `summary` first, `retainedTail` after; together
+they replace the compacted history.
 
 #### 4.1.3 `branch_summary`
 
@@ -122,11 +137,11 @@ entry write 是拍平结构：`{kind:"entry", ...Entry}`。Entry 以 `type`
  "fromId":"e5","summary":"...","fromHook":false}
 ```
 
-| 字段 | 类型 | 含义 |
+| Field | Type | Meaning |
 |---|---|---|
-| `fromId` | string \| null | 摘要分叉自哪个 entry；`null` = 树根 |
-| `summary` | string | 摘要文本（空串的 entry 不投影出上下文消息） |
-| `details` / `usage` / `fromHook` | — | 同 4.1.2 |
+| `fromId` | string \| null | the entry the summary branches from; `null` = tree root |
+| `summary` | string | summary text (an entry whose summary is the empty string projects no context message) |
+| `details` / `usage` / `fromHook` | — | same as 4.1.2 |
 
 #### 4.1.4 `custom`
 
@@ -135,42 +150,45 @@ entry write 是拍平结构：`{kind:"entry", ...Entry}`。Entry 以 `type`
  "customType":"model_change","data":{"provider":"anthropic","modelId":"claude"}}
 ```
 
-| 字段 | 类型 | 含义 |
+| Field | Type | Meaning |
 |---|---|---|
-| `customType` | string | 应用定义的类型标签 |
-| `data` | any | 可选应用载荷 |
+| `customType` | string | application-defined type tag |
+| `data` | any | optional application payload |
 
-存储层不解释 custom 条目；是否投影进上下文由应用决定。
-tack 约定（读取方应原样保留，无义务解释）的 customType：
-`model_change`（`{provider, modelId}`）、`thinking_level_change`
-（`{thinkingLevel}`）、`session_info`（`{name}`）、`label`
-（`{targetId, label}`）。
+The storage layer does not interpret custom entries; whether they are
+projected into context is up to the application. customType values used by
+tack convention (readers should preserve them verbatim, with no obligation
+to interpret): `model_change` (`{provider, modelId}`),
+`thinking_level_change` (`{thinkingLevel}`), `session_info` (`{name}`),
+`label` (`{targetId, label}`).
 
 #### 4.1.5 AgentMessage
 
-`message` 载荷与 `retainedTail` 元素是 `AgentMessage`：以 `role` 判别
-的消息联合（`user` / `assistant` / `toolResult` / `system` / `custom` /
-`bashExecution` / `branchSummary` / `compactionSummary`），其内容块、
-usage 与时间戳 schema 定义于 `crates/tack-agent-core/src/message.rs`
-（与上游 pi 的 message 线格式一致，本文不展开）。
+The `message` payload and the `retainedTail` elements are `AgentMessage`: a
+message union discriminated by `role` (`user` / `assistant` / `toolResult`
+/ `system` / `custom` / `bashExecution` / `branchSummary` /
+`compactionSummary`), whose content blocks, usage, and timestamp schemas
+are defined in `crates/tack-agent-core/src/message.rs` (identical to
+upstream pi's message wire format; not elaborated here).
 
-### 4.2 `usage` — 用量账本行
+### 4.2 `usage` — Usage Ledger Row
 
 ```json
 {"kind":"usage","id":"u1","seq":13,"usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":15,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"entryId":"e2","adjustment":false}
 ```
 
-| 字段 | 类型 | 含义 |
+| Field | Type | Meaning |
 |---|---|---|
-| `id` | string | 行 id（与 entry id 同一命名空间） |
-| `seq` | int | 会话级序列号 |
-| `usage` | Usage | 见 §4.2.1 |
-| `entryId` | string | 可选；归属的 entry |
-| `adjustment` | bool | `true` = 账本修正（如格式导入行），`false` = 新消耗 |
-| `details` | any | 可选扩展载荷（导入行约定 `{source:"v3-import"}`） |
+| `id` | string | row id (same namespace as entry ids) |
+| `seq` | int | session-level sequence number |
+| `usage` | Usage | see §4.2.1 |
+| `entryId` | string | optional; the owning entry |
+| `adjustment` | bool | `true` = ledger correction (e.g. a format-import row), `false` = new consumption |
+| `details` | any | optional extension payload (import rows use `{source:"v3-import"}` by convention) |
 
-账本行不进 entry 树；会话级用量统计 = 账本行 `usage` 之和。entry 载荷
-内的 `usage` 字段只是数据，不进统计。
+Ledger rows do not enter the entry tree; session-level usage totals = the
+sum of the ledger rows' `usage`. The `usage` field inside an entry payload
+is just data and does not enter the totals.
 
 #### 4.2.1 Usage
 
@@ -179,111 +197,125 @@ usage 与时间戳 schema 定义于 `crates/tack-agent-core/src/message.rs`
  "totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}}
 ```
 
-整数字段为 token 数；`cacheWrite1h`、`reasoning` 可选（缺省 = 不统计该
-类别）；`cost.*` 为浮点金额。
+Integer fields are token counts; `cacheWrite1h` and `reasoning` are
+optional (absent = that category is not tracked); `cost.*` are
+floating-point amounts.
 
-### 4.3 `value` — scalar 当前状态
+### 4.3 `value` — Scalar Current State
 
 ```json
 {"kind":"value","op":"set","seq":14,"namespace":"tack.branch.tip","key":"main","value":"e9"}
 {"kind":"value","op":"delete","seq":15,"namespace":"tack.entry.label","key":"e3"}
 ```
 
-| 字段 | 类型 | 含义 |
+| Field | Type | Meaning |
 |---|---|---|
-| `op` | `"set"` \| `"delete"` | 其他值属于文件损坏 |
-| `seq` | int | 会话级序列号 |
-| `namespace` | string | 命名空间（§7） |
-| `key` | string | 地址键；空字符串表示单例地址 |
-| `value` | any | 仅 `set`；任意 JSON 值 |
+| `op` | `"set"` \| `"delete"` | other values are file corruption |
+| `seq` | int | session-level sequence number |
+| `namespace` | string | namespace (§7) |
+| `key` | string | address key; the empty string denotes a singleton address |
+| `value` | any | `set` only; any JSON value |
 
-地址的当前值 = 重放中最后一个 set/delete 决定（delete 后该地址无当前
-值；再次 set 恢复）。
+The current value of an address is decided by the last set/delete in replay
+(after a delete the address has no current value; a later set restores it).
 
-### 4.4 `list` — 列表当前状态
+### 4.4 `list` — List Current State
 
 ```json
 {"kind":"list","op":"append","seq":16,"namespace":"app.log","key":"k","value":{"n":1}}
 {"kind":"list","op":"delete","seq":17,"namespace":"app.log","key":"k"}
 ```
 
-字段同 4.3。`append` 追加一个元素；`delete` 清空整个列表。**存活元素**
-= 最后一次 `delete` 之后 `append` 的全部元素（按 `seq` 升序）；从未
-`delete` 时 = 全部 `append`。
+Fields as in 4.3. `append` appends one element; `delete` clears the entire
+list. **Live elements** = all elements `append`ed after the last `delete`
+(ascending `seq`); if never `delete`d, all `append`s.
 
-## 5. 不变量
+## 5. Invariants
 
-### 5.1 序列号（seq）
+### 5.1 Sequence Numbers (seq)
 
-- `seq` 是**会话级**整数序列，从 1 开始，由写入方在提交时分配；一个
-  事务内的多个 write 取连续值。
-- 重放时所有 write（含 entry/usage/value/list）的 `seq` 必须**全局严格
-  递增**。
-- 每个 write `seq ≥ 1`。
+- `seq` is a **session-level** integer sequence starting at 1, assigned by
+  the writer at commit time; multiple writes within one transaction take
+  consecutive values.
+- During replay, the `seq` of all writes (including entry/usage/value/list)
+  must be **globally strictly increasing**.
+- Every write has `seq ≥ 1`.
 
-### 5.2 `nextSeq` 高水位
+### 5.2 `nextSeq` High-Water Mark
 
-快照式重写（fork 等只复制存活 write 的过程）会在目标 header 写入
-`nextSeq`。读取方打开后，下一个可分配 seq 为
-`max(已见最大 seq + 1, header.nextSeq)`。它保证重写后的文件不会复用
-源文件已消耗过的序列号。
+Snapshot-style rewrites (processes like fork that copy only live writes)
+write `nextSeq` into the target header. After opening, the next allocatable
+seq is `max(highest seq seen + 1, header.nextSeq)`. This guarantees that
+the rewritten file never reuses sequence numbers already consumed by the
+source file.
 
-### 5.3 id 唯一性与 parent 完整性
+### 5.3 id Uniqueness and Parent Integrity
 
-- 所有 entry/usage 的 `id` 全局唯一（跨两种 kind 同一命名空间）。
-- entry 的 `parentId` 为 `null`，或指向一个已重放存在的 entry；同
-  一事务内先出现的父 entry 合法（父 seq 因此总小于子 seq）。
+- All entry/usage `id`s are globally unique (one namespace across both
+  kinds).
+- An entry's `parentId` is `null`, or points to an already-replayed entry;
+  a parent entry appearing earlier within the same transaction is legal
+  (parent seq is therefore always less than child seq).
 
-### 5.4 时间戳
+### 5.4 Timestamps
 
-- `timestamp` 只出现在 entry write 上，纪元毫秒。usage/value/list 不
-  携带时间戳。
-- 消息载荷（AgentMessage）内部的时间戳同为纪元毫秒，与 entry 的提交
-  时间戳独立。
+- `timestamp` appears only on entry writes, in epoch milliseconds.
+  usage/value/list carry no timestamp.
+- Timestamps inside message payloads (AgentMessage) are likewise epoch
+  milliseconds, independent of the entry's commit timestamp.
 
-### 5.5 重放校验清单
+### 5.5 Replay Validation Checklist
 
-读取方必须按事务顺序执行以下校验，任一违反即文件损坏：
+The reader must perform the following checks in transaction order; any
+violation means file corruption:
 
-1. 行是合法 JSON，且为对象或对象数组；
-2. 每个 write 的 `kind`、`op` 是本规范枚举值，`seq ≥ 1`；
-3. `seq` 全局严格递增（§5.1）；
-4. id 唯一、parent 完整（§5.3）；
-5. header `storageVersion` 受支持（§3）。
+1. the line is valid JSON, and is an object or an array of objects;
+2. every write's `kind` and `op` are enum values of this specification,
+   `seq ≥ 1`;
+3. `seq` is globally strictly increasing (§5.1);
+4. ids are unique and parents are complete (§5.3);
+5. the header `storageVersion` is supported (§3).
 
-只读的场景（列表、搜索、统计）可以使用**宽松重放**：跳过无法解析的
-行、不校验不变量，但不得把宽松读取的结果用于写回。
+Read-only scenarios (listing, search, statistics) may use **lenient
+replay**: skip unparseable lines and skip invariant checks — but the result
+of a lenient read must never be used for write-back.
 
-## 6. 写入方规则
+## 6. Writer Rules
 
-1. 所有变更以一个事务一行追加；多 write 的事务必须原子落盘（不可分割
-   在两个事务中）。
-2. 创建文件时先写 header，再写初始事务（可为空，即只有 header）。
-3. 快照式重写（fork、任何形式的整文件重写）必须：先写临时文件再原子
-   改名；header 写入正确的 `nextSeq`（§5.2）。
-4. entry 的 `parentId` 在写入时必须满足 §5.3。
+1. All changes are appended as one transaction per line; a multi-write
+   transaction must be persisted atomically (indivisible across two
+   transactions).
+2. When creating a file, write the header first, then the initial
+   transaction (which may be empty, i.e. header only).
+3. Snapshot-style rewrites (fork, any whole-file rewrite) must: write a
+   temporary file first, then atomically rename; and write the correct
+   `nextSeq` into the header (§5.2).
+4. An entry's `parentId` must satisfy §5.3 at write time.
 
-## 7. 命名空间
+## 7. Namespaces
 
-当前状态按 `namespace` 字符串寻址。命名空间分两类：
+Current state is addressed by `namespace` strings. Namespaces fall into two
+categories:
 
-- **保留命名空间**：前缀 `tack.`（tack）或 `pi.`（上游 pi）。两者布局
-  相同、前缀不同；实现**不得**向对方的保留前缀写入（读取回退规则见
-  §7.2）。
-- **应用命名空间**：其他任意字符串，应用自行解释。
+- **Reserved namespaces**: prefix `tack.` (tack) or `pi.` (upstream pi).
+  The two have the same layout with different prefixes; implementations
+  **must not** write to the other's reserved prefix (read-fallback rules in
+  §7.2).
+- **Application namespaces**: any other string, interpreted by the
+  application itself.
 
-### 7.1 保留地址表
+### 7.1 Reserved Address Table
 
-| namespace（`tack.`/`pi.` 前缀） | key | value 类型 | 含义 |
+| namespace (`tack.`/`pi.` prefix) | key | value type | meaning |
 |---|---|---|---|
-| `.session.name` | `""` | string | 会话显示名 |
-| `.entry.label` | entryId | string | entry 标签 |
-| `.branch.tip` | branch 名 | string \| null | 分支 tip 的 entry id；null = 空分支 |
-| `.lane.config` | lane 名 | LaneConfiguration | 泳道配置 |
-| `.lane.state` | lane 名 | LaneState | 泳道运行状态 |
-| `.result` | operationId | OperationResultRecord | 已结束 operation 的结果 |
-| `.op.*` | 由实现定义 | operation 运行态 |
-| `.pending.*` | 由实现定义 | 待物化/挂起状态 |
+| `.session.name` | `""` | string | session display name |
+| `.entry.label` | entryId | string | entry label |
+| `.branch.tip` | branch name | string \| null | entry id of the branch tip; null = empty branch |
+| `.lane.config` | lane name | LaneConfiguration | lane configuration |
+| `.lane.state` | lane name | LaneState | lane runtime state |
+| `.result` | operationId | OperationResultRecord | result of a finished operation |
+| `.op.*` | implementation-defined | operation runtime state |
+| `.pending.*` | implementation-defined | to-be-materialized/pending state |
 
 ```
 LaneConfiguration = {"model":{"provider":string,"modelId":string},
@@ -294,83 +326,102 @@ LaneState         = {"currentOperationId":string|null,
 idle LaneState    = {"currentOperationId":null,"lastOperationId":null,"inbox":[]}
 ```
 
-**branch**：entry 树（§1）上的一条具名路径，`.branch.tip/{branch}` 指向
-其 tip；主分支名约定为 `"main"`。**完整 lane** = 同名 branch tip 行 +
-lane config + lane state 三者齐备；支持 lane 的写入方应在一个事务内
-原子创建三者。
+**branch**: a named path on the entry tree (§1); `.branch.tip/{branch}`
+points to its tip; the main branch name is `"main"` by convention. A
+**complete lane** = the branch tip row + lane config + lane state under the
+same name, all three present; lane-supporting writers should create all
+three atomically in one transaction.
 
-### 7.2 跨前缀读取回退（tack 实现）
+### 7.2 Cross-Prefix Read Fallback (tack Implementation)
 
-tack 打开只含 `pi.*` 行的会话时，以下读取在 `tack.*` 行缺失时回退到
-`pi.*` 行：branch tip、lane config、session name、entry label；
-`tack.*` 行一旦存在即优先。tack 永不写 `pi.*`——混合文件里 pi 前缀的
-tip 行会随 tack 追加而陈旧，重新交给 pi 打开时将回退到该旧 tip（已声明
-的跨实现限制）。
+When tack opens a session containing only `pi.*` rows, the following reads
+fall back to `pi.*` rows when `tack.*` rows are missing: branch tip, lane
+config, session name, entry label; once a `tack.*` row exists it wins. tack
+never writes `pi.*` — in a mixed file the pi-prefixed tip row goes stale as
+tack appends, and handing the file back to pi will fall back to that old
+tip (a declared cross-implementation limitation).
 
-## 8. Fork 契约
+## 8. Fork Contract
 
-fork 把源会话投影进一个新 v4 文件（源不被修改）：
+fork projects a source session into a new v4 file (the source is not
+modified):
 
-- 复制的 write **保留原 seq**；目标 header 写入
-  `parentSessionId = 源 id` 与源的高水位 `nextSeq`（§5.2）。
-- entry 选择：
-  - **`tree` scope**：复制全部 entry；
-  - **`branch` scope**：源分支必须是**完整 lane**（§7.1），只复制其
-    tip 的祖先链；`entryId` 默认取 tip，`position:"before"` 切到该
-    entry 的父（可产生 null tip）。
-- 当前状态投影是**封闭分类器**——对 `tack.*` 与 `pi.*` 前缀分别适用
-  同一套规则（下表）；usage 账本行永不复制；已删除（非存活）的历史行
-  不参与投影。
+- Copied writes **retain their original seq**; the target header records
+  `parentSessionId = source id` and the source's high-water `nextSeq`
+  (§5.2).
+- Entry selection:
+  - **`tree` scope**: copy all entries;
+  - **`branch` scope**: the source branch must be a **complete lane**
+    (§7.1); only the ancestor chain of its tip is copied; `entryId`
+    defaults to the tip, and `position:"before"` cuts to that entry's
+    parent (may yield a null tip).
+- Current-state projection is a **closed classifier** — the same set of
+  rules (table below) applies to the `tack.*` and `pi.*` prefixes; usage
+  ledger rows are never copied; deleted (non-live) historical rows do not
+  participate in projection.
 
 | namespace | tree scope | branch scope |
 |---|---|---|
-| `*.session.name` | 复制 | 复制 |
-| `*.entry.label` | 仅当其 entry 被复制 | 同左 |
-| `*.branch.tip` | 全部分支原样 | 仅该分支，值重写为切割点（可为 null） |
-| `*.lane.config` | 全部泳道 | 仅该泳道 |
-| `*.lane.state` | 全部泳道，值重置为 idle | 仅该泳道，值重置为 idle |
-| `*.result`、`*.op.*`、`*.pending.*` | **排除** | **排除** |
-| 其他以 `tack`/`tack.` 或 `pi`/`pi.` 开头的 namespace | **fork 失败**（fail-closed） | 同左 |
-| 应用 namespace | 复制 | 排除 |
+| `*.session.name` | copy | copy |
+| `*.entry.label` | only if its entry is copied | same |
+| `*.branch.tip` | all branches as-is | only that branch, value rewritten to the cut point (may be null) |
+| `*.lane.config` | all lanes | only that lane |
+| `*.lane.state` | all lanes, values reset to idle | only that lane, value reset to idle |
+| `*.result`, `*.op.*`, `*.pending.*` | **excluded** | **excluded** |
+| other namespaces starting with `tack`/`tack.` or `pi`/`pi.` | **fork fails** (fail-closed) | same |
+| application namespaces | copy | excluded |
 
-fail-closed 是本契约的一部分：为保留前缀引入新 namespace 的实现，必须
-同时在分类器中声明其 fork 语义，否则含该 namespace 存活状态的会话
-fork 必须失败，而不是被静默复制或丢弃。
+Fail-closed is part of this contract: an implementation that introduces a
+new namespace under a reserved prefix must simultaneously declare its fork
+semantics in the classifier; otherwise, forking a session containing live
+state in that namespace must fail, rather than the state being silently
+copied or dropped.
 
-## 9. 加密层（tack 扩展）
+## 9. Encryption Layer (tack Extension)
 
-加密对协议是**透明的行级封装**：
+Encryption is a **transparent line-level wrapper** for the protocol:
 
-- header 永远明文；事务行可整行加密为 `tack-enc:v1:<payload>`（算法与
-  密钥派生见 `crates/tack-session/src/crypto.rs`）。
-- 读取方先按行识别并解密，再按本规范解析；无法解密的加密行（无密钥、
-  密钥错误、密文被篡改）必须使整个文件以"加密无法读取"失败，而不是
-  跳过或按损坏处理。
-- 写入方启用加密时，所有事务行（含初始事务与快照重写的产物）都必须
-  加密；加密失败则该事务不得落盘——绝不降级为明文。
-- 不持密钥的读取方可以把 `tack-enc:v1:` 行当作不可解析行：按 §2，这
-  意味着整个文件不可用（对 pi 等无加密概念的实现即"文件损坏"）。
+- The header is always plaintext; transaction lines may be encrypted whole
+  as `tack-enc:v1:<payload>` (algorithm and key derivation in
+  `crates/tack-session/src/crypto.rs`).
+- The reader first recognizes and decrypts per line, then parses per this
+  specification; an encrypted line that cannot be decrypted (no key, wrong
+  key, tampered ciphertext) must make the entire file fail as "encryption
+  unreadable", not be skipped or treated as corruption.
+- When a writer enables encryption, all transaction lines (including the
+  initial transaction and the products of snapshot rewrites) must be
+  encrypted; if encryption fails, the transaction must not be persisted —
+  never downgrade to plaintext.
+- A reader without the key may treat `tack-enc:v1:` lines as unparseable
+  lines: per §2, this means the entire file is unusable (for
+  implementations like pi that have no encryption concept, i.e. "file
+  corrupt").
 
-## 10. 版本与扩展规则
+## 10. Versioning and Extension Rules
 
-- `v` / `storageVersion` 双重版本：格式（v4）之外，布局变更通过
-  `storageVersion` 表达；不支持的版本必须拒绝打开（§3）。
-- 对象上的**未识别字段**必须被忽略（header、write、entry、载荷皆然）。
-- 未识别的 `kind`、`type`、`op` 枚举值是**文件损坏**（它们无法安全地
-  被忽略）。
-- 新保留 namespace 必须经 §8 的 fail-closed 规则登记 fork 语义。
+- Dual versioning with `v` / `storageVersion`: beyond the format (v4),
+  layout changes are expressed via `storageVersion`; unsupported versions
+  must be refused on open (§3).
+- **Unrecognized fields** on objects must be ignored (header, writes,
+  entries, payloads alike).
+- Unrecognized `kind`, `type`, `op` enum values are **file corruption**
+  (they cannot be safely ignored).
+- New reserved namespaces must register fork semantics under §8's
+  fail-closed rule.
 
-## 11. 一致性要求（conformance）
+## 11. Conformance Requirements
 
-**合法读取方**：满足 §2 行规则、§3 header 识别、§5.5 校验清单、
-§5.2 `nextSeq` 推进、§8 fork 投影表；支持 §9 时可声明加密能力。
+**Conforming reader**: satisfies the §2 line rules, §3 header recognition,
+the §5.5 validation checklist, §5.2 `nextSeq` advancement, and the §8 fork
+projection table; may declare encryption capability if it supports §9.
 
-**合法写入方**：满足 §5 全部不变量、§6 写入规则、§8 快照重写要求；
-不向对方保留前缀写入（§7）。
+**Conforming writer**: satisfies all §5 invariants, the §6 write rules, and
+the §8 snapshot-rewrite requirements; does not write to the other's
+reserved prefix (§7).
 
-## 12. 附录
+## 12. Appendix
 
-### A. 完整示例
+### A. Complete Example
 
 ```jsonl
 {"v":4,"kind":"header","id":"s1","storageVersion":1,"createdAt":1767225600000,"cwd":"/work"}
@@ -381,27 +432,30 @@ fork 必须失败，而不是被静默复制或丢弃。
 {"kind":"usage","id":"d3e4f5a6","seq":10,"usage":{"input":12,"output":4,"cacheRead":0,"cacheWrite":0,"totalTokens":16,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"entryId":"a1b2c3d4","adjustment":false}
 ```
 
-逐行：① header；② 创建时的空主分支 tip（裸对象事务）；③ 用户消息
-+ tip 移动（数组事务）；④ model 变更（custom entry + tip 移动）；
-⑤ thinking 变更——model 与 thinking 齐备，同事务镜像 lane config 与
-idle lane state；⑥ 一条 usage 账本行。
+Line by line: ① header; ② empty main branch tip at creation (bare-object
+transaction); ③ user message + tip move (array transaction); ④ model
+change (custom entry + tip move); ⑤ thinking change — with model and
+thinking both present, lane config and idle lane state are mirrored in the
+same transaction; ⑥ one usage ledger row.
 
-### B. 非 v4 文件的识别
+### B. Recognizing Non-v4 Files
 
-首行 `{"type":"session","version":3,...}` 为 legacy v3 文件（更早版本
-先经 v3 链式升级）。v3 与 v4 是**不同格式**：v3 每行一条 entry 记录、
-时间戳为 ISO 字符串、无事务/namespace 概念。v3 → v4 的迁移规则与实现
-见 `crates/tack-session/V4_NOTES.md` 与 `src/v4/migrate.rs`，不属于本
-规范。
+A first line `{"type":"session","version":3,...}` is a legacy v3 file
+(earlier versions are chain-upgraded through v3 first). v3 and v4 are
+**different formats**: v3 has one entry record per line, ISO-string
+timestamps, and no transaction/namespace concepts. The v3 → v4 migration
+rules and implementation live in `crates/tack-session/V4_NOTES.md` and
+`src/v4/migrate.rs`, outside this specification.
 
-### C. 参考实现
+### C. Reference Implementations
 
-| 实现 | 位置 |
+| Implementation | Location |
 |---|---|
-| tack（Rust） | `crates/tack-session/src/v4/{types,codec,store,fork}.rs`、`src/fork_policy.rs`、`src/v4_bridge.rs` |
-| 上游 pi（TypeScript） | `packages/agent/src/harness/session/jsonl/*.ts`、`session/{commit,fork-policy,values}.ts` |
+| tack (Rust) | `crates/tack-session/src/v4/{types,codec,store,fork}.rs`, `src/fork_policy.rs`, `src/v4_bridge.rs` |
+| upstream pi (TypeScript) | `packages/agent/src/harness/session/jsonl/*.ts`, `session/{commit,fork-policy,values}.ts` |
 
 ---
 
-*协议版本：format v4 / storage v1。修改本规范请同步
-`crates/tack-session/V4_NOTES.md` 与 `docs/compatibility.md` §2.1。*
+*Protocol version: format v4 / storage v1. When modifying this
+specification, also update `crates/tack-session/V4_NOTES.md` and
+`docs/compatibility.md` §2.1.*

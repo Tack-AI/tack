@@ -1,4 +1,6 @@
-# Tack 目录与加载顺序
+# Tack directories and load order
+
+**English | [简体中文](directories.zh-CN.md)**
 
 Configuration, rules, skills, and MCP: where Tack looks, and in what order.
 (Everything lives under `~/.tack/` — sessions never touch TS pi's `~/.pi/`.)
@@ -40,10 +42,10 @@ Configuration, rules, skills, and MCP: where Tack looks, and in what order.
     skills/             # project skills (priority 2, ancestors up to git root)
 ```
 
-> `~/.agents/skills/`（跨工具的 Agent Skills 标准位置）**不会**被加载——
-> pi→Tack 切割时已移除该用户级来源。
+> `~/.agents/skills/` (the cross-tool Agent Skills standard location) is
+> **not** loaded — that user-level source was removed in the pi→Tack split.
 
-## Rules（上下文文件）加载顺序
+## Rules (context files) load order
 
 Context files are injected as `<project_instructions path="…">` blocks in
 `<project_context>` (first-loaded first):
@@ -68,7 +70,7 @@ linked worktree nested inside its main checkout, the worktree's own context
 file shadows the main repo's same-named file (the `agent/rules/` directory is
 a Tack extension on top of the TS layout).
 
-## Skills 加载顺序
+## Skills load order
 
 Name collisions: **first loaded wins** (TS `resourcePrecedenceRank`:
 
@@ -110,7 +112,7 @@ Surfacing: skills are listed in `<available_skills>` in the system prompt
 in TUI / print / RPC (expanded to `<skill name location>…</skill>`).
 `enableSkillCommands` (settings.json, default `true`) gates autocomplete only.
 
-## MCP 配置顺序
+## MCP configuration order
 
 Server entries merge **by name, project wins**:
 
@@ -130,7 +132,7 @@ Entry shapes:
 
 Connection failures are logged and skipped (never fail session creation).
 
-## Settings 合并顺序
+## Settings merge order
 
 1. Defaults
 2. `~/.tack/agent/settings.json`
@@ -141,7 +143,7 @@ Known keys: `defaultProvider`, `defaultModel`, `shellPath`, `theme`,
 `compaction.{enabled,reserveTokens,keepRecentTokens}`,
 `retry.{enabled,maxRetries,baseDelayMs}`. Unknown keys are preserved on rewrite.
 
-## 其他资源目录
+## Other resource directories
 
 | Resource | Global | Project | Precedence |
 |---|---|---|---|

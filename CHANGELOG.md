@@ -6,8 +6,9 @@ notice can parse entries (same convention as TS pi).
 
 ## [1.0.2] - 2026-09-27
 
-Repository relocation release — no functional changes. The project moved
-from `sufar/tack` to `Tack-AI/tack` after the GitHub account rename.
+Repository relocation plus a bilingual documentation restructure — no
+functional changes. The project moved from `sufar/tack` to `Tack-AI/tack`
+after the GitHub account rename.
 
 ### Changed
 
@@ -16,6 +17,10 @@ from `sufar/tack` to `Tack-AI/tack` after the GitHub account rename.
   binaries keep finding updates through GitHub's username-rename redirect.
 - All repository references — README, SECURITY.md, docs, ACP registry
   metadata, CI examples — point at the new location.
+- Every document under `docs/` now ships in two languages: `foo.md` is the
+  English canonical, `foo.zh-CN.md` the Chinese version (previously most
+  docs were Chinese-only). Cross-links, nav headers, and the
+  `README.zh-CN.md` doc index were updated to match.
 
 ### Added
 

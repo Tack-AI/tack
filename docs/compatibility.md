@@ -1,5 +1,7 @@
 # Compatibility & Versioning Policy
 
+**English | [简体中文](compatibility.zh-CN.md)**
+
 This document defines which Tack interfaces are stable, how they are
 versioned, and what guarantees integrators (editor plugins, remote clients,
 extension authors, hook writers) can rely on. It is the normative reference

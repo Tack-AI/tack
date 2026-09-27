@@ -126,9 +126,10 @@ encouraged. Note platform coverage in your PR description.
   comments. `README.zh-CN.md` is a Chinese translation of `README.md` for
   readers; when you change `README.md`, update `README.zh-CN.md` in the same
   PR to keep the two in sync.
-- **In-depth design documents under `docs/` are currently mostly in
-  Chinese**, and new Chinese design docs are welcome there. However, keep any
-  contributor-facing summary information in English.
+- **In-depth design documents under `docs/` are bilingual**: `foo.md` is the
+  English canonical and `foo.zh-CN.md` the Chinese version. Write new docs in
+  English, add the zh-CN translation in the same PR, and keep both versions in
+  sync on later edits (Chinese files link to `.zh-CN.md` cross-doc targets).
 
 ## Architecture orientation
 

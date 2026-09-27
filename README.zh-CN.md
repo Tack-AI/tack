@@ -17,7 +17,7 @@ TCP/WebSocket 远程会话。与 TypeScript pi 线上协议和存储格式兼容
   RPC/ACP 线上协议、相同的 provider 注册表与模型目录、相同的 CLI 标志。
 - **不止是移植** —— 后台任务、LSP 导航与诊断、文件 checkpoint、持久记忆、
   worktree 隔离的子代理、跨会话搜索、cron、OS 沙箱、声明式权限、MCP
-  client *和* server、eval 框架等：**[docs/features.md](docs/features.md)**。
+  client *和* server、eval 框架等：**[docs/features.zh-CN.md](docs/features.zh-CN.md)**。
 - **内置 42 个 provider** —— 40 个镜像 TS pi 注册表，外加零配置本地
   **ollama** 和 **llama.cpp** —— 内嵌完整模型目录（1130 个模型：上下文
   窗口、成本、推理标志、compat 怪癖）。
@@ -26,7 +26,7 @@ TCP/WebSocket 远程会话。与 TypeScript pi 线上协议和存储格式兼容
 - **远程优先** —— `tack serve` 通过 TCP/WebSocket/TLS + token 鉴权托管
   会话；可从 `tack client` 或浏览器接入。
 - **默认隐私** —— 无遥测；本地 crash.log、opt-in tracing 和
-  `tack doctor` 替代（[docs/telemetry.md](docs/telemetry.md)）。
+  `tack doctor` 替代（[docs/telemetry.zh-CN.md](docs/telemetry.zh-CN.md)）。
 
 ## 安装
 
@@ -78,7 +78,7 @@ export ANTHROPIC_API_KEY=...      # headless：用环境变量代替登录
 `--thinking off|minimal|low|medium|high|xhigh|max`、`--session-dir`、
 `--system-prompt`、`--append-system-prompt`、`-t/--tools`、`--mode text|json|rpc`、
 `--offline`。完整标志列表与 TS 对齐说明：
-[docs/configuration.md](docs/configuration.md)。
+[docs/configuration.zh-CN.md](docs/configuration.zh-CN.md)。
 
 ### 编辑器集成（ACP）
 
@@ -99,7 +99,7 @@ export ANTHROPIC_API_KEY=...      # headless：用环境变量代替登录
 ```
 
 模式（ask/acceptEdits/plan/bypass）、模型和 thinking 等级可在客户端 UI 中
-选择。JetBrains IDE 见 [docs/intellij-idea-acp.md](docs/intellij-idea-acp.md)。
+选择。JetBrains IDE 见 [docs/intellij-idea-acp.zh-CN.md](docs/intellij-idea-acp.zh-CN.md)。
 
 ### 远程会话与浏览器客户端
 
@@ -150,7 +150,7 @@ tack ext ...      # 安装/列出/移除/校验扩展，市场管理
 
 RPC 命令面与 TS 完全对齐（34 个命令，`prompt`/`steer`/`follow_up`/`abort`/
 `set_model`/`get_state`/`export_html`/……）；见
-[docs/compatibility.md](docs/compatibility.md) §2.3。
+[docs/compatibility.zh-CN.md](docs/compatibility.zh-CN.md) §2.3。
 
 ### 会话
 
@@ -182,7 +182,7 @@ RPC 命令面与 TS 完全对齐（34 个命令，`prompt`/`steer`/`follow_up`/`
   （`providers.<id>.{baseUrl, api, apiKey, headers, compat, models[]}`），
   支持 `$ENV_VAR` 插值和 `apiKey` 中的 `!command` 执行。
 - **Bedrock / Vertex**：凭据链、SigV4、ADC 细节见
-  [docs/providers.md](docs/providers.md)。
+  [docs/providers.zh-CN.md](docs/providers.zh-CN.md)。
 
 ## MCP servers
 
@@ -203,8 +203,8 @@ stdio / Streamable HTTP / 旧版 SSE 传输；工具以 `mcp__<server>__<tool>` 
 正常权限管线；资源和提示可经 `/mcp` 浏览；远程服务器支持 OAuth 2.1
 （`"oauth": true`）；惰性工具 schema（`mcpDeferThreshold`）、server 反向
 sampling（`mcpSampling`，默认关）和 elicitation（`mcpElicitation`）均有
-加固默认值。细节：[docs/features.md](docs/features.md) §生态互操作 与
-[docs/configuration.md](docs/configuration.md)。
+加固默认值。细节：[docs/features.zh-CN.md](docs/features.zh-CN.md) §生态互操作 与
+[docs/configuration.zh-CN.md](docs/configuration.zh-CN.md)。
 
 ## 扩展
 
@@ -228,8 +228,8 @@ tack ext list
 插件可注册工具（`ext__<plugin>__<tool>`）、斜杠命令、事件处理器、UI
 对话框/通知、会话控制和运行时 provider。[`examples/extensions/`](examples/extensions/)
 下有现成示例（Node.js hello-world、protected-paths 防护、git checkpoint、
-会话 handoff）。**完整指南：[docs/extensions.md](docs/extensions.md)**
-（协议、API 参考、安全模型）与 [docs/extensions-v2.md](docs/extensions-v2.md)
+会话 handoff）。**完整指南：[docs/extensions.zh-CN.md](docs/extensions.zh-CN.md)**
+（协议、API 参考、安全模型）与 [docs/extensions-v2.zh-CN.md](docs/extensions-v2.zh-CN.md)
 （WASM 载体）。
 
 ## 配置
@@ -251,8 +251,8 @@ project（`<project>/.pi/settings.json`，受信任门控）—— 深度合并�
 
 `features.*` 开关让被禁用的功能**对 agent 不可见**（无工具 schema、无系统
 提示片段、子系统不启动）。每个 settings 键、环境变量、CLI 标志及优先级
-规则：**[docs/configuration.md](docs/configuration.md)** —— 资源加载顺序
-（rules/skills/MCP/主题）：**[docs/directories.md](docs/directories.md)**。
+规则：**[docs/configuration.zh-CN.md](docs/configuration.zh-CN.md)** —— 资源加载顺序
+（rules/skills/MCP/主题）：**[docs/directories.zh-CN.md](docs/directories.zh-CN.md)**。
 
 ## 文档
 
@@ -261,21 +261,21 @@ project（`<project>/.pi/settings.json`，受信任门控）—— 深度合并�
 
 | 文档 | 内容 |
 |---|---|
-| **[docs/features.md](docs/features.md)** | Tack 超出 TS pi 的全部功能 —— 每个功能怎么用、怎么关 |
-| **[docs/configuration.md](docs/configuration.md)** | 配置参考：每个 settings 键、环境变量、CLI 标志、优先级 |
-| **[docs/onboarding.md](docs/onboarding.md)** | 新开发者上手：源码阅读路线、功能→代码速查表、mermaid 图 |
-| [docs/architecture.md](docs/architecture.md) | 内部架构（crate 分层、流式模型、hooks、渲染器） |
-| [docs/providers.md](docs/providers.md) | Provider 认证深入（Bedrock SigV4、Vertex ADC）、自定义 provider schema |
-| [docs/directories.md](docs/directories.md) | 目录与资源加载顺序 |
-| [docs/compatibility.md](docs/compatibility.md) | 各类接口的兼容与版本政策 |
-| [docs/extensions.md](docs/extensions.md) / [docs/extensions-v2.md](docs/extensions-v2.md) | 扩展开发（进程协议；WASM 载体） |
-| [docs/plugin-system.md](docs/plugin-system.md) | 插件系统总览（hooks / tack-ext / WASM / bundle / 市场） |
-| [docs/hooks.md](docs/hooks.md) | 生命周期 hooks（兼容 Claude Code） |
-| [docs/codebuddy.md](docs/codebuddy.md) | CodeBuddy 指南（安装/登录、`/model`、排障） |
-| [docs/intellij-idea-acp.md](docs/intellij-idea-acp.md) | JetBrains IDE 的 ACP 配置 |
-| [docs/telemetry.md](docs/telemetry.md) | 为什么没有遥测，以及替代方案 |
-| [docs/upstream-alignment.md](docs/upstream-alignment.md) | TS pi → Tack 同步跟踪（每周自动 delta 报告） |
-| [docs/release.md](docs/release.md) | 发布流程（tag、跨平台构建、自更新） |
+| **[docs/features.zh-CN.md](docs/features.zh-CN.md)** | Tack 超出 TS pi 的全部功能 —— 每个功能怎么用、怎么关 |
+| **[docs/configuration.zh-CN.md](docs/configuration.zh-CN.md)** | 配置参考：每个 settings 键、环境变量、CLI 标志、优先级 |
+| **[docs/onboarding.zh-CN.md](docs/onboarding.zh-CN.md)** | 新开发者上手：源码阅读路线、功能→代码速查表、mermaid 图 |
+| [docs/architecture.zh-CN.md](docs/architecture.zh-CN.md) | 内部架构（crate 分层、流式模型、hooks、渲染器） |
+| [docs/providers.zh-CN.md](docs/providers.zh-CN.md) | Provider 认证深入（Bedrock SigV4、Vertex ADC）、自定义 provider schema |
+| [docs/directories.zh-CN.md](docs/directories.zh-CN.md) | 目录与资源加载顺序 |
+| [docs/compatibility.zh-CN.md](docs/compatibility.zh-CN.md) | 各类接口的兼容与版本政策 |
+| [docs/extensions.zh-CN.md](docs/extensions.zh-CN.md) / [docs/extensions-v2.zh-CN.md](docs/extensions-v2.zh-CN.md) | 扩展开发（进程协议；WASM 载体） |
+| [docs/plugin-system.zh-CN.md](docs/plugin-system.zh-CN.md) | 插件系统总览（hooks / tack-ext / WASM / bundle / 市场） |
+| [docs/hooks.zh-CN.md](docs/hooks.zh-CN.md) | 生命周期 hooks（兼容 Claude Code） |
+| [docs/codebuddy.zh-CN.md](docs/codebuddy.zh-CN.md) | CodeBuddy 指南（安装/登录、`/model`、排障） |
+| [docs/intellij-idea-acp.zh-CN.md](docs/intellij-idea-acp.zh-CN.md) | JetBrains IDE 的 ACP 配置 |
+| [docs/telemetry.zh-CN.md](docs/telemetry.zh-CN.md) | 为什么没有遥测，以及替代方案 |
+| [docs/upstream-alignment.zh-CN.md](docs/upstream-alignment.zh-CN.md) | TS pi → Tack 同步跟踪（每周自动 delta 报告） |
+| [docs/release.zh-CN.md](docs/release.zh-CN.md) | 发布流程（tag、跨平台构建、自更新） |
 
 ## 开发
 
@@ -314,8 +314,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 - **Windows**：bash 像 pi 的 `utils/shell.ts` 一样解析 Git Bash；可选的
   `powershell` 工具在列入 `defaultTools` 时注册。
 
-新来乍到？从 [docs/onboarding.md](docs/onboarding.md)（源码导览）开始，
-然后 [docs/architecture.md](docs/architecture.md)，提 PR 前阅读
+新来乍到？从 [docs/onboarding.zh-CN.md](docs/onboarding.zh-CN.md)（源码导览）开始，
+然后 [docs/architecture.zh-CN.md](docs/architecture.zh-CN.md)，提 PR 前阅读
 [CONTRIBUTING.md](CONTRIBUTING.md)（conventional commits、CHANGELOG 条目、
 CI 门禁）。
 
