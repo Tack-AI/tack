@@ -5,6 +5,7 @@
 
 pub mod accumulator;
 pub mod ask_codebuddy;
+pub mod ask_user;
 pub mod background;
 pub mod bash;
 pub mod browser;
@@ -94,6 +95,7 @@ pub fn create_coding_tools(services: &ToolServices) -> Vec<Arc<dyn AgentTool>> {
         Arc::new(WriteTool::new(services.clone())),
         Arc::new(crate::web::WebFetchTool::new(services.clone())),
         Arc::new(crate::web::WebSearchTool::new(services.clone())),
+        Arc::new(ask_user::AskUserTool::new(services.clone())),
     ];
     // AskCodebuddy parity: only when the codebuddy CLI is installed.
     if tack_ai::codebuddy::cli_available() {
@@ -133,6 +135,7 @@ pub fn create_all_tools(services: &ToolServices) -> Vec<Arc<dyn AgentTool>> {
         Arc::new(LsTool::new(services.clone())),
         Arc::new(crate::web::WebFetchTool::new(services.clone())),
         Arc::new(crate::web::WebSearchTool::new(services.clone())),
+        Arc::new(ask_user::AskUserTool::new(services.clone())),
     ];
     // AskCodebuddy parity: only when the codebuddy CLI is installed.
     if tack_ai::codebuddy::cli_available() {

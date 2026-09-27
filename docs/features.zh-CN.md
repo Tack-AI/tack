@@ -451,5 +451,6 @@ tack eval evals/examples --runs 3 --report report.json --baseline baseline.json
 - **Ctrl+R 历史反向搜索**：编辑器内 Ctrl+R 进入增量搜索——输入即过滤 prompt 历史（新→旧，大小写不敏感），↑/↓/重复 Ctrl+R 循环命中，Enter 接受、Esc 取消恢复草稿。（原 Ctrl+R 的 dequeue 绑定迁移为 Alt+↑。）
 - **桌面通知**：权限弹窗弹出、run 完成/出错、后台任务完成时发 OSC 9 / OSC 777 终端通知（按事件源 5s 节流，终端不支持则静默无效）。关闭：`"notifications": false`。
 - **plan mode 闭环**：`/mode plan` 下 agent 拿到 `exit_plan_mode` 工具——计划落盘 `~/.tack/agent/plans/` 并弹审批框：Yes→acceptEdits（改动自由、命令仍问）、Always→bypass、No→留在 plan 模式修订。
+- **ask_user 工具**：agent 可以在 run 中途暂停，向用户提结构化问题（`ask_user`，每次 1–4 个）——多选（2–4 个带描述的选项，外加“其他…”自由输入出口）或省略选项时的纯自由输入。TUI 逐题弹对话框（Esc 取消整批，工具结果会提示模型自行决策）。headless 模式（print/rpc/acp/serve）和 subagent 注册的是无交互 handler 的工具：调用后返回带内的“无交互用户”消息，模型据此自行判断继续，不会永久阻塞（与 MCP elicitation decline 同一策略）。
 - **多工作区**：`--add-dir <path>`（可重复）或 `additionalDirs`——额外目录的 AGENTS.md 进上下文，系统提示列出在 scope 的目录，沙箱可写集合合并。
 - **i18n**：`language: "zh"`（或 LANG=zh*）——TUI 用户可见文案全量双语（斜杠命令帮助与描述、对话框标题/按钮/提示、通知/错误、状态栏、footer、/settings /model /providers /trust /resume 等界面）；日志/调试输出、命令名、协议值（权限模式、思考级别）不翻译；缺译自动回落英文。

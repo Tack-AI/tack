@@ -46,6 +46,10 @@ pub struct ToolServices {
     /// User-scope memory root override (settings `memoryDirectory`).
     /// `TACK_MEMORY_DIR` env wins over this; see `memory::user_memory_dir`.
     pub memory_dir_override: Option<PathBuf>,
+    /// Interactive "ask the user" channel for the ask_user tool. The TUI
+    /// installs a dialog-backed handler; headless modes leave it None and
+    /// the tool returns an in-band "no interactive user" message.
+    pub ask_user: Option<Arc<dyn crate::ask_user::AskUserHandler>>,
 }
 
 impl std::fmt::Debug for ToolServices {
@@ -73,6 +77,7 @@ impl ToolServices {
             background_tasks_enabled: true,
             untrusted_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             memory_dir_override: None,
+            ask_user: None,
             env: Vec::new(),
         }
     }
@@ -129,6 +134,11 @@ impl ToolServices {
 
     pub fn with_memory_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.memory_dir_override = dir;
+        self
+    }
+
+    pub fn with_ask_user(mut self, handler: Arc<dyn crate::ask_user::AskUserHandler>) -> Self {
+        self.ask_user = Some(handler);
         self
     }
 }

@@ -192,6 +192,8 @@ pub enum AppEvent {
     },
     /// An MCP server asks the user for structured input (elicitation).
     McpElicitation(crate::mcp_elicitation::ElicitationQuery),
+    /// The ask_user tool asks the user a batch of questions.
+    AskUser(crate::ask_user::AskUserQuery),
     /// An MCP sampling completion finished; fold usage into the footer.
     McpSamplingDone {
         usage: tack_ai::Usage,
@@ -484,6 +486,8 @@ pub struct TuiApp {
     )>,
     /// In-flight MCP elicitation dialog (per-field input walk).
     pending_elicitation: Option<crate::mcp_elicitation::PendingElicitation>,
+    /// In-flight ask_user dialog (per-question select/input walk).
+    pending_ask_user: Option<crate::ask_user::PendingAskUser>,
     /// Plugin-provided status line text (ui.set_status).
     ext_label: Option<String>,
     /// v2.1: per-widget panel interaction state (selection/scroll/cache).
@@ -768,6 +772,7 @@ impl TuiApp {
             extensions,
             pending_ext_ui: None,
             pending_elicitation: None,
+            pending_ask_user: None,
             ext_label: None,
             #[cfg(feature = "ext")]
             ext_panel_ui: HashMap::new(),
@@ -1603,6 +1608,23 @@ impl TuiApp {
                 } else {
                     self.open_elicitation_dialog(&pending);
                     self.pending_elicitation = Some(pending);
+                }
+            }
+            AppEvent::AskUser(query) => {
+                let pending = crate::ask_user::PendingAskUser::new(query);
+                if pending.current().is_none() {
+                    // Nothing to ask: resolve immediately with no answers.
+                    pending.finish();
+                } else if self.dialog.is_some()
+                    || self.pending_elicitation.is_some()
+                    || self.pending_ask_user.is_some()
+                {
+                    // Never clobber an open dialog; the tool result tells
+                    // the model the user declined so the run continues.
+                    pending.cancel();
+                } else {
+                    self.open_ask_user_dialog(&pending);
+                    self.pending_ask_user = Some(pending);
                 }
             }
             AppEvent::RunContextReady {

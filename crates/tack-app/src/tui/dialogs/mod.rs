@@ -125,6 +125,8 @@ pub enum SelectPurpose {
     FirstRunTheme,
     /// tack-ext plugin dialog (answer goes to pending_ext_ui, not apply_select).
     ExtUi,
+    /// ask_user tool dialog (answer goes to pending_ask_user, not apply_select).
+    AskUser,
 }
 
 /// Minimal text-input dialog (plugin `ui.input`; also usable generally).

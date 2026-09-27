@@ -28,6 +28,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "memory",
     "lsp",
     "ask_codebuddy",
+    "ask_user",
     "session_search",
 ];
 

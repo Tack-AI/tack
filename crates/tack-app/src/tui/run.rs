@@ -638,7 +638,12 @@ impl TuiApp {
         }
         .with_web_render(self.settings.web_render_mode())
         .with_web_search(self.settings.web_search_config())
-        .with_memory_dir(self.settings.memory_directory.clone());
+        .with_memory_dir(self.settings.memory_directory.clone())
+        // ask_user: the TUI answers questions with dialogs; headless modes
+        // leave the handler unset and the tool degrades in-band.
+        .with_ask_user(std::sync::Arc::new(
+            crate::ask_user::TuiAskUserHandler::new(self.event_tx.clone()),
+        ));
         let mut tools = tack_tools::create_coding_tools(&services);
         // tack-subagents: built-in parallel sub-agent tool, with custom agent
         // definitions from .pi/agents/*.md (project dir trust-gated). The
@@ -1128,6 +1133,65 @@ impl TuiApp {
         if pending.current().is_some() {
             self.open_elicitation_dialog(&pending);
             self.pending_elicitation = Some(pending);
+        } else {
+            pending.finish();
+        }
+    }
+
+    /// Open the dialog for the ask_user walk's current question:
+    /// multiple-choice questions get a SelectDialog with a trailing
+    /// "Other…" escape, free-text questions (and the Other escape itself)
+    /// an InputDialog.
+    pub(crate) fn open_ask_user_dialog(&mut self, pending: &crate::ask_user::PendingAskUser) {
+        use tack_tui::components::select_list::SelectItem;
+        let Some(question) = pending.current() else {
+            return;
+        };
+        let (step, total) = pending.progress();
+        let step_label = crate::i18n::trf(
+            "ask_user.step",
+            &[("step", &step.to_string()), ("total", &total.to_string())],
+        );
+        let title = match &question.header {
+            Some(header) if !header.trim().is_empty() => {
+                format!("{step_label} [{header}] {}", question.question)
+            }
+            _ => format!("{step_label} {}", question.question),
+        };
+        if pending.awaiting_custom || question.options.is_none() {
+            self.dialog = Some(commands::Dialog::Input(commands::InputDialog::new(
+                title,
+                crate::i18n::tr("ask_user.placeholder"),
+                self.theme,
+            )));
+            return;
+        }
+        let options = question.options.as_deref().unwrap_or_default();
+        let mut items: Vec<SelectItem> = options
+            .iter()
+            .map(|option| {
+                let mut item = SelectItem::new(option.label.clone(), option.label.clone());
+                item.description = option.description.clone();
+                item
+            })
+            .collect();
+        items.push(SelectItem::new(
+            crate::i18n::tr("ask_user.other"),
+            crate::ask_user::CUSTOM_ANSWER_VALUE,
+        ));
+        self.dialog = Some(commands::Dialog::Select(commands::SelectDialog::new(
+            title,
+            items,
+            commands::SelectPurpose::AskUser,
+            self.theme,
+        )));
+    }
+
+    /// Continue the per-question walk after one accepted answer.
+    pub(crate) fn continue_ask_user(&mut self, pending: crate::ask_user::PendingAskUser) {
+        if pending.current().is_some() {
+            self.open_ask_user_dialog(&pending);
+            self.pending_ask_user = Some(pending);
         } else {
             pending.finish();
         }

@@ -161,6 +161,11 @@ const EN: &[(&str, &str)] = &[
         " type to filter • ↑↓ select • enter confirm • esc cancel",
     ),
     ("dialog.hint.input", " enter confirm • esc cancel"),
+    // -- ask_user tool dialogs --
+    ("ask_user.step", " Question {step}/{total}:"),
+    ("ask_user.other", "Other (type a custom answer)"),
+    ("ask_user.placeholder", "type your answer"),
+    ("ask_user.empty", "answer must not be empty"),
     (
         "dialog.hint.scoped",
         " type to filter • ↑↓ move • enter/space toggle • esc done",
@@ -1070,6 +1075,11 @@ const ZH: &[(&str, &str)] = &[
         " 输入过滤 • ↑↓ 选择 • 回车确认 • Esc 取消",
     ),
     ("dialog.hint.input", " 回车确认 • Esc 取消"),
+    // -- ask_user 工具对话框 --
+    ("ask_user.step", " 问题 {step}/{total}:"),
+    ("ask_user.other", "其他（自定义回答）"),
+    ("ask_user.placeholder", "输入你的回答"),
+    ("ask_user.empty", "回答不能为空"),
     (
         "dialog.hint.scoped",
         " 输入过滤 • ↑↓ 移动 • 回车/空格 切换 • Esc 完成",

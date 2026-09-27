@@ -143,6 +143,32 @@ impl TuiApp {
                             }
                         }
                     }
+                } else if let Some(mut pending) = self.pending_ask_user.take() {
+                    // ask_user: the dialog belongs to the question walk.
+                    match dialog.take_result() {
+                        // Esc: dismiss the whole batch (in-band "declined").
+                        None => pending.cancel(),
+                        Some((_, value, _)) => {
+                            // "Other…" on a multiple-choice question: re-ask
+                            // the same question as free text.
+                            if !pending.awaiting_custom
+                                && value == crate::ask_user::CUSTOM_ANSWER_VALUE
+                            {
+                                pending.awaiting_custom = true;
+                                self.open_ask_user_dialog(&pending);
+                                self.pending_ask_user = Some(pending);
+                            } else if value.trim().is_empty() {
+                                // No empty answers: re-ask (same policy as
+                                // elicitation's invalid-input re-ask).
+                                self.notice(crate::i18n::tr("ask_user.empty"), NoticeKind::Warning);
+                                self.open_ask_user_dialog(&pending);
+                                self.pending_ask_user = Some(pending);
+                            } else {
+                                pending.push_answer(value);
+                                self.continue_ask_user(pending);
+                            }
+                        }
+                    }
                 } else if let commands::Dialog::ScopedModels(d) = &dialog {
                     let values = d.enabled_values();
                     self.settings.scoped_models = values.clone();

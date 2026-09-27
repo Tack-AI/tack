@@ -4,6 +4,20 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [Unreleased]
+
+### Added
+
+- `ask_user` tool: the agent can pause mid-run and ask the user structured
+  questions — 1–4 per call, multiple-choice (2–4 options with descriptions,
+  plus an "Other…" free-text escape) or free-text when options are omitted.
+  The TUI walks the questions one dialog at a time; Esc dismisses the batch
+  and the tool result tells the model to decide on its own. Headless modes
+  (print/rpc/acp/serve) and subagents register the tool without an
+  interactive handler, so calling it there returns an in-band "no
+  interactive user" message instead of blocking forever (same policy as MCP
+  elicitation decline).
+
 ## [1.0.2] - 2026-09-27
 
 Repository relocation plus a bilingual documentation restructure — no

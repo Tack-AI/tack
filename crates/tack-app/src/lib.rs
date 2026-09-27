@@ -2,6 +2,7 @@
 
 pub mod acp;
 pub mod agents;
+pub mod ask_user;
 pub mod atomic_write;
 pub mod auth;
 pub mod catalog_refresh;

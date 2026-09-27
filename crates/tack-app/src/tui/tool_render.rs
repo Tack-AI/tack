@@ -105,6 +105,18 @@ pub fn tool_title(tool_name: &str, args: &Value, width: u16) -> String {
         "grep" => format!("grep {}", short("pattern")),
         "find" => format!("find {}", short("pattern")),
         "ls" => format!("ls {}", short("path")),
+        "ask_user" => {
+            // First question of the batch (the one the dialog leads with).
+            let question = args
+                .get("questions")
+                .and_then(Value::as_array)
+                .and_then(|q| q.first())
+                .and_then(|q| q.get("question"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .replace(['\n', '\r'], " ");
+            format!("ask_user {question}").trim_end().to_string()
+        }
         other => unknown_tool_title(other, args),
     };
     if full.chars().count() > budget {

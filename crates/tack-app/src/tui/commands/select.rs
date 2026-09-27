@@ -77,6 +77,7 @@ impl TuiApp {
             }
             SelectPurpose::Thinking => self.apply_thinking(value).await,
             SelectPurpose::ExtUi => {} // routed to pending_ext_ui by the caller
+            SelectPurpose::AskUser => {} // routed to pending_ask_user by the caller
             SelectPurpose::Resume => {
                 let path = PathBuf::from(value);
                 match SessionManager::open(
