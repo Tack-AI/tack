@@ -84,6 +84,12 @@ pub enum V4Error {
     /// Legacy v3 compaction whose `firstKeptEntryId` is not an ancestor.
     #[error("legacy v3 compaction {id} firstKeptEntryId is not on its parent branch: {first_kept}")]
     CompactionBoundaryNotOnBranch { id: String, first_kept: String },
+    /// Legacy v3 compaction with no materialized checkpoint tail AND no
+    /// `firstKeptEntryId` to rebuild one from: the correct tail is
+    /// unknowable, so emitting an empty tail would silently truncate the
+    /// conversation (upstream rejects these too).
+    #[error("legacy v3 compaction {id} has neither retainedTail nor firstKeptEntryId")]
+    MissingCompactionBoundary { id: String },
 }
 
 /// In-memory current state folded from the transaction log (upstream
@@ -390,8 +396,18 @@ impl V4Store {
 
     /// A branch's current tip: `None` = unknown branch, `Some(None)` =
     /// present but empty (mirrors upstream's `string | null | undefined`).
+    ///
+    /// Read-only fallback: when no `tack.branch.tip` row exists, the
+    /// upstream `pi.branch.tip` row is honored, so a pi-written session
+    /// resumes from its own tip. Writes always go to the `tack.*`
+    /// namespace (the first tack append starts moving `tack.branch.tip`;
+    /// pi's row then goes stale — pi reopening the file resumes from
+    /// that stale tip, a documented cross-implementation limitation).
     pub fn branch_tip(&self, branch: &str) -> Option<Option<String>> {
-        self.get_value(NS_BRANCH_TIP, branch).map(|v| match v {
+        let row = self
+            .get_value(NS_BRANCH_TIP, branch)
+            .or_else(|| self.get_value(crate::fork_policy::PI_BRANCH_TIP, branch));
+        row.map(|v| match v {
             Value::Null => None,
             Value::String(s) => Some(s.clone()),
             _ => None,
@@ -406,9 +422,11 @@ impl V4Store {
             .collect()
     }
 
-    /// A lane's configuration, if present.
+    /// A lane's configuration, if present. Read-only fallback to the
+    /// upstream `pi.lane.config` row (see [`Self::branch_tip`]).
     pub fn lane_config(&self, lane: &str) -> Option<LaneConfiguration> {
         self.get_value(NS_LANE_CONFIG, lane)
+            .or_else(|| self.get_value(crate::fork_policy::PI_LANE_CONFIG, lane))
             .and_then(|v| serde_json::from_value(v.clone()).ok())
     }
 
@@ -511,9 +529,13 @@ impl V4Store {
 
     // --- session name / labels --------------------------------------------
 
-    /// The session display name, if set.
+    /// The session display name, if set. Read-only fallback to the
+    /// upstream `pi.session.name` row (see [`Self::branch_tip`]).
     pub fn session_name(&self) -> Option<String> {
-        match self.get_value(NS_SESSION_NAME, "") {
+        let row = self
+            .get_value(NS_SESSION_NAME, "")
+            .or_else(|| self.get_value(crate::fork_policy::PI_SESSION_NAME, ""));
+        match row {
             Some(Value::String(s)) => Some(s.clone()),
             _ => None,
         }
@@ -528,9 +550,13 @@ impl V4Store {
         }])
     }
 
-    /// The current label of one entry, if any.
+    /// The current label of one entry, if any. Read-only fallback to
+    /// the upstream `pi.entry.label` row (see [`Self::branch_tip`]).
     pub fn get_label(&self, entry_id: &str) -> Option<String> {
-        match self.get_value(NS_ENTRY_LABEL, entry_id) {
+        let row = self
+            .get_value(NS_ENTRY_LABEL, entry_id)
+            .or_else(|| self.get_value(crate::fork_policy::PI_ENTRY_LABEL, entry_id));
+        match row {
             Some(Value::String(s)) => Some(s.clone()),
             _ => None,
         }

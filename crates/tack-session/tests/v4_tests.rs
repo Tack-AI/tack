@@ -552,6 +552,512 @@ fn fork_of_migrated_store_applies_policy() {
     assert_eq!(branch.lane_state("main"), Some(LaneState::idle()));
 }
 
+// --- regression tests for upstream-alignment fixes -------------------------
+
+/// The replayed `systemMessage` is preserved on the REBUILD path too
+/// (compaction without a materialized checkpoint tail): the tail is
+/// rebuilt from ancestry, then the system message leads it.
+#[test]
+fn v3_migration_preserves_system_message_on_rebuilt_tail() {
+    let tmp = tempfile::tempdir().unwrap();
+    let content = concat!(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"s8\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work\"}\n",
+        "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"kept\",\"timestamp\":1}}\n",
+        "{\"type\":\"compaction\",\"id\":\"c1\",\"parentId\":\"m1\",\"timestamp\":\"2026-01-01T00:00:02.000Z\",\"summary\":\"sum\",\"firstKeptEntryId\":\"m1\",\"tokensBefore\":100,",
+        "\"systemMessage\":{\"role\":\"system\",\"content\":\"\",\"sections\":{\"system-prompt\":\"Rebuilt prompt.\"},\"timestamp\":2}}\n",
+    );
+    let path = write_v3(&tmp, "s.jsonl", content);
+    let store = V4Store::open(&path).unwrap();
+    let V4Entry::Compaction { retained_tail, .. } = &store.entries()[1] else {
+        panic!("expected compaction");
+    };
+    assert_eq!(retained_tail.len(), 2, "{retained_tail:?}");
+    let AgentMessage::System(system) = &retained_tail[0] else {
+        panic!(
+            "expected leading system message, got {:?}",
+            retained_tail[0]
+        );
+    };
+    assert_eq!(
+        system
+            .sections
+            .as_ref()
+            .and_then(|s| s.get("system-prompt"))
+            .and_then(|v| v.as_deref()),
+        Some("Rebuilt prompt.")
+    );
+    // ... followed by the rebuilt tail (m1's user message).
+    assert!(matches!(&retained_tail[1], AgentMessage::User(_)));
+}
+
+/// The imported usage adjustment row sums the optional token classes
+/// (`cacheWrite1h`, `reasoning`) like upstream `addUsage`.
+#[test]
+fn v3_migration_imports_full_usage_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let content = concat!(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"s9\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work\"}\n",
+        "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[],\"api\":\"messages\",\"provider\":\"anthropic\",\"model\":\"claude\",",
+        "\"usage\":{\"input\":10,\"output\":5,\"cacheRead\":1,\"cacheWrite\":2,\"cacheWrite1h\":3,\"reasoning\":4,\"totalTokens\":25,\"cost\":{\"input\":0.0,\"output\":0.0,\"cacheRead\":0.0,\"cacheWrite\":0.0,\"total\":0.0}},\"stopReason\":\"stop\",\"timestamp\":2}}\n",
+    );
+    let path = write_v3(&tmp, "s.jsonl", content);
+    let store = V4Store::open(&path).unwrap();
+    let rows = store.usage_rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].usage.input, 10);
+    assert_eq!(rows[0].usage.cache_write_1h, Some(3));
+    assert_eq!(rows[0].usage.reasoning, Some(4));
+}
+
+/// A retained record whose payload no longer fits the typed schema is
+/// preserved as a payload-carrying custom entry — the migration must
+/// not abort on one bad record (upstream passes payloads through).
+#[test]
+fn v3_migration_preserves_schema_drifting_records() {
+    let tmp = tempfile::tempdir().unwrap();
+    let content = concat!(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"s10\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work\"}\n",
+        "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"ok\",\"timestamp\":1}}\n",
+        // Unknown message role: cannot materialize as a typed entry.
+        "{\"type\":\"message\",\"id\":\"m2\",\"parentId\":\"m1\",\"timestamp\":\"2026-01-01T00:00:02.000Z\",\"message\":{\"role\":\"wizard\",\"content\":\"abra\",\"timestamp\":2},\"extraField\":{\"nested\":true}}\n",
+        "{\"type\":\"message\",\"id\":\"m3\",\"parentId\":\"m2\",\"timestamp\":\"2026-01-01T00:00:03.000Z\",\"message\":{\"role\":\"user\",\"content\":\"after\",\"timestamp\":3}}\n",
+    );
+    let path = write_v3(&tmp, "s.jsonl", content);
+    let store = V4Store::open(&path).unwrap();
+    assert!(store.was_legacy_v3());
+    assert_eq!(store.entries().len(), 3, "{:?}", store.entries());
+    let V4Entry::Custom {
+        custom_type, data, ..
+    } = &store.entries()[1]
+    else {
+        panic!("expected custom entry, got {:?}", store.entries()[1]);
+    };
+    assert_eq!(custom_type, "message");
+    let data = data.as_ref().expect("payload preserved");
+    assert_eq!(data["message"]["role"], "wizard");
+    assert_eq!(data["extraField"]["nested"], true);
+    // The tree stays linked through the preserved record.
+    assert_eq!(
+        store.entries()[2].parent_id(),
+        Some(store.entries()[1].id())
+    );
+}
+
+/// Compactions whose tail can neither be read from a checkpoint nor
+/// rebuilt (missing `firstKeptEntryId`, or a boundary unreachable from a
+/// null parent) fail the migration instead of silently truncating the
+/// context to an empty tail.
+#[test]
+fn v3_migration_rejects_boundaryless_compactions() {
+    let tmp = tempfile::tempdir().unwrap();
+    // No retainedTail AND no firstKeptEntryId.
+    let no_boundary = concat!(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"s11\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work\"}\n",
+        "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"x\",\"timestamp\":1}}\n",
+        "{\"type\":\"compaction\",\"id\":\"c1\",\"parentId\":\"m1\",\"timestamp\":\"2026-01-01T00:00:02.000Z\",\"summary\":\"s\",\"tokensBefore\":10}\n",
+    );
+    let path = write_v3(&tmp, "b1.jsonl", no_boundary);
+    let err = V4Store::open(&path).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            tack_session::v4::V4Error::MissingCompactionBoundary { .. }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), no_boundary);
+
+    // A boundary that can never be reached from a null parent.
+    let root_boundary = concat!(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"s12\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work\"}\n",
+        "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"x\",\"timestamp\":1}}\n",
+        "{\"type\":\"compaction\",\"id\":\"c1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:02.000Z\",\"summary\":\"s\",\"firstKeptEntryId\":\"m1\",\"tokensBefore\":10}\n",
+    );
+    let path = write_v3(&tmp, "b2.jsonl", root_boundary);
+    let err = V4Store::open(&path).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            tack_session::v4::V4Error::CompactionBoundaryNotOnBranch { .. }
+        ),
+        "{err:?}"
+    );
+}
+
+/// Unparseable timestamps fall back to the nearest known time instead of
+/// aborting the migration (upstream's `Date.parse` tolerance); date-only
+/// stamps parse at midnight UTC.
+#[test]
+fn v3_migration_tolerates_bad_timestamps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let content = concat!(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"s13\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work\"}\n",
+        "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"not a date\",\"message\":{\"role\":\"user\",\"content\":\"x\",\"timestamp\":1}}\n",
+        "{\"type\":\"message\",\"id\":\"m2\",\"parentId\":\"m1\",\"timestamp\":\"2026-01-02\",\"message\":{\"role\":\"user\",\"content\":\"y\",\"timestamp\":2}}\n",
+    );
+    let path = write_v3(&tmp, "s.jsonl", content);
+    let store = V4Store::open(&path).unwrap();
+    assert!(store.was_legacy_v3());
+    // Bad timestamp → the header creation time (the seed fallback).
+    assert_eq!(store.entries()[0].base().timestamp, 1767225600000);
+    // Date-only timestamp → midnight UTC of that day.
+    assert_eq!(store.entries()[1].base().timestamp, 1767312000000);
+}
+
+/// Empty-string session names are skipped and empty-string labels count
+/// as cleared (upstream's truthiness rules).
+#[test]
+fn v3_migration_skips_empty_names_and_labels() {
+    let tmp = tempfile::tempdir().unwrap();
+    let content = concat!(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"s14\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work\"}\n",
+        "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"x\",\"timestamp\":1}}\n",
+        "{\"type\":\"label\",\"id\":\"l1\",\"parentId\":\"m1\",\"timestamp\":\"2026-01-01T00:00:02.000Z\",\"targetId\":\"m1\",\"label\":\"real\"}\n",
+        "{\"type\":\"label\",\"id\":\"l2\",\"parentId\":\"l1\",\"timestamp\":\"2026-01-01T00:00:03.000Z\",\"targetId\":\"m1\",\"label\":\"\"}\n",
+        "{\"type\":\"session_info\",\"id\":\"si1\",\"parentId\":\"l2\",\"timestamp\":\"2026-01-01T00:00:04.000Z\",\"name\":\"\"}\n",
+    );
+    let path = write_v3(&tmp, "s.jsonl", content);
+    let store = V4Store::open(&path).unwrap();
+    assert_eq!(store.session_name(), None, "empty name not written");
+    let m1 = store.entries()[0].id().to_string();
+    assert_eq!(store.get_label(&m1), None, "empty label clears");
+}
+
+/// A non-string `parentId` can never resolve: fail loudly instead of
+/// silently re-rooting the record (upstream fails the same lookup).
+#[test]
+fn v3_migration_rejects_non_string_parent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let content = concat!(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"s15\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work\"}\n",
+        "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":123,\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"x\",\"timestamp\":1}}\n",
+    );
+    let path = write_v3(&tmp, "s.jsonl", content);
+    let err = V4Store::open(&path).unwrap_err();
+    assert!(
+        matches!(err, tack_session::v4::V4Error::MissingLegacyParent { .. }),
+        "{err:?}"
+    );
+}
+
+/// A `branchSummary` message projected into a compaction's retained tail
+/// carries `fromId: null` for a root source (the v4/upstream wire
+/// shape), not the v3 entry-level `"root"` sentinel.
+#[test]
+fn v3_migration_tail_branch_summary_uses_null_from_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let content = concat!(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"s16\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work\"}\n",
+        "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"x\",\"timestamp\":1}}\n",
+        "{\"type\":\"branch_summary\",\"id\":\"bs1\",\"parentId\":\"m1\",\"timestamp\":\"2026-01-01T00:00:02.000Z\",\"fromId\":\"root\",\"summary\":\"recap\"}\n",
+        "{\"type\":\"compaction\",\"id\":\"c1\",\"parentId\":\"bs1\",\"timestamp\":\"2026-01-01T00:00:03.000Z\",\"summary\":\"s\",\"firstKeptEntryId\":\"bs1\",\"tokensBefore\":10}\n",
+    );
+    let path = write_v3(&tmp, "s.jsonl", content);
+    let store = V4Store::open(&path).unwrap();
+    // The branch summary ENTRY maps the sentinel to a null fromId too.
+    let V4Entry::BranchSummary { from_id, .. } = &store.entries()[1] else {
+        panic!("expected branch summary");
+    };
+    assert_eq!(*from_id, None);
+    let V4Entry::Compaction { retained_tail, .. } = &store.entries()[2] else {
+        panic!("expected compaction");
+    };
+    assert_eq!(retained_tail.len(), 1, "{retained_tail:?}");
+    let AgentMessage::BranchSummary(b) = &retained_tail[0] else {
+        panic!("expected branchSummary message, got {:?}", retained_tail[0]);
+    };
+    assert_eq!(b.from_id, None);
+    // ... and the serialized wire shape is literally `"fromId":null`.
+    let json = serde_json::to_value(&retained_tail[0]).unwrap();
+    assert_eq!(json["fromId"], serde_json::Value::Null);
+}
+
+// --- pi.* interoperability --------------------------------------------------
+
+/// A pi-written session (upstream `pi.*` namespaces) resumes sensibly:
+/// tip, lane configuration, session name and labels are honored as
+/// read-only fallbacks; `tack.*` rows win once both exist.
+#[test]
+fn v4_store_reads_pi_namespaces_as_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("pi.jsonl");
+    let mut store = V4Store::create(&path, header("p1"), vec![]).unwrap();
+    let entry_id = store
+        .commit(vec![
+            tack_session::v4::V4NewWrite::Entry(V4Entry::new_message(
+                "e1".to_string(),
+                AgentMessage::user("pi hello"),
+            )),
+            tack_session::v4::V4NewWrite::ValueSet {
+                namespace: "pi.branch.tip".to_string(),
+                key: "main".to_string(),
+                value: Value::String("e1".to_string()),
+            },
+            tack_session::v4::V4NewWrite::ValueSet {
+                namespace: "pi.lane.config".to_string(),
+                key: "main".to_string(),
+                value: serde_json::json!({
+                    "model": {"provider": "anthropic", "modelId": "claude"},
+                    "thinkingLevel": "high",
+                    "activeToolNames": [],
+                }),
+            },
+            tack_session::v4::V4NewWrite::ValueSet {
+                namespace: "pi.session.name".to_string(),
+                key: String::new(),
+                value: Value::String("pi session".to_string()),
+            },
+            tack_session::v4::V4NewWrite::ValueSet {
+                namespace: "pi.entry.label".to_string(),
+                key: "e1".to_string(),
+                value: Value::String("pi label".to_string()),
+            },
+        ])
+        .unwrap();
+    let _ = entry_id;
+
+    assert_eq!(store.branch_tip("main"), Some(Some("e1".to_string())));
+    let config = store.lane_config("main").expect("pi lane config honored");
+    assert_eq!(config.model.model_id, "claude");
+    assert_eq!(store.session_name().as_deref(), Some("pi session"));
+    assert_eq!(store.get_label("e1").as_deref(), Some("pi label"));
+
+    // Once a `tack.*` row exists it wins over the pi fallback.
+    store
+        .commit(vec![tack_session::v4::V4NewWrite::ValueSet {
+            namespace: "tack.session.name".to_string(),
+            key: String::new(),
+            value: Value::String("tack name".to_string()),
+        }])
+        .unwrap();
+    assert_eq!(store.session_name().as_deref(), Some("tack name"));
+
+    // The fallback survives a reopen.
+    drop(store);
+    let store = V4Store::open(&path).unwrap();
+    assert_eq!(store.branch_tip("main"), Some(Some("e1".to_string())));
+    assert_eq!(store.get_label("e1").as_deref(), Some("pi label"));
+}
+
+/// Forking a pi-written session applies upstream fork semantics to the
+/// `pi.*` rows: operation/pending/result state is excluded, lane state
+/// resets to idle, and the branch tip crosses on tree scope.
+#[test]
+fn tree_fork_of_pi_session_excludes_runtime_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("pi.jsonl");
+    let mut store = V4Store::create(&path, header("p1"), vec![]).unwrap();
+    store
+        .commit(vec![
+            tack_session::v4::V4NewWrite::Entry(V4Entry::new_message(
+                "e1".to_string(),
+                AgentMessage::user("pi hello"),
+            )),
+            tack_session::v4::V4NewWrite::ValueSet {
+                namespace: "pi.branch.tip".to_string(),
+                key: "main".to_string(),
+                value: Value::String("e1".to_string()),
+            },
+            tack_session::v4::V4NewWrite::ValueSet {
+                namespace: "pi.lane.state".to_string(),
+                key: "main".to_string(),
+                value: serde_json::json!({
+                    "currentOperationId": "op-1",
+                    "lastOperationId": null,
+                    "inbox": [{"entryId": "e1", "kind": "steer"}],
+                }),
+            },
+            tack_session::v4::V4NewWrite::ValueSet {
+                namespace: "pi.op.meta".to_string(),
+                key: "op-1".to_string(),
+                value: serde_json::json!({"operationId": "op-1"}),
+            },
+            tack_session::v4::V4NewWrite::ValueSet {
+                namespace: "pi.pending.entry".to_string(),
+                key: "e2".to_string(),
+                value: serde_json::json!({"type": "message"}),
+            },
+            tack_session::v4::V4NewWrite::ValueSet {
+                namespace: "pi.result".to_string(),
+                key: "op-0".to_string(),
+                value: serde_json::json!({"status": "completed"}),
+            },
+        ])
+        .unwrap();
+
+    let fork = tack_session::v4::run_v4_fork(
+        &store,
+        &tmp.path().join("fork.jsonl"),
+        header("f1"),
+        &ForkOptions::Tree { id: None },
+    )
+    .unwrap();
+    assert_eq!(fork.entries().len(), 1, "entries cross");
+    assert_eq!(
+        fork.branch_tip("main"),
+        Some(Some("e1".to_string())),
+        "pi tip crosses via the fallback"
+    );
+    // Runtime state is excluded; lane state is reset to idle.
+    assert_eq!(fork.get_value("pi.op.meta", "op-1"), None);
+    assert_eq!(fork.get_value("pi.pending.entry", "e2"), None);
+    assert_eq!(fork.get_value("pi.result", "op-0"), None);
+    assert_eq!(
+        fork.get_value("pi.lane.state", "main"),
+        Some(&serde_json::json!({
+            "currentOperationId": null,
+            "lastOperationId": null,
+            "inbox": [],
+        }))
+    );
+}
+
+/// End-to-end: a pi-written session (upstream `pi.*` state, including
+/// leftover mid-run operation rows) opens in tack and continues
+/// natively — new entries link onto pi's tip, mirrored state moves to
+/// `tack.*`, and everything keeps working when pi never reads the file
+/// again.
+#[test]
+fn pi_session_continues_natively_in_tack() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("pi.jsonl");
+    let mut store = V4Store::create(&path, header("pi-1"), vec![]).unwrap();
+    let msg = |id: &str, parent: Option<&str>, text: &str| V4Entry::Message {
+        base: tack_session::v4::V4EntryBase {
+            id: id.to_string(),
+            parent_id: parent.map(str::to_string),
+            seq: 0,
+            timestamp: 0,
+        },
+        message: AgentMessage::user(text),
+        terminate: None,
+    };
+    // A pi session closed mid-run: tip/config/state under `pi.*`, plus
+    // operation/pending junk tack must tolerate.
+    store
+        .commit(vec![
+            V4NewWrite::Entry(msg("e1", None, "pi one")),
+            V4NewWrite::Entry(msg("e2", Some("e1"), "pi two")),
+            V4NewWrite::ValueSet {
+                namespace: "pi.branch.tip".to_string(),
+                key: "main".to_string(),
+                value: Value::String("e2".to_string()),
+            },
+            V4NewWrite::ValueSet {
+                namespace: "pi.lane.config".to_string(),
+                key: "main".to_string(),
+                value: serde_json::json!({
+                    "model": {"provider": "anthropic", "modelId": "claude"},
+                    "thinkingLevel": "medium",
+                    "activeToolNames": ["read"],
+                }),
+            },
+            V4NewWrite::ValueSet {
+                namespace: "pi.lane.state".to_string(),
+                key: "main".to_string(),
+                value: serde_json::json!({
+                    "currentOperationId": "op-1",
+                    "lastOperationId": null,
+                    "inbox": [],
+                }),
+            },
+            V4NewWrite::ValueSet {
+                namespace: "pi.op.meta".to_string(),
+                key: "op-1".to_string(),
+                value: serde_json::json!({"operationId": "op-1"}),
+            },
+            V4NewWrite::ValueSet {
+                namespace: "pi.pending.entry".to_string(),
+                key: "draft".to_string(),
+                value: serde_json::json!({"type": "message"}),
+            },
+            V4NewWrite::ValueSet {
+                namespace: "pi.session.name".to_string(),
+                key: String::new(),
+                value: Value::String("pi session".to_string()),
+            },
+            V4NewWrite::ValueSet {
+                namespace: "pi.entry.label".to_string(),
+                key: "e1".to_string(),
+                value: Value::String("pi label".to_string()),
+            },
+        ])
+        .unwrap();
+    drop(store);
+
+    // Opens as an ordinary v4 session, resuming from pi's tip.
+    let mut mgr = SessionManager::open(&path, None).unwrap();
+    assert_eq!(mgr.leaf_id(), Some("e2"));
+    assert_eq!(mgr.entries().len(), 2);
+    assert_eq!(mgr.get_label("e1").as_deref(), Some("pi label"));
+
+    // Work continues natively: new entries must link onto pi's tip.
+    mgr.append_model_change("anthropic", "claude-opus-4.5")
+        .unwrap();
+    mgr.append_thinking_level_change("high").unwrap();
+    mgr.append_message(AgentMessage::user("tack three")).unwrap();
+    let label_entry = mgr
+        .append_label_change("e1", Some("tack label".to_string()))
+        .unwrap();
+    let entries = mgr.entries();
+    assert_eq!(entries.len(), 6, "{entries:?}");
+    assert_eq!(
+        entries[2].parent_id(),
+        Some("e2"),
+        "the first tack entry parents onto pi's tip"
+    );
+    assert_eq!(mgr.leaf_id(), Some(label_entry.as_str()));
+    drop(mgr);
+
+    // Store view: `tack.*` rows take precedence, `pi.*` still falls back
+    // where no tack row exists.
+    let store = V4Store::open(&path).unwrap();
+    assert_eq!(
+        store.branch_tip("main"),
+        Some(Some(label_entry.clone())),
+        "tack tip row wins"
+    );
+    let config = store.lane_config("main").unwrap();
+    assert_eq!(config.model.model_id, "claude-opus-4.5");
+    assert_eq!(config.thinking_level, "high");
+    assert_eq!(
+        config.active_tool_names,
+        vec!["read".to_string()],
+        "pi's tool list was preserved into the first tack lane config"
+    );
+    assert_eq!(
+        store.session_name().as_deref(),
+        Some("pi session"),
+        "no tack name yet — pi fallback still applies"
+    );
+    assert_eq!(store.get_label("e1").as_deref(), Some("tack label"));
+    assert!(store.has_complete_lane("main"));
+
+    // Reopen: the hybrid session keeps working as a normal tack session.
+    let mgr2 = SessionManager::open(&path, None).unwrap();
+    assert_eq!(mgr2.leaf_id(), Some(label_entry.as_str()));
+    assert_eq!(mgr2.entries().len(), 6);
+    let ctx = mgr2.build_session_context();
+    assert_eq!(ctx.thinking_level, "high");
+    assert_eq!(
+        ctx.model,
+        Some(("anthropic".to_string(), "claude-opus-4.5".to_string()))
+    );
+
+    // ... and a tree fork stays clean (pi runtime state excluded/reset).
+    let fork = tack_session::v4::run_v4_fork(
+        &store,
+        &tmp.path().join("fork.jsonl"),
+        header("f1"),
+        &ForkOptions::Tree { id: None },
+    )
+    .unwrap();
+    assert_eq!(fork.entries().len(), 6);
+    assert_eq!(fork.get_value("pi.op.meta", "op-1"), None);
+    assert_eq!(fork.get_value("pi.pending.entry", "draft"), None);
+    assert_eq!(fork.branch_tip("main"), Some(Some(label_entry)));
+}
+
 /// Helper kept for parity with other test modules.
 #[allow(dead_code)]
 fn path_display(p: &Path) -> String {

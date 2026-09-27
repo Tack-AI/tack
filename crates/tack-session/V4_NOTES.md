@@ -1,5 +1,9 @@
 # Session storage v4 — design notes
 
+> The normative wire-format specification lives in
+> [`docs/session-v4-protocol.md`](../../docs/session-v4-protocol.md); this
+> file records the design decisions and deliberate divergences behind it.
+
 Tracking issue: `docs/upstream-alignment.md` → "存储 v4 迁移" (largest known
 upstream gap). Upstream references (local checkout of TS pi):
 
@@ -37,7 +41,9 @@ The v4 file is a **transaction log**, replacing v3's one-entry-per-line tree:
   `tack.lane.state/{lane}`. `tack.result`, `tack.op.*`, `tack.pending.*` are
   recognized (and excluded from forks) but never written by Tack yet.
   (Upstream TS pi writes the same layout under `pi.*`; Tack renamed the
-  namespaces and does not read legacy `pi.*` rows.)
+  namespaces. `pi.*` rows are never WRITTEN, but they are honored as
+  read-only fallbacks on open and get upstream fork semantics when a
+  pi-written session crosses a fork — see the pi-interop section below.)
 
 ## Branch/lane separation (WP06/08, minimal viable semantics)
 
@@ -73,6 +79,14 @@ The v4 file is a **transaction log**, replacing v3's one-entry-per-line tree:
   scope. Usage rows are never copied.
 - Copied writes keep their source `seq`; the destination header records the
   source's `next_seq` high-water mark, like upstream `runJsonlFork`.
+- Upstream `pi.*` namespaces cross forks under upstream's OWN rules
+  (the same closed classifier under the `pi` prefix): `pi.session.name`
+  copied, `pi.entry.label` follows copied entries, `pi.branch.tip`/
+  `pi.lane.config` scoped like their tack counterparts, `pi.lane.state`
+  reset to idle, `pi.result`/`pi.op.*`/`pi.pending.*` excluded on both
+  scopes, and any other `pi`/`pi.*` namespace fails the fork. Without
+  this, tree-forking a pi-written session would copy stale
+  operation/pending runtime state into the destination.
 - Tradeoff: Tack forks from the already-loaded in-memory state (equivalent
   to upstream's *memory* backend path) instead of the two-scan streaming
   JSONL procedure. This matches Tack's existing whole-file model
@@ -108,9 +122,17 @@ migration matches local precedent and keeps `open` total):
 - Unknown/extension record types are retained as custom entries too
   (`custom_type` = original type, `data` = all non-structural fields) —
   Tack's standing no-silent-data-loss rule (upstream's migrator rejects
-  them outright). Records without an `id` are skipped (payloads survive
+  them outright). The same fallback applies to RETAINED kinds whose
+  payload no longer fits the typed `SessionEntry` schema (unknown
+  message roles, missing fields): preserved as custom entries rather
+  than aborting the migration (upstream passes such payloads through
+  verbatim). When such a record feeds a compaction tail, its raw
+  `message` payload still lands in the tail on a best-effort basis.
+  Records without an `id` are skipped (payloads survive
   in the `.bak`) so a malformed line can never lock a user out of the
-  whole session on open.
+  whole session on open; a non-string `parentId` is a hard error
+  (re-rooting would silently corrupt the tree; upstream fails the same
+  lookup).
 - Derived values: `tack.session.name`, `tack.entry.label/{mappedId}` (latest
   label wins, cleared labels dropped), `tack.branch.tip/main` (mapped final
   entry), and — only when both model and thinking level are recoverable by
@@ -119,12 +141,32 @@ migration matches local precedent and keeps `open` total):
 - Imported usage (assistant/toolResult message usage + compaction and
   branch-summary LLM usage) is preserved as one
   `{kind:"usage", adjustment:true, details:{source:"v3-import"}}` row.
+- Timestamps are parsed leniently (upstream `Date.parse` tolerance):
+  RFC-3339, then RFC-2822, then date-only; anything else falls back to
+  the previous record's timestamp (seeded with the header `createdAt`) —
+  one bad timestamp never aborts the migration (upstream propagates NaN,
+  which JSON renders `null`; tack's `u64` timestamps carry the nearest
+  known time instead). Empty-string session names are not written and
+  empty-string labels count as cleared (upstream's truthiness rules).
+- Compactions WITHOUT a `retainedTail` checkpoint require a reachable
+  `firstKeptEntryId` on the parent ancestry — a missing boundary or a
+  null-parent compaction fails the migration
+  (`MissingCompactionBoundary` / `CompactionBoundaryNotOnBranch`) instead
+  of silently producing an empty tail (upstream throws in the same
+  situations). Compactions that DO carry a checkpoint keep the
+  checkpoint tail, with `systemMessage` prepended when present (the
+  checkpoint is NOT byte-verbatim in that case — see the system-message
+  section below).
 - The original file is kept as `<path>.bak`; the new file is written to a
   temp file and atomically renamed (same crash-safety pattern as the v3
-  migration). Encryption state is preserved: undecryptable input fails with
+  migration; the Windows delete-then-rename retry is acceptable because
+  the `.bak` already exists, and unix builds propagate the atomic
+  rename's error instead). Pass 2 re-verifies the header identity before
+  streaming, like upstream's changed-source guard. Encryption state is
+  preserved: undecryptable input fails with
   `Encrypted`; output transaction lines are encrypted iff a session key is
-  installed. Compactions that already carry a v3 `retainedTail` checkpoint
-  keep it verbatim.
+  installed. Imported usage sums the optional `cacheWrite1h`/`reasoning`
+  token classes too, matching upstream `addUsage`.
 
 ## Deliberate divergences from upstream
 
@@ -147,6 +189,28 @@ migration matches local precedent and keeps `open` total):
 - No SQLite v4 backend, no operation/pending state, no repo-level session
   listing (WP07): out of scope for this change; the existing v3 SQLite
   backend is untouched.
+
+## pi-written session interoperability (read fallback)
+
+Reserved namespaces differ on disk (`tack.*` vs upstream `pi.*`), so a
+pi-written session carries no `tack.*` rows. To keep such sessions
+resumable, `V4Store` honors the upstream rows as READ-ONLY fallbacks:
+
+- `branch_tip` falls back to `pi.branch.tip/{branch}` (so resume starts
+  from pi's tip), `lane_config` to `pi.lane.config/{lane}` (so the
+  `LaneTracker` seeds model/thinking state), `session_name` to
+  `pi.session.name`, and `get_label` to `pi.entry.label/{entryId}`.
+  Once a `tack.*` row exists it wins — the fallback only applies while
+  the tack row is absent. The lenient whole-file scanners (session
+  listing/search) likewise recognize `pi.session.name`.
+- Writes NEVER go to `pi.*`: the first tack append starts moving
+  `tack.branch.tip/main` while pi's row goes stale. A tack-appended pi
+  session reopened IN PI therefore resumes from that stale pi tip — a
+  known cross-implementation limitation (mirroring it would require
+  dual-writing both namespaces).
+- `has_complete_lane` and lane-state reads remain `tack.*`-only, so
+  branch-scope forks of pi lanes still reject (tree scope works and
+  applies the pi fork rules above).
 
 ## Transcript system messages (upstream #9548, aligned 2026-09)
 
@@ -186,7 +250,14 @@ Tack aligns:
   preserves it by prepending the replayed system message to the v4
   compaction's `retainedTail` (`compaction_tail_with_system`) — readable
   by both implementations (v4 readers project `summary + retainedTail`).
-  Live v4 writes do the same for compactions recorded after the change.
+  This applies on BOTH the checkpoint path and the rebuilt-tail path
+  (earlier versions only preserved it on the checkpoint path). Live v4
+  writes do the same for compactions recorded after the change.
+- **branchSummary `fromId`**: inside retained tails (and everywhere else
+  a `branchSummary` MESSAGE appears) a root source is `fromId: null`,
+  the v4/upstream wire shape — the v3 ENTRY-level `"root"` sentinel is
+  mapped at the projection boundary (`BranchSummaryMessage.from_id` is
+  `Option<String>`).
 - **Key order**: Tack serializes system messages in interface declaration
   order (`role, content, sections?, toolsAdded?, toolsRemoved?,
   timestamp`). Upstream itself is inconsistent: `createInitialSystemMessage`

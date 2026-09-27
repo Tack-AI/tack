@@ -44,8 +44,9 @@ pub struct V4MigrationReport {
     /// branch_summary/compaction plus the change records model_change/
     /// thinking_level_change/session_info/label as custom entries).
     pub retained_entries: usize,
-    /// v3 records dropped structurally (active_tools_change, unknown
-    /// types); payloads survive in the `.bak`.
+    /// v3 records dropped structurally: `active_tools_change` entries
+    /// and id-less malformed records (unknown/extension types are
+    /// RETAINED as custom entries). Payloads survive in the `.bak`.
     pub discarded_entries: usize,
     /// Derived current-state value writes (name, labels, tip, lane).
     pub derived_values: usize,
@@ -301,12 +302,22 @@ fn add_usage(total: &mut Usage, u: &Usage) {
     total.output += u.output;
     total.cache_read += u.cache_read;
     total.cache_write += u.cache_write;
+    add_optional(&mut total.cache_write_1h, u.cache_write_1h);
+    add_optional(&mut total.reasoning, u.reasoning);
     total.total_tokens += u.total_tokens;
     total.cost.input += u.cost.input;
     total.cost.output += u.cost.output;
     total.cost.cache_read += u.cost.cache_read;
     total.cost.cache_write += u.cost.cache_write;
     total.cost.total += u.cost.total;
+}
+
+/// Sum an optional token class (upstream `addUsage` sums `cacheWrite1h`
+/// and `reasoning` too): `Some` when either side carries a value.
+fn add_optional(total: &mut Option<u64>, u: Option<u64>) {
+    if let Some(v) = u {
+        *total = Some(total.unwrap_or(0) + v);
+    }
 }
 
 /// Pass 1: stream the file, building the structural index.
@@ -340,7 +351,20 @@ fn scan_v3_file(path: &Path, header_cwd: &str) -> Result<MigrationIndex, V4Error
         let Some(legacy_id) = json_string(&value, "id") else {
             continue;
         };
-        let parent_id = json_opt_string(&value, "parentId");
+        let parent_id = match value.get("parentId") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.clone()),
+            // A non-string parentId can never resolve (upstream fails the
+            // same lookup); re-rooting the record would silently corrupt
+            // the tree, so fail loudly instead.
+            Some(other) => {
+                return Err(V4Error::MissingLegacyParent {
+                    id: legacy_id.clone(),
+                    line: line_number,
+                    parent: other.to_string(),
+                });
+            }
+        };
         if by_legacy_id.contains_key(&legacy_id) {
             return Err(V4Error::CorruptLine {
                 path: path.to_path_buf(),
@@ -407,16 +431,39 @@ fn scan_v3_file(path: &Path, header_cwd: &str) -> Result<MigrationIndex, V4Error
 
 /// Mark every legacy entry whose context message is needed to rebuild a
 /// compaction retained tail (upstream `collectRequiredTailMessageIds`).
+///
+/// A compaction WITHOUT a materialized checkpoint tail is only migratable
+/// when its boundary is knowable: `firstKeptEntryId` must be present and
+/// on the compaction's parent ancestry. Anything else would migrate into
+/// a silently truncated context — fail the migration instead (the `.bak`
+/// preserves the original, and the v3 backend can still open the file).
 fn collect_required_tail_message_ids(index: &mut MigrationIndex) -> Result<(), V4Error> {
     let mut required = HashSet::new();
     for entry in &index.entries {
         let IndexKind::Compaction {
-            first_kept_entry_id: Some(first_kept),
-            has_retained_tail: false,
+            first_kept_entry_id,
+            has_retained_tail,
         } = &entry.kind
         else {
             continue;
         };
+        if *has_retained_tail {
+            continue; // checkpoint form: the tail is already materialized
+        }
+        let Some(first_kept) = first_kept_entry_id else {
+            return Err(V4Error::MissingCompactionBoundary {
+                id: entry.legacy_id.clone(),
+            });
+        };
+        if entry.parent_id.is_none() {
+            // The ancestry walk starts at the parent; a root-hung
+            // compaction can never reach its boundary (upstream throws
+            // the same way by falling off the walk).
+            return Err(V4Error::CompactionBoundaryNotOnBranch {
+                id: entry.legacy_id.clone(),
+                first_kept: first_kept.clone(),
+            });
+        }
         // Walk physical ancestry from the compaction's parent through
         // firstKeptEntryId, inclusive (upstream `retainedTailStructure`).
         let mut current = entry.parent_id.clone();
@@ -480,16 +527,21 @@ fn selected_configuration(index: &MigrationIndex) -> Option<Value> {
 /// and — when recoverable — the main lane's config + idle state.
 fn derive_value_writes(index: &MigrationIndex) -> Result<Vec<(String, String, Value)>, V4Error> {
     let mut values: Vec<(String, String, Value)> = Vec::new();
-    if let Some(name) = &index.name {
+    // Upstream writes the name only when truthy: an empty-string name is
+    // skipped (and thereby erases any earlier one).
+    if let Some(name) = &index.name
+        && !name.is_empty()
+    {
         values.push((
             NS_SESSION_NAME.to_string(),
             String::new(),
             Value::String(name.clone()),
         ));
     }
-    // Latest label per target wins; cleared labels are dropped. Targets
-    // resolve through the id mapping; targets resolving to the root (null)
-    // are skipped (upstream behavior).
+    // Latest label per target wins; cleared labels are dropped (upstream
+    // treats an empty-string label as cleared too). Targets resolve
+    // through the id mapping; targets resolving to the root (null) are
+    // skipped (upstream behavior).
     let mut labels: HashMap<String, Option<String>> = HashMap::new();
     let mut label_order: Vec<String> = Vec::new();
     for entry in &index.entries {
@@ -502,7 +554,7 @@ fn derive_value_writes(index: &MigrationIndex) -> Result<Vec<(String, String, Va
         if !labels.contains_key(&target) {
             label_order.push(target.clone());
         }
-        labels.insert(target, label.clone());
+        labels.insert(target, label.clone().filter(|l| !l.is_empty()));
     }
     for target in label_order {
         if let Some(Some(label)) = labels.get(&target) {
@@ -530,22 +582,30 @@ fn derive_value_writes(index: &MigrationIndex) -> Result<Vec<(String, String, Va
     Ok(values)
 }
 
-/// An entry timestamp as epoch millis (upstream `Date.parse`).
-fn entry_timestamp_millis(timestamp: &str, path: &Path, line: usize) -> Result<u64, V4Error> {
-    iso_to_millis(timestamp).ok_or_else(|| V4Error::CorruptLine {
-        path: path.to_path_buf(),
-        line,
-        reason: format!("invalid entry timestamp: {timestamp}"),
-    })
+/// An entry timestamp as epoch millis, lenient like upstream's
+/// `Date.parse`: RFC-3339 first, then RFC-2822 and date-only forms.
+/// Anything else yields `None` and the caller substitutes the nearest
+/// known timestamp (upstream propagates NaN, which JSON renders as
+/// `null`; tack's `u64` timestamps cannot). One malformed timestamp must
+/// never abort the whole migration.
+fn lenient_timestamp_millis(timestamp: &str) -> Option<u64> {
+    if let Some(ms) = iso_to_millis(timestamp) {
+        return Some(ms);
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(timestamp) {
+        return Some(dt.timestamp_millis() as u64);
+    }
+    let date = chrono::NaiveDate::parse_from_str(timestamp, "%Y-%m-%d").ok()?;
+    Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis() as u64)
 }
 
 /// Project one v3 entry into a context message for a compaction retained
-/// tail (upstream `projectContextMessage`).
+/// tail (upstream `projectContextMessage`). `fallback_ts` substitutes for
+/// an unparseable entry timestamp (see [`lenient_timestamp_millis`]).
 fn project_context_message(
     entry: &SessionEntry,
     index: &MigrationIndex,
-    path: &Path,
-    line: usize,
+    fallback_ts: u64,
 ) -> Result<Option<AgentMessage>, V4Error> {
     Ok(match entry {
         SessionEntry::Message { message, .. } => Some(message.clone()),
@@ -561,7 +621,7 @@ fn project_context_message(
             content: content.clone(),
             display: *display,
             details: details.clone(),
-            timestamp: entry_timestamp_millis(timestamp, path, line)?,
+            timestamp: lenient_timestamp_millis(timestamp).unwrap_or(fallback_ts),
         })),
         SessionEntry::BranchSummary {
             summary,
@@ -579,10 +639,9 @@ fn project_context_message(
                 };
                 Some(AgentMessage::BranchSummary(BranchSummaryMessage {
                     summary: summary.clone(),
-                    // tack's BranchSummaryMessage keeps the v3 "root"
-                    // sentinel for a null source.
-                    from_id: from.unwrap_or_else(|| "root".to_string()),
-                    timestamp: entry_timestamp_millis(timestamp, path, line)?,
+                    // v4/upstream encode a root source as `fromId: null`.
+                    from_id: from,
+                    timestamp: lenient_timestamp_millis(timestamp).unwrap_or(fallback_ts),
                 }))
             }
         }
@@ -594,21 +653,21 @@ fn project_context_message(
         } => Some(AgentMessage::CompactionSummary(CompactionSummaryMessage {
             summary: summary.clone(),
             tokens_before: *tokens_before,
-            timestamp: entry_timestamp_millis(timestamp, path, line)?,
+            timestamp: lenient_timestamp_millis(timestamp).unwrap_or(fallback_ts),
         })),
         _ => None,
     })
 }
 
 /// Materialize one retained v3 record as a v4 entry (upstream
-/// `normalizeRetainedEntry`).
+/// `normalizeRetainedEntry`). `fallback_ts` substitutes for an
+/// unparseable entry timestamp (see [`lenient_timestamp_millis`]).
 fn materialize_entry(
     entry: &SessionEntry,
     indexed: &IndexEntry,
     index: &MigrationIndex,
     tail_cache: &HashMap<String, AgentMessage>,
-    path: &Path,
-    line: usize,
+    fallback_ts: u64,
 ) -> Result<V4Entry, V4Error> {
     let base = V4EntryBase {
         id: indexed
@@ -617,7 +676,7 @@ fn materialize_entry(
             .ok_or_else(|| V4Error::MissingLegacyReference(indexed.legacy_id.clone()))?,
         parent_id: index.resolve(indexed.parent_id.as_deref())?,
         seq: indexed.seq,
-        timestamp: entry_timestamp_millis(entry.timestamp(), path, line)?,
+        timestamp: lenient_timestamp_millis(entry.timestamp()).unwrap_or(fallback_ts),
     };
     Ok(match entry {
         SessionEntry::Message { message, .. } => V4Entry::Message {
@@ -638,7 +697,7 @@ fn materialize_entry(
                 content: content.clone(),
                 display: *display,
                 details: details.clone(),
-                timestamp: entry_timestamp_millis(timestamp, path, line)?,
+                timestamp: lenient_timestamp_millis(timestamp).unwrap_or(fallback_ts),
             }),
             base,
             terminate: None,
@@ -681,7 +740,13 @@ fn materialize_entry(
                     system_message,
                     &Some(tail.clone()),
                 ),
-                None => rebuild_retained_tail(indexed, index, tail_cache)?,
+                // Rebuilt tail: the replayed system message leads it too
+                // (preserving `systemMessage` is unconditional — see
+                // compaction_tail_with_system).
+                None => crate::v4_bridge::compaction_tail_with_system(
+                    system_message,
+                    &Some(rebuild_retained_tail(indexed, index, tail_cache)?),
+                ),
             };
             V4Entry::Compaction {
                 base,
@@ -734,7 +799,10 @@ fn materialize_entry(
 }
 
 /// Rebuild a compaction's retained tail from the pass-2 message cache,
-/// oldest first (upstream `retainedTailStructure` + reverse).
+/// oldest first (upstream `retainedTailStructure` + reverse). Boundary
+/// validation already happened in pass 1
+/// ([`collect_required_tail_message_ids`]); the error arms here are
+/// defensive.
 fn rebuild_retained_tail(
     compaction: &IndexEntry,
     index: &MigrationIndex,
@@ -745,7 +813,9 @@ fn rebuild_retained_tail(
         ..
     } = &compaction.kind
     else {
-        return Ok(Vec::new());
+        return Err(V4Error::MissingCompactionBoundary {
+            id: compaction.legacy_id.clone(),
+        });
     };
     let mut tail = Vec::new();
     let mut current = compaction.parent_id.clone();
@@ -805,14 +875,21 @@ fn normalize_header(
     Ok(header)
 }
 
+/// Read a file's first line for header sniffing. Unlike
+/// [`CompleteLines`] an unterminated first line still counts (upstream's
+/// parent-session sniff does not require the terminator either).
 fn read_first_line_of(path: &Path) -> Result<Option<String>, std::io::Error> {
-    let mut lines = CompleteLines::open(path).map_err(|e| match e {
-        V4Error::Io(io) => io,
-        other => std::io::Error::other(other.to_string()),
-    })?;
-    lines
-        .next_line()
-        .map_err(|e| std::io::Error::other(e.to_string()))
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut buf = String::new();
+    if reader.read_line(&mut buf)? == 0 {
+        return Ok(None);
+    }
+    let line = buf.trim_end_matches(['\n', '\r']);
+    if line.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(line.to_string()))
 }
 
 /// Render one transaction line for the migrated file, encrypting when a
@@ -888,8 +965,27 @@ pub fn migrate_v3_to_v4(path: &Path) -> Result<V4MigrationReport, V4Error> {
         let mut seq = index.next_seq;
         let mut tail_cache: HashMap<String, AgentMessage> = HashMap::new();
         let mut lines = CompleteLines::open(path)?;
-        let _ = lines.next_line()?; // header
+        // Guard against the source changing between the two passes
+        // (upstream re-checks the header identity and per-line id/type).
+        let pass2_header = lines.next_line()?;
+        let pass2_header = pass2_header
+            .as_deref()
+            .and_then(codec::parse_session_header);
+        match pass2_header {
+            Some(ParsedSessionHeader::LegacyV3(ref h))
+                if h.id == legacy_header.id && h.cwd == legacy_header.cwd => {}
+            _ => {
+                return Err(V4Error::CorruptLine {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    reason: "legacy v3 source changed during migration".to_string(),
+                });
+            }
+        }
         let mut line_number = 1usize;
+        // Fallback for unparseable timestamps: the previous record's
+        // timestamp, seeded with the header creation time.
+        let mut last_timestamp = created_at;
         while let Some(raw) = lines.next_line()? {
             line_number += 1;
             let decrypted = decrypt_if_needed(&raw, path)?;
@@ -909,46 +1005,43 @@ pub fn migrate_v3_to_v4(path: &Path) -> Result<V4MigrationReport, V4Error> {
                 report.discarded_entries += 1;
                 continue;
             }
-            // Unknown/extension record: preserve the full payload as a
-            // custom entry (custom_type = the original record type; all
-            // non-structural fields kept as data).
-            if matches!(indexed.kind, IndexKind::Other) {
-                let record_type = json_str(&value, "type").unwrap_or("unknown");
-                let mut payload = value.clone();
-                if let Some(obj) = payload.as_object_mut() {
-                    obj.remove("type");
-                    obj.remove("id");
-                    obj.remove("parentId");
-                    obj.remove("timestamp");
+            // Records that cannot materialize as a typed SessionEntry —
+            // unknown/extension types, and payloads that no longer fit
+            // the typed schema — are preserved as custom entries with
+            // their full payload: no silent data loss, and one bad record
+            // never aborts the migration (upstream passes payloads
+            // through verbatim).
+            let entry = if matches!(indexed.kind, IndexKind::Other) {
+                None
+            } else {
+                match parse_retained_entry(&value) {
+                    Some(entry) => Some(entry),
+                    None => {
+                        // Best effort: a record some compaction tail needs
+                        // still contributes its raw message payload.
+                        if index.required_tail_message_ids.contains(&legacy_id)
+                            && let Some(raw_message) = value.pointer("/message").cloned()
+                            && let Ok(message) = serde_json::from_value::<AgentMessage>(raw_message)
+                        {
+                            tail_cache.insert(legacy_id.clone(), message);
+                        }
+                        None
+                    }
                 }
-                let timestamp = json_str(&value, "timestamp")
-                    .and_then(iso_to_millis)
-                    .unwrap_or(created_at);
-                let v4_entry = V4Entry::Custom {
-                    base: V4EntryBase {
-                        id: indexed.mapped_id.clone().ok_or_else(|| {
-                            V4Error::MissingLegacyReference(indexed.legacy_id.clone())
-                        })?,
-                        parent_id: index.resolve(indexed.parent_id.as_deref())?,
-                        seq: indexed.seq,
-                        timestamp,
-                    },
-                    custom_type: record_type.to_string(),
-                    data: Some(payload),
-                };
-                out.write_all(render_out_line(&V4Write::Entry { entry: v4_entry })?.as_bytes())?;
-                out.write_all(b"\n")?;
-                report.retained_entries += 1;
-                continue;
-            }
-            let entry = parse_retained_entry(value, path, line_number)?;
-            if index.required_tail_message_ids.contains(&legacy_id)
-                && let Some(message) = project_context_message(&entry, &index, path, line_number)?
-            {
-                tail_cache.insert(legacy_id.clone(), message);
-            }
-            let v4_entry =
-                materialize_entry(&entry, indexed, &index, &tail_cache, path, line_number)?;
+            };
+            let v4_entry = match &entry {
+                Some(entry) => {
+                    if index.required_tail_message_ids.contains(&legacy_id)
+                        && let Some(message) =
+                            project_context_message(entry, &index, last_timestamp)?
+                    {
+                        tail_cache.insert(legacy_id.clone(), message);
+                    }
+                    materialize_entry(entry, indexed, &index, &tail_cache, last_timestamp)?
+                }
+                None => payload_preserving_entry(&value, indexed, &index, last_timestamp)?,
+            };
+            last_timestamp = v4_entry.base().timestamp;
             out.write_all(render_out_line(&V4Write::Entry { entry: v4_entry })?.as_bytes())?;
             out.write_all(b"\n")?;
             report.retained_entries += 1;
@@ -987,10 +1080,7 @@ pub fn migrate_v3_to_v4(path: &Path) -> Result<V4MigrationReport, V4Error> {
 
     // Publish over the original (temp + rename, same-directory).
     let result = write_result.and_then(|()| {
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            std::fs::remove_file(path)?;
-            std::fs::rename(&tmp, path).map_err(|_| V4Error::Io(e))?;
-        }
+        rename_over(&tmp, path)?;
         set_file_private(path);
         if let Some(parent) = path.parent()
             && let Ok(dir) = std::fs::File::open(parent)
@@ -1006,19 +1096,76 @@ pub fn migrate_v3_to_v4(path: &Path) -> Result<V4MigrationReport, V4Error> {
     Ok(report)
 }
 
+/// Atomically replace `path` with the staged `tmp` file.
+#[cfg(not(windows))]
+fn rename_over(tmp: &Path, path: &Path) -> Result<(), V4Error> {
+    // POSIX rename over an existing file is atomic; a failure leaves the
+    // original untouched (and the staged tmp is cleaned up by the caller).
+    std::fs::rename(tmp, path)?;
+    Ok(())
+}
+/// Atomically replace `path` with the staged `tmp` file.
+#[cfg(windows)]
+fn rename_over(tmp: &Path, path: &Path) -> Result<(), V4Error> {
+    if let Err(e) = std::fs::rename(tmp, path) {
+        // Windows cannot rename over an existing file: remove the
+        // original, then retry. The `.bak` copy made before pass 2 keeps
+        // this (tiny) crash window recoverable.
+        std::fs::remove_file(path)?;
+        std::fs::rename(tmp, path).map_err(|_| V4Error::Io(e))?;
+    }
+    Ok(())
+}
+
+/// Build a payload-preserving custom entry for a record that cannot
+/// materialize as a typed entry (unknown/extension record types, and
+/// records whose payload fails the typed schema): `custom_type` is the
+/// original record type and every non-structural field is kept in `data`.
+fn payload_preserving_entry(
+    value: &Value,
+    indexed: &IndexEntry,
+    index: &MigrationIndex,
+    fallback_ts: u64,
+) -> Result<V4Entry, V4Error> {
+    let record_type = json_str(value, "type").unwrap_or("unknown");
+    let mut payload = value.clone();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.remove("type");
+        obj.remove("id");
+        obj.remove("parentId");
+        obj.remove("timestamp");
+    }
+    let timestamp = json_str(value, "timestamp")
+        .and_then(lenient_timestamp_millis)
+        .unwrap_or(fallback_ts);
+    Ok(V4Entry::Custom {
+        base: V4EntryBase {
+            id: indexed
+                .mapped_id
+                .clone()
+                .ok_or_else(|| V4Error::MissingLegacyReference(indexed.legacy_id.clone()))?,
+            parent_id: index.resolve(indexed.parent_id.as_deref())?,
+            seq: indexed.seq,
+            timestamp,
+        },
+        custom_type: record_type.to_string(),
+        data: Some(payload),
+    })
+}
+
 /// Parse a retained record into a `SessionEntry` (pass 2 only decodes
 /// retained records — discarded payloads are never materialized).
-fn parse_retained_entry(value: Value, path: &Path, line: usize) -> Result<SessionEntry, V4Error> {
-    let mut value = value;
+/// `None` when the payload no longer fits the typed schema; the caller
+/// preserves it as a payload-carrying custom entry instead of aborting
+/// the migration (mirrors `SessionLine::Unknown`'s preserve-don't-crash
+/// rule and upstream's verbatim pass-through).
+fn parse_retained_entry(value: &Value) -> Option<SessionEntry> {
+    let mut value = value.clone();
     if value.get("type").and_then(Value::as_str) == Some("message")
         && let Some(message) = value.get_mut("message")
         && message.get("role").and_then(Value::as_str) == Some("hookMessage")
     {
         message["role"] = Value::String("custom".to_string());
     }
-    serde_json::from_value(value).map_err(|e| V4Error::CorruptLine {
-        path: path.to_path_buf(),
-        line,
-        reason: format!("invalid retained v3 record: {e}"),
-    })
+    serde_json::from_value(value).ok()
 }

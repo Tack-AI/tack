@@ -525,7 +525,8 @@ pub fn scan_v4_file_summary(content: &str) -> Option<V4FileSummary> {
         // parse and are rejected by the match below.)
         let has_user_msg =
             line.contains("\"role\":\"user\"") || line.contains("\"role\": \"user\"");
-        let has_session_name = line.contains(NS_SESSION_NAME);
+        let has_session_name =
+            line.contains(NS_SESSION_NAME) || line.contains(crate::fork_policy::PI_SESSION_NAME);
         let has_session_info = line.contains("\"customType\":\"session_info\"")
             || line.contains("\"customType\": \"session_info\"");
         if !has_user_msg && !has_session_name && !has_session_info {
@@ -562,12 +563,16 @@ pub fn scan_v4_file_summary(content: &str) -> Option<V4FileSummary> {
                         V4ValueOp::Set {
                             namespace, value, ..
                         },
-                } if namespace == NS_SESSION_NAME => {
+                } if namespace == NS_SESSION_NAME
+                    || namespace == crate::fork_policy::PI_SESSION_NAME =>
+                {
                     summary.session_name = value.as_str().map(str::to_string);
                 }
                 V4Write::Value {
                     op: V4ValueOp::Delete { namespace, .. },
-                } if namespace == NS_SESSION_NAME => {
+                } if namespace == NS_SESSION_NAME
+                    || namespace == crate::fork_policy::PI_SESSION_NAME =>
+                {
                     summary.session_name = None;
                 }
                 _ => {}
@@ -621,12 +626,16 @@ pub fn scan_v4_file_content(content: &str) -> Option<V4FileScan> {
                         V4ValueOp::Set {
                             namespace, value, ..
                         },
-                } if namespace == NS_SESSION_NAME => {
+                } if namespace == NS_SESSION_NAME
+                    || namespace == crate::fork_policy::PI_SESSION_NAME =>
+                {
                     scan.session_name = value.as_str().map(str::to_string);
                 }
                 V4Write::Value {
                     op: V4ValueOp::Delete { namespace, .. },
-                } if namespace == NS_SESSION_NAME => {
+                } if namespace == NS_SESSION_NAME
+                    || namespace == crate::fork_policy::PI_SESSION_NAME =>
+                {
                     scan.session_name = None;
                 }
                 _ => {}

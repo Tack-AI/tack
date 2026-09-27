@@ -47,7 +47,10 @@ pub struct BashExecutionMessage {
 #[serde(rename_all = "camelCase")]
 pub struct BranchSummaryMessage {
     pub summary: String,
-    pub from_id: String,
+    /// Entry the summary branches from; `None` is the tree root (v4/
+    /// upstream wire shape — the v3 entry-level "root" sentinel is mapped
+    /// to `None` at the projection boundary).
+    pub from_id: Option<String>,
     pub timestamp: u64,
 }
 

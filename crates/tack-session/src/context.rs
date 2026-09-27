@@ -77,7 +77,9 @@ pub fn session_entry_to_context_messages(entry: &SessionEntry) -> Vec<AgentMessa
         } => {
             vec![AgentMessage::BranchSummary(BranchSummaryMessage {
                 summary: summary.clone(),
-                from_id: from_id.clone(),
+                // The v3 entry-level "root" sentinel maps to a null fromId
+                // (v4/upstream wire shape).
+                from_id: (from_id != "root").then(|| from_id.clone()),
                 timestamp: iso_to_millis(timestamp).unwrap_or(0),
             })]
         }

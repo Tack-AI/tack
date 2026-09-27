@@ -23,6 +23,29 @@ pub const PREFIX_OPERATION: &str = "tack.op.";
 /// Pending/deferred-write state prefix (never forked).
 pub const PREFIX_PENDING: &str = "tack.pending.";
 
+// Upstream TS pi reserved namespaces (same layout under `pi.*`). Tack
+// never WRITES these, but a pi-written session can be opened and forked
+// through tack: the fork classifier gives them upstream's own semantics
+// (`fork-policy.ts`) so a forked pi session stays a clean pi session —
+// runtime/operation state never crosses a fork and lane state resets to
+// idle. The read-side fallback for pi sessions lives in `V4Store`.
+/// Upstream session display name (scalar, key "").
+pub const PI_SESSION_NAME: &str = "pi.session.name";
+/// Upstream entry labels, keyed by entry id.
+pub const PI_ENTRY_LABEL: &str = "pi.entry.label";
+/// Upstream branch tips, keyed by branch name.
+pub const PI_BRANCH_TIP: &str = "pi.branch.tip";
+/// Upstream lane configurations, keyed by lane name.
+pub const PI_LANE_CONFIG: &str = "pi.lane.config";
+/// Upstream lane operation states, keyed by lane name.
+pub const PI_LANE_STATE: &str = "pi.lane.state";
+/// Upstream terminal operation result records (never forked).
+const PI_OPERATION_RESULT: &str = "pi.result";
+/// Upstream open-operation state prefix (never forked).
+const PI_PREFIX_OPERATION: &str = "pi.op.";
+/// Upstream pending/deferred-write state prefix (never forked).
+const PI_PREFIX_PENDING: &str = "pi.pending.";
+
 /// Errors raised by fork planning and namespace projection.
 #[derive(Debug, thiserror::Error)]
 pub enum ForkPolicyError {
@@ -190,6 +213,7 @@ pub fn select_branch_fork(
 ///   value is always replaced with fresh idle state.
 /// * `tack.result`, `tack.op.*`, `tack.pending.*` → excluded, both scopes.
 /// * the exact namespace `tack` or any other `tack.*` → the fork FAILS.
+/// * upstream `pi.*` namespaces → the same rules under the `pi` prefix.
 /// * anything else (application state) → tree: copied; branch: excluded.
 pub fn project_fork_current_state_write(
     write: &ForkStateWrite,
@@ -249,6 +273,64 @@ pub fn project_fork_current_state_write(
         return Ok(None);
     }
     if namespace == "tack" || namespace.starts_with("tack.") {
+        return Err(ForkPolicyError::UnknownReservedNamespace(
+            namespace.to_string(),
+        ));
+    }
+    // Upstream `pi.*` reserved namespaces: identical semantics under the
+    // upstream prefix (see the constants block above).
+    match namespace {
+        PI_SESSION_NAME => return Ok(Some(write.clone())),
+        PI_ENTRY_LABEL => {
+            return Ok(if is_entry_copied(write.key()) {
+                Some(write.clone())
+            } else {
+                None
+            });
+        }
+        PI_BRANCH_TIP => {
+            return Ok(match plan {
+                ForkCurrentStatePlan::Tree => Some(write.clone()),
+                ForkCurrentStatePlan::Branch {
+                    branch,
+                    destination_tip,
+                } if write.key() == branch => {
+                    let tip = match destination_tip {
+                        Some(tip) => Value::String(tip.clone()),
+                        None => Value::Null,
+                    };
+                    Some(write.clone().with_value(tip))
+                }
+                ForkCurrentStatePlan::Branch { .. } => None,
+            });
+        }
+        PI_LANE_CONFIG => {
+            return Ok(match plan {
+                ForkCurrentStatePlan::Tree => Some(write.clone()),
+                ForkCurrentStatePlan::Branch { branch, .. } if write.key() == branch => {
+                    Some(write.clone())
+                }
+                ForkCurrentStatePlan::Branch { .. } => None,
+            });
+        }
+        PI_LANE_STATE => {
+            return Ok(match plan {
+                ForkCurrentStatePlan::Tree => {
+                    Some(write.clone().with_value(idle_lane_state_value()))
+                }
+                ForkCurrentStatePlan::Branch { branch, .. } if write.key() == branch => {
+                    Some(write.clone().with_value(idle_lane_state_value()))
+                }
+                ForkCurrentStatePlan::Branch { .. } => None,
+            });
+        }
+        PI_OPERATION_RESULT => return Ok(None),
+        _ => {}
+    }
+    if namespace.starts_with(PI_PREFIX_OPERATION) || namespace.starts_with(PI_PREFIX_PENDING) {
+        return Ok(None);
+    }
+    if namespace == "pi" || namespace.starts_with("pi.") {
         return Err(ForkPolicyError::UnknownReservedNamespace(
             namespace.to_string(),
         ));
@@ -424,6 +506,81 @@ mod tests {
                     "{ns} on {plan:?}: {err:?}"
                 );
             }
+        }
+    }
+
+    /// Upstream `pi.*` rows get upstream fork semantics: operation and
+    /// pending state never crosses a fork, lane state resets to idle,
+    /// tips rewrite on branch scope, unknown pi namespaces fail closed.
+    #[test]
+    fn upstream_pi_namespaces_follow_upstream_rules() {
+        for ns in [
+            "pi.result",
+            "pi.op.meta",
+            "pi.op.state",
+            "pi.pending.entry",
+            "pi.pending.assistant_frame",
+        ] {
+            for plan in [branch_plan(), ForkCurrentStatePlan::Tree] {
+                let out =
+                    project_fork_current_state_write(&set(ns, "k", Value::Null), &plan, &|_| true)
+                        .unwrap();
+                assert!(out.is_none(), "{ns} must be excluded on {plan:?}");
+            }
+        }
+
+        // Lane state resets to idle on both scopes.
+        let busy = serde_json::json!({
+            "currentOperationId": "op-1",
+            "lastOperationId": "op-0",
+            "inbox": [{"entryId": "e1", "kind": "steer"}],
+        });
+        let write = set("pi.lane.state", "main", busy);
+        for plan in [branch_plan(), ForkCurrentStatePlan::Tree] {
+            let out = project_fork_current_state_write(&write, &plan, &|_| true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(out, set("pi.lane.state", "main", idle_lane_state_value()));
+        }
+
+        // Branch tip rewrites to the destination tip on branch scope.
+        let tip = set("pi.branch.tip", "main", Value::String("old".into()));
+        let out = project_fork_current_state_write(&tip, &branch_plan(), &|_| true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            out,
+            set("pi.branch.tip", "main", Value::String("tip-1".into()))
+        );
+
+        // Session name and labels follow the tack-namespace rules.
+        let name = set("pi.session.name", "", Value::String("s".into()));
+        assert!(
+            project_fork_current_state_write(&name, &branch_plan(), &|_| false)
+                .unwrap()
+                .is_some()
+        );
+        let label = set("pi.entry.label", "e1", Value::String("l".into()));
+        assert!(
+            project_fork_current_state_write(&label, &branch_plan(), &|id| id == "e1")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            project_fork_current_state_write(&label, &branch_plan(), &|_| false)
+                .unwrap()
+                .is_none()
+        );
+
+        // Unknown upstream-reserved namespaces fail closed.
+        for ns in ["pi", "pi.future.thing"] {
+            let err = project_fork_current_state_write(
+                &set(ns, "k", Value::Null),
+                &ForkCurrentStatePlan::Tree,
+                &|_| true,
+            )
+            .unwrap_err();
+            assert!(matches!(err, ForkPolicyError::UnknownReservedNamespace(_)));
         }
     }
 

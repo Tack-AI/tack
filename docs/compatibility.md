@@ -37,8 +37,10 @@ binary and its externally observable behavior.
   transaction log with a `{"kind":"header","v":4,"storage_version":1,...}`
   first line. Format constants live in
   `crates/tack-session/src/v4/types.rs` (`V4_FORMAT_VERSION = 4`,
-  `V4_STORAGE_VERSION = 1`); format decisions and deliberate divergences
-  from upstream TS pi are documented in `crates/tack-session/V4_NOTES.md`.
+  `V4_STORAGE_VERSION = 1`); the normative wire-format specification is
+  `docs/session-v4-protocol.md`, and format decisions and deliberate
+  divergences from upstream TS pi are documented in
+  `crates/tack-session/V4_NOTES.md`.
 - **Version probing** is first-line sniffing in
   `crates/tack-session/src/v4/codec.rs` (`parse_session_header`): a v4
   storage header is recognized by `kind == "header" && v == 4`; a legacy
@@ -58,9 +60,18 @@ binary and its externally observable behavior.
   (`SessionBackend::from_setting`, `crates/tack-session/src/manager.rs`).
   Opening a v4 file with the v3 backend is a hard error, not silent
   corruption (`SessionError::V4FileWithV3Backend`).
-- Unknown or future entry types are preserved as v4 *custom* entries on
-  migration rather than rejected — Tack's no-data-loss principle
-  (`crates/tack-session/src/v4_bridge.rs`).
+- **`pi.*` interoperability.** Upstream pi writes the same v4 layout under
+  the `pi.` namespace prefix. Tack never writes `pi.*`, but opening a
+  pi-written session honors its rows as read-only fallbacks (branch tip,
+  lane configuration, session name, entry labels; `tack.*` rows win once
+  present), and forks apply upstream's own projection rules to `pi.*`
+  namespaces (`crates/tack-session/src/fork_policy.rs`,
+  `crates/tack-session/src/v4/store.rs`).
+- Unknown or future entry types — and retained records whose payload no
+  longer fits the typed schema (unknown message roles, missing fields) —
+  are preserved as v4 *custom* entries on migration rather than rejected
+  or aborted — Tack's no-data-loss principle
+  (`crates/tack-session/src/v4/migrate.rs`).
 - `crates/tack-session/src/sqlite_backend.rs` is an **experimental** backend
   (`sessionBackend: "sqlite"`), not covered by the guarantees below.
 
@@ -72,7 +83,12 @@ binary and its externally observable behavior.
   remain openable. This is the strongest guarantee in this document.
 - New sessions are written in the current format only. Within a format,
   evolution is **append-only**: new entry types and new optional fields may
-  be added; existing fields never change meaning.
+  be added; existing fields never change meaning. Alignment fixes that
+  bring the wire shape closer to the documented protocol — e.g. a root
+  `branchSummary.fromId` serialized as `null` in v4 message payloads
+  (the v3 `"root"` sentinel stays confined to v3 records) — are bug
+  fixes, not format changes: files written before the fix remain
+  readable.
 - If a future v5 format is ever introduced, the v1–v4 read/migrate chain
   is extended, not replaced, and a byte-compatible write-path escape hatch
   equivalent to `sessionBackend: "v3"` ships in the same release that
