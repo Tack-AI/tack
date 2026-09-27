@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 # Edition 2024 requires rustc 1.85; no newer language features are used.
 # rust-version is only inherited by tack-protocol (the crate the CI msrv job

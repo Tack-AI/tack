@@ -4,7 +4,7 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
-## [Unreleased]
+## [1.0.3] - 2026-09-27
 
 ### Added
 
