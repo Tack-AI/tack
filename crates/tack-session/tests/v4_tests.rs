@@ -995,7 +995,8 @@ fn pi_session_continues_natively_in_tack() {
     mgr.append_model_change("anthropic", "claude-opus-4.5")
         .unwrap();
     mgr.append_thinking_level_change("high").unwrap();
-    mgr.append_message(AgentMessage::user("tack three")).unwrap();
+    mgr.append_message(AgentMessage::user("tack three"))
+        .unwrap();
     let label_entry = mgr
         .append_label_change("e1", Some("tack label".to_string()))
         .unwrap();
