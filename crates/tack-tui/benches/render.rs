@@ -3,7 +3,8 @@
 //! append-one-line streaming case.
 
 #![allow(clippy::unwrap_used)] // benches: panics are failures, keep code terse
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use std::hint::black_box;
 use tack_tui::line::{Line, Span};
 use tack_tui::screen_main::MainScreenRenderer;
 use tack_tui::style::{Color, Style};

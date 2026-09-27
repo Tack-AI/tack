@@ -4,7 +4,8 @@
 //! (CJK/emoji) inputs exercise the grapheme-segmentation slow path.
 
 #![allow(clippy::unwrap_used)] // benches: panics are failures, keep code terse
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use std::hint::black_box;
 use tack_tui::line::{Line, Span, sanitize};
 use tack_tui::style::{Color, Style};
 

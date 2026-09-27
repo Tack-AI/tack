@@ -3,7 +3,8 @@
 //! change) and the framed variant used on the socket.
 
 #![allow(clippy::unwrap_used)] // benches: panics are failures, keep code terse
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use std::hint::black_box;
 use tack_protocol::framing::{decode_payload, encode_frame, encode_payload};
 use tack_protocol::schemas::{
     AssistantContent, ModelRef, SessionPhase, SessionSnapshot, ThinkingLevel, TranscriptItem,

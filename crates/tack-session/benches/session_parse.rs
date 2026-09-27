@@ -5,7 +5,8 @@
 //! silently benchmark the cheap path).
 
 #![allow(clippy::unwrap_used)] // benches: panics are failures, keep code terse
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use std::hint::black_box;
 use tack_session::entry::SessionLine;
 
 const LONG_OUTPUT: &str = include_str!("session_parse_long_output.txt");

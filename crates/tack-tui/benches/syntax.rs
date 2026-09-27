@@ -8,7 +8,8 @@
 //! memoizes exact repeats, which would otherwise measure a cache hit.
 
 #![allow(clippy::unwrap_used)] // benches: panics are failures, keep code terse
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use std::hint::black_box;
 use tack_tui::syntax::{highlight_block, highlight_block_uncached, highlight_line};
 
 /// A real Rust source file as the large input (~900 lines).

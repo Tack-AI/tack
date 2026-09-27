@@ -4,7 +4,8 @@
 //! global action — that common path must stay cheap.
 
 #![allow(clippy::unwrap_used)] // benches: panics are failures, keep code terse
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use tack_tui::input::KeyEvent;
 use tack_tui::keys::Keybindings;
 use tack_tui::{Key, Modifiers};
