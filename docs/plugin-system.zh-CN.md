@@ -6,7 +6,9 @@
 > 协议细节分散在三份专题文档：[hooks.md](hooks.zh-CN.md)（生命周期钩子）、
 > [extensions.md](extensions.zh-CN.md)（tack-ext 子进程/WASM 插件协议）、
 > [extensions-v2.md](extensions-v2.zh-CN.md)（WASM 载体设计）。本文档把它们
-> 拼成一张全景图，并说明设计取舍。
+> 拼成一张全景图，并说明设计取舍。清零重设计方案——DX 优先的三级
+> 插件模型、schema 生成的 tack-RPC v3，以及企业级管理面——见
+> [plugin-roadmap.md](plugin-roadmap.zh-CN.md)。
 
 ## 1. 架构：一个内核，三个入口
 

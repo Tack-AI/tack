@@ -8,7 +8,9 @@
 > [extensions.md](extensions.md) (the tack-ext subprocess/WASM plugin
 > protocol), and [extensions-v2.md](extensions-v2.md) (WASM carrier
 > design). This document stitches them into one panorama and explains the
-> design trade-offs.
+> design trade-offs. The clean-slate redesign — DX-first three-level
+> plugin model, schema-generated tack-RPC v3, plus the enterprise
+> management plane — lives in [plugin-roadmap.md](plugin-roadmap.md).
 
 ## 1. Architecture: one core, three entry points
 
