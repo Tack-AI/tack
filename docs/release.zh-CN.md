@@ -111,6 +111,11 @@ curl -sL https://github.com/<owner>/<repo>/releases/download/tack-v0.9.0/SHA256S
 sha256sum tack-x86_64-unknown-linux-gnu.tar.gz   # 与上行比对
 ```
 
+最后同步 ACP registry 草稿（`assets/acp-registry/tack/agent.json`）：将
+`version` 与各 archive URL 中的 tag 更新为新版本，并用已发布
+`SHA256SUMS.txt` 中的值替换 sha256，保持草稿处于可提交状态（见
+`assets/acp-registry/README.md`）。
+
 ## 5. 故障排查
 
 | 症状 | 原因与处理 |

@@ -74,7 +74,7 @@ Line 1 must be the header object:
 
 Recognition: `kind == "header" && v == 4` and all type constraints in the
 table above hold. **Unrecognized fields must be ignored** (forward
-compatibility). The header always appears in plaintext (§10 encryption
+compatibility). The header always appears in plaintext (§9 encryption
 applies only to transaction lines).
 
 ## 4. Write Types

@@ -124,6 +124,12 @@ curl -sL https://github.com/<owner>/<repo>/releases/download/tack-v0.9.0/SHA256S
 sha256sum tack-x86_64-unknown-linux-gnu.tar.gz   # compare with the line above
 ```
 
+Finally, refresh the ACP registry draft
+(`assets/acp-registry/tack/agent.json`): bump `version` and the tag in every
+archive URL to the new release, and replace the sha256 values with the ones
+from the published `SHA256SUMS.txt`, so the draft stays submission-ready
+(see `assets/acp-registry/README.md`).
+
 ## 5. Troubleshooting
 
 | Symptom | Cause and fix |
