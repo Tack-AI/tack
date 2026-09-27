@@ -38,25 +38,31 @@ target triple 匹配当前平台，用 tag 中的版本号比较新旧，两者�
 # 1. 确认 main 分支是绿的（CI 通过、工作区干净）
 git switch main && git pull
 
-# 2. 提升版本号：编辑 Cargo.toml 的 workspace.package.version
+# 2. 本地预检，命令与 ci.yml 完全一致。tag 推送不触发 ci.yml，
+#    不打 tag 就发现不了格式/lint 问题，所以必须在本地先跑。
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+
+# 3. 提升版本号：编辑 Cargo.toml 的 workspace.package.version
 #    如 0.8.0 → 0.9.0
 
-# 3. 更新 CHANGELOG.md（用户可见的变更）
+# 4. 更新 CHANGELOG.md（用户可见的变更）
 
-# 4. 提交版本提升
+# 5. 提交版本提升
 git add Cargo.toml CHANGELOG.md
 git commit -m "release: v0.9.0"
 git push
 
-# 5. 打 tag 并推送（触发打包 workflow）
+# 6. 打 tag 并推送（触发打包 workflow）
 git tag tack-v0.9.0
 git push origin tack-v0.9.0
 ```
 
 推送 tag 后，workflow 自动执行三个阶段：
 
-1. **prepare** — 校验 tag 版本与 `Cargo.toml` 一致，创建 GitHub Release
-   （release notes 由 `--generate-notes` 自动生成，可事后在网页编辑）
+1. **prepare** — 校验 tag 版本与 `Cargo.toml` 一致、检查 CHANGELOG 条目、
+   跑 fmt + clippy 预检（快速失败，避免浪费 6 平台并行构建），创建 GitHub
+   Release（release notes 由 `--generate-notes` 自动生成，可事后在网页编辑）
 2. **build** — 6 平台并行 `cargo build --release --locked --package tack-app`，
    各自打包为 tar.gz / zip
 3. **publish** — 汇总产物、生成 `SHA256SUMS.txt`，上传到 Release
@@ -108,6 +114,7 @@ sha256sum tack-x86_64-unknown-linux-gnu.tar.gz   # 与上行比对
 | 症状 | 原因与处理 |
 |---|---|
 | prepare 阶段报 "tag does not match workspace.package.version" | tag 版本号与 Cargo.toml 不一致。删 tag（`git push origin :tack-vX.Y.Z`）、改对后重打 |
+| prepare 阶段 fmt/clippy 失败 | tag 的代码未通过预检（说明发布前没跑第 2 步）。修复合并进 main 后删 tag 重打，或修复后 workflow_dispatch 重发 |
 | 某个平台 build 失败 | 单个矩阵 leg 失败不影响其他 leg（`fail-fast: false`），但 publish 会因缺产物而失败。修复后用 workflow_dispatch 重发 |
 | `tack update` 找不到资产 | 检查资产名是否与 `self_update.rs` 的 `asset_name()` 一致；Release 是否属于 `tack-v*` 系列（`/releases/latest` 接口不会被用到） |
 | macOS x86_64 leg 排队不动 | 确认用的是 `macos-15-intel` 而非已退役的 `macos-13` |

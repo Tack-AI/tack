@@ -60,6 +60,17 @@ jobs:
             echo "::error::CHANGELOG.md has no '## [$version]' entry"
             exit 1
           fi
+      # Fail fast on lint issues, before creating the release and fanning
+      # out to the 6-platform matrix: tag pushes don't trigger ci.yml, so
+      # this gate is the only automated fmt/clippy check on a release.
+      # `rustup show` installs the pinned toolchain (rust-toolchain.toml
+      # already declares the rustfmt/clippy components).
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Create draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
