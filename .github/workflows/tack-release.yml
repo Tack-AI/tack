@@ -41,7 +41,7 @@ jobs:
     permissions:
       contents: write  # gh release create
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.TAG }}
       - name: Verify tag matches workspace version
@@ -105,7 +105,7 @@ jobs:
       id-token: write      # actions/attest-build-provenance (OIDC)
       attestations: write  # actions/attest-build-provenance
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.TAG }}
       # Respect the pinned channel in rust-toolchain.toml: dtolnay/rust-toolchain

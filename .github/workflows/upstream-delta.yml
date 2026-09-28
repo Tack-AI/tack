@@ -18,7 +18,7 @@ jobs:
   report:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # UPSTREAM_REPO 用脚本默认值（https://github.com/earendil-works/pi.git），
       # 基线从 docs/upstream-alignment.md 解析。
