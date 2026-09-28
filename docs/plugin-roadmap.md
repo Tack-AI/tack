@@ -400,19 +400,32 @@ Given zero installed base:
 
 ## 11. Milestones
 
-| Phase | Deliverable | Depends on |
-|---|---|---|
-| P0 | OpenRPC schema + codegen pipeline + generated Rust types | — |
-| P1 | tack-RPC v3 host core (peer, initialize, namespaces) + `tack-ext-sdk` (Rust) | P0 |
-| P2 | TS + Python SDKs; `ext new` / `ext dev` / `ext test` / `ext inspect` | P1 |
-| P3 | Identity, load outcome, enable/disable, versioned store, atomic install/upgrade | P1 |
-| P4 | MCP server plugins (Level 2); WIT/component WASM carrier | P1 |
-| P5 | Enterprise policy (allow-lists, load-time filter, narrow-only) | P3 |
-| P6 | Distribution (curated sync, bundles, catalog v2) + observability (metrics sidecar, telemetry, doctor) | P3, P5 |
+| Phase | Deliverable | Depends on | Status |
+|---|---|---|---|
+| P0 | OpenRPC schema + codegen pipeline + generated Rust types | — | landed |
+| P1 | tack-RPC v3 host core (peer, initialize, namespaces) + `tack-ext-sdk` (Rust) | P0 | landed |
+| P2 | TS + Python SDKs; `ext new` / `ext dev` / `ext test` / `ext inspect` | P1 | landed |
+| P3 | Identity, load outcome, enable/disable, versioned store, atomic install/upgrade | P1 | landed |
+| P4 | MCP server plugins (Level 2); WIT/component WASM carrier | P1 | landed |
+| P5 | Enterprise policy (allow-lists, load-time filter, narrow-only) | P3 | — |
+| P6 | Distribution (curated sync, bundles, catalog v2) + observability (metrics sidecar, telemetry, doctor) | P3, P5 | — |
 
 P0–P2 are the DX spine and ship first — a plugin system is its
 development loop. P3–P6 make it enterprise-grade; their designs are
 unchanged by the protocol swap because they live above it.
+
+P4 landed with two deliberate deviations from the sketches above,
+recorded in [compatibility.md](compatibility.md):
+
+- **The WIT world carries JSON strings, not typed records**
+  (§6.3 sketched typed interfaces): the rpc3 data types (`ToolSpec`,
+  `ToolOutput`, `Verdict`, …) serialize as JSON strings over the
+  canonical ABI, so the OpenRPC document stays the single schema source
+  and wit-bindgen is only asked to frame strings. A typed-record world
+  can land later as `tack:plugin@0.4.0` without touching the schema.
+- **Level 2 adapts ALL MCP tool surfaces** (tools + resource meta-tools
+  + prompt tools), so plugin-attributed servers behave exactly like
+  config-file servers, including the untrusted-content defense.
 
 ## 12. Open questions
 
@@ -423,12 +436,24 @@ unchanged by the protocol swap because they live above it.
    stages; if guest async is not ready at P4, tools/hooks start
    synchronous (host keeps the 30s call timeout) and async upgrades the
    world version.
+   → **Resolved at P4**: synchronous start. `tack:plugin@0.3.0` calls
+   are blocking host→guest calls with per-call fuel, epoch, and memory
+   limits; guest async upgrades the world version when component-model
+   async is ready.
 3. **MCP elicitation ↔ `ui/*`**: whether Level 2 elicitations map onto
    the Level 3 dialog surface or stay MCP-native; leaning map (one UI
    path for users).
+   → **Resolved at P4**: MCP-native. Level-2 connections get the same
+   elicitation handling as config-file MCP servers (TUI prompts,
+   headless declines) — one UI path for users, no `ui/*` bridge.
+   Sampling stays unwired for plugin connections (no session model at
+   load time).
 4. **Widget/MCP namespacing**: keep first-wins-with-warning collisions,
    or require plugin-prefixed ids in v3? With no legacy, prefixing is
    affordable — leaning yes for MCP server names, no for widgets.
+   → **Resolved at P4**: prefixed by construction — Level-2 tools are
+   `ext__<plugin-id>__<tool>` like any other plugin tool (the in-plugin
+   names stay the server's own, sanitized and deduplicated).
 5. **Subagent inheritance**: full plugin set vs narrowed set for
    subagent sessions (Codex `SessionIsolation`); the load-outcome
    filter makes either cheap. Needs a product decision.

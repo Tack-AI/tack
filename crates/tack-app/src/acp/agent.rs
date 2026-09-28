@@ -649,6 +649,11 @@ impl Agent for TackAcpAgent {
                 crate::project_trust::is_trusted(&cwd, &agent_dir),
             ),
             self.settings.extension_lock_required,
+            crate::mcp_config::plugin_mcp_callbacks(
+                &self.settings,
+                crate::mcp_elicitation::InteractionMode::Headless,
+                None,
+            ),
         )
         .await;
 
@@ -753,6 +758,11 @@ impl Agent for TackAcpAgent {
                         crate::project_trust::is_trusted(&cwd, &agent_dir),
                     ),
                     self.settings.extension_lock_required,
+                    crate::mcp_config::plugin_mcp_callbacks(
+                        &self.settings,
+                        crate::mcp_elicitation::InteractionMode::Headless,
+                        None,
+                    ),
                 )
                 .await;
                 let mut specs =

@@ -12,7 +12,8 @@ use crate::rpc3::{
     AfterToolCallParams, BeforeToolCallParams, ContentBlock, ContentBlockKind, HookCapabilities,
     ToolCall, ToolOutput, TransformContextParams, VerdictAction,
 };
-use crate::v3::HostClient;
+use crate::v3::PluginConnection;
+use std::sync::Arc;
 
 /// How hook failures (timeout, dead plugin, malformed reply) are treated.
 /// TS extensions crash-isolate (fail-open), which stays the default;
@@ -39,7 +40,7 @@ impl FailMode {
 
 /// One v3 plugin's hook bridge (composed into the app's HooksChain).
 pub struct ExtHooks {
-    pub(crate) client: HostClient,
+    pub(crate) client: Arc<dyn PluginConnection>,
     capabilities: HookCapabilities,
     fail_mode: FailMode,
 }
@@ -53,12 +54,12 @@ impl std::fmt::Debug for ExtHooks {
 }
 
 impl ExtHooks {
-    pub fn new(client: HostClient, capabilities: HookCapabilities) -> Self {
+    pub fn new(client: Arc<dyn PluginConnection>, capabilities: HookCapabilities) -> Self {
         Self::with_fail_mode(client, capabilities, FailMode::default())
     }
 
     pub fn with_fail_mode(
-        client: HostClient,
+        client: Arc<dyn PluginConnection>,
         capabilities: HookCapabilities,
         fail_mode: FailMode,
     ) -> Self {
@@ -248,7 +249,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::rpc3::ErrorObject;
-    use crate::v3::{JsonRpcPeer, PeerHandler};
+    use crate::v3::{HostClient, JsonRpcPeer, PeerHandler};
     use serde_json::{Value, json};
     use std::sync::Arc;
 
@@ -278,7 +279,7 @@ mod tests {
         let (r2, w2) = tokio::io::split(s2);
         let client = HostClient::new(JsonRpcPeer::new(r1, w1, Arc::new(Noop)));
         let plugin = JsonRpcPeer::new(r2, w2, Arc::new(Scripted(reply)));
-        (ExtHooks::new(client, capabilities), plugin)
+        (ExtHooks::new(Arc::new(client), capabilities), plugin)
     }
 
     fn caps(before: bool, transform: bool, after: bool) -> HookCapabilities {
@@ -421,8 +422,9 @@ mod tests {
             let (r1, w1) = tokio::io::split(s1);
             let client = HostClient::new(JsonRpcPeer::new(r1, w1, Arc::new(Noop)));
             drop(s2);
-            let hooks = ExtHooks::with_fail_mode(client, caps(true, false, false), fail_mode);
-            hooks.client.peer().wait_dead().await;
+            let hooks =
+                ExtHooks::with_fail_mode(Arc::new(client), caps(true, false, false), fail_mode);
+            hooks.client.wait_dead().await;
             hooks
         }
         let model = test_model();

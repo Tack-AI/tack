@@ -13,7 +13,7 @@ pub mod host;
 pub mod peer;
 pub mod process;
 
-pub use host::HostClient;
+pub use host::{HostClient, PluginConnection, unsupported_capability};
 pub use peer::{JsonRpcPeer, PeerError, PeerHandler};
 pub use process::V3Process;
 

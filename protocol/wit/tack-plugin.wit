@@ -1,0 +1,59 @@
+// tack:plugin@0.3.0 — the WIT/component-model world for sandboxed tack
+// plugins (the WASM distribution carrier; docs/plugin-roadmap.md §6.3).
+//
+// Design notes
+// ------------
+// * Payloads are JSON strings carrying the tack-RPC v3 (rpc3) data types:
+//   the OpenRPC document `protocol/tack-rpc.openrpc.json` stays the single
+//   source of truth for the data schema — duplicating every rpc3 record as
+//   WIT records would fork it. wit-bindgen (Rust/C/Go/JS/Python) handles
+//   the string framing; the JSON layer is the guest language's serde.
+// * A component may export ANY subset of the interfaces below (the host
+//   discovers exports dynamically); the `plugin` world simply names the
+//   full surface for guest SDKs that want one world to generate against.
+// * Capability-free by construction: the world imports no WASI interfaces,
+//   so sandbox posture (no fs, no env, no network) is structural. The only
+//   ambient authority is `host.log`.
+//
+// Compatibility: this file is a versioned interface surface (see
+// docs/compatibility.md). Additive changes bump the MINOR package version
+// (guests/targets pin `tack:plugin@0.3.x`); breaking changes bump to a new
+// minor/major package directory.
+
+package tack:plugin@0.3.0;
+
+/// Host services offered to the guest.
+interface host {
+    /// Append a diagnostic log line, forwarded to the host's tracing
+    /// (`level` is a tracing level name: "error" | "warn" | "info" |
+    /// "debug" | "trace"; unknown values log at info).
+    log: func(level: string, message: string);
+}
+
+/// Tool contribution. Payloads are rpc3 JSON:
+///   list    → `ToolSpec[]`
+///   execute → in `ToolExecuteParams`, out `ToolOutput` (ok) or an error
+///             message (err — a protocol-level failure, not a tool-level
+///             `isError` result, which stays inside ToolOutput).
+interface tools {
+    /// The plugin's advertised tools (rpc3 `ToolSpec[]` JSON).
+    list: func() -> string;
+    /// Run one tool call (rpc3 `ToolExecuteParams` JSON in).
+    execute: func(call: string) -> result<string, string>;
+}
+
+/// Tool-call interception. Payloads are rpc3 JSON:
+///   before-tool-call → in `BeforeToolCallParams`, out `Verdict` (ok) or
+///   an error message (err — the host applies the plugin's `failMode`).
+interface hooks {
+    /// allow / deny / rewrite verdict for a tool call.
+    before-tool-call: func(call: string) -> result<string, string>;
+}
+
+/// The full plugin surface. Components exporting only a subset are valid
+/// plugins (a tools-only plugin exports just `tack:plugin/tools`).
+world plugin {
+    import host;
+    export tools;
+    export hooks;
+}

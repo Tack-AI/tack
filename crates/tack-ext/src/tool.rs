@@ -2,14 +2,14 @@
 //! the plugin over `tools/execute`.
 
 use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::Value;
 use tack_agent_core::{AgentTool, AgentToolResult};
 use tokio_util::sync::CancellationToken;
 
 use crate::rpc3::{ContentBlockKind, ToolExecuteParams, ToolSpec};
-use crate::v3::HostClient;
+use crate::v3::PluginConnection;
 
 /// Intern a fully-qualified tool name. `AgentTool::name` must return
 /// `&'static str`, and the naive `Box::leak` on every `ExtTool::new`
@@ -30,9 +30,14 @@ fn intern_tool_name(name: &str) -> &'static str {
 /// A plugin tool exposed to the agent loop.
 pub struct ExtTool {
     spec: ToolSpec,
-    client: HostClient,
+    client: Arc<dyn PluginConnection>,
     full_name: &'static str,
     label: String,
+    /// Prompt-injection defense for tools of MCP-carrier plugins (the
+    /// output is untrusted server data): wrap result text in
+    /// `<untrusted_content>` and flag the run for the permission layer.
+    /// None for process/WASM plugins (host-trusted code).
+    untrusted: Option<(Arc<std::sync::atomic::AtomicBool>, String)>,
 }
 
 impl std::fmt::Debug for ExtTool {
@@ -44,7 +49,7 @@ impl std::fmt::Debug for ExtTool {
 }
 
 impl ExtTool {
-    pub fn new(plugin_id: &str, spec: ToolSpec, client: HostClient) -> Self {
+    pub fn new(plugin_id: &str, spec: ToolSpec, client: Arc<dyn PluginConnection>) -> Self {
         // Provider APIs restrict tool names to [A-Za-z0-9_-]; the plugin
         // id (name@source, dots allowed) is sanitized into that charset.
         let sanitized = |s: &str| {
@@ -69,6 +74,33 @@ impl ExtTool {
             client,
             full_name,
             label,
+            untrusted: None,
+        }
+    }
+
+    /// Mark this tool's output as untrusted external content (MCP-carrier
+    /// plugins): text results are wrapped in `<untrusted_content>` tagged
+    /// with `source`, and `flag` is set so the permission layer re-prompts
+    /// for mutating follow-ups (same defense as config-file MCP tools).
+    pub fn with_untrusted(
+        mut self,
+        flag: Arc<std::sync::atomic::AtomicBool>,
+        source: String,
+    ) -> Self {
+        self.untrusted = Some((flag, source));
+        self
+    }
+
+    /// Wrap result text when the untrusted defense is wired (success AND
+    /// error results: a hostile server's error text must not enter the
+    /// conversation unwrapped either).
+    fn wrap_text(&self, text: String) -> String {
+        match &self.untrusted {
+            Some((flag, source)) => {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                format!("<untrusted_content source=\"{source}\">\n{text}\n</untrusted_content>")
+            }
+            None => text,
         }
     }
 }
@@ -125,9 +157,38 @@ impl AgentTool for ExtTool {
             text
         };
         if output.is_error.unwrap_or(false) {
-            return Err(text);
+            return Err(self.wrap_text(text));
         }
-        Ok(AgentToolResult::text(text))
+        // Image blocks flow through to the model (an MCP tool returning a
+        // screenshot must not silently degrade to "(no output)").
+        let images: Vec<tack_ai::InputContentBlock> = output
+            .content
+            .iter()
+            .filter_map(|block| match block.r#type {
+                ContentBlockKind::Image => match (&block.data, &block.mime_type) {
+                    (Some(data), Some(mime_type)) => Some(tack_ai::InputContentBlock::Image {
+                        data: data.clone(),
+                        mime_type: mime_type.clone(),
+                    }),
+                    _ => None,
+                },
+                ContentBlockKind::Text => None,
+            })
+            .collect();
+        if images.is_empty() {
+            return Ok(AgentToolResult::text(self.wrap_text(text)));
+        }
+        let mut content = vec![tack_ai::InputContentBlock::text(self.wrap_text(text))];
+        content.extend(images);
+        Ok(AgentToolResult {
+            content,
+            details: output
+                .details
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+            usage: None,
+            terminate: false,
+            added_tool_names: None,
+        })
     }
 }
 
@@ -136,7 +197,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::rpc3::{ErrorObject, ToolOutput};
-    use crate::v3::{JsonRpcPeer, PeerHandler};
+    use crate::v3::{HostClient, JsonRpcPeer, PeerHandler};
     use std::sync::Arc;
 
     /// Interning: reloading a plugin must reuse the same &'static str for
@@ -187,7 +248,7 @@ mod tests {
                 description: "probe".to_string(),
                 parameters: serde_json::json!({"type": "object"}),
             },
-            client,
+            Arc::new(client),
         );
         tool.execute(
             "call-1",

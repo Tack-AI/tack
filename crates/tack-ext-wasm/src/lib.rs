@@ -37,6 +37,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+pub mod component;
+
 use tack_ext::v3::{HostClient, JsonRpcPeer, PeerHandler};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf};
 use wasmtime::{CallHook, Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};

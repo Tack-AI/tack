@@ -19,4 +19,4 @@ pub use hooks::{ExtHooks, FailMode};
 pub use plugin_id::PluginId;
 pub use provider_events::{EventSink, ExtNotifyProvider};
 pub use tool::ExtTool;
-pub use v3::{HostClient, JsonRpcPeer, PeerError, PeerHandler, V3Process};
+pub use v3::{HostClient, JsonRpcPeer, PeerError, PeerHandler, PluginConnection, V3Process};

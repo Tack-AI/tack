@@ -8,6 +8,9 @@ The examples moved with the plugin system redesign (tack-RPC v3, see
 - **TypeScript / Python SDKs**: `sdk/typescript`, `sdk/python`.
 - **WASM carrier (hand-written WAT protocol references)**: the
   `hello-wasm/` and `hello-wasm-caps/` directories here.
+- **WIT component carrier**: `hello-component/` — a hand-written
+  component-WAT plugin driven via `tack:plugin@0.3.0` exports (see
+  `protocol/wit/tack-plugin.wit`).
 - **Scaffolding**: `tack ext new <dir> <rust|ts|python>` generates a
   starter plugin; `tack ext inspect|dev|test` drives it.
 

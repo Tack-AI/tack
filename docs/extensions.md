@@ -15,10 +15,10 @@
 | Level | Form | Best for |
 |---|---|---|
 | **1 — declarative bundle** | `extension.json` + hooks/MCP/skills files, no code | guardrails, context, tool wiring |
-| **2 — MCP server plugin** | `extension.json` declaring MCP servers | tool contribution from the MCP ecosystem |
+| **2 — MCP server plugin** | `extension.json` with `carrier: "mcp"` declaring one MCP server | tool contribution from the MCP ecosystem, with plugin identity |
 | **3 — tack-RPC plugin** | process or WASM-carrier executable speaking tack-RPC v3 | interception, lifecycle, widgets, session control, approval, config, metrics |
 
-Level 3 is what this document covers. Plugins are built with an SDK
+Level 3 is what most of this document covers. Plugins are built with an SDK
 (Rust `tack-ext-sdk`, `@tack/plugin` for TypeScript, `tack-plugin` for
 Python) — plugin code never sees a JSON-RPC envelope. Scaffold one with
 `tack ext new <dir> <rust|ts|python>`.
@@ -32,8 +32,14 @@ Python) — plugin code never sees a JSON-RPC envelope. Scaffold one with
   "command": "node",                   // process carrier: executable to spawn
   "args": ["plugin.js"],               // path-like entries resolve against the ext dir
   "env": { "FOO": "bar" },             // explicit env (sensitive host vars are stripped)
-  "carrier": "process",                // "process" (default) | "wasm"
-  "module": "plugin.wat",              // wasm carrier: module file (.wasm/.wat)
+  "carrier": "process",                // "process" (default) | "wasm" | "mcp"
+  "module": "plugin.wat",              // wasm carrier: module file (.wasm/.wat,
+                                       //   core module or WIT component — auto-detected)
+  "mcpServer": {                       // mcp carrier (Level 2): ONE MCP server entry
+    "command": "node",                 //   (same shape as an mcp.json server:
+    "args": ["server.js"],             //   command/args/env, or url/headers/type/oauth)
+    "env": { "DEBUG": "1" }
+  },
   "limits": { "maxFuel": 100000000, "maxMemoryBytes": 16777216, "maxExecutionMs": 60000 },
   "capabilities": {                    // wasm carrier: explicit sandbox grants
     "fs": [{ "host": "data", "guest": "/data", "access": "read-only" }],
@@ -49,6 +55,71 @@ Python) — plugin code never sees a JSON-RPC envelope. Scaffold one with
 
 A bundle-only manifest (no `command`/`module`) is legal: it contributes
 declarative resources without running a plugin process.
+
+## 2.1 Level 2: MCP server plugins (`carrier: "mcp"`)
+
+A Level-2 plugin's `extension.json` declares exactly one MCP server — the
+server **is** the plugin; no tack-RPC process is ever spawned. Any
+existing MCP server qualifies (stdio, Streamable HTTP, or legacy SSE,
+same entry shape as `mcp.json`). The host connects at load time and
+adapts the probe into the plugin model:
+
+- **Capabilities**: the server's tools become the plugin's advertised
+  tools; when it has resources, `list_resources` / `read_resource`
+  meta-tools join; its prompts join as `prompt__<name>` tools — the same
+  surfaces as config-file MCP servers.
+- **Identity**: agent-facing tool names are `ext__<plugin-id>__<tool>`
+  (the plugin-id prefix is sanitized); attribution, `ext list`, policy,
+  and hook interception treat them exactly like any other plugin tool.
+  Interception is uniform: another plugin's `hooks/beforeToolCall` sees
+  these calls like any other.
+- **Untrusted-content defense**: tool results are wrapped in
+  `<untrusted_content>` and set the session's untrusted flag (permission
+  elevation), identical to config-file MCP tools.
+- **stdio resolution**: the server runs with the extension directory as
+  cwd; a path-like relative `command` (containing `/` or starting with
+  `.`) resolves against it. Arguments are never rewritten (npm package
+  names like `@scope/pkg` contain `/` but are not paths).
+- **Sampling / elicitation**: elicitation follows the run mode (TUI
+  prompts, headless modes decline). Sampling is **not** wired for plugin
+  connections — the session model does not exist at load time — so a
+  server's sampling request gets method-not-found (documented Level-2
+  limitation).
+- **Failure as data**: a server that fails to connect or probe lands in
+  `ext list` with its error (`LoadedPlugin.error`), like any other
+  plugin. Shutdown cancels the connection (server child killed).
+
+Capabilities MCP cannot express (hooks, widgets, session control, …)
+are never declared; a host bug calling one gets
+`ERR_CAPABILITY_NOT_GRANTED`.
+
+## 2.2 WASM carriers: WASI stdio and WIT component
+
+`carrier: "wasm"` covers two module formats, auto-detected from the
+module bytes (or the `(component` text form):
+
+- **WASI-stdio core module** (the debug carrier): the plugin speaks the
+  same tack-RPC v3 NDJSON protocol over WASI stdin/stdout; host-side it
+  shares the JSON-RPC peer with the process carrier. Manifest
+  `capabilities` (fs preopens, env, args) are honored here.
+- **WIT component** (the distribution carrier, `tack:plugin@0.3.0` —
+  [`protocol/wit/tack-plugin.wit`](../protocol/wit/tack-plugin.wit)):
+  the component exports `tack:plugin/tools` and/or `tack:plugin/hooks`
+  with JSON-string payloads carrying the rpc3 data types (the OpenRPC
+  schema stays the single source of truth; wit-bindgen handles the
+  string framing in any guest language). The world imports no WASI
+  interfaces — the sandbox (no fs, no env, no network) is structural,
+  and WASI capability grants are ignored with a warning. Calls are
+  synchronous in 0.3.0 (per-call fuel, wall-clock, and memory limits,
+  same ceilings as the stdio carrier); a trapping call kills the plugin.
+
+The component's capability list is probed at spawn: `tools.list` (rpc3
+`ToolSpec[]` JSON) plus the presence of `hooks.before-tool-call`.
+Subsets are valid plugins — a hooks-only component exports just
+`tack:plugin/hooks`. See
+[`examples/extensions/hello-component/`](../examples/extensions/hello-component/)
+for a hand-written component-WAT reference (guest SDKs come from
+wit-bindgen toolchains, not from us).
 
 ## 3. Identity, store, enable/disable
 
@@ -213,7 +284,11 @@ learns the mode and the available surfaces from the initialize payload's
 - **Credential hygiene**: sensitive host env vars are stripped from
   plugin children unless the manifest re-declares them.
 - **WASM sandbox**: no preopens/env/network by default; capability
-  grants are explicit and audit-logged.
+  grants are explicit and audit-logged. WIT component plugins are
+  capability-free by construction (the world has no WASI).
+- **Untrusted content**: MCP tool results (config-file servers and
+  Level-2 MCP plugins alike) are wrapped and flagged for the permission
+  layer.
 - **Supply chain**: commit pinning + drift skip, ed25519 catalog
   signatures, atomic installs.
 - **Fail-open hooks**: hook failures warn and let the call through

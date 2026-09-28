@@ -146,20 +146,35 @@ v2 锁定并做漂移检查。`plugins."<id>".enabled` 不卸载即可禁用；
 `is_active()` 过滤——坏插件出现在 `ext list`/doctor 中，而不是带
 着一行日志消失（Codex 的 `PluginLoadOutcome` 模式）。
 
-### 3.3 两种载体
+### 3.3 载体
 
-| | process（默认） | wasm |
-|---|---|---|
-| 插件形态 | 任意可执行体 | WASI p1 模块（`.wasm`/`.wat`） |
-| 协议 | **stdio 上的 tack-RPC v3**（同一 schema） | 相同 |
-| 隔离 | 进程边界 | wasmtime 沙箱：无文件系统/网络/环境变量 |
-| 资源限制 | 无（信任门控） | fuel + epoch 墙钟 + 内存硬上限（manifest `limits`，宿主钳制） |
-| 能力授权 | —（进程天然全权限） | manifest `capabilities` 显式声明：fs preopen（ro/rw）、env（字面量或宿主透传）、args；加载时记审计日志 |
+| | process（默认） | wasm（WASI stdio） | wasm（WIT component） |
+|---|---|---|---|
+| 插件形态 | 任意可执行体 | WASI p1 模块（`.wasm`/`.wat`） | 组件模型二进制/文本 |
+| 协议 | **stdio 上的 tack-RPC v3**（同一 schema） | 相同 | `tack:plugin@0.3.0` 导出，JSON 字符串载荷（rpc3 类型） |
+| 隔离 | 进程边界 | wasmtime 沙箱：无文件系统/网络/环境变量 | 结构性：world 完全不导入 WASI |
+| 资源限制 | 无（信任门控） | fuel + epoch 墙钟 + 内存硬上限（manifest `limits`，宿主钳制） | 相同上限，按每次调用 |
+| 能力授权 | —（进程天然全权限） | manifest `capabilities` 显式声明：fs preopen（ro/rw）、env（字面量或宿主透传）、args；加载时记审计日志 | —（授权仅限 WASI，被忽略并记警告） |
 
-两种载体共享同一个 `JsonRpcPeer`（传输层抽象为
+process 与 WASI-stdio 载体共享同一个 `JsonRpcPeer`（传输层抽象为
 AsyncRead/AsyncWrite）：握手、超时、取消、死插件 fail-fast 语义完全
-一致。示例：[`examples/extensions/hello-wasm/`](../examples/extensions/hello-wasm/)
-（手写 WAT 的 v3 协议参考实现）。
+一致。component 载体则通过类型化 WIT 调用（而非线上协议）实现相同
+的宿主→插件表面（`PluginConnection`）。示例：
+[`examples/extensions/hello-wasm/`](../examples/extensions/hello-wasm/)
+（手写 WAT 的 v3 协议参考实现）、
+[`examples/extensions/hello-component/`](../examples/extensions/hello-component/)
+（手写 component-WAT 参考实现）。
+
+### 3.4 Level 2：MCP server 插件
+
+扩展可以完全不走 tack-RPC：`carrier: "mcp"` 加上一个 `mcpServer`
+条目让一个 MCP 服务器**成为插件**（见
+[extensions.md](extensions.zh-CN.md) §2.1）。
+宿主在加载时连接，把 tools/resources/prompts 以插件的身份适配进插
+件的能力列表（归因、策略、拦截与 untrusted-content 防御都统一适
+用），并从不启动 tack-RPC 进程。这是 process/WASM 之外的第三个载
+体家族：同样的加载结果模型、同样的 `PluginConnection` 表面，底下
+是 MCP。
 
 ## 4. 分发：bundle + marketplace
 
@@ -267,5 +282,5 @@ tack ext marketplace remove acme
   但不跑 shell hooks）
 - 热重载（插件工具/hooks 在会话启动时织入 agent loop，热替换成本远超
   收益；用 `ext install` + 重启代替）
-- WIT/组件 WASM 载体与 MCP server 插件（路线图 P4）、企业策略（P5）、
-  指标 sidecar 与分发同步（P6）
+- 企业策略（P5）、指标 sidecar 与分发同步（P6）——Level-2 MCP server
+  插件与 WIT/组件 WASM 载体（P4）已落地，见 §3.3/§3.4

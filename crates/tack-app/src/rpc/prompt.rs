@@ -57,12 +57,13 @@ pub(crate) async fn spawn_prompt(
     };
 
     let agent_dir = tack_session::default_agent_dir();
-    // tack-ext plugin contributions, collected once per prompt run.
-    let (ext_tools, ext_hooks, ext_mcp_servers, ext_bundle_hooks) = {
+    // tack-ext plugin contributions, collected once per prompt run (the
+    // tools themselves join below, where the untrusted-content flag is
+    // available).
+    let (ext_hooks, ext_mcp_servers, ext_bundle_hooks) = {
         let state_guard = state.lock().await;
         let extensions = state_guard.extensions.lock().await;
         (
-            extensions.tools(),
             extensions.hooks(),
             extensions.bundle_mcp_servers.clone(),
             extensions.bundle_hooks.clone(),
@@ -162,8 +163,13 @@ pub(crate) async fn spawn_prompt(
             &connections,
             Some(services.untrusted_seen.clone()),
         ));
-        // tack-ext plugin tools (ext__<plugin>__<tool>).
-        tools.extend(ext_tools);
+        // tack-ext plugin tools (ext__<plugin>__<tool>); MCP-carrier
+        // plugins get the untrusted-content defense.
+        tools.extend({
+            let state_guard = state.lock().await;
+            let extensions = state_guard.extensions.lock().await;
+            extensions.tools_with_untrusted(Some(services.untrusted_seen.clone()))
+        });
         crate::cli_flags::filter_feature_tools(tools, &settings.features)
     };
     let (tools, tool_pool) =

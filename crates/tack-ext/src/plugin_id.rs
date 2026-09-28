@@ -4,7 +4,9 @@
 //! by construction — the versioned store layout relies on this. Reserved
 //! sources: `user` (installed without a marketplace), `project`
 //! (`.pi/extensions`), `local` (`extensionPaths` checkouts), `mcp`
-//! (Level-2 MCP server plugins).
+//! (reserved for MCP servers lifted into the plugin model from MCP
+//! config; unused today — Level-2 MCP server plugins carry their
+//! discovery source like any other plugin).
 
 use std::fmt;
 use std::str::FromStr;

@@ -704,8 +704,12 @@ impl TuiApp {
         tools.push(Arc::new(
             crate::session_search_tool::SessionSearchTool::new(self.agent_dir.clone()),
         ));
-        // tack-ext: plugin tools join the tool set (MCP-style proxies).
-        tools.extend(self.extensions.tools());
+        // tack-ext: plugin tools join the tool set (MCP-style proxies);
+        // MCP-carrier plugins get the untrusted-content defense.
+        tools.extend(
+            self.extensions
+                .tools_with_untrusted(Some(services.untrusted_seen.clone())),
+        );
         // MCP server specs are resolved here (cheap config read); the
         // connections themselves are established INSIDE the spawned run
         // task (see below) — subprocess spawn + handshake + OAuth on a

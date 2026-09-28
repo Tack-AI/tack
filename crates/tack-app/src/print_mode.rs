@@ -431,6 +431,11 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
             crate::project_trust::is_trusted(&options.cwd, &agent_dir),
         ),
         settings.extension_lock_required,
+        crate::mcp_config::plugin_mcp_callbacks(
+            &settings,
+            crate::mcp_elicitation::InteractionMode::Headless,
+            None,
+        ),
     )
     .await;
     hooks_cfg.extend(extensions.bundle_hooks.clone());
@@ -514,8 +519,9 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
             &connections,
             Some(services.untrusted_seen.clone()),
         ));
-        // tack-ext plugin tools (ext__<plugin>__<tool>).
-        tools.extend(extensions.tools());
+        // tack-ext plugin tools (ext__<plugin>__<tool>); MCP-carrier
+        // plugins get the untrusted-content defense.
+        tools.extend(extensions.tools_with_untrusted(Some(services.untrusted_seen.clone())));
         let filtered = crate::cli_flags::filter_tools(tools, flags);
         let filtered = crate::cli_flags::filter_feature_tools(filtered, &settings.features);
         // settings.defaultTools: built-in tool allowlist (MCP tools

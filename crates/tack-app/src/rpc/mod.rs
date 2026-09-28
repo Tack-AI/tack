@@ -251,6 +251,11 @@ pub async fn run_rpc(
             crate::project_trust::is_trusted(&cwd, &agent_dir),
         ),
         settings.extension_lock_required,
+        crate::mcp_config::plugin_mcp_callbacks(
+            &settings,
+            crate::mcp_elicitation::InteractionMode::Headless,
+            None,
+        ),
     )
     .await;
     // Provider-boundary lifecycle events for subscribed plugins.

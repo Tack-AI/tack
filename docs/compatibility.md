@@ -198,6 +198,22 @@ in `docs/upstream-alignment.md` (§5).
   on the next install/upgrade. The legacy flat `extensions/<name>/`
   layout keeps loading as `name@user`; new installs land in the versioned
   store (`extensions/store/<source>/<name>/<version>/`).
+- **Level-2 MCP server plugins** (`extension.json` `carrier: "mcp"` +
+  one `mcpServer` entry, same shape as `mcp.json`): the host connects to
+  the declared MCP server (stdio / Streamable HTTP / legacy SSE) and
+  adapts its tools, resource meta-tools, and prompt tools into the
+  plugin's capability list. No tack-RPC wire change: the adaptation is
+  host-internal (`PluginConnection`), and plugin policy/interception
+  treat the tools exactly like tack-RPC plugin tools.
+- **WIT component WASM carrier** (`carrier: "wasm"`, auto-detected from
+  the module format): components export `tack:plugin/tools` and/or
+  `tack:plugin/hooks` from
+  [`protocol/wit/tack-plugin.wit`](../protocol/wit/tack-plugin.wit)
+  (`tack:plugin@0.3.0`). Payloads are JSON strings carrying the rpc3
+  types — the OpenRPC document stays the single schema source. The WIT
+  package version is the contract's version handle (additive = minor
+  bump; breaking = new package version). The WASI-stdio core-module
+  carrier remains supported as the debug carrier.
 
 **Commitment.**
 
@@ -207,6 +223,11 @@ in `docs/upstream-alignment.md` (§5).
 - A breaking wire change bumps the major protocol version and follows
   §4.3; the semver handshake (same major, peer minor ≤ host minor) is the
   compatibility mechanism and must keep working for mixed-version pairs.
+- The WIT package follows the same additive rule within
+  `tack:plugin@0.x`: new interfaces or new functions on `host` are
+  additive (guests export subsets, and imports they don't use are not
+  required); removing or retyping an export is breaking and bumps the
+  package.
 
 ### 2.6 Hooks (tier: versioned, upstream-following)
 

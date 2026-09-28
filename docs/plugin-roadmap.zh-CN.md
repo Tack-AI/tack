@@ -374,18 +374,31 @@ stdio、硬超时）。
 
 ## 11. 里程碑
 
-| 阶段 | 交付物 | 依赖 |
-|---|---|---|
-| P0 | OpenRPC schema + 代码生成管线 + 生成的 Rust 类型 | — |
-| P1 | tack-RPC v3 宿主核心（peer、initialize、命名空间）+ `tack-ext-sdk`（Rust） | P0 |
-| P2 | TS + Python SDK；`ext new` / `ext dev` / `ext test` / `ext inspect` | P1 |
-| P3 | 身份、加载结果、启用/禁用、版本化 store、原子安装/升级 | P1 |
-| P4 | MCP server 插件（Level 2）；WIT/组件 WASM 载体 | P1 |
-| P5 | 企业策略（白名单、加载时过滤、只收窄） | P3 |
-| P6 | 分发（策展同步、bundle、目录 v2）+ 可观测（指标 sidecar、遥测、doctor） | P3、P5 |
+| 阶段 | 交付物 | 依赖 | 状态 |
+|---|---|---|---|
+| P0 | OpenRPC schema + 代码生成管线 + 生成的 Rust 类型 | — | landed |
+| P1 | tack-RPC v3 宿主核心（peer、initialize、命名空间）+ `tack-ext-sdk`（Rust） | P0 | landed |
+| P2 | TS + Python SDK；`ext new` / `ext dev` / `ext test` / `ext inspect` | P1 | landed |
+| P3 | 身份、加载结果、启用/禁用、版本化 store、原子安装/升级 | P1 | landed |
+| P4 | MCP server 插件（Level 2）；WIT/组件 WASM 载体 | P1 | landed |
+| P5 | 企业策略（白名单、加载时过滤、只收窄） | P3 | — |
+| P6 | 分发（策展同步、bundle、目录 v2）+ 可观测（指标 sidecar、遥测、doctor） | P3、P5 | — |
 
 P0–P2 是 DX 脊柱，最先交付——插件系统就是它的开发回路。P3–P6
 把它做成企业级；它们的设计位于协议之上，不受协议替换影响。
+
+P4 落地时对上面的草图做了两处有意偏离，记录在
+[compatibility.zh-CN.md](compatibility.zh-CN.md)：
+
+- **WIT world 承载 JSON 字符串而非 typed records**（§6.3 草图是
+  typed interfaces）：rpc3 数据类型（`ToolSpec`、`ToolOutput`、
+  `Verdict`……）以 JSON 字符串经 canonical ABI 序列化，OpenRPC
+  文档保持单一 schema 来源，wit-bindgen 只需为字符串分帧。
+  typed-record world 可以日后作为 `tack:plugin@0.4.0` 落地，不动
+  schema。
+- **Level 2 适配所有 MCP 工具表面**（tools + resource 元工具 +
+  prompt 工具），插件归因的服务器与配置文件服务器行为完全一致，
+  包括 untrusted-content 防御。
 
 ## 12. 开放问题
 
@@ -393,13 +406,23 @@ P0–P2 是 DX 脊柱，最先交付——插件系统就是它的开发回路�
    份 JSON Schema + 手写生成器（单一事实来源不变，少一点花哨）。
 2. **WIT async**：wasmtime 组件模型 async 支持分阶段落地；若 P4
    时 guest async 未就绪，tools/hooks 先以同步形态发布（宿主保
-   留 30s 调用超时），async 通过 world 版本升级引入。
+   保留 30s 调用超时），async 通过 world 版本升级引入。
+   → **P4 已解决**：同步起步。`tack:plugin@0.3.0` 的调用是阻塞式
+   宿主→guest 调用，带每次调用的 fuel、epoch 与内存上限；组件模
+   型 async 就绪时 guest async 通过 world 版本升级引入。
 3. **MCP elicitation ↔ `ui/*`**：Level 2 的 elicitation 是映射到
    Level 3 的对话框表面还是保持 MCP 原生；倾向映射（用户只有一
    条 UI 路径）。
+   → **P4 已解决**：MCP 原生。Level-2 连接获得与配置文件 MCP 服务
+   器相同的 elicitation 处理（TUI 弹窗，headless 拒绝）——用户只
+   有一条 UI 路径，无 `ui/*` 桥接。Sampling 保持不为插件连接接线
+   （加载时无会话模型）。
 4. **Widget/MCP 命名空间**：冲突保持先注册者胜记警告，还是 v3
    强制 ID 带插件前缀？没有包袱，前缀代价可承受——倾向 MCP
    server 名强制前缀、widget 不强制。
+   → **P4 已解决**：构造上前缀——Level-2 工具是
+   `ext__<plugin-id>__<tool>`，与任何其他插件工具相同（插件内名称
+   保留服务器原名，经消毒并去重）。
 5. **子代理继承**：子代理会话继承完整插件集还是收窄集合
    （Codex `SessionIsolation`）；加载结果过滤器让两种做法都很便
    宜。需要产品决策。

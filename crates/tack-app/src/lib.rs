@@ -40,6 +40,8 @@ pub mod logs;
 pub mod mcp_config;
 pub mod mcp_elicitation;
 pub mod mcp_oauth;
+#[cfg(feature = "ext")]
+pub mod mcp_plugin;
 pub mod mcp_sampling;
 pub mod mcp_serve;
 pub mod model;

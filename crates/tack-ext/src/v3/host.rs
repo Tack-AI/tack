@@ -13,9 +13,9 @@ use super::{PROTOCOL_VERSION, protocol_compatible};
 use crate::rpc3::{
     AfterToolCallParams, AfterToolCallPatch, ApprovalDecision, ApprovalReviewParams,
     AutocompleteProvideParams, AutocompleteProvideResult, BeforeToolCallParams,
-    CommandInvokeParams, InitializeParams, InitializeResult, LifecycleEventParams,
-    ToolExecuteParams, ToolOutput, TransformContextParams, TransformContextResult, Verdict,
-    WidgetActionParams, method,
+    CommandInvokeParams, ERR_CAPABILITY_NOT_GRANTED, ErrorObject, InitializeParams,
+    InitializeResult, LifecycleEventParams, ToolExecuteParams, ToolOutput, TransformContextParams,
+    TransformContextResult, Verdict, WidgetActionParams, method,
 };
 
 /// Handshake bound (a plugin that cannot answer initialize quickly is
@@ -152,5 +152,149 @@ impl HostClient {
         let params =
             serde_json::to_value(params).map_err(|e| PeerError::Transport(e.to_string()))?;
         self.peer.notify(method::WIDGETS_ACTION, params).await
+    }
+}
+
+/// The error a [`PluginConnection`] returns when the caller invokes a
+/// capability namespace its carrier does not implement (Level-2 MCP
+/// plugins and the component carrier implement a subset of the v3
+/// surface; the manager only calls declared capabilities, so reaching
+/// this is a host bug, not a plugin failure).
+pub fn unsupported_capability(namespace: &str) -> PeerError {
+    PeerError::Remote(ErrorObject {
+        code: ERR_CAPABILITY_NOT_GRANTED,
+        message: format!("carrier does not implement {namespace}"),
+        data: None,
+    })
+}
+
+/// The host→plugin call surface, abstract over the carrier.
+///
+/// [`HostClient`] implements this for the JSON-RPC carriers (process and
+/// WASI-stdio WASM); Level-2 MCP server plugins and the WIT component
+/// carrier provide their own implementations in the crates that own those
+/// clients (`tack-app`, `tack-ext-wasm`). The method set mirrors
+/// [`HostClient`] exactly; consumers (tools, hooks, widgets, dev tooling)
+/// code against the trait so every carrier plugs in uniformly.
+#[async_trait::async_trait]
+pub trait PluginConnection: Send + Sync + std::fmt::Debug {
+    /// `initialize` handshake (version-checked).
+    async fn initialize(&self, params: &InitializeParams) -> Result<InitializeResult, PeerError>;
+    /// `tools/execute`.
+    async fn tool_execute(&self, params: &ToolExecuteParams) -> Result<ToolOutput, PeerError>;
+    /// `commands/invoke`.
+    async fn command_invoke(&self, params: &CommandInvokeParams) -> Result<Value, PeerError>;
+    /// `hooks/beforeToolCall`.
+    async fn before_tool_call(&self, params: &BeforeToolCallParams) -> Result<Verdict, PeerError>;
+    /// `hooks/transformContext`.
+    async fn transform_context(
+        &self,
+        params: &TransformContextParams,
+    ) -> Result<Option<TransformContextResult>, PeerError>;
+    /// `hooks/afterToolCall`.
+    async fn after_tool_call(
+        &self,
+        params: &AfterToolCallParams,
+    ) -> Result<Option<AfterToolCallPatch>, PeerError>;
+    /// `approval/review`.
+    async fn approval_review(
+        &self,
+        params: &ApprovalReviewParams,
+    ) -> Result<Option<ApprovalDecision>, PeerError>;
+    /// `autocomplete/provide`.
+    async fn autocomplete_provide(
+        &self,
+        params: &AutocompleteProvideParams,
+    ) -> Result<AutocompleteProvideResult, PeerError>;
+    /// `events/lifecycle` notification (fire-and-forget).
+    async fn lifecycle_event(&self, event: &str, payload: Value) -> Result<(), PeerError>;
+    /// `widgets/action` notification.
+    async fn widget_action(&self, params: &WidgetActionParams) -> Result<(), PeerError>;
+    /// Untyped request escape hatch for dev tooling (`ext dev`, `ext
+    /// inspect` script arbitrary methods).
+    async fn call_raw(&self, rpc_method: &str, params: Value) -> Result<Value, PeerError>;
+    /// Untyped notification escape hatch (see [`Self::call_raw`]).
+    async fn notify_raw(&self, rpc_method: &str, params: Value) -> Result<(), PeerError>;
+    /// `shutdown` (graceful stop request; the caller still enforces the
+    /// carrier teardown after a grace period).
+    async fn shutdown(&self) -> Result<(), PeerError>;
+    /// Carrier liveness (process alive / connection open / store running).
+    fn is_alive(&self) -> bool;
+    /// Resolve once the carrier is gone (EOF, trap, connection close).
+    async fn wait_dead(&self);
+}
+
+#[async_trait::async_trait]
+impl PluginConnection for HostClient {
+    async fn initialize(&self, params: &InitializeParams) -> Result<InitializeResult, PeerError> {
+        HostClient::initialize(self, params).await
+    }
+
+    async fn tool_execute(&self, params: &ToolExecuteParams) -> Result<ToolOutput, PeerError> {
+        HostClient::tool_execute(self, params).await
+    }
+
+    async fn command_invoke(&self, params: &CommandInvokeParams) -> Result<Value, PeerError> {
+        HostClient::command_invoke(self, params).await
+    }
+
+    async fn before_tool_call(&self, params: &BeforeToolCallParams) -> Result<Verdict, PeerError> {
+        HostClient::before_tool_call(self, params).await
+    }
+
+    async fn transform_context(
+        &self,
+        params: &TransformContextParams,
+    ) -> Result<Option<TransformContextResult>, PeerError> {
+        HostClient::transform_context(self, params).await
+    }
+
+    async fn after_tool_call(
+        &self,
+        params: &AfterToolCallParams,
+    ) -> Result<Option<AfterToolCallPatch>, PeerError> {
+        HostClient::after_tool_call(self, params).await
+    }
+
+    async fn approval_review(
+        &self,
+        params: &ApprovalReviewParams,
+    ) -> Result<Option<ApprovalDecision>, PeerError> {
+        HostClient::approval_review(self, params).await
+    }
+
+    async fn autocomplete_provide(
+        &self,
+        params: &AutocompleteProvideParams,
+    ) -> Result<AutocompleteProvideResult, PeerError> {
+        HostClient::autocomplete_provide(self, params).await
+    }
+
+    async fn lifecycle_event(&self, event: &str, payload: Value) -> Result<(), PeerError> {
+        HostClient::lifecycle_event(self, event, payload).await
+    }
+
+    async fn widget_action(&self, params: &WidgetActionParams) -> Result<(), PeerError> {
+        HostClient::widget_action(self, params).await
+    }
+
+    async fn call_raw(&self, rpc_method: &str, params: Value) -> Result<Value, PeerError> {
+        self.peer.call(rpc_method, params).await
+    }
+
+    async fn notify_raw(&self, rpc_method: &str, params: Value) -> Result<(), PeerError> {
+        self.peer.notify(rpc_method, params).await
+    }
+
+    async fn shutdown(&self) -> Result<(), PeerError> {
+        HostClient::shutdown(self).await
+    }
+
+    fn is_alive(&self) -> bool {
+        self.peer.is_alive()
+    }
+
+    async fn wait_dead(&self) {
+        self.peer.wait_dead().await;
     }
 }

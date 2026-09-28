@@ -290,6 +290,14 @@ impl McpConnection {
     pub fn has_resources(&self) -> bool {
         !self.resources.is_empty() || !self.resource_templates.is_empty()
     }
+
+    /// Cancel the service (server child killed / HTTP session closed).
+    /// Idempotent; in-flight calls resolve with closed-channel errors.
+    /// Dropping the last `Arc<McpConnection>` cancels too — this is the
+    /// explicit, prompt version for plugin shutdown.
+    pub fn cancel(&self) {
+        self.service.cancellation_token().cancel();
+    }
 }
 
 /// Connect to a server, list its tools/resources/prompts. Capability probes
@@ -369,11 +377,41 @@ pub async fn connect_with(
                 .map_err(|e| format!("MCP initialize failed for {} (SSE): {e}", spec.name))?
         }
     };
+    finish_connection(spec.name.clone(), service).await
+}
 
+/// Test seam (also used by tack-app's plugin tests): connect over an
+/// arbitrary in-memory transport instead of spawning a child or dialing
+/// HTTP — a fixture server answers on the other end of the duplex.
+#[doc(hidden)]
+pub async fn connect_transport<S>(
+    name: &str,
+    stream: S,
+    callbacks: McpClientCallbacks,
+) -> Result<McpConnection, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+{
+    use rmcp::ServiceExt;
+    let handler = TackClientHandler::new(name.to_string(), callbacks);
+    let service = handler
+        .serve(stream)
+        .await
+        .map_err(|e| format!("MCP initialize failed for {name}: {e}"))?;
+    finish_connection(name.to_string(), service).await
+}
+
+/// Shared post-handshake tail of `connect_with` / `connect_transport`:
+/// probe the server's tools/resources/prompts (unsupported capability
+/// probes degrade to empty lists).
+async fn finish_connection(
+    name: String,
+    service: RunningService<RoleClient, TackClientHandler>,
+) -> Result<McpConnection, String> {
     let tools = service
         .list_all_tools()
         .await
-        .map_err(|e| format!("MCP tools/list failed for {}: {e}", spec.name))?;
+        .map_err(|e| format!("MCP tools/list failed for {name}: {e}"))?;
 
     // Capability probes degrade gracefully (older servers may not implement
     // resources/prompts at all).
@@ -385,7 +423,7 @@ pub async fn connect_with(
     let prompts = service.list_all_prompts().await.unwrap_or_default();
 
     Ok(McpConnection {
-        name: spec.name.clone(),
+        name,
         service,
         tools,
         resources,
@@ -1061,6 +1099,133 @@ pub fn mcp_tools_with(
         }
     }
     tools
+}
+
+/// One capability of an MCP server advertised through the plugin model
+/// (Level-2 MCP server plugins, `docs/plugin-roadmap.md` §4): an
+/// unprefixed tool spec for the plugin's capability list, paired with the
+/// execution engine that runs the underlying MCP call (callTool /
+/// resources/list+read / prompts/get) with all the usual MCP result
+/// handling (truncation, image caps, error mapping).
+pub struct McpPluginTool {
+    /// Provider-safe tool name, unique within the plugin, WITHOUT any
+    /// server prefix — the plugin host prefixes it with
+    /// `ext__<plugin-id>__` like any other plugin tool.
+    pub spec_name: String,
+    /// Advertised description (the engine's own).
+    pub description: String,
+    /// Advertised JSON parameter schema (the engine's own; an object).
+    pub parameters: Value,
+    engine: Arc<dyn AgentTool>,
+}
+
+impl std::fmt::Debug for McpPluginTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpPluginTool")
+            .field("spec_name", &self.spec_name)
+            .finish()
+    }
+}
+
+impl McpPluginTool {
+    /// Run the underlying MCP call. Cancellation is structural: dropping
+    /// the returned future aborts the await (same semantics as dropping a
+    /// plugin-carrier `tools/execute` call).
+    pub async fn execute(
+        &self,
+        tool_call_id: &str,
+        params: Value,
+    ) -> Result<AgentToolResult, String> {
+        self.engine
+            .execute(tool_call_id, params, CancellationToken::new(), &|_| {})
+            .await
+    }
+}
+
+fn push_plugin_tool(
+    out: &mut Vec<McpPluginTool>,
+    taken: &mut std::collections::HashSet<String>,
+    raw_spec_name: &str,
+    engine: Arc<dyn AgentTool>,
+) {
+    let spec_name = unique_tool_name(raw_spec_name, taken);
+    out.push(McpPluginTool {
+        spec_name,
+        description: engine.description().to_string(),
+        parameters: engine.parameters_schema(),
+        engine,
+    });
+}
+
+/// Build the Level-2 plugin view of one connection: the server's tools,
+/// its resource meta-tools (`list_resources` / `read_resource`, when it
+/// has resources), and its prompts (`prompt__<name>` tools) — the same
+/// surfaces `mcp_tools_with` exposes, but with unprefixed spec names so
+/// the plugin host can attribute them to the plugin's identity.
+///
+/// Engines are built WITHOUT the untrusted-content flag: Level-2 plugin
+/// tools get the wrapping uniformly at the ExtTool layer (the plugin host
+/// owns the trust decision for plugin-attributed output).
+pub fn plugin_capabilities(conn: &Arc<McpConnection>) -> Vec<McpPluginTool> {
+    let mut out = Vec::new();
+    let mut spec_taken = std::collections::HashSet::new();
+    let mut engine_taken = std::collections::HashSet::new();
+    for info in &conn.tools {
+        let full_name = intern_tool_name(unique_tool_name(
+            &format!("mcp__{}__{}", conn.name, info.name),
+            &mut engine_taken,
+        ));
+        let mut tool = McpTool::new(&conn.name, info.clone(), conn.peer().clone());
+        tool.full_name = full_name;
+        tool.keepalive = Some(conn.clone());
+        push_plugin_tool(&mut out, &mut spec_taken, &info.name, Arc::new(tool));
+    }
+    if conn.has_resources() {
+        let list_name = intern_tool_name(unique_tool_name(
+            &format!("mcp__{}__list_resources", conn.name),
+            &mut engine_taken,
+        ));
+        push_plugin_tool(
+            &mut out,
+            &mut spec_taken,
+            "list_resources",
+            Arc::new(McpListResourcesTool {
+                conn: conn.clone(),
+                full_name: list_name,
+                untrusted: None,
+            }),
+        );
+        let read_name = intern_tool_name(unique_tool_name(
+            &format!("mcp__{}__read_resource", conn.name),
+            &mut engine_taken,
+        ));
+        push_plugin_tool(
+            &mut out,
+            &mut spec_taken,
+            "read_resource",
+            Arc::new(McpReadResourceTool {
+                conn: conn.clone(),
+                full_name: read_name,
+                untrusted: None,
+            }),
+        );
+    }
+    for prompt in &conn.prompts {
+        let full_name = intern_tool_name(unique_tool_name(
+            &format!("mcp__{}__prompt__{}", conn.name, prompt.name),
+            &mut engine_taken,
+        ));
+        let mut tool =
+            McpPromptTool::new(&conn.name, prompt.clone(), conn.peer().clone(), full_name);
+        tool.keepalive = Some(conn.clone());
+        push_plugin_tool(
+            &mut out,
+            &mut spec_taken,
+            &format!("prompt__{}", prompt.name),
+            Arc::new(tool),
+        );
+    }
+    out
 }
 
 #[cfg(test)]

@@ -180,6 +180,20 @@ ACP 侧的破坏性变更只通过上游 crate 升级进入，会在 CHANGELOG �
   v2。旧版平铺 `extensions/<name>/` 布局继续以 `name@user` 加载；
   新安装进入版本化 store
   （`extensions/store/<source>/<name>/<version>/`）。
+- **Level-2 MCP server 插件**（`extension.json` 的 `carrier: "mcp"`
+  加一个 `mcpServer` 条目，形状与 `mcp.json` 相同）：宿主连接声明
+  的 MCP 服务器（stdio / Streamable HTTP / 旧版 SSE），并把它的工
+  具、resource 元工具与 prompt 工具适配进插件的能力列表。无
+  tack-RPC 线上协议变化：适配是宿主内部的（`PluginConnection`），
+  插件策略/拦截把这些工具与 tack-RPC 插件工具完全同等对待。
+- **WIT component WASM 载体**（`carrier: "wasm"`，从模块格式自动
+  检测）：组件从
+  [`protocol/wit/tack-plugin.wit`](../protocol/wit/tack-plugin.wit)
+  （`tack:plugin@0.3.0`）导出 `tack:plugin/tools` 和/或
+  `tack:plugin/hooks`。载荷是承载 rpc3 类型的 JSON 字符串——
+  OpenRPC 文档保持单一 schema 来源。WIT 包版本是契约的版本句柄
+  （只增 = minor 提升；破坏 = 新包版本）。WASI-stdio core-module
+  载体保留为 debug 载体。
 
 **承诺。**
 
@@ -188,6 +202,9 @@ ACP 侧的破坏性变更只通过上游 crate 升级进入，会在 CHANGELOG �
 - 线上破坏性变更提升 major 协议版本并遵循 §4.3；semver 握手（major
   相同、对端 minor ≤ 宿主 minor）就是兼容机制，必须对混合版本组合
   持续有效。
+- WIT 包在 `tack:plugin@0.x` 内遵循相同的只增规则：新接口或
+  `host` 上的新函数是只增的（guest 导出子集，不用的 import 不必
+  需）；移除或改类型的导出是破坏性的，提升包版本。
 
 ### 2.6 Hooks（级别：版本化，跟随上游）
 

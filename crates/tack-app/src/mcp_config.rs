@@ -95,43 +95,70 @@ pub fn specs_from_value(raw: &serde_json::Value, origin: &str) -> Vec<McpServerS
     };
     servers
         .iter()
-        .filter_map(|(name, value)| {
-            let entry: McpServerEntry = match serde_json::from_value(value.clone()) {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!(
-                        "skipping malformed MCP server entry {name:?} in {origin}: {e}",
-                    );
-                    return None;
-                }
-            };
-            let name = name.clone();
-            let oauth = parse_oauth(entry.oauth);
-            if let Some(url) = entry.url {
-                let headers: Vec<(String, String)> = entry.headers.into_iter().collect();
-                let spec = if entry.transport_type.as_deref() == Some("sse") {
-                    McpServerSpec::sse(name, url, headers)
-                } else {
-                    McpServerSpec::http(name, url, headers)
-                };
-                Some(match oauth {
-                    Some(oauth) => spec.with_oauth(oauth),
-                    None => spec,
-                })
-            } else if let Some(command) = entry.command {
-                Some(McpServerSpec::stdio(
-                    name,
-                    command,
-                    entry.args,
-                    entry.env.into_iter().collect(),
-                    None,
-                ))
-            } else {
-                tracing::warn!("mcp.json entry {name:?} has neither command nor url; skipped");
-                None
-            }
-        })
+        .filter_map(|(name, value)| spec_from_entry(name, value, origin))
         .collect()
+}
+
+/// Parse ONE MCP server entry (`{"command": …} | {"url": …}`) into a
+/// spec — the same shape as an `mcp.json` entry. Used for Level-2 MCP
+/// server plugins (`extension.json` `mcpServer`), where the entry is not
+/// part of a server map. Malformed entries warn and return None.
+pub fn spec_from_entry(
+    name: &str,
+    value: &serde_json::Value,
+    origin: &str,
+) -> Option<McpServerSpec> {
+    let entry: McpServerEntry = match serde_json::from_value(value.clone()) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("skipping malformed MCP server entry {name:?} in {origin}: {e}",);
+            return None;
+        }
+    };
+    let name = name.to_string();
+    let oauth = parse_oauth(entry.oauth);
+    if let Some(url) = entry.url {
+        let headers: Vec<(String, String)> = entry.headers.into_iter().collect();
+        let spec = if entry.transport_type.as_deref() == Some("sse") {
+            McpServerSpec::sse(name, url, headers)
+        } else {
+            McpServerSpec::http(name, url, headers)
+        };
+        Some(match oauth {
+            Some(oauth) => spec.with_oauth(oauth),
+            None => spec,
+        })
+    } else if let Some(command) = entry.command {
+        Some(McpServerSpec::stdio(
+            name,
+            command,
+            entry.args,
+            entry.env.into_iter().collect(),
+            None,
+        ))
+    } else {
+        tracing::warn!("mcp.json entry {name:?} has neither command nor url; skipped");
+        None
+    }
+}
+
+/// Client callbacks for Level-2 MCP server plugins (connected at
+/// extension-load time): elicitation follows the mode's usual rule (TUI
+/// prompts, headless auto-declines). Sampling is NOT wired: the session
+/// model does not exist yet at load time, so a plugin server's sampling
+/// request gets method-not-found (documented Level-2 limitation).
+pub fn plugin_mcp_callbacks(
+    settings: &crate::settings::Settings,
+    mode: crate::mcp_elicitation::InteractionMode,
+    tui_events: Option<crate::tui::AppEventTx>,
+) -> tack_tools::mcp::McpClientCallbacks {
+    let mut callbacks = tack_tools::mcp::McpClientCallbacks::default();
+    if let Some(handler) =
+        crate::mcp_elicitation::elicitation_callback(mode, settings.mcp_elicitation, tui_events)
+    {
+        callbacks = callbacks.with_elicitation(handler);
+    }
+    callbacks
 }
 
 /// LLM access for MCP sampling: the session's current provider/model/auth.

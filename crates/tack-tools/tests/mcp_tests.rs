@@ -104,3 +104,38 @@ async fn mcp_tools_from_connections_prefixes_names() {
     // the roundtrip test above.
     let _ = mcp_tools(&[]);
 }
+
+/// Level-2 MCP server plugins: `plugin_capabilities` synthesizes the
+/// plugin's advertised tool specs (UNPREFIXED names — the plugin host
+/// adds `ext__<plugin-id>__`) and routes execution to the MCP calls.
+#[tokio::test]
+async fn plugin_capabilities_expose_unprefixed_specs_and_execute() {
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move {
+        let server = Calculator {
+            tool_router: Calculator::tool_router(),
+        };
+        let running = server.serve(server_io).await.unwrap();
+        running.waiting().await.unwrap();
+    });
+    let conn = Arc::new(
+        tack_tools::mcp::connect_transport("calc", client_io, Default::default())
+            .await
+            .unwrap(),
+    );
+    let caps = tack_tools::mcp::plugin_capabilities(&conn);
+    let mut names: Vec<&str> = caps.iter().map(|c| c.spec_name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["fail", "sum"], "unprefixed spec names");
+    let sum = caps.iter().find(|c| c.spec_name == "sum").unwrap();
+    assert!(sum.description.contains("sum of two numbers"));
+    assert_eq!(sum.parameters["type"], json!("object"));
+
+    let result = sum.execute("t1", json!({"a": 20, "b": 22})).await.unwrap();
+    let tack_ai::InputContentBlock::Text { text, .. } = &result.content[0] else {
+        panic!()
+    };
+    assert_eq!(text, "42");
+
+    conn.cancel();
+}

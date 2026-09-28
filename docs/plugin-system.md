@@ -168,21 +168,36 @@ consumers filter on `is_active()` — a broken plugin shows up in
 `ext list`/doctor instead of vanishing with a log line (Codex's
 `PluginLoadOutcome` pattern).
 
-### 3.3 The two carriers
+### 3.3 The carriers
 
-| | process (default) | wasm |
-|---|---|---|
-| Plugin form | Any executable | WASI p1 module (`.wasm`/`.wat`) |
-| Protocol | **tack-RPC v3 over stdio** (same schema) | same |
-| Isolation | Process boundary | wasmtime sandbox: no fs/network/environment variables |
-| Resource limits | None (trust gating) | fuel + epoch wall-clock + memory hard caps (manifest `limits`, host-clamped) |
-| Capability grants | — (a process is inherently fully privileged) | Explicit manifest `capabilities` declarations: fs preopen (ro/rw), env (literals or host passthrough), args; audit log at load time |
+| | process (default) | wasm (WASI stdio) | wasm (WIT component) |
+|---|---|---|---|
+| Plugin form | Any executable | WASI p1 module (`.wasm`/`.wat`) | Component-model binary/text |
+| Protocol | **tack-RPC v3 over stdio** (same schema) | same | `tack:plugin@0.3.0` exports, JSON-string payloads (rpc3 types) |
+| Isolation | Process boundary | wasmtime sandbox: no fs/network/environment variables | Structural: the world imports no WASI at all |
+| Resource limits | None (trust gating) | fuel + epoch wall-clock + memory hard caps (manifest `limits`, host-clamped) | same ceilings, per call |
+| Capability grants | — (a process is inherently fully privileged) | Explicit manifest `capabilities` declarations: fs preopen (ro/rw), env (literals or host passthrough), args; audit log at load time | — (grants are WASI-only, ignored with a warning) |
 
-Both carriers share one `JsonRpcPeer` (transport abstracted as
-AsyncRead/AsyncWrite): handshake, timeout, cancellation, and dead-peer
-fail-fast semantics are identical. Example:
+The process and WASI-stdio carriers share one `JsonRpcPeer` (transport
+abstracted as AsyncRead/AsyncWrite): handshake, timeout, cancellation,
+and dead-peer fail-fast semantics are identical. The component carrier
+implements the same host→plugin surface (`PluginConnection`) over typed
+WIT calls instead of a wire protocol. Examples:
 [`examples/extensions/hello-wasm/`](../examples/extensions/hello-wasm/)
-(a handwritten-WAT v3 protocol reference).
+(a handwritten-WAT v3 protocol reference),
+[`examples/extensions/hello-component/`](../examples/extensions/hello-component/)
+(a handwritten component-WAT reference).
+
+### 3.4 Level 2: MCP server plugins
+
+An extension can skip tack-RPC entirely: `carrier: "mcp"` plus one
+`mcpServer` entry makes an MCP server **the plugin** (see extensions.md
+§2.1). The host connects at load, adapts tools/resources/prompts into
+the plugin's capability list with the plugin's identity (attribution,
+policy, interception, and the untrusted-content defense all apply
+uniformly), and never spawns a tack-RPC process. This is the third
+carrier family beside process/WASM: same load-outcome model, same
+`PluginConnection` surface, MCP underneath.
 
 ## 4. Distribution: bundles + marketplace
 ## 4. Distribution: bundles + marketplace
@@ -306,5 +321,6 @@ gated**).
 - Hot reload (plugin tools/hooks are woven into the agent loop at session
   start; hot-swapping costs far more than it gains — use `ext install` +
   restart instead)
-- The WIT/component WASM carrier and MCP-server plugins (roadmap P4),
-  enterprise policy (P5), metrics sidecar + distribution sync (P6)
+- Enterprise policy (P5), metrics sidecar + distribution sync (P6) —
+  Level-2 MCP server plugins and the WIT/component WASM carrier (P4)
+  landed and are documented in §3.3/§3.4

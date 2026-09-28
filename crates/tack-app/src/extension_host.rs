@@ -29,7 +29,7 @@ use tack_ext::rpc3::{
     WidgetSpec, WidgetUpdateParams,
 };
 use tack_ext::tool::ExtTool;
-use tack_ext::v3::{HostClient, JsonRpcPeer, PeerHandler, V3Process};
+use tack_ext::v3::{PeerHandler, PluginConnection, V3Process};
 use tokio::sync::{mpsc, oneshot};
 
 pub use tack_ext::ExtNotifyProvider;
@@ -260,9 +260,30 @@ struct ExtensionManifest {
     /// Bundle: MCP servers — a file path or an inline server map.
     #[serde(default, rename = "mcpServers")]
     mcp_servers: Option<Value>,
+    /// Level-2 MCP server plugin (`carrier: "mcp"`): ONE MCP server
+    /// entry (same shape as an mcp.json server); the server IS the
+    /// plugin — its tools/resources/prompts become the plugin's
+    /// capabilities with the plugin's identity.
+    #[serde(default, rename = "mcpServer")]
+    mcp_server: Option<Value>,
     /// Bundle: skill directories (each containing SKILL.md files).
     #[serde(default)]
     skills: Option<Vec<String>>,
+}
+
+/// Level-2 MCP plugins: a stdio server runs with the extension directory
+/// as cwd so bundled server scripts resolve, and a path-like relative
+/// command resolves against that directory (same rule as the process
+/// carrier — args are NOT rewritten: npm package names like `@scope/pkg`
+/// contain '/'). HTTP/SSE specs are untouched.
+fn resolve_mcp_stdio_spec(spec: &mut tack_tools::mcp::McpServerSpec, dir: &Path) {
+    if let tack_tools::mcp::McpTransport::Stdio { command, cwd, .. } = &mut spec.transport {
+        let path_like = command.contains('/') || command.contains('\\') || command.starts_with('.');
+        if path_like && !PathBuf::from(command.as_str()).is_absolute() {
+            *command = dir.join(command.as_str()).to_string_lossy().to_string();
+        }
+        *cwd = Some(dir.to_path_buf());
+    }
 }
 
 /// True for environment variable names that typically carry credentials
@@ -478,6 +499,12 @@ pub enum PluginHandle {
     /// Option: shutdown consumes the plugin (take()).
     #[cfg(feature = "wasm")]
     Wasm(Option<tack_ext_wasm::WasmPlugin>),
+    /// WIT component plugin (tack:plugin@0.3.0; the module format, not
+    /// the manifest, selects this over the WASI-stdio carrier).
+    #[cfg(feature = "wasm")]
+    WasmComponent(Arc<tack_ext_wasm::component::WasmComponentPlugin>),
+    /// Level-2 MCP server plugin (Option: shutdown consumes it).
+    Mcp(Option<Arc<crate::mcp_plugin::McpPluginConnection>>),
 }
 
 impl std::fmt::Debug for PluginHandle {
@@ -486,26 +513,27 @@ impl std::fmt::Debug for PluginHandle {
             PluginHandle::Process(_) => f.debug_struct("PluginHandle::Process").finish(),
             #[cfg(feature = "wasm")]
             PluginHandle::Wasm(_) => f.debug_struct("PluginHandle::Wasm").finish(),
+            #[cfg(feature = "wasm")]
+            PluginHandle::WasmComponent(_) => {
+                f.debug_struct("PluginHandle::WasmComponent").finish()
+            }
+            PluginHandle::Mcp(_) => f.debug_struct("PluginHandle::Mcp").finish(),
         }
     }
 }
 
 impl PluginHandle {
-    pub fn peer(&self) -> &Arc<JsonRpcPeer> {
+    /// The host→plugin call surface (carrier-agnostic).
+    pub fn client(&self) -> Arc<dyn PluginConnection> {
         match self {
-            PluginHandle::Process(process) => &process.peer,
-            #[cfg(feature = "wasm")]
-            PluginHandle::Wasm(plugin) => &plugin.as_ref().expect("wasm plugin taken").peer,
-        }
-    }
-
-    pub fn client(&self) -> HostClient {
-        match self {
-            PluginHandle::Process(process) => process.client.clone(),
+            PluginHandle::Process(process) => Arc::new(process.client.clone()),
             #[cfg(feature = "wasm")]
             PluginHandle::Wasm(plugin) => {
-                plugin.as_ref().expect("wasm plugin taken").client.clone()
+                Arc::new(plugin.as_ref().expect("wasm plugin taken").client.clone())
             }
+            #[cfg(feature = "wasm")]
+            PluginHandle::WasmComponent(plugin) => plugin.clone(),
+            PluginHandle::Mcp(conn) => conn.as_ref().expect("mcp plugin taken").clone(),
         }
     }
 
@@ -516,6 +544,13 @@ impl PluginHandle {
             PluginHandle::Wasm(plugin) => {
                 if let Some(plugin) = plugin.take() {
                     plugin.shutdown().await;
+                }
+            }
+            #[cfg(feature = "wasm")]
+            PluginHandle::WasmComponent(plugin) => plugin.shutdown().await,
+            PluginHandle::Mcp(conn) => {
+                if let Some(conn) = conn.take() {
+                    let _ = PluginConnection::shutdown(&*conn).await;
                 }
             }
         }
@@ -650,7 +685,7 @@ pub struct ExtAutocompleteProvider {
     pub key: String,
     pub plugin: String,
     pub spec: tack_ext::rpc3::AutocompleteProviderSpec,
-    client: HostClient,
+    client: Arc<dyn PluginConnection>,
 }
 
 impl std::fmt::Debug for ExtAutocompleteProvider {
@@ -683,12 +718,15 @@ impl ExtAutocompleteProvider {
     }
 }
 
-/// Spawn a watcher firing `on_dead` once the plugin's peer observes EOF
-/// (carrier exit / guest trap). The TUI uses it to drop the plugin's
-/// widgets — a dead plugin leaves no UI residue.
-pub fn watch_plugin_death(peer: Arc<JsonRpcPeer>, on_dead: impl FnOnce() + Send + 'static) {
+/// Spawn a watcher firing `on_dead` once the plugin's connection observes
+/// EOF (carrier exit / guest trap / MCP server exit). The TUI uses it to
+/// drop the plugin's widgets — a dead plugin leaves no UI residue.
+pub fn watch_plugin_death(
+    conn: Arc<dyn PluginConnection>,
+    on_dead: impl FnOnce() + Send + 'static,
+) {
     tokio::spawn(async move {
-        peer.wait_dead().await;
+        conn.wait_dead().await;
         on_dead();
     });
 }
@@ -992,6 +1030,7 @@ impl ExtensionManager {
         mode: &str,
         services: Arc<dyn PeerHandler>,
         lock_required: bool,
+        mcp_callbacks: tack_tools::mcp::McpClientCallbacks,
     ) -> Self {
         let mut manager = ExtensionManager::default();
         let trusted = crate::project_trust::is_trusted(cwd, agent_dir);
@@ -1084,6 +1123,66 @@ impl ExtensionManager {
             });
             let carrier = manifest.carrier.as_deref().unwrap_or("process");
             let mut handle = match carrier {
+                "mcp" => {
+                    // Level-2 MCP server plugin: the declared server IS
+                    // the plugin (no tack-RPC process is spawned).
+                    let Some(server) = &manifest.mcp_server else {
+                        manager.plugins.push(LoadedPlugin {
+                            id: entry.id,
+                            enabled,
+                            error: Some("carrier mcp requires an `mcpServer` entry".to_string()),
+                            register: None,
+                            handle: None,
+                            version: entry.version,
+                            dir: entry.dir,
+                        });
+                        continue;
+                    };
+                    let Some(mut spec) = crate::mcp_config::spec_from_entry(
+                        &id_string,
+                        server,
+                        &format!("extension {id_string}"),
+                    ) else {
+                        manager.plugins.push(LoadedPlugin {
+                            id: entry.id,
+                            enabled,
+                            error: Some("carrier mcp: malformed `mcpServer` entry".to_string()),
+                            register: None,
+                            handle: None,
+                            version: entry.version,
+                            dir: entry.dir,
+                        });
+                        continue;
+                    };
+                    // A stdio server runs with the extension directory as
+                    // cwd so bundled server scripts resolve; a path-like
+                    // relative command resolves against it (same rule as
+                    // the process carrier — args are NOT rewritten: npm
+                    // package names like @scope/pkg contain '/').
+                    resolve_mcp_stdio_spec(&mut spec, &entry.dir);
+                    match crate::mcp_plugin::McpPluginConnection::connect(
+                        &spec,
+                        mcp_callbacks.clone(),
+                        entry.id.name().to_string(),
+                        entry.version.clone(),
+                    )
+                    .await
+                    {
+                        Ok(conn) => PluginHandle::Mcp(Some(Arc::new(conn))),
+                        Err(e) => {
+                            manager.plugins.push(LoadedPlugin {
+                                id: entry.id,
+                                enabled,
+                                error: Some(format!("failed to start (mcp): {e}")),
+                                register: None,
+                                handle: None,
+                                version: entry.version,
+                                dir: entry.dir,
+                            });
+                            continue;
+                        }
+                    }
+                }
                 "wasm" => {
                     #[cfg(feature = "wasm")]
                     {
@@ -1142,27 +1241,59 @@ impl ExtensionManager {
                             .map(|c| c.into_capabilities(&id_string, &entry.dir))
                             .unwrap_or_default();
                         audit_capability_grants(&id_string, &capabilities);
-                        match carrier_engine
-                            .spawn_with_capabilities(
-                                &wasm,
-                                &limits,
-                                services.clone(),
-                                &capabilities,
-                            )
-                            .await
-                        {
-                            Ok(plugin) => PluginHandle::Wasm(Some(plugin)),
-                            Err(e) => {
-                                manager.plugins.push(LoadedPlugin {
-                                    id: entry.id,
-                                    enabled,
-                                    error: Some(format!("failed to start (wasm): {e}")),
-                                    register: None,
-                                    handle: None,
-                                    version: entry.version,
-                                    dir: entry.dir,
-                                });
-                                continue;
+                        // WIT component vs WASI-stdio core module: the
+                        // module format selects the carrier (both are
+                        // `carrier: "wasm"` in the manifest).
+                        if tack_ext_wasm::component::is_component(&wasm) {
+                            match carrier_engine
+                                .spawn_component(
+                                    &wasm,
+                                    &limits,
+                                    &capabilities,
+                                    entry.id.name().to_string(),
+                                    entry.version.clone(),
+                                )
+                                .await
+                            {
+                                Ok(plugin) => PluginHandle::WasmComponent(Arc::new(plugin)),
+                                Err(e) => {
+                                    manager.plugins.push(LoadedPlugin {
+                                        id: entry.id,
+                                        enabled,
+                                        error: Some(format!(
+                                            "failed to start (wasm component): {e}"
+                                        )),
+                                        register: None,
+                                        handle: None,
+                                        version: entry.version,
+                                        dir: entry.dir,
+                                    });
+                                    continue;
+                                }
+                            }
+                        } else {
+                            match carrier_engine
+                                .spawn_with_capabilities(
+                                    &wasm,
+                                    &limits,
+                                    services.clone(),
+                                    &capabilities,
+                                )
+                                .await
+                            {
+                                Ok(plugin) => PluginHandle::Wasm(Some(plugin)),
+                                Err(e) => {
+                                    manager.plugins.push(LoadedPlugin {
+                                        id: entry.id,
+                                        enabled,
+                                        error: Some(format!("failed to start (wasm): {e}")),
+                                        register: None,
+                                        handle: None,
+                                        version: entry.version,
+                                        dir: entry.dir,
+                                    });
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -1413,6 +1544,19 @@ impl ExtensionManager {
 
     /// All active plugins' tools for the agent loop.
     pub fn tools(&self) -> Vec<Arc<dyn AgentTool>> {
+        self.tools_with_untrusted(None)
+    }
+
+    /// All active plugins' tools, wiring the prompt-injection defense for
+    /// MCP-carrier plugins: their tool output is untrusted server data,
+    /// so results are wrapped in `<untrusted_content>` and `untrusted`
+    /// is set for the permission layer (same treatment as config-file
+    /// MCP tools). Process/WASM plugin tools are host-trusted and pass
+    /// through unwrapped.
+    pub fn tools_with_untrusted(
+        &self,
+        untrusted: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Vec<Arc<dyn AgentTool>> {
         let mut tools: Vec<Arc<dyn AgentTool>> = Vec::new();
         for plugin in self.plugins.iter().filter(|p| p.is_active()) {
             let Some(handle) = &plugin.handle else {
@@ -1423,11 +1567,15 @@ impl ExtensionManager {
             };
             if let Some(specs) = &capabilities.tools {
                 for spec in specs {
-                    tools.push(Arc::new(ExtTool::new(
-                        &plugin.id.to_string(),
-                        spec.clone(),
-                        handle.client(),
-                    )));
+                    let mut tool =
+                        ExtTool::new(&plugin.id.to_string(), spec.clone(), handle.client());
+                    if let (Some(flag), PluginHandle::Mcp(_)) = (&untrusted, handle) {
+                        tool = tool.with_untrusted(
+                            flag.clone(),
+                            format!("mcp://{}/{}", plugin.id, spec.name),
+                        );
+                    }
+                    tools.push(Arc::new(tool));
                 }
             }
         }
@@ -1628,8 +1776,12 @@ pub struct ExtSinkHandle {
 /// Backlog bound for plugin-bound events before they are dropped.
 const EXT_EVENT_QUEUE_DEPTH: usize = 256;
 
+/// One event-sink target: the plugin connection plus its event
+/// subscriptions (None/empty = the default set).
+type EventTarget = (Arc<dyn PluginConnection>, Option<Vec<String>>);
+
 impl ExtSinkHandle {
-    fn spawn(peers: Vec<(HostClient, Option<Vec<String>>)>) -> Arc<Self> {
+    fn spawn(peers: Vec<EventTarget>) -> Arc<Self> {
         let (tx, mut rx) = mpsc::channel::<(String, Value)>(EXT_EVENT_QUEUE_DEPTH);
         tokio::spawn(async move {
             while let Some((event, payload)) = rx.recv().await {
@@ -3190,8 +3342,15 @@ mod tests {
         let cwd = tmp.path().join("cwd");
         std::fs::create_dir_all(&cwd).unwrap();
 
-        let manager =
-            ExtensionManager::load(&cwd, &agent_dir, "tui", Arc::new(NoopServices), true).await;
+        let manager = ExtensionManager::load(
+            &cwd,
+            &agent_dir,
+            "tui",
+            Arc::new(NoopServices),
+            true,
+            Default::default(),
+        )
+        .await;
         assert!(
             manager.plugins.is_empty(),
             "bundle-only manifest runs no plugin"
@@ -3205,6 +3364,114 @@ mod tests {
         );
         assert_eq!(manager.bundle_mcp_servers.len(), 1);
         assert_eq!(manager.bundle_skill_dirs.len(), 1);
+    }
+
+    /// Level-2 MCP plugins: `carrier: "mcp"` without an `mcpServer`
+    /// entry is a load error (failure-as-data), and so is a malformed one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mcp_carrier_requires_a_valid_mcp_server_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let missing_dir = agent_dir.join("extensions").join("missing");
+        let malformed_dir = agent_dir.join("extensions").join("malformed");
+        std::fs::create_dir_all(&missing_dir).unwrap();
+        std::fs::create_dir_all(&malformed_dir).unwrap();
+        std::fs::write(
+            missing_dir.join("extension.json"),
+            r#"{"name": "missing", "carrier": "mcp"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            malformed_dir.join("extension.json"),
+            r#"{"name": "malformed", "carrier": "mcp", "mcpServer": {"neither": 1}}"#,
+        )
+        .unwrap();
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let manager = ExtensionManager::load(
+            &cwd,
+            &agent_dir,
+            "tui",
+            Arc::new(NoopServices),
+            true,
+            Default::default(),
+        )
+        .await;
+        assert_eq!(manager.plugins.len(), 2);
+        let missing = manager
+            .plugins
+            .iter()
+            .find(|p| p.id.name() == "missing")
+            .unwrap();
+        assert!(
+            missing.error.as_deref().unwrap_or("").contains("mcpServer"),
+            "{missing:?}"
+        );
+        let malformed = manager
+            .plugins
+            .iter()
+            .find(|p| p.id.name() == "malformed")
+            .unwrap();
+        assert!(
+            malformed
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("malformed"),
+            "{malformed:?}"
+        );
+        assert!(manager.is_empty(), "no ACTIVE plugins");
+    }
+
+    /// Level-2 MCP plugins: a relative stdio command resolves against the
+    /// extension directory and the server runs with it as cwd; HTTP specs
+    /// are untouched.
+    #[test]
+    fn mcp_stdio_spec_resolves_against_extension_dir() {
+        let dir = std::path::Path::new("/ext/dir");
+        let mut spec = crate::mcp_config::spec_from_entry(
+            "p@user",
+            &serde_json::json!({"command": "./server.js", "args": ["--port", "8080"]}),
+            "test",
+        )
+        .unwrap();
+        resolve_mcp_stdio_spec(&mut spec, dir);
+        let tack_tools::mcp::McpTransport::Stdio {
+            command, cwd, args, ..
+        } = &spec.transport
+        else {
+            panic!("expected stdio transport");
+        };
+        assert_eq!(command, "/ext/dir/./server.js");
+        assert_eq!(cwd.as_deref(), Some(dir));
+        assert_eq!(args, &["--port", "8080"], "args are never rewritten");
+
+        // Bare commands (PATH lookup) stay as-is; only cwd is set.
+        let mut spec = crate::mcp_config::spec_from_entry(
+            "p@user",
+            &serde_json::json!({"command": "npx", "args": ["-y", "@scope/pkg"]}),
+            "test",
+        )
+        .unwrap();
+        resolve_mcp_stdio_spec(&mut spec, dir);
+        let tack_tools::mcp::McpTransport::Stdio { command, args, .. } = &spec.transport else {
+            panic!("expected stdio transport");
+        };
+        assert_eq!(command, "npx");
+        assert_eq!(args[1], "@scope/pkg", "npm package names are not paths");
+
+        let mut spec = crate::mcp_config::spec_from_entry(
+            "p@user",
+            &serde_json::json!({"url": "https://example.com/mcp"}),
+            "test",
+        )
+        .unwrap();
+        resolve_mcp_stdio_spec(&mut spec, dir);
+        assert!(matches!(
+            spec.transport,
+            tack_tools::mcp::McpTransport::Http { .. }
+        ));
     }
 
     /// A plugin that fails its handshake stays in the outcome with the
@@ -3223,8 +3490,15 @@ mod tests {
         let cwd = tmp.path().join("cwd");
         std::fs::create_dir_all(&cwd).unwrap();
 
-        let manager =
-            ExtensionManager::load(&cwd, &agent_dir, "tui", Arc::new(NoopServices), true).await;
+        let manager = ExtensionManager::load(
+            &cwd,
+            &agent_dir,
+            "tui",
+            Arc::new(NoopServices),
+            true,
+            Default::default(),
+        )
+        .await;
         assert_eq!(manager.plugins.len(), 1);
         let plugin = &manager.plugins[0];
         assert!(!plugin.is_active());
@@ -3255,8 +3529,15 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         set_plugin_enabled(&agent_dir, "demo@user", false).unwrap();
 
-        let manager =
-            ExtensionManager::load(&cwd, &agent_dir, "tui", Arc::new(NoopServices), true).await;
+        let manager = ExtensionManager::load(
+            &cwd,
+            &agent_dir,
+            "tui",
+            Arc::new(NoopServices),
+            true,
+            Default::default(),
+        )
+        .await;
         assert_eq!(manager.plugins.len(), 1);
         let plugin = &manager.plugins[0];
         assert!(!plugin.enabled);
@@ -3346,8 +3627,15 @@ mod tests {
         let cwd = tmp.path().join("cwd");
         std::fs::create_dir_all(&cwd).unwrap();
 
-        let mut manager =
-            ExtensionManager::load(&cwd, &agent_dir, "tui", Arc::new(NoopServices), true).await;
+        let mut manager = ExtensionManager::load(
+            &cwd,
+            &agent_dir,
+            "tui",
+            Arc::new(NoopServices),
+            true,
+            Default::default(),
+        )
+        .await;
         assert_eq!(manager.plugins.len(), 1, "wasm plugin must load");
         assert!(matches!(
             manager.plugins[0].handle,
@@ -3373,6 +3661,78 @@ mod tests {
 
         let command_result = manager.invoke_command("hello-wasm", "").await.unwrap();
         assert_eq!(command_result["ok"], serde_json::json!(true));
+
+        manager.shutdown().await;
+    }
+
+    /// e2e: a WIT-component extension (`carrier: "wasm"` + a component
+    /// module) is detected, driven via the tack:plugin exports, and
+    /// answers tools/execute + hooks/beforeToolCall — no JSON-RPC peer.
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "wasm")]
+    async fn wasm_component_extension_loads_and_answers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let ext_dir = agent_dir.join("extensions").join("hello-component");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(
+            ext_dir.join("extension.json"),
+            r#"{
+  "name": "hello-component",
+  "carrier": "wasm",
+  "module": "plugin.wat",
+  "limits": { "maxFuel": 100000000, "maxMemoryBytes": 16777216 }
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ext_dir.join("plugin.wat"),
+            include_str!("../../../examples/extensions/hello-component/plugin.wat"),
+        )
+        .unwrap();
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let mut manager = ExtensionManager::load(
+            &cwd,
+            &agent_dir,
+            "tui",
+            Arc::new(NoopServices),
+            true,
+            Default::default(),
+        )
+        .await;
+        assert_eq!(
+            manager.plugins.len(),
+            1,
+            "component plugin must load: {:?}",
+            manager.plugins
+        );
+        assert!(matches!(
+            manager.plugins[0].handle,
+            Some(PluginHandle::WasmComponent(_))
+        ));
+
+        let tools = manager.tools();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name(), "ext__hello-component_user__hello");
+        let result = tools[0]
+            .execute(
+                "call-1",
+                serde_json::json!({"name": "tack"}),
+                tokio_util::sync::CancellationToken::new(),
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        let tack_ai::InputContentBlock::Text { text, .. } = &result.content[0] else {
+            panic!("expected text")
+        };
+        assert_eq!(text, "hello from the component carrier");
+
+        // The hooks interface surfaces through the AgentHooks chain.
+        let hooks = manager.hooks();
+        assert_eq!(hooks.len(), 1, "component declared before-tool-call");
 
         manager.shutdown().await;
     }
@@ -3408,8 +3768,15 @@ mod tests {
         )
         .unwrap();
 
-        let mut manager =
-            ExtensionManager::load(&cwd, &agent_dir, "tui", Arc::new(NoopServices), true).await;
+        let mut manager = ExtensionManager::load(
+            &cwd,
+            &agent_dir,
+            "tui",
+            Arc::new(NoopServices),
+            true,
+            Default::default(),
+        )
+        .await;
         let tools = manager.tools();
         let readfile = tools
             .iter()
@@ -3445,8 +3812,15 @@ mod tests {
         .unwrap();
         std::fs::write(ext_dir.join("plugin.wat"), wat).unwrap();
 
-        let mut manager =
-            ExtensionManager::load(&cwd, &agent_dir, "tui", Arc::new(NoopServices), true).await;
+        let mut manager = ExtensionManager::load(
+            &cwd,
+            &agent_dir,
+            "tui",
+            Arc::new(NoopServices),
+            true,
+            Default::default(),
+        )
+        .await;
         let tools = manager.tools();
         let readfile = tools
             .iter()

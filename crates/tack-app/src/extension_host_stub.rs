@@ -119,12 +119,22 @@ impl ExtensionManager {
         _mode: &str,
         _services: Arc<dyn Send + Sync + 'static>,
         _lock_required: bool,
+        _mcp_callbacks: tack_tools::mcp::McpClientCallbacks,
     ) -> Self {
         ExtensionManager::default()
     }
 
     /// All plugin tools for the agent loop.
     pub fn tools(&self) -> Vec<Arc<dyn AgentTool>> {
+        Vec::new()
+    }
+
+    /// All plugin tools, wiring the untrusted-content defense for
+    /// MCP-carrier plugins (no plugins without the `ext` feature).
+    pub fn tools_with_untrusted(
+        &self,
+        _untrusted: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Vec<Arc<dyn AgentTool>> {
         Vec::new()
     }
 

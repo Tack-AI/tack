@@ -90,7 +90,15 @@ async fn load_demo(
     )
     .unwrap();
     let services = Arc::new(FakeServices::default());
-    let manager = ExtensionManager::load(cwd, agent_dir, "tui", services.clone(), true).await;
+    let manager = ExtensionManager::load(
+        cwd,
+        agent_dir,
+        "tui",
+        services.clone(),
+        true,
+        Default::default(),
+    )
+    .await;
     (manager, services)
 }
 
@@ -212,8 +220,15 @@ async fn demo_plugin_in_headless_mode() {
     )
     .unwrap();
     let services = tack_app::ext_headless::HeadlessExtServices::new("print", true);
-    let mut manager =
-        ExtensionManager::load(cwd.path(), agent_dir.path(), "print", services, true).await;
+    let mut manager = ExtensionManager::load(
+        cwd.path(),
+        agent_dir.path(),
+        "print",
+        services,
+        true,
+        Default::default(),
+    )
+    .await;
     assert_eq!(manager.plugins.len(), 1, "demo plugin should load headless");
 
     let tools = manager.tools();

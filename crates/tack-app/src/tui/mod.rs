@@ -828,10 +828,10 @@ impl TuiApp {
             let Some(handle) = &plugin.handle else {
                 continue;
             };
-            let peer = handle.peer().clone();
+            let conn = handle.client();
             let name = plugin.id.to_string();
             let tx = app.event_tx.clone();
-            crate::extension_host::watch_plugin_death(peer, move || {
+            crate::extension_host::watch_plugin_death(conn, move || {
                 let _ = tx.send(AppEvent::ExtPluginDead(name));
             });
         }
@@ -945,6 +945,11 @@ impl TuiApp {
             "tui",
             ext_services,
             settings.extension_lock_required,
+            crate::mcp_config::plugin_mcp_callbacks(
+                settings,
+                crate::mcp_elicitation::InteractionMode::Tui,
+                Some(event_tx.clone()),
+            ),
         )
         .await;
         // tack-ext: provider-boundary lifecycle events (before/after request),

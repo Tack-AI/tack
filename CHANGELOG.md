@@ -6,6 +6,36 @@ notice can parse entries (same convention as TS pi).
 
 ## [Unreleased]
 
+### Added
+
+- **Plugin redesign P4 — Level-2 MCP server plugins and the WIT
+  component WASM carrier.** An `extension.json` with `carrier: "mcp"`
+  and one `mcpServer` entry (mcp.json shape: stdio, Streamable HTTP, or
+  legacy SSE) makes an MCP server *the plugin* — no tack-RPC process is
+  spawned. The host adapts the server's tools, `list_resources` /
+  `read_resource` meta-tools, and `prompt__<name>` prompt tools into the
+  plugin's capability list with full plugin identity: `ext__<plugin>__
+  <tool>` naming, attribution, policy, hook interception, and the
+  untrusted-content defense (results wrapped in `<untrusted_content>`,
+  permission elevation) apply exactly as for config-file MCP servers.
+  stdio servers run with the extension directory as cwd; elicitation
+  follows the run mode (sampling is a documented non-goal for plugin
+  connections).
+- **WIT component WASM carrier** (`tack:plugin@0.3.0`,
+  `protocol/wit/tack-plugin.wit`): `carrier: "wasm"` now auto-detects
+  the module format — WIT components are driven via typed
+  `tack:plugin/tools` / `tack:plugin/hooks` exports with JSON-string
+  payloads (the OpenRPC schema stays the single source of truth), while
+  WASI-stdio core modules keep the debug-carrier path unchanged.
+  Components are capability-free by construction (the world imports no
+  WASI; fs/env/args grants are ignored with a warning), calls are
+  synchronous with per-call fuel/wall-clock/memory limits, and interface
+  subsets are valid plugins (a hooks-only component exports just
+  `tack:plugin/hooks`). New example:
+  `examples/extensions/hello-component/` (hand-written component WAT).
+- Plugin tools may now return image blocks to the model (previously
+  text-only), for MCP and tack-RPC carriers alike.
+
 ### Changed
 
 - **Plugin system rework (redesign P3): the ExtensionManager now speaks
