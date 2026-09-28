@@ -4605,6 +4605,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tack-ext-sdk"
+version = "1.0.4"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tack-ext",
+ "tokio",
+]
+
+[[package]]
 name = "tack-ext-wasm"
 version = "1.0.4"
 dependencies = [

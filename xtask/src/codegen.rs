@@ -119,15 +119,12 @@ fn emit_method_constants(doc: &Value, out: &mut String) -> Result<()> {
         }
         emit_doc(out, &doc_line, 1);
         let const_name = name
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() {
-                    c.to_ascii_uppercase()
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>();
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|part| !part.is_empty())
+            .map(field_ident)
+            .collect::<Vec<_>>()
+            .join("_")
+            .to_uppercase();
         let _ = writeln!(out, "    pub const {const_name}: &str = \"{name}\";\n");
     }
     out.push_str("}\n");

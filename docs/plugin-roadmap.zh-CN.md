@@ -203,17 +203,16 @@ v1/v2 协议（自研信封、手写 peer、文档即规范）被替换为 schem
 
 ### 6.2 SDK
 
-- **Rust**（`tack-ext-sdk`）：在生成类型之上提供过程宏——
+- **Rust**（`tack-ext-sdk`）：在生成类型之上的 builder API（过程宏
+  语法糖是后续的锦上添花）——
 
   ```rust
-  #[tack::plugin(name = "acme-review")]
-  impl Plugin for Acme {
-      #[tool(description = "Review the current diff")]
-      async fn review(&self, args: ReviewArgs, cx: &Cx) -> Result<ToolOutput> { … }
-
-      #[hook]
-      async fn before_tool_call(&self, call: &ToolCall) -> Verdict { Verdict::Allow }
-  }
+  Plugin::builder("acme-review")
+      .tool(ToolSpec { /* name、description、parameters */ ..spec() },
+            |params, cx| async move { Ok(text_output("…")) })
+      .before_tool_call(|params, _cx| async move { Ok(allow()) })
+      .run()
+      .await
   ```
 
 - **TypeScript**（`@tack/plugin`）：builder API，zod 风格 schema，

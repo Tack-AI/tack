@@ -15,6 +15,18 @@ notice can parse entries (same convention as TS pi).
   the Rust types (`tack_ext::rpc3`) from it, with a CI freshness check.
   Existing v1/v2 plugins are unaffected — the v3 protocol is not wired
   into the host yet.
+- tack-RPC v3 host core and Rust SDK (redesign P1):
+  `tack_ext::v3::{JsonRpcPeer, HostClient}` implements the transport-
+  agnostic JSON-RPC 2.0 peer (both-directions requests, `$/cancelRequest`,
+  timeouts, dead-peer semantics) plus the typed host-side client for every
+  capability namespace, and the new `tack-ext-sdk` crate lets Rust plugin
+  authors build a Level-3 plugin with a builder API (tools, commands,
+  before/after hooks, context transform, approval review, lifecycle
+  events, widgets, autocomplete, config/metrics declarations, and a typed
+  host client for ui/exec/session/snapshot/config services) without ever
+  seeing an envelope. See `crates/tack-ext-sdk/examples/hello_rpc3.rs`.
+  The v1/v2 protocol is still the live one; the ExtensionManager switch
+  and v1/v2 removal land with the loader rework.
 
 ## [1.0.4] - 2026-09-27
 

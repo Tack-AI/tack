@@ -221,17 +221,16 @@ disappear.
 
 ### 6.2 SDKs
 
-- **Rust** (`tack-ext-sdk`): proc-macros over generated types —
+- **Rust** (`tack-ext-sdk`): a builder API over the generated types
+  (proc-macro sugar on top is future polish) —
 
   ```rust
-  #[tack::plugin(name = "acme-review")]
-  impl Plugin for Acme {
-      #[tool(description = "Review the current diff")]
-      async fn review(&self, args: ReviewArgs, cx: &Cx) -> Result<ToolOutput> { … }
-
-      #[hook]
-      async fn before_tool_call(&self, call: &ToolCall) -> Verdict { Verdict::Allow }
-  }
+  Plugin::builder("acme-review")
+      .tool(ToolSpec { /* name, description, parameters */ ..spec() },
+            |params, cx| async move { Ok(text_output("…")) })
+      .before_tool_call(|params, _cx| async move { Ok(allow()) })
+      .run()
+      .await
   ```
 
 - **TypeScript** (`@tack/plugin`): builder API, zod-flavored schemas,

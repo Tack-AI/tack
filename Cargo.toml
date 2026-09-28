@@ -9,6 +9,7 @@ members = [
     "crates/tack-protocol",
     "crates/tack-tui",
     "crates/tack-ext",
+    "crates/tack-ext-sdk",
     "crates/tack-ext-wasm",
     "xtask",
 ]
@@ -36,6 +37,7 @@ tack-tools = { path = "crates/tack-tools" }
 tack-protocol = { path = "crates/tack-protocol" }
 tack-tui = { path = "crates/tack-tui" }
 tack-ext = { path = "crates/tack-ext" }
+tack-ext-sdk = { path = "crates/tack-ext-sdk" }
 tack-ext-wasm = { path = "crates/tack-ext-wasm" }
 
 # serialization

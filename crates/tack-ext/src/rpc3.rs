@@ -148,13 +148,13 @@ pub mod method {
     pub const COMMANDS_INVOKE: &str = "commands/invoke";
 
     /// \[host-to-plugin\] A tool call is about to run; the plugin may allow, deny (reason becomes the error tool result), or rewrite the arguments. Chained plugins observe the previous plugin's rewrite; the first deny short-circuits.
-    pub const HOOKS_BEFORETOOLCALL: &str = "hooks/beforeToolCall";
+    pub const HOOKS_BEFORE_TOOL_CALL: &str = "hooks/beforeToolCall";
 
     /// \[host-to-plugin\] COW context pipeline (opt-in via capabilities.hooks.transformContext): a null result means unchanged; a returned list replaces the messages every later hook sees.
-    pub const HOOKS_TRANSFORMCONTEXT: &str = "hooks/transformContext";
+    pub const HOOKS_TRANSFORM_CONTEXT: &str = "hooks/transformContext";
 
     /// \[host-to-plugin\] Observe and patch a tool result (opt-in via capabilities.hooks.afterToolCall). Patches merge in chain order; later plugins win per field.
-    pub const HOOKS_AFTERTOOLCALL: &str = "hooks/afterToolCall";
+    pub const HOOKS_AFTER_TOOL_CALL: &str = "hooks/afterToolCall";
 
     /// \[host-to-plugin\] An approval decision is needed (opt-in via capabilities.hooks.approvalReview). A null result passes to the next reviewer in the chain; a returned decision claims the approval (first-claim-wins).
     pub const APPROVAL_REVIEW: &str = "approval/review";
@@ -175,7 +175,7 @@ pub mod method {
     pub const SESSION_GET: &str = "session/get";
 
     /// \[plugin-to-host\] Inject a user message into the session (trust/mode gated).
-    pub const SESSION_SENDUSERMESSAGE: &str = "session/sendUserMessage";
+    pub const SESSION_SEND_USER_MESSAGE: &str = "session/sendUserMessage";
 
     /// \[plugin-to-host\] Versioned read-only session digest. historyVersion and compactionRevision let the plugin detect staleness between calls without re-fetching.
     pub const SNAPSHOT_GET: &str = "snapshot/get";
@@ -205,7 +205,7 @@ pub mod method {
     pub const WARNINGS_EMIT: &str = "warnings/emit";
 
     /// \[plugin-to-host\] Dynamically register an LLM provider bridge (trust/mode gated). The registration payload mirrors the provider registry entry format.
-    pub const HOST_REGISTERPROVIDER: &str = "host/registerProvider";
+    pub const HOST_REGISTER_PROVIDER: &str = "host/registerProvider";
 }
 
 /// hooks/afterToolCall params.

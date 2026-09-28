@@ -8,6 +8,7 @@ pub mod protocol;
 pub mod provider_events;
 pub mod rpc3;
 pub mod tool;
+pub mod v3;
 
 pub use hooks::{ExtHooks, FailMode};
 pub use process::{HostServices, PluginPeer, PluginProcess};
