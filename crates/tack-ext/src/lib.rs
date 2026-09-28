@@ -6,6 +6,7 @@ pub mod hooks;
 pub mod process;
 pub mod protocol;
 pub mod provider_events;
+pub mod rpc3;
 pub mod tool;
 
 pub use hooks::{ExtHooks, FailMode};

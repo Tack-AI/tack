@@ -4,6 +4,18 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [Unreleased]
+
+### Added
+
+- tack-RPC v3 groundwork (plugin system redesign P0, see
+  `docs/plugin-roadmap.md`): `protocol/tack-rpc.openrpc.json` is the new
+  schema-first definition of the host↔plugin protocol (JSON-RPC 2.0,
+  capability namespaces), and `cargo run -p xtask -- codegen` generates
+  the Rust types (`tack_ext::rpc3`) from it, with a CI freshness check.
+  Existing v1/v2 plugins are unaffected — the v3 protocol is not wired
+  into the host yet.
+
 ## [1.0.4] - 2026-09-27
 
 ### Added

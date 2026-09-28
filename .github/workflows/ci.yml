@@ -42,6 +42,10 @@ jobs:
           cache-on-failure: true
       - name: Format
         run: cargo fmt --all -- --check
+      # crates/tack-ext/src/rpc3.rs is generated from
+      # protocol/tack-rpc.openrpc.json — fail on schema/code drift.
+      - name: Protocol codegen freshness
+        run: cargo run --locked -p xtask -- codegen --check
       # The tree is clippy-clean; keep it that way.
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings

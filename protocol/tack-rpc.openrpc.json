@@ -1,0 +1,720 @@
+{
+  "openrpc": "1.3.2",
+  "info": {
+    "title": "tack-RPC",
+    "version": "3.0.0",
+    "description": "tack-RPC v3: the host <-> plugin protocol for tack Level-3 plugins. JSON-RPC 2.0 envelopes over NDJSON stdio (process carrier) or WIT component calls (WASM carrier). This document is the single source of truth; Rust types in crates/tack-ext/src/rpc3.rs are generated from it by `cargo run -p xtask -- codegen`. Method naming follows MCP conventions (<namespace>/<verb>); direction is annotated with x-direction. Design: docs/plugin-roadmap.md."
+  },
+  "servers": [],
+  "methods": [
+    {
+      "name": "initialize",
+      "description": "Lifecycle handshake, host -> plugin, sent immediately after spawn. The host advertises its capabilities and the validated per-plugin config; the plugin answers with its identity and its (all-optional) capability contributions. A protocolVersion outside the host's supported range is a clean handshake error, not a silent degradation.",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/InitializeParams" } }],
+      "result": { "name": "result", "required": true, "schema": { "$ref": "#/components/schemas/InitializeResult" } },
+      "x-direction": "host-to-plugin"
+    },
+    {
+      "name": "shutdown",
+      "description": "Graceful stop, host -> plugin. The plugin should finish in-flight work and exit; the host kills the carrier after a grace period.",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": { "name": "result", "schema": { "type": "null" } },
+      "x-direction": "host-to-plugin"
+    },
+    {
+      "name": "tools/execute",
+      "description": "Run a plugin-contributed tool. The call carries the provider-issued toolCallId so the plugin can correlate progress/cancellation.",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/ToolExecuteParams" } }],
+      "result": { "name": "result", "required": true, "schema": { "$ref": "#/components/schemas/ToolOutput" } },
+      "x-direction": "host-to-plugin"
+    },
+    {
+      "name": "commands/invoke",
+      "description": "Run a plugin-registered slash command.",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/CommandInvokeParams" } }],
+      "result": { "name": "result", "schema": { "type": ["object", "null"], "additionalProperties": true } },
+      "x-direction": "host-to-plugin"
+    },
+    {
+      "name": "hooks/beforeToolCall",
+      "description": "A tool call is about to run; the plugin may allow, deny (reason becomes the error tool result), or rewrite the arguments. Chained plugins observe the previous plugin's rewrite; the first deny short-circuits.",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/BeforeToolCallParams" } }],
+      "result": { "name": "result", "required": true, "schema": { "$ref": "#/components/schemas/Verdict" } },
+      "x-direction": "host-to-plugin"
+    },
+    {
+      "name": "hooks/transformContext",
+      "description": "COW context pipeline (opt-in via capabilities.hooks.transformContext): a null result means unchanged; a returned list replaces the messages every later hook sees.",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/TransformContextParams" } }],
+      "result": { "name": "result", "required": true, "schema": { "oneOf": [{ "$ref": "#/components/schemas/TransformContextResult" }, { "type": "null" }] } },
+      "x-direction": "host-to-plugin"
+    },
+    {
+      "name": "hooks/afterToolCall",
+      "description": "Observe and patch a tool result (opt-in via capabilities.hooks.afterToolCall). Patches merge in chain order; later plugins win per field.",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/AfterToolCallParams" } }],
+      "result": { "name": "result", "schema": { "oneOf": [{ "$ref": "#/components/schemas/AfterToolCallPatch" }, { "type": "null" }] } },
+      "x-direction": "host-to-plugin"
+    },
+    {
+      "name": "approval/review",
+      "description": "An approval decision is needed (opt-in via capabilities.hooks.approvalReview). A null result passes to the next reviewer in the chain; a returned decision claims the approval (first-claim-wins).",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/ApprovalReviewParams" } }],
+      "result": { "name": "result", "schema": { "oneOf": [{ "$ref": "#/components/schemas/ApprovalDecision" }, { "type": "null" }] } },
+      "x-direction": "host-to-plugin"
+    },
+    {
+      "name": "autocomplete/provide",
+      "description": "Query an autocomplete provider for input-line suggestions. Timeouts and cancellations degrade to no suggestions.",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/AutocompleteProvideParams" } }],
+      "result": { "name": "result", "required": true, "schema": { "$ref": "#/components/schemas/AutocompleteProvideResult" } },
+      "x-direction": "host-to-plugin"
+    },
+    {
+      "name": "events/lifecycle",
+      "description": "Lifecycle notification, subscription-gated via capabilities.events. The event name is one of the well-known lifecycle set (sessionStart, sessionShutdown, agentStart, agentEnd, turnStart, turnEnd, messageStart, messageEnd, toolExecutionStart, toolExecutionEnd, modelSelect, thinkingLevelSelect); the payload shape depends on the event.",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/LifecycleEventParams" } }],
+      "x-direction": "host-to-plugin"
+    },
+    {
+      "name": "widgets/action",
+      "description": "User interaction with a declared widget (never produced in headless modes). Sent only to the owning plugin.",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/WidgetActionParams" } }],
+      "x-direction": "host-to-plugin"
+    },
+    {
+      "name": "widgets/update",
+      "description": "Idempotent full-state replacement for a declared widget (not a diff; dropped frames are harmless).",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/WidgetUpdateParams" } }],
+      "x-direction": "plugin-to-host"
+    },
+    {
+      "name": "session/get",
+      "description": "Read current session state (trust/mode gated).",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": { "name": "result", "required": true, "schema": { "$ref": "#/components/schemas/SessionInfo" } },
+      "x-direction": "plugin-to-host"
+    },
+    {
+      "name": "session/sendUserMessage",
+      "description": "Inject a user message into the session (trust/mode gated).",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/SendUserMessageParams" } }],
+      "result": { "name": "result", "schema": { "type": "null" } },
+      "x-direction": "plugin-to-host"
+    },
+    {
+      "name": "snapshot/get",
+      "description": "Versioned read-only session digest. historyVersion and compactionRevision let the plugin detect staleness between calls without re-fetching.",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": { "name": "result", "required": true, "schema": { "$ref": "#/components/schemas/Snapshot" } },
+      "x-direction": "plugin-to-host"
+    },
+    {
+      "name": "config/get",
+      "description": "Read the plugin's effective configuration (host-validated against the declared config schema; invalid user config degrades to defaults with a load warning).",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": { "name": "result", "required": true, "schema": { "$ref": "#/components/schemas/ConfigResult" } },
+      "x-direction": "plugin-to-host"
+    },
+    {
+      "name": "ui/notify",
+      "description": "Show a notification. Headless modes degrade to a log line.",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/UiNotifyParams" } }],
+      "result": { "name": "result", "schema": { "type": "null" } },
+      "x-direction": "plugin-to-host"
+    },
+    {
+      "name": "ui/select",
+      "description": "Ask the user to pick one option. Headless modes answer with an error (see host capabilities). A null result means dismissed.",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/UiSelectParams" } }],
+      "result": { "name": "result", "schema": { "type": ["string", "null"] } },
+      "x-direction": "plugin-to-host"
+    },
+    {
+      "name": "ui/confirm",
+      "description": "Ask the user for confirmation. Headless modes answer with an error.",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/UiConfirmParams" } }],
+      "result": { "name": "result", "required": true, "schema": { "type": "boolean" } },
+      "x-direction": "plugin-to-host"
+    },
+    {
+      "name": "ui/input",
+      "description": "Prompt the user for free text. A null result means cancelled; headless modes answer with an error.",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/UiInputParams" } }],
+      "result": { "name": "result", "schema": { "type": ["string", "null"] } },
+      "x-direction": "plugin-to-host"
+    },
+    {
+      "name": "exec/run",
+      "description": "Run a shell command on the host. Trust-gated: untrusted contexts answer with a policyDenied error.",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/ExecRunParams" } }],
+      "result": { "name": "result", "required": true, "schema": { "$ref": "#/components/schemas/ExecRunResult" } },
+      "x-direction": "plugin-to-host"
+    },
+    {
+      "name": "logs/emit",
+      "description": "Diagnostic log line, routed to the host log with plugin attribution.",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/LogParams" } }],
+      "x-direction": "plugin-to-host"
+    },
+    {
+      "name": "warnings/emit",
+      "description": "Structured user-facing warning (dismissible in the TUI, logged with plugin attribution everywhere).",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/WarningParams" } }],
+      "x-direction": "plugin-to-host"
+    },
+    {
+      "name": "host/registerProvider",
+      "description": "Dynamically register an LLM provider bridge (trust/mode gated). The registration payload mirrors the provider registry entry format.",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/RegisterProviderParams" } }],
+      "result": { "name": "result", "schema": { "type": "null" } },
+      "x-direction": "plugin-to-host"
+    }
+  ],
+  "components": {
+    "errors": {
+      "policyDenied": { "code": -32001, "message": "denied by policy" },
+      "capabilityNotGranted": { "code": -32002, "message": "capability not granted" },
+      "pluginUnavailable": { "code": -32003, "message": "plugin unavailable" },
+      "requestTimeout": { "code": -32004, "message": "request timed out" }
+    },
+    "schemas": {
+      "RunMode": {
+        "description": "Host run mode, reported at initialize so a plugin never depends on interactive requests for correctness.",
+        "type": "string",
+        "enum": ["tui", "print", "rpc", "acp"]
+      },
+      "HostInfo": {
+        "description": "Host identification (for user agents and logs).",
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "version": { "type": "string" }
+        },
+        "required": ["name", "version"]
+      },
+      "MetricsHostCapability": {
+        "description": "Metrics sidecar host support: the plugin appends NDJSON measurements to scratchFile; the host validates the drain against the declared operations schema.",
+        "type": "object",
+        "properties": {
+          "scratchFile": { "type": "string", "description": "Absolute path of the per-session scratch file (WASM carrier: inside the dedicated preopen)." }
+        },
+        "required": ["scratchFile"]
+      },
+      "HostCapabilities": {
+        "description": "What this host supports in the current mode. Absent boolean means unsupported; a plugin must check before depending on a surface.",
+        "type": "object",
+        "properties": {
+          "widgets": { "type": "boolean" },
+          "autocomplete": { "type": "boolean" },
+          "sessionControl": { "type": "boolean" },
+          "snapshot": { "type": "boolean" },
+          "uiDialogs": { "type": "boolean" },
+          "exec": { "type": "boolean" },
+          "providerRegistration": { "type": "boolean" },
+          "metrics": { "$ref": "#/components/schemas/MetricsHostCapability" }
+        }
+      },
+      "InitializeParams": {
+        "description": "Host -> plugin handshake.",
+        "type": "object",
+        "properties": {
+          "protocolVersion": { "type": "string", "description": "Semver protocol version the host speaks." },
+          "host": { "$ref": "#/components/schemas/HostInfo" },
+          "mode": { "$ref": "#/components/schemas/RunMode" },
+          "cwd": { "type": "string" },
+          "trusted": { "type": "boolean", "description": "Project trust state; gates exec and other privileged services." },
+          "capabilities": { "$ref": "#/components/schemas/HostCapabilities" },
+          "config": { "description": "Effective per-plugin configuration, validated against the plugin's declared config schema (empty object when the plugin declares none)." }
+        },
+        "required": ["protocolVersion", "host", "mode", "cwd", "trusted", "capabilities"]
+      },
+      "PluginInfo": {
+        "description": "Plugin identification.",
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "version": { "type": "string" },
+          "description": { "type": "string" }
+        },
+        "required": ["name"]
+      },
+      "ToolSpec": {
+        "description": "A contributed tool. parameters must be a JSON object schema; anything else is rejected at registration.",
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "label": { "type": "string" },
+          "description": { "type": "string" },
+          "parameters": { "description": "JSON Schema (object) of the tool arguments." }
+        },
+        "required": ["name", "description", "parameters"]
+      },
+      "CommandSpec": {
+        "description": "A contributed slash command.",
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" }
+        },
+        "required": ["name"]
+      },
+      "HookCapabilities": {
+        "description": "Opt-in hook surfaces. Absent boolean means not implemented (the host skips the call entirely).",
+        "type": "object",
+        "properties": {
+          "beforeToolCall": { "type": "boolean" },
+          "transformContext": { "type": "boolean" },
+          "afterToolCall": { "type": "boolean" },
+          "approvalReview": { "type": "boolean" }
+        }
+      },
+      "WidgetKind": {
+        "description": "Declarative widget kinds; the host owns rendering and layout.",
+        "type": "string",
+        "enum": ["statusLineSegment", "markdownPanel", "listPanel"]
+      },
+      "WidgetSpec": {
+        "description": "A declared long-lived UI unit. The host keys it as <plugin>:<id>; the plugin pushes full-state snapshots via widgets/update.",
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "$ref": "#/components/schemas/WidgetKind" },
+          "priority": { "type": "integer", "description": "Sort key for status line segments (smaller first)." },
+          "title": { "type": "string", "description": "Panel title (required by contract for panel kinds)." },
+          "visible": { "type": "boolean", "description": "Initial visibility for panel kinds." },
+          "initial": { "description": "Initial state, shaped per the widget kind." }
+        },
+        "required": ["id", "type"]
+      },
+      "AutocompleteProviderSpec": {
+        "description": "An autocomplete provider for the input line.",
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "trigger": { "type": "string", "description": "Token prefix that triggers the provider (for example #)." },
+          "description": { "type": "string" }
+        },
+        "required": ["id", "trigger"]
+      },
+      "ConfigDeclaration": {
+        "description": "Per-plugin configuration declaration: a JSON Schema the host validates settings plugins.\"<id>\".config against at load time.",
+        "type": "object",
+        "properties": {
+          "schema": { "description": "JSON Schema (object) of the plugin configuration." }
+        },
+        "required": ["schema"]
+      },
+      "MetricOperation": {
+        "description": "One declared metric operation. Identifiers match [a-z][a-z0-9_.]{0,63}; at most 8 dimensions per operation.",
+        "type": "object",
+        "properties": {
+          "description": { "type": "string" },
+          "dimensions": {
+            "type": "object",
+            "additionalProperties": { "type": "array", "items": { "type": "string" }, "description": "Allowed values (enum) for this dimension." },
+            "description": "Dimension name -> allowed values."
+          }
+        }
+      },
+      "MetricsDeclaration": {
+        "description": "Declared telemetry schema for the metrics sidecar. Any violation voids the whole declaration with a load warning.",
+        "type": "object",
+        "properties": {
+          "operations": {
+            "type": "object",
+            "additionalProperties": { "$ref": "#/components/schemas/MetricOperation" }
+          }
+        },
+        "required": ["operations"]
+      },
+      "PluginCapabilities": {
+        "description": "Everything a plugin contributes. Every field is optional and independent; an absent field contributes nothing and costs nothing.",
+        "type": "object",
+        "properties": {
+          "tools": { "type": "array", "items": { "$ref": "#/components/schemas/ToolSpec" } },
+          "commands": { "type": "array", "items": { "$ref": "#/components/schemas/CommandSpec" } },
+          "hooks": { "$ref": "#/components/schemas/HookCapabilities" },
+          "events": { "type": "array", "items": { "type": "string" }, "description": "Lifecycle events the plugin subscribes to (empty/absent = the default set)." },
+          "widgets": { "type": "array", "items": { "$ref": "#/components/schemas/WidgetSpec" } },
+          "autocompleteProviders": { "type": "array", "items": { "$ref": "#/components/schemas/AutocompleteProviderSpec" } },
+          "config": { "$ref": "#/components/schemas/ConfigDeclaration" },
+          "metrics": { "$ref": "#/components/schemas/MetricsDeclaration" }
+        }
+      },
+      "InitializeResult": {
+        "description": "Plugin -> host handshake answer.",
+        "type": "object",
+        "properties": {
+          "protocolVersion": { "type": "string" },
+          "plugin": { "$ref": "#/components/schemas/PluginInfo" },
+          "capabilities": { "$ref": "#/components/schemas/PluginCapabilities" }
+        },
+        "required": ["protocolVersion", "plugin", "capabilities"]
+      },
+      "ToolExecuteParams": {
+        "description": "tools/execute params.",
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "toolCallId": { "type": "string" },
+          "arguments": { "description": "Validated against the tool's parameter schema by the host." }
+        },
+        "required": ["name", "toolCallId", "arguments"]
+      },
+      "ContentBlockKind": {
+        "description": "Tool output content block kinds.",
+        "type": "string",
+        "enum": ["text", "image"]
+      },
+      "ContentBlock": {
+        "description": "One tool output content block. Fields not matching kind are absent (text blocks carry text; image blocks carry mimeType + data).",
+        "type": "object",
+        "properties": {
+          "type": { "$ref": "#/components/schemas/ContentBlockKind" },
+          "text": { "type": "string" },
+          "mimeType": { "type": "string" },
+          "data": { "type": "string", "description": "Base64 payload for image blocks." }
+        },
+        "required": ["type"]
+      },
+      "ToolOutput": {
+        "description": "Tool execution result.",
+        "type": "object",
+        "properties": {
+          "content": { "type": "array", "items": { "$ref": "#/components/schemas/ContentBlock" } },
+          "details": { "description": "Structured details for the UI (not sent to the model)." },
+          "isError": { "type": "boolean" }
+        },
+        "required": ["content"]
+      },
+      "CommandInvokeParams": {
+        "description": "commands/invoke params.",
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "args": { "type": "string" }
+        },
+        "required": ["name"]
+      },
+      "ToolCall": {
+        "description": "A tool call in flight.",
+        "type": "object",
+        "properties": {
+          "toolCallId": { "type": "string" },
+          "toolName": { "type": "string" },
+          "arguments": {}
+        },
+        "required": ["toolCallId", "toolName", "arguments"]
+      },
+      "BeforeToolCallParams": {
+        "description": "hooks/beforeToolCall params.",
+        "type": "object",
+        "properties": {
+          "toolCall": { "$ref": "#/components/schemas/ToolCall" },
+          "assistantMessage": { "description": "The assistant message that issued the call (provider-shaped JSON)." }
+        },
+        "required": ["toolCall"]
+      },
+      "VerdictAction": {
+        "description": "Interception verdict actions.",
+        "type": "string",
+        "enum": ["allow", "deny", "rewrite"]
+      },
+      "Verdict": {
+        "description": "Interception verdict. deny carries reason (becomes the error tool result); rewrite carries arguments (the full replacement).",
+        "type": "object",
+        "properties": {
+          "action": { "$ref": "#/components/schemas/VerdictAction" },
+          "reason": { "type": "string" },
+          "arguments": {}
+        },
+        "required": ["action"]
+      },
+      "TransformContextParams": {
+        "description": "hooks/transformContext params. Messages are session-entry shaped JSON.",
+        "type": "object",
+        "properties": {
+          "messages": { "type": "array", "items": {} }
+        },
+        "required": ["messages"]
+      },
+      "TransformContextResult": {
+        "description": "null = unchanged; a list replaces the context every later hook (and the loop) sees.",
+        "type": "object",
+        "properties": {
+          "messages": { "type": "array", "items": {} }
+        },
+        "required": ["messages"]
+      },
+      "AfterToolCallParams": {
+        "description": "hooks/afterToolCall params.",
+        "type": "object",
+        "properties": {
+          "toolCall": { "$ref": "#/components/schemas/ToolCall" },
+          "result": { "$ref": "#/components/schemas/ToolOutput" },
+          "isError": { "type": "boolean" }
+        },
+        "required": ["toolCall", "result", "isError"]
+      },
+      "AfterToolCallPatch": {
+        "description": "Per-field patch; absent fields are untouched. Later plugins in the chain win per field.",
+        "type": "object",
+        "properties": {
+          "content": { "type": "array", "items": { "$ref": "#/components/schemas/ContentBlock" } },
+          "details": {},
+          "usage": { "type": "object", "additionalProperties": true, "description": "Usage accounting override (provider-shaped)." },
+          "terminate": { "type": "boolean", "description": "End the agent loop after this result." },
+          "isError": { "type": "boolean" }
+        }
+      },
+      "ApprovalReviewParams": {
+        "description": "approval/review params.",
+        "type": "object",
+        "properties": {
+          "approvalId": { "type": "string" },
+          "toolCall": { "$ref": "#/components/schemas/ToolCall" },
+          "approvalPolicy": { "type": "string", "description": "The session's active approval policy name." },
+          "evidence": { "description": "Permission evidence gathered by the host (rule matches, sandbox state)." }
+        },
+        "required": ["approvalId", "toolCall", "approvalPolicy"]
+      },
+      "ApprovalDecisionAction": {
+        "description": "Approval outcomes a reviewer can return.",
+        "type": "string",
+        "enum": ["allow", "reviewed", "askUser"]
+      },
+      "ApprovalDecision": {
+        "description": "A claimed approval decision (a null method result passes to the next reviewer).",
+        "type": "object",
+        "properties": {
+          "action": { "$ref": "#/components/schemas/ApprovalDecisionAction" },
+          "reason": { "type": "string" }
+        },
+        "required": ["action"]
+      },
+      "AutocompleteProvideParams": {
+        "description": "autocomplete/provide params.",
+        "type": "object",
+        "properties": {
+          "providerId": { "type": "string" },
+          "query": { "type": "string" },
+          "cursorOffset": { "type": "integer", "format": "uint64" }
+        },
+        "required": ["providerId", "query", "cursorOffset"]
+      },
+      "AutocompleteSuggestion": {
+        "description": "One suggestion. insertText absent = insert value.",
+        "type": "object",
+        "properties": {
+          "value": { "type": "string" },
+          "label": { "type": "string" },
+          "detail": { "type": "string" },
+          "insertText": { "type": "string" }
+        },
+        "required": ["value", "label"]
+      },
+      "AutocompleteProvideResult": {
+        "description": "An empty suggestions list is a legal no-suggestions answer.",
+        "type": "object",
+        "properties": {
+          "suggestions": { "type": "array", "items": { "$ref": "#/components/schemas/AutocompleteSuggestion" } }
+        },
+        "required": ["suggestions"]
+      },
+      "LifecycleEventParams": {
+        "description": "events/lifecycle params. event is the lifecycle event name; payload is event-shaped JSON.",
+        "type": "object",
+        "properties": {
+          "event": { "type": "string" },
+          "payload": {}
+        },
+        "required": ["event", "payload"]
+      },
+      "WidgetUpdateParams": {
+        "description": "widgets/update params: idempotent full-state replacement, shaped per the widget kind.",
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "state": {},
+          "visible": { "type": "boolean" }
+        },
+        "required": ["id", "state"]
+      },
+      "WidgetActionParams": {
+        "description": "widgets/action params (for example action select for list panels).",
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "action": { "type": "string" },
+          "itemId": { "type": "string" }
+        },
+        "required": ["id", "action"]
+      },
+      "SessionInfo": {
+        "description": "session/get result.",
+        "type": "object",
+        "properties": {
+          "sessionId": { "type": "string" },
+          "modelId": { "type": "string" },
+          "mode": { "$ref": "#/components/schemas/RunMode" },
+          "cwd": { "type": "string" },
+          "trusted": { "type": "boolean" },
+          "messageCount": { "type": "integer", "format": "uint64" },
+          "label": { "type": "string" }
+        },
+        "required": ["sessionId", "mode", "cwd", "trusted", "messageCount"]
+      },
+      "SendUserMessageParams": {
+        "description": "session/sendUserMessage params.",
+        "type": "object",
+        "properties": {
+          "text": { "type": "string" }
+        },
+        "required": ["text"]
+      },
+      "TokenUsage": {
+        "description": "Token accounting snapshot (provider-shaped totals).",
+        "type": "object",
+        "properties": {
+          "input": { "type": "integer", "format": "uint64" },
+          "output": { "type": "integer", "format": "uint64" },
+          "cacheRead": { "type": "integer", "format": "uint64" },
+          "cacheWrite": { "type": "integer", "format": "uint64" },
+          "total": { "type": "integer", "format": "uint64" }
+        },
+        "required": ["input", "output", "total"]
+      },
+      "Snapshot": {
+        "description": "snapshot/get result: a digest, not a transcript (full-history use cases are served by event subscriptions).",
+        "type": "object",
+        "properties": {
+          "historyVersion": { "type": "integer", "format": "uint64", "description": "Bumped on every history mutation." },
+          "compactionRevision": { "type": "integer", "format": "uint64", "description": "Bumped on every compaction." },
+          "messageCount": { "type": "integer", "format": "uint64" },
+          "tokenUsage": { "$ref": "#/components/schemas/TokenUsage" },
+          "recentDigest": { "type": "string", "description": "Truncated, prompt-hygiene-normalized digest of recent messages." }
+        },
+        "required": ["historyVersion", "compactionRevision", "messageCount", "recentDigest"]
+      },
+      "ConfigResult": {
+        "description": "config/get result.",
+        "type": "object",
+        "properties": {
+          "config": { "description": "Effective per-plugin config (host-validated; defaults when the user config was invalid)." }
+        },
+        "required": ["config"]
+      },
+      "LogLevel": {
+        "description": "Log/notify levels.",
+        "type": "string",
+        "enum": ["info", "warning", "error", "debug"]
+      },
+      "UiNotifyParams": {
+        "description": "ui/notify params.",
+        "type": "object",
+        "properties": {
+          "message": { "type": "string" },
+          "level": { "$ref": "#/components/schemas/LogLevel" }
+        },
+        "required": ["message"]
+      },
+      "UiSelectParams": {
+        "description": "ui/select params.",
+        "type": "object",
+        "properties": {
+          "title": { "type": "string" },
+          "options": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["title", "options"]
+      },
+      "UiConfirmParams": {
+        "description": "ui/confirm params.",
+        "type": "object",
+        "properties": {
+          "title": { "type": "string" },
+          "message": { "type": "string" }
+        },
+        "required": ["title", "message"]
+      },
+      "UiInputParams": {
+        "description": "ui/input params.",
+        "type": "object",
+        "properties": {
+          "title": { "type": "string" },
+          "placeholder": { "type": "string" }
+        },
+        "required": ["title"]
+      },
+      "ExecRunParams": {
+        "description": "exec/run params.",
+        "type": "object",
+        "properties": {
+          "command": { "type": "string" },
+          "timeoutMs": { "type": "integer", "format": "uint64" }
+        },
+        "required": ["command"]
+      },
+      "ExecRunResult": {
+        "description": "exec/run result.",
+        "type": "object",
+        "properties": {
+          "stdout": { "type": "string" },
+          "stderr": { "type": "string" },
+          "code": { "type": "integer", "format": "int32" }
+        },
+        "required": ["stdout", "stderr", "code"]
+      },
+      "LogParams": {
+        "description": "logs/emit params.",
+        "type": "object",
+        "properties": {
+          "level": { "$ref": "#/components/schemas/LogLevel" },
+          "message": { "type": "string" }
+        },
+        "required": ["message"]
+      },
+      "WarningParams": {
+        "description": "warnings/emit params.",
+        "type": "object",
+        "properties": {
+          "message": { "type": "string" },
+          "context": { "description": "Structured context shown in the warning details." }
+        },
+        "required": ["message"]
+      },
+      "RegisterProviderParams": {
+        "description": "host/registerProvider params: a provider registry entry (provider-shaped JSON).",
+        "type": "object",
+        "properties": {
+          "provider": {}
+        },
+        "required": ["provider"]
+      }
+    }
+  }
+}

@@ -13,7 +13,8 @@ or wire protocol without a migration path and a note in `docs/compatibility.md`.
 
 ## Workspace layout
 
-Nine crates, acyclic dependency direction (`tack-app` depends on all):
+Nine crates, acyclic dependency direction (`tack-app` depends on all),
+plus an `xtask` automation crate (no library role):
 
 | Crate | Role |
 |---|---|
@@ -26,6 +27,7 @@ Nine crates, acyclic dependency direction (`tack-app` depends on all):
 | `tack-ext` | Subprocess plugin protocol (NDJSON over stdio) |
 | `tack-ext-wasm` | Sandboxed WASM extensions |
 | `tack-app` | The `tack` binary: CLI, TUI app, print/ACP/RPC/serve modes |
+| `xtask` | Repo automation: OpenRPC → Rust codegen for tack-RPC v3 (`cargo run -p xtask -- codegen`, `--check` in CI) |
 
 Start with `docs/onboarding.md` and `docs/architecture.md` when lost.
 

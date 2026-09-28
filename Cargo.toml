@@ -10,6 +10,7 @@ members = [
     "crates/tack-tui",
     "crates/tack-ext",
     "crates/tack-ext-wasm",
+    "xtask",
 ]
 
 [workspace.package]
