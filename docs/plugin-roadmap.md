@@ -407,7 +407,7 @@ Given zero installed base:
 | P2 | TS + Python SDKs; `ext new` / `ext dev` / `ext test` / `ext inspect` | P1 | landed |
 | P3 | Identity, load outcome, enable/disable, versioned store, atomic install/upgrade | P1 | landed |
 | P4 | MCP server plugins (Level 2); WIT/component WASM carrier | P1 | landed |
-| P5 | Enterprise policy (allow-lists, load-time filter, narrow-only) | P3 | — |
+| P5 | Enterprise policy (allow-lists, load-time filter, narrow-only) | P3 | landed |
 | P6 | Distribution (curated sync, bundles, catalog v2) + observability (metrics sidecar, telemetry, doctor) | P3, P5 | — |
 
 P0–P2 are the DX spine and ship first — a plugin system is its

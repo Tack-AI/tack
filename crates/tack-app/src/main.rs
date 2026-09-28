@@ -1135,6 +1135,21 @@ fn resolve_ext_id(
     }
 }
 
+/// Note (after `ext enable|disable`) when the managed policy pins the
+/// opposite value: the user setting is written but the managed layer
+/// wins at load time.
+#[cfg(feature = "ext")]
+fn warn_managed_enabled_pin(id: &str) {
+    if let Some(policy) = tack_app::plugin_policy::PluginPolicy::load()
+        && let Some(pinned) = policy.managed_enabled(id)
+    {
+        eprintln!(
+            "note: managed policy ({}) pins enabled={pinned} for {id}; the managed layer wins at load time",
+            policy.origin
+        );
+    }
+}
+
 #[cfg(feature = "ext")]
 async fn cmd_ext(command: &ExtCommand) -> Result<()> {
     let cwd = std::env::current_dir()?;
@@ -1185,7 +1200,13 @@ async fn cmd_ext(command: &ExtCommand) -> Result<()> {
                 println!("no extensions installed");
             } else {
                 for info in extensions {
-                    let state = if info.enabled { "active" } else { "disabled" };
+                    let state = if let Some(reason) = &info.policy_block {
+                        format!("policy-blocked ({reason})")
+                    } else if info.enabled {
+                        "active".to_string()
+                    } else {
+                        "disabled".to_string()
+                    };
                     let layout = if info.legacy { "legacy" } else { "store" };
                     println!(
                         "{}\t{}\t{}\t{}\t{}",
@@ -1203,12 +1224,14 @@ async fn cmd_ext(command: &ExtCommand) -> Result<()> {
             let id = resolve_ext_id(&cwd, &agent_dir, name)?;
             tack_app::extension_host::set_plugin_enabled(&agent_dir, &id, true)?;
             println!("enabled {id}");
+            warn_managed_enabled_pin(&id);
             Ok(())
         }
         ExtCommand::Disable { name } => {
             let id = resolve_ext_id(&cwd, &agent_dir, name)?;
             tack_app::extension_host::set_plugin_enabled(&agent_dir, &id, false)?;
             println!("disabled {id}");
+            warn_managed_enabled_pin(&id);
             Ok(())
         }
         ExtCommand::Upgrade { name } => {

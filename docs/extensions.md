@@ -293,3 +293,67 @@ learns the mode and the available surfaces from the initialize payload's
   signatures, atomic installs.
 - **Fail-open hooks**: hook failures warn and let the call through
   (`failMode: "closed"` flips that per plugin).
+
+## 9. Enterprise policy (managed `pluginPolicy`)
+
+Organizations constrain the plugin surface through the **managed
+settings layer** (the highest-authority settings file — see
+[configuration.md](configuration.md); users and projects cannot set or
+weaken policy):
+
+```jsonc
+// /etc/tack/managed-settings.json (Linux; path varies by OS)
+{
+  "pluginPolicy": {
+    // Only plugins explicitly named in `plugins` may load at all.
+    "managedPluginsOnly": false,
+    // Where plugin bits may come from. Empty/absent = no restriction.
+    "allowedSources": [
+      // Exact git URL; an optional "ref" only allows installs pinned
+      // to exactly that ref (an unpinned clone is denied).
+      { "type": "git", "url": "https://git.acme.com/tack/plugins.git", "ref": "main" },
+      // Regex matched against the source URL's host (https and
+      // scp-style git@host: sources).
+      { "type": "hostPattern", "pattern": "^(.+\\.)?acme\\.com$" },
+      // Local-directory sources must be this path or live beneath it.
+      { "type": "local", "path": "/opt/acme/tack-ext" }
+    ],
+    "plugins": {
+      "review@acme": {
+        // Managed `enabled` wins over the user/project layers in both
+        // directions (force-on or force-off).
+        "enabled": true,
+        // Narrow-only intersections with what the plugin registers —
+        // they shrink the surface, never expand it:
+        "mcpServers": ["jira"],      // bundle MCP servers kept
+        "tools": ["create_ticket"]   // registered tools kept
+      }
+    }
+  }
+}
+```
+
+The policy is enforced **twice**:
+
+1. **At install time** — the source is checked against `allowedSources`
+   before any clone or network access; after the manifest is parsed
+   (the plugin id is known) but before activation, `managedPluginsOnly`
+   membership and a managed `enabled: false` deny the install. Denials
+   name the rule and the layer they came from. `tack ext upgrade`
+   re-checks the locked source before re-fetching.
+2. **At load time** (the backstop) — the discovered set is filtered
+   before any carrier starts: unlisted plugins under
+   `managedPluginsOnly`, and plugins whose locked source (store
+   installs) or directory (user/project/extensionPaths checkouts)
+   matches no `allowedSources` rule, so a hand-edited store or
+   lockfile cannot smuggle in an unapproved source. Tool and MCP-server
+   narrowing is applied at registration, so every downstream consumer
+   is compliant by construction.
+
+Policy-blocked plugins are **rows, not absences**: `tack ext list`
+shows them as `policy-blocked (<reason>)`. Every policy decision —
+deny, filter, narrow, `enabled` override — is audit-logged as a
+structured tracing event (target `plugin_policy`) naming the rule and
+the origin layer; with a managed `auditSink` configured those events
+are shipped to the organization collector. `tack ext enable|disable`
+warns when the managed layer pins the opposite value.

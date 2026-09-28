@@ -8,6 +8,24 @@ notice can parse entries (same convention as TS pi).
 
 ### Added
 
+- **Plugin redesign P5 — enterprise plugin policy.** The managed
+  settings layer gains a `pluginPolicy` key: `managedPluginsOnly`
+  restricts loading to plugins explicitly named in the managed
+  `plugins` map; `allowedSources` is a source allow-list (`git` exact
+  URL with optional `ref` pin, `hostPattern` regex over the source
+  host, `local` directory roots); per-plugin `enabled` wins over the
+  user/project layers in both directions, and per-plugin
+  `tools`/`mcpServers` are narrow-only intersections with what the
+  plugin registers. Policy is enforced twice: at install time (source
+  check before any clone/network access; `managedPluginsOnly` and
+  managed-disabled checks after manifest parse, before activation;
+  `ext upgrade` re-checks) and at load time (discovery filter with a
+  lockfile/dir origin backstop, plus registration-time narrowing).
+  Blocked plugins stay visible as rows in `tack ext list`
+  (`policy-blocked (<reason>)`), every decision is audit-logged with
+  the rule and its origin layer (shipped via the managed `auditSink`
+  when configured), and `tack ext enable|disable` warns when the
+  managed layer pins the opposite value. See docs/extensions.md §9.
 - **Plugin redesign P4 — Level-2 MCP server plugins and the WIT
   component WASM carrier.** An `extension.json` with `carrier: "mcp"`
   and one `mcpServer` entry (mcp.json shape: stdio, Streamable HTTP, or

@@ -268,3 +268,60 @@ payload 的 `mode` 与 `capabilities` 获知当前模式与可用表面。
 - **供应链**：commit 锁定 + 漂移跳过、ed25519 目录签名、原子安装。
 - **fail-open hooks**：hook 失败记警告并放行（`failMode: "closed"`
   可按插件反转）。
+
+## 9. 企业策略（managed `pluginPolicy`）
+
+组织通过 **managed 设置层** 约束插件面（最高优先级设置文件——见
+[configuration.zh-CN.md](configuration.zh-CN.md)；用户层和项目层无法
+设置或削弱策略）：
+
+```jsonc
+// /etc/tack/managed-settings.json（Linux；路径因操作系统而异）
+{
+  "pluginPolicy": {
+    // 为 true 时，只有在 `plugins` 中显式列名的插件才能加载。
+    "managedPluginsOnly": false,
+    // 插件来源白名单。缺省/为空 = 不限制。
+    "allowedSources": [
+      // 精确匹配 git URL；可选 "ref" 只允许锁定到该 ref 的安装
+      //（未锁定的克隆会被拒绝）。
+      { "type": "git", "url": "https://git.acme.com/tack/plugins.git", "ref": "main" },
+      // 对来源 URL 的 host 做正则匹配（https 与 scp 风格 git@host: 均适用）。
+      { "type": "hostPattern", "pattern": "^(.+\\.)?acme\\.com$" },
+      // 本地目录来源必须等于该路径或位于其下。
+      { "type": "local", "path": "/opt/acme/tack-ext" }
+    ],
+    "plugins": {
+      "review@acme": {
+        // managed 的 `enabled` 在两个方向上都压过用户/项目层
+        //（强制启用或强制禁用）。
+        "enabled": true,
+        // 只收窄：与插件实际注册集合求交集——只缩不扩：
+        "mcpServers": ["jira"],      // 保留的 bundle MCP 服务器
+        "tools": ["create_ticket"]   // 保留的已注册工具
+      }
+    }
+  }
+}
+```
+
+策略执行 **两次**：
+
+1. **安装时**——在任何克隆或网络访问之前先检查来源是否在
+   `allowedSources` 内；清单解析后（插件 id 已知）、激活前，再以
+   `managedPluginsOnly` 成员资格和 managed `enabled: false` 拒绝安装。
+   拒绝信息会指明规则及其来源层。`tack ext upgrade` 在重新拉取前
+   也会重新检查锁定的来源。
+2. **加载时**（兜底）——发现集合在任何载体启动前先过滤：
+   `managedPluginsOnly` 下未列名的插件，以及其锁定来源（store 安装）
+   或目录（user/project/extensionPaths 检出）不匹配任何
+   `allowedSources` 规则的插件——手工篡改 store 或 lockfile 无法
+   偷运未批准的来源。工具与 MCP 服务器的收窄在注册时应用，因此
+   所有下游消费者天然合规。
+
+被策略阻止的插件 **是行而不是缺席**：`tack ext list` 显示为
+`policy-blocked (<原因>)`。每个策略决策——deny、filter、narrow、
+`enabled` 覆盖——都以结构化 tracing 事件（target `plugin_policy`）
+记入审计日志，指明规则与来源层；配置了 managed `auditSink` 时，
+这些事件会上报到组织收集器。当 managed 层钉住相反的值时，
+`tack ext enable|disable` 会给出提示。

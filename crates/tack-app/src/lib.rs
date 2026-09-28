@@ -48,6 +48,8 @@ pub mod model;
 pub mod oauth_login;
 pub mod observability;
 pub mod permissions;
+#[cfg(feature = "ext")]
+pub mod plugin_policy;
 pub mod print_mode;
 pub mod project_trust;
 pub mod prompt_templates;

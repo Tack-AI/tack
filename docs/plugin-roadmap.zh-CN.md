@@ -381,7 +381,7 @@ stdio、硬超时）。
 | P2 | TS + Python SDK；`ext new` / `ext dev` / `ext test` / `ext inspect` | P1 | landed |
 | P3 | 身份、加载结果、启用/禁用、版本化 store、原子安装/升级 | P1 | landed |
 | P4 | MCP server 插件（Level 2）；WIT/组件 WASM 载体 | P1 | landed |
-| P5 | 企业策略（白名单、加载时过滤、只收窄） | P3 | — |
+| P5 | 企业策略（白名单、加载时过滤、只收窄） | P3 | 已落地 |
 | P6 | 分发（策展同步、bundle、目录 v2）+ 可观测（指标 sidecar、遥测、doctor） | P3、P5 | — |
 
 P0–P2 是 DX 脊柱，最先交付——插件系统就是它的开发回路。P3–P6

@@ -194,6 +194,13 @@ ACP 侧的破坏性变更只通过上游 crate 升级进入，会在 CHANGELOG �
   OpenRPC 文档保持单一 schema 来源。WIT 包版本是契约的版本句柄
   （只增 = minor 提升；破坏 = 新包版本）。WASI-stdio core-module
   载体保留为 debug 载体。
+- **企业插件策略**（managed 设置 `pluginPolicy`）：
+  `managedPluginsOnly`、`allowedSources` 来源白名单
+  （git/hostPattern/local），以及按插件的 `enabled`（managed 压过
+  用户/项目层）加只收窄的 `tools`/`mcpServers` 交集。在安装时
+  （克隆/网络之前与激活之前）与加载时（发现过滤 + 注册收窄）双重
+  执行；被阻止的插件保留为可见行，决策连规则与来源层一并记入审计
+  日志。该键直接以最终形态落地——不规划 v1→v2 迁移。
 
 **承诺。**
 

@@ -274,6 +274,7 @@ Effective only in managed-settings.json:
 | `lockedProvider` | Lock the provider (blocked at startup and in /model) |
 | `lockedModel` | Lock the model id |
 | `auditSink` | Audit reporting: `{"url": "…", "token": "…", "intervalMs": 5000}` — batch POSTs of trace events (newline-delimited JSON, Bearer auth). Setting this force-enables observability |
+| `pluginPolicy` | Enterprise plugin policy: `managedPluginsOnly`, `allowedSources` (git/hostPattern/local source allow-list), per-plugin `enabled` (wins over user/project) and narrow-only `tools`/`mcpServers` intersections. Enforced at install time and at load time; decisions are audit-logged. See docs/extensions.md §9 |
 
 ### MCP (mcp.json)
 

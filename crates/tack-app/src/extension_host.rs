@@ -562,10 +562,15 @@ impl PluginHandle {
 /// every consumer filters on [`LoadedPlugin::is_active`].
 pub struct LoadedPlugin {
     pub id: PluginId,
-    /// From settings `plugins."<id>".enabled` (default true).
+    /// From settings `plugins."<id>".enabled` (default true); a managed
+    /// `pluginPolicy.plugins."<id>".enabled` wins over the user/project
+    /// layers in both directions.
     pub enabled: bool,
     /// Load/handshake failure, when any (capabilities empty then).
     pub error: Option<String>,
+    /// Managed plugin-policy block reason, when the load-time filter
+    /// rejected this plugin (rows, not absences — roadmap §8.1/§8.3).
+    pub policy_block: Option<String>,
     /// The handshake result (capabilities), when running.
     pub register: Option<InitializeResult>,
     /// The carrier, when running.
@@ -578,7 +583,7 @@ pub struct LoadedPlugin {
 
 impl LoadedPlugin {
     pub fn is_active(&self) -> bool {
-        self.enabled && self.error.is_none()
+        self.enabled && self.error.is_none() && self.policy_block.is_none()
     }
 
     /// The plugin name (id's name segment).
@@ -597,6 +602,7 @@ impl std::fmt::Debug for LoadedPlugin {
             .field("id", &self.id.to_string())
             .field("enabled", &self.enabled)
             .field("error", &self.error)
+            .field("policy_block", &self.policy_block)
             .finish()
     }
 }
@@ -1032,6 +1038,32 @@ impl ExtensionManager {
         lock_required: bool,
         mcp_callbacks: tack_tools::mcp::McpClientCallbacks,
     ) -> Self {
+        let policy = crate::plugin_policy::PluginPolicy::load();
+        Self::load_with_policy(
+            cwd,
+            agent_dir,
+            mode,
+            services,
+            lock_required,
+            mcp_callbacks,
+            policy,
+        )
+        .await
+    }
+
+    /// `load` with an explicit managed plugin policy (the production
+    /// entry point reads it from the managed settings file; tests pass
+    /// one in directly — `TACK_MANAGED_SETTINGS` is process-global and
+    /// parallel tests would race it).
+    pub async fn load_with_policy(
+        cwd: &Path,
+        agent_dir: &Path,
+        mode: &str,
+        services: Arc<dyn PeerHandler>,
+        lock_required: bool,
+        mcp_callbacks: tack_tools::mcp::McpClientCallbacks,
+        policy: Option<crate::plugin_policy::PluginPolicy>,
+    ) -> Self {
         let mut manager = ExtensionManager::default();
         let trusted = crate::project_trust::is_trusted(cwd, agent_dir);
         let enabled_map = plugin_enabled_map(cwd, agent_dir);
@@ -1042,9 +1074,39 @@ impl ExtensionManager {
         });
         for entry in discovered {
             let id_string = entry.id.to_string();
-            let enabled = enabled_map.get(&id_string).copied().unwrap_or(true);
-            // Read the manifest first: it is needed for bundle resources
-            // even when the plugin is disabled.
+            let mut enabled = enabled_map.get(&id_string).copied().unwrap_or(true);
+            // Managed `enabled` wins over the user/project layers.
+            if let Some(policy) = &policy
+                && let Some(managed) = policy.managed_enabled(&id_string)
+                && managed != enabled
+            {
+                policy.audit_enabled_override(&id_string, managed);
+                enabled = managed;
+            }
+            // Load-time policy filter (the backstop): managedPluginsOnly
+            // membership + origin re-verified against allowedSources.
+            if let Some(policy) = &policy {
+                let origin = match lock.plugins.get(&id_string) {
+                    Some(locked) => crate::plugin_policy::LoadOrigin::Locked {
+                        source: &locked.source,
+                        rev: locked.rev.as_deref(),
+                    },
+                    None => crate::plugin_policy::LoadOrigin::Dir(&entry.dir),
+                };
+                if let Some(reason) = policy.load_block(&entry.id, origin) {
+                    manager.plugins.push(LoadedPlugin {
+                        id: entry.id,
+                        enabled,
+                        error: None,
+                        policy_block: Some(reason),
+                        register: None,
+                        handle: None,
+                        version: entry.version,
+                        dir: entry.dir,
+                    });
+                    continue;
+                }
+            }
             let manifest_path = entry.dir.join("extension.json");
             let manifest: Option<ExtensionManifest> = match std::fs::read_to_string(&manifest_path)
             {
@@ -1055,6 +1117,7 @@ impl ExtensionManager {
                             id: entry.id,
                             enabled,
                             error: Some(format!("bad extension.json: {e}")),
+                            policy_block: None,
                             register: None,
                             handle: None,
                             version: entry.version,
@@ -1068,6 +1131,7 @@ impl ExtensionManager {
                         id: entry.id,
                         enabled,
                         error: Some(format!("cannot read extension.json: {e}")),
+                        policy_block: None,
                         register: None,
                         handle: None,
                         version: entry.version,
@@ -1083,6 +1147,7 @@ impl ExtensionManager {
                     id: entry.id,
                     enabled: false,
                     error: None,
+                    policy_block: None,
                     register: None,
                     handle: None,
                     version: entry.version,
@@ -1103,6 +1168,7 @@ impl ExtensionManager {
                         "checkout drifted from the locked commit (extensionLockRequired)"
                             .to_string(),
                     ),
+                    policy_block: None,
                     register: None,
                     handle: None,
                     version: entry.version,
@@ -1113,7 +1179,7 @@ impl ExtensionManager {
 
             // Bundle contributions (hooks/MCP/skills) are collected for
             // every enabled plugin, even when its carrier fails to start.
-            manager.collect_bundle_resources(&id_string, &entry.dir, &manifest);
+            manager.collect_bundle_resources(&id_string, &entry.dir, &manifest, policy.as_ref());
 
             // Tag this plugin's notifications (widgets/update needs the
             // origin).
@@ -1131,6 +1197,7 @@ impl ExtensionManager {
                             id: entry.id,
                             enabled,
                             error: Some("carrier mcp requires an `mcpServer` entry".to_string()),
+                            policy_block: None,
                             register: None,
                             handle: None,
                             version: entry.version,
@@ -1147,6 +1214,7 @@ impl ExtensionManager {
                             id: entry.id,
                             enabled,
                             error: Some("carrier mcp: malformed `mcpServer` entry".to_string()),
+                            policy_block: None,
                             register: None,
                             handle: None,
                             version: entry.version,
@@ -1174,6 +1242,7 @@ impl ExtensionManager {
                                 id: entry.id,
                                 enabled,
                                 error: Some(format!("failed to start (mcp): {e}")),
+                                policy_block: None,
                                 register: None,
                                 handle: None,
                                 version: entry.version,
@@ -1191,6 +1260,7 @@ impl ExtensionManager {
                                 id: entry.id,
                                 enabled,
                                 error: Some("carrier wasm requires `module`".to_string()),
+                                policy_block: None,
                                 register: None,
                                 handle: None,
                                 version: entry.version,
@@ -1209,6 +1279,7 @@ impl ExtensionManager {
                                         "cannot read {}: {e}",
                                         module_path.display()
                                     )),
+                                    policy_block: None,
                                     register: None,
                                     handle: None,
                                     version: entry.version,
@@ -1225,6 +1296,7 @@ impl ExtensionManager {
                                         id: entry.id,
                                         enabled,
                                         error: Some(format!("wasmtime unavailable: {e}")),
+                                        policy_block: None,
                                         register: None,
                                         handle: None,
                                         version: entry.version,
@@ -1263,6 +1335,7 @@ impl ExtensionManager {
                                         error: Some(format!(
                                             "failed to start (wasm component): {e}"
                                         )),
+                                        policy_block: None,
                                         register: None,
                                         handle: None,
                                         version: entry.version,
@@ -1287,6 +1360,7 @@ impl ExtensionManager {
                                         id: entry.id,
                                         enabled,
                                         error: Some(format!("failed to start (wasm): {e}")),
+                                        policy_block: None,
                                         register: None,
                                         handle: None,
                                         version: entry.version,
@@ -1306,6 +1380,7 @@ impl ExtensionManager {
                                 "carrier wasm requested, but this build has no wasm support"
                                     .to_string(),
                             ),
+                            policy_block: None,
                             register: None,
                             handle: None,
                             version: entry.version,
@@ -1342,6 +1417,7 @@ impl ExtensionManager {
                                 id: entry.id,
                                 enabled,
                                 error: Some(format!("failed to start: {e}")),
+                                policy_block: None,
                                 register: None,
                                 handle: None,
                                 version: entry.version,
@@ -1356,6 +1432,7 @@ impl ExtensionManager {
                         id: entry.id,
                         enabled,
                         error: Some(format!("unknown carrier {other:?}")),
+                        policy_block: None,
                         register: None,
                         handle: None,
                         version: entry.version,
@@ -1415,6 +1492,43 @@ impl ExtensionManager {
                             }
                         });
                     }
+                    // Managed policy tool narrowing (intersect-only): a
+                    // tool not in the managed allow-list is dropped at
+                    // registration, so every downstream consumer is
+                    // compliant by construction.
+                    if let Some(policy) = &policy
+                        && let Some(allow) = policy.narrowed_tools(&id_string)
+                        && let Some(tools) = &mut register.capabilities.tools
+                    {
+                        let registered: Vec<String> =
+                            tools.iter().map(|spec| spec.name.clone()).collect();
+                        tools.retain(|spec| allow.iter().any(|name| name == &spec.name));
+                        let kept: Vec<String> =
+                            tools.iter().map(|spec| spec.name.clone()).collect();
+                        let dropped: Vec<String> = registered
+                            .iter()
+                            .filter(|name| !kept.contains(name))
+                            .cloned()
+                            .collect();
+                        let unknown: Vec<String> = allow
+                            .iter()
+                            .filter(|name| !registered.contains(name))
+                            .cloned()
+                            .collect();
+                        policy.audit_narrow(&id_string, "plugins.tools", &dropped);
+                        if !dropped.is_empty() {
+                            manager.load_warnings.push(format!(
+                                "extension {id_string}: managed policy dropped tool(s): {}",
+                                dropped.join(", ")
+                            ));
+                        }
+                        if !unknown.is_empty() {
+                            manager.load_warnings.push(format!(
+                                "extension {id_string}: managed policy allows tool(s) the plugin does not register (narrow-only): {}",
+                                unknown.join(", ")
+                            ));
+                        }
+                    }
                     tracing::info!(
                         "extension {} loaded (carrier {}, version {})",
                         id_string,
@@ -1435,6 +1549,7 @@ impl ExtensionManager {
                         id: entry.id,
                         enabled,
                         error: None,
+                        policy_block: None,
                         register: Some(register),
                         handle: Some(handle),
                         version: entry.version,
@@ -1447,6 +1562,7 @@ impl ExtensionManager {
                         id: entry.id,
                         enabled,
                         error: Some(format!("handshake failed: {e}")),
+                        policy_block: None,
                         register: None,
                         handle: None,
                         version: entry.version,
@@ -1460,8 +1576,15 @@ impl ExtensionManager {
 
     /// Collect a manifest's declarative bundle resources (hooks / MCP
     /// servers / skill dirs). Paths resolve against the extension
-    /// directory.
-    fn collect_bundle_resources(&mut self, name: &str, dir: &Path, manifest: &ExtensionManifest) {
+    /// directory. A managed policy `mcpServers` list narrows the
+    /// collected servers (intersect-only).
+    fn collect_bundle_resources(
+        &mut self,
+        name: &str,
+        dir: &Path,
+        manifest: &ExtensionManifest,
+        policy: Option<&crate::plugin_policy::PluginPolicy>,
+    ) {
         if let Some(hooks) = &manifest.hooks {
             let paths: Vec<&str> = match hooks {
                 Value::String(path) => vec![path.as_str()],
@@ -1490,43 +1613,74 @@ impl ExtensionManager {
                 }
             }
         }
-        match &manifest.mcp_servers {
+        let mcp_specs: Vec<tack_tools::mcp::McpServerSpec> = match &manifest.mcp_servers {
             Some(Value::String(path)) => {
                 let path = dir.join(path);
                 match std::fs::read_to_string(&path) {
                     Ok(content) => match serde_json::from_str::<Value>(&content) {
                         Ok(value) => {
-                            self.bundle_mcp_servers
-                                .extend(crate::mcp_config::specs_from_value(
-                                    &value,
-                                    &path.display().to_string(),
-                                ))
+                            crate::mcp_config::specs_from_value(&value, &path.display().to_string())
                         }
-                        Err(e) => self.load_warnings.push(format!(
-                            "extension {name}: bad MCP servers file {}: {e}",
-                            path.display()
-                        )),
+                        Err(e) => {
+                            self.load_warnings.push(format!(
+                                "extension {name}: bad MCP servers file {}: {e}",
+                                path.display()
+                            ));
+                            Vec::new()
+                        }
                     },
-                    Err(e) => self.load_warnings.push(format!(
-                        "extension {name}: cannot read {}: {e}",
-                        path.display()
-                    )),
+                    Err(e) => {
+                        self.load_warnings.push(format!(
+                            "extension {name}: cannot read {}: {e}",
+                            path.display()
+                        ));
+                        Vec::new()
+                    }
                 }
             }
             Some(value @ Value::Object(_)) => {
-                self.bundle_mcp_servers
-                    .extend(crate::mcp_config::specs_from_value(
-                        value,
-                        &format!("extension {name}"),
-                    ));
+                crate::mcp_config::specs_from_value(value, &format!("extension {name}"))
             }
             Some(_) => {
                 self.load_warnings.push(format!(
                     "extension {name}: `mcpServers` must be a path or an object"
                 ));
+                Vec::new()
             }
-            None => {}
+            None => Vec::new(),
+        };
+        let mut mcp_specs = mcp_specs;
+        if let Some(policy) = policy
+            && let Some(allow) = policy.narrowed_mcp_servers(name)
+            && !mcp_specs.is_empty()
+        {
+            let declared: Vec<String> = mcp_specs.iter().map(|spec| spec.name.clone()).collect();
+            mcp_specs.retain(|spec| allow.iter().any(|name| name == &spec.name));
+            let dropped: Vec<String> = declared
+                .iter()
+                .filter(|declared| !mcp_specs.iter().any(|spec| &spec.name == *declared))
+                .cloned()
+                .collect();
+            let unknown: Vec<String> = allow
+                .iter()
+                .filter(|name| !declared.contains(name))
+                .cloned()
+                .collect();
+            policy.audit_narrow(name, "plugins.mcpServers", &dropped);
+            if !dropped.is_empty() {
+                self.load_warnings.push(format!(
+                    "extension {name}: managed policy dropped MCP server(s): {}",
+                    dropped.join(", ")
+                ));
+            }
+            if !unknown.is_empty() {
+                self.load_warnings.push(format!(
+                    "extension {name}: managed policy allows MCP server(s) the plugin does not declare (narrow-only): {}",
+                    unknown.join(", ")
+                ));
+            }
         }
+        self.bundle_mcp_servers.extend(mcp_specs);
         if let Some(skills) = &manifest.skills {
             for path in skills {
                 let path = dir.join(path);
@@ -2230,6 +2384,15 @@ pub fn install_extension_named(
         || source.starts_with("git@")
         || source.ends_with(".git");
 
+    // Managed plugin policy, first enforcement point: the source
+    // allow-list is checked BEFORE any clone or network access; the
+    // per-plugin rules run after the manifest is parsed (the id is
+    // known) but before activation. Denials name the rule and layer.
+    let policy = crate::plugin_policy::PluginPolicy::load();
+    if let Some(policy) = &policy {
+        policy.check_install_source(source, rev)?;
+    }
+
     // Stage: fetch the plugin into a temporary sibling directory, then
     // validate and activate atomically.
     if local {
@@ -2257,6 +2420,12 @@ pub fn install_extension_named(
             .map(str::to_string)
             .unwrap_or_else(|| manifest.name.clone());
         let id = PluginId::new(&name, "project")?;
+        if let Some(policy) = &policy
+            && let Err(denial) = policy.check_install_allowed(&id)
+        {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(denial.into());
+        }
         let target = root.join(id.name());
         activate_staging(&staging, &target)?;
         return Ok(target);
@@ -2292,6 +2461,12 @@ pub fn install_extension_named(
         .map(str::to_string)
         .unwrap_or_else(|| manifest.name.clone());
     let id = PluginId::new(&name, id_source)?;
+    if let Some(policy) = &policy
+        && let Err(denial) = policy.check_install_allowed(&id)
+    {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(denial.into());
+    }
     let version = install_version(&manifest, rev);
     let plugin_root = store_root(agent_dir).join(id.source()).join(id.name());
     std::fs::create_dir_all(&plugin_root)?;
@@ -2447,6 +2622,9 @@ pub fn upgrade_extensions(
     name: Option<&str>,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let lock = read_lock(agent_dir)?;
+    // A managed policy change since install also constrains upgrades:
+    // re-check the recorded source before any network access.
+    let policy = crate::plugin_policy::PluginPolicy::load();
     let mut out = Vec::new();
     for (id_string, entry) in lock.plugins.clone() {
         if !entry.store {
@@ -2468,6 +2646,12 @@ pub fn upgrade_extensions(
             || source.ends_with(".git");
         if !is_git {
             out.push((id_string.clone(), "skipped (not a git install)".to_string()));
+            continue;
+        }
+        if let Some(policy) = &policy
+            && let Err(denial) = policy.check_install_source(&source, entry.rev.as_deref())
+        {
+            out.push((id_string.clone(), format!("blocked: {denial}")));
             continue;
         }
         // Stage a fresh clone and compare the resolved commit first
@@ -2527,6 +2711,9 @@ pub struct InstalledInfo {
     pub legacy: bool,
     pub enabled: bool,
     pub locked_commit: Option<String>,
+    /// Managed policy block reason (the load-time filter's verdict);
+    /// the plugin never runs while this is set.
+    pub policy_block: Option<String>,
 }
 
 /// List installed extensions across the store, legacy dir, and project
@@ -2547,6 +2734,7 @@ pub fn list_extensions(cwd: &Path, agent_dir: &Path) -> Vec<InstalledInfo> {
             dir: discovered.dir,
             version: discovered.version,
             legacy: false,
+            policy_block: None,
         });
     }
     // Legacy flat installs not shadowed by a store install.
@@ -2578,6 +2766,7 @@ pub fn list_extensions(cwd: &Path, agent_dir: &Path) -> Vec<InstalledInfo> {
                 dir: path,
                 version: "local".to_string(),
                 legacy: true,
+                policy_block: None,
             });
         }
     }
@@ -2601,10 +2790,31 @@ pub fn list_extensions(cwd: &Path, agent_dir: &Path) -> Vec<InstalledInfo> {
                 dir: path,
                 version: "local".to_string(),
                 legacy: true,
+                policy_block: None,
             });
         }
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
+    // Managed policy overlay (display mirror of the load-time filter):
+    // a managed `enabled` wins and blocked rows show their reason.
+    if let Some(policy) = crate::plugin_policy::PluginPolicy::load() {
+        for info in &mut out {
+            let Ok(id) = info.id.parse::<PluginId>() else {
+                continue;
+            };
+            if let Some(managed) = policy.managed_enabled(&info.id) {
+                info.enabled = managed;
+            }
+            let origin = match lock.plugins.get(&info.id) {
+                Some(locked) => crate::plugin_policy::LoadOrigin::Locked {
+                    source: &locked.source,
+                    rev: locked.rev.as_deref(),
+                },
+                None => crate::plugin_policy::LoadOrigin::Dir(&info.dir),
+            };
+            info.policy_block = policy.load_block(&id, origin);
+        }
+    }
     out
 }
 
@@ -3843,5 +4053,306 @@ mod tests {
             "sandbox denial should surface as errno, got: {text}"
         );
         manager.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    //! Managed plugin policy (P5) wired through `load_with_policy` (the
+    //! production `load` reads the policy from the managed settings
+    //! file; passing one in keeps these tests free of the process-global
+    //! TACK_MANAGED_SETTINGS).
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    struct NoopServices;
+
+    #[async_trait::async_trait]
+    impl PeerHandler for NoopServices {}
+
+    fn test_policy(raw: &str) -> crate::plugin_policy::PluginPolicy {
+        let raw: Value = serde_json::from_str(raw).unwrap();
+        crate::plugin_policy::PluginPolicy::from_raw(&raw, "/test/managed.json".to_string())
+            .expect("policy parses")
+    }
+
+    fn dirs() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        (tmp, agent_dir, cwd)
+    }
+
+    fn write_flat_plugin(agent_dir: &Path, name: &str, manifest: &str) {
+        let dir = agent_dir.join("extensions").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("extension.json"), manifest).unwrap();
+    }
+
+    /// managedPluginsOnly: an unlisted plugin never spawns — it stays as
+    /// a policy-blocked row (rows, not absences).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn managed_plugins_only_blocks_unlisted_plugin() {
+        let (_tmp, agent_dir, cwd) = dirs();
+        write_flat_plugin(
+            &agent_dir,
+            "sketchy",
+            r#"{"name": "sketchy", "command": "definitely-not-a-real-command-xyz"}"#,
+        );
+        let policy = test_policy(
+            r#"{"pluginPolicy": {"managedPluginsOnly": true,
+                "plugins": {"review@acme": {"enabled": true}}}}"#,
+        );
+        let manager = ExtensionManager::load_with_policy(
+            &cwd,
+            &agent_dir,
+            "tui",
+            Arc::new(NoopServices),
+            true,
+            Default::default(),
+            Some(policy),
+        )
+        .await;
+        assert_eq!(manager.plugins.len(), 1);
+        let plugin = &manager.plugins[0];
+        assert!(!plugin.is_active());
+        assert!(plugin.error.is_none(), "a policy block is not a failure");
+        assert!(plugin.handle.is_none(), "blocked plugins never spawn");
+        let reason = plugin.policy_block.as_deref().unwrap_or("");
+        assert!(reason.contains("managedPluginsOnly"), "{reason}");
+        assert!(reason.contains("/test/managed.json"), "{reason}");
+    }
+
+    /// Managed `enabled` wins over the user layer in both directions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn managed_enabled_wins_over_user_settings() {
+        let (_tmp, agent_dir, cwd) = dirs();
+        write_flat_plugin(
+            &agent_dir,
+            "forced",
+            r#"{"name": "forced", "command": "definitely-not-a-real-command-xyz"}"#,
+        );
+        write_flat_plugin(
+            &agent_dir,
+            "pinned-off",
+            r#"{"name": "pinned-off", "command": "definitely-not-a-real-command-xyz"}"#,
+        );
+        // User layer: forced@user disabled; pinned-off@user enabled.
+        set_plugin_enabled(&agent_dir, "forced@user", false).unwrap();
+        let policy = test_policy(
+            r#"{"pluginPolicy": {"plugins": {
+                "forced@user": {"enabled": true},
+                "pinned-off@user": {"enabled": false}
+            }}}"#,
+        );
+        let manager = ExtensionManager::load_with_policy(
+            &cwd,
+            &agent_dir,
+            "tui",
+            Arc::new(NoopServices),
+            true,
+            Default::default(),
+            Some(policy),
+        )
+        .await;
+        let forced = manager
+            .plugins
+            .iter()
+            .find(|p| p.id.name() == "forced")
+            .unwrap();
+        assert!(
+            forced.enabled,
+            "managed enabled=true overrides the user disable"
+        );
+        assert!(
+            forced.error.is_some(),
+            "a force-enabled plugin attempts the spawn"
+        );
+        let pinned = manager
+            .plugins
+            .iter()
+            .find(|p| p.id.name() == "pinned-off")
+            .unwrap();
+        assert!(!pinned.enabled, "managed enabled=false wins too");
+        assert!(pinned.handle.is_none(), "disabled plugins never spawn");
+    }
+
+    /// A managed `mcpServers` list narrows bundle contributions
+    /// (intersect-only; unknown entries warn, never expand).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn policy_narrows_bundle_mcp_servers() {
+        let (_tmp, agent_dir, cwd) = dirs();
+        write_flat_plugin(
+            &agent_dir,
+            "bundle",
+            r#"{
+  "name": "bundle",
+  "mcpServers": {
+    "jira": { "url": "https://jira.example.com/mcp" },
+    "docs": { "url": "https://docs.example.com/mcp" }
+  }
+}"#,
+        );
+        let policy = test_policy(
+            r#"{"pluginPolicy": {"plugins": {
+                "bundle@user": {"mcpServers": ["jira", "nonexistent"]}
+            }}}"#,
+        );
+        let manager = ExtensionManager::load_with_policy(
+            &cwd,
+            &agent_dir,
+            "tui",
+            Arc::new(NoopServices),
+            true,
+            Default::default(),
+            Some(policy),
+        )
+        .await;
+        assert_eq!(
+            manager.bundle_mcp_servers.len(),
+            1,
+            "only the allowed server survives: {:?}",
+            manager
+                .bundle_mcp_servers
+                .iter()
+                .map(|s| &s.name)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(manager.bundle_mcp_servers[0].name, "jira");
+        let warnings = manager.load_warnings.join("\n");
+        assert!(
+            warnings.contains("dropped MCP server(s): docs"),
+            "{warnings}"
+        );
+        assert!(warnings.contains("nonexistent"), "{warnings}");
+    }
+
+    /// A managed `tools` list narrows the registered tool set at
+    /// registration time (intersect-only).
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "wasm")]
+    async fn policy_narrows_registered_tools() {
+        let (_tmp, agent_dir, cwd) = dirs();
+        let ext_dir = agent_dir.join("extensions").join("hello-wasm");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(
+            ext_dir.join("extension.json"),
+            r#"{
+  "name": "hello-wasm",
+  "carrier": "wasm",
+  "module": "plugin.wat",
+  "limits": { "maxFuel": 100000000, "maxMemoryBytes": 16787216 }
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ext_dir.join("plugin.wat"),
+            include_str!("../../../examples/extensions/hello-wasm/plugin.wat"),
+        )
+        .unwrap();
+
+        // Allow only a tool the plugin does not register: everything is
+        // dropped (narrow-only never expands).
+        let policy = test_policy(
+            r#"{"pluginPolicy": {"plugins": {
+                "hello-wasm@user": {"tools": ["nope"]}
+            }}}"#,
+        );
+        let mut manager = ExtensionManager::load_with_policy(
+            &cwd,
+            &agent_dir,
+            "tui",
+            Arc::new(NoopServices),
+            true,
+            Default::default(),
+            Some(policy),
+        )
+        .await;
+        assert!(
+            manager.tools().is_empty(),
+            "ping is dropped by the managed tool list"
+        );
+        let warnings = manager.load_warnings.join("\n");
+        assert!(warnings.contains("dropped tool(s): ping"), "{warnings}");
+        assert!(warnings.contains("does not register"), "{warnings}");
+        manager.shutdown().await;
+
+        // Allow exactly the registered tool: it survives.
+        let policy = test_policy(
+            r#"{"pluginPolicy": {"plugins": {
+                "hello-wasm@user": {"tools": ["ping"]}
+            }}}"#,
+        );
+        let mut manager = ExtensionManager::load_with_policy(
+            &cwd,
+            &agent_dir,
+            "tui",
+            Arc::new(NoopServices),
+            true,
+            Default::default(),
+            Some(policy),
+        )
+        .await;
+        assert_eq!(manager.tools().len(), 1);
+        manager.shutdown().await;
+    }
+
+    /// Load-time source backstop: a store install whose locked source
+    /// matches no allowedSources rule is filtered at load.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn load_time_source_backstop_filters_store_install() {
+        let (_tmp, agent_dir, cwd) = dirs();
+        let plain = _tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(
+            plain.join("extension.json"),
+            r#"{"name": "plain", "command": "definitely-not-a-real-command-xyz"}"#,
+        )
+        .unwrap();
+        install_extension(plain.to_str().unwrap(), &cwd, &agent_dir, false).unwrap();
+        let policy = test_policy(
+            r#"{"pluginPolicy": {"allowedSources": [
+                {"type": "local", "path": "/opt/acme/approved"}
+            ]}}"#,
+        );
+        let manager = ExtensionManager::load_with_policy(
+            &cwd,
+            &agent_dir,
+            "tui",
+            Arc::new(NoopServices),
+            true,
+            Default::default(),
+            Some(policy),
+        )
+        .await;
+        assert_eq!(manager.plugins.len(), 1);
+        let plugin = &manager.plugins[0];
+        let reason = plugin.policy_block.as_deref().unwrap_or("");
+        assert!(reason.contains("allowedSources"), "{reason}");
+        assert!(plugin.handle.is_none(), "filtered plugins never spawn");
+
+        // With the install root approved the same plugin loads.
+        let policy = test_policy(&format!(
+            r#"{{"pluginPolicy": {{"allowedSources": [
+                {{"type": "local", "path": "{}"}}
+            ]}}}}"#,
+            _tmp.path().display()
+        ));
+        let manager = ExtensionManager::load_with_policy(
+            &cwd,
+            &agent_dir,
+            "tui",
+            Arc::new(NoopServices),
+            true,
+            Default::default(),
+            Some(policy),
+        )
+        .await;
+        assert!(
+            manager.plugins[0].policy_block.is_none(),
+            "approved origin loads: {:?}",
+            manager.plugins[0].policy_block
+        );
     }
 }

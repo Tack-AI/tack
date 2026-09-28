@@ -214,6 +214,15 @@ in `docs/upstream-alignment.md` (§5).
   package version is the contract's version handle (additive = minor
   bump; breaking = new package version). The WASI-stdio core-module
   carrier remains supported as the debug carrier.
+- **Enterprise plugin policy** (managed settings `pluginPolicy`):
+  `managedPluginsOnly`, the `allowedSources` source allow-list
+  (git/hostPattern/local), and per-plugin `enabled` (managed wins over
+  the user/project layers) plus narrow-only `tools`/`mcpServers`
+  intersections. Enforced at install time (before clone/network and
+  before activation) and at load time (discovery filter + registration
+  narrowing); blocked plugins stay visible as rows, and decisions are
+  audit-logged with rule and layer. The key landed in its final form —
+  no v1→v2 migration is planned.
 
 **Commitment.**
 
