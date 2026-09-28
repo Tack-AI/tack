@@ -377,6 +377,36 @@ enum ExtCommand {
         #[command(subcommand)]
         command: MarketplaceCommand,
     },
+    /// Scaffold a new tack-RPC v3 plugin (extension.json + SDK starter).
+    /// Dev tooling speaks v3 directly; the session loader switches with
+    /// the loader rework (see docs/plugin-roadmap.md)
+    New {
+        /// Target directory, created by the scaffold
+        dir: std::path::PathBuf,
+        /// Plugin language: rust | ts | python
+        lang: String,
+    },
+    /// Spawn a v3 plugin and dump its declared capabilities (handshake)
+    Inspect {
+        /// Extension directory (containing extension.json)
+        dir: std::path::PathBuf,
+    },
+    /// Run a v3 plugin against a scenario file (or stream its logs
+    /// until Ctrl-C when no scenario is given)
+    Dev {
+        /// Extension directory (containing extension.json)
+        dir: std::path::PathBuf,
+        /// Scenario file (JSON); see crates/tack-app/src/ext_dev.rs
+        scenario: Option<std::path::PathBuf>,
+    },
+    /// Run scenario assertions for a v3 plugin; exits non-zero on
+    /// failure (default scenario: `<dir>/plugin.scenario.json`)
+    Test {
+        /// Extension directory (containing extension.json)
+        dir: std::path::PathBuf,
+        /// Scenario file (JSON)
+        scenario: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1218,6 +1248,14 @@ async fn cmd_ext(command: &ExtCommand) -> Result<()> {
                 Ok(())
             }
         },
+        ExtCommand::New { dir, lang } => tack_app::ext_dev::cmd_ext_new(dir, lang),
+        ExtCommand::Inspect { dir } => tack_app::ext_dev::cmd_ext_inspect(dir).await,
+        ExtCommand::Dev { dir, scenario } => {
+            tack_app::ext_dev::cmd_ext_dev(dir, scenario.as_deref()).await
+        }
+        ExtCommand::Test { dir, scenario } => {
+            tack_app::ext_dev::cmd_ext_test(dir, scenario.as_deref()).await
+        }
     }
 }
 

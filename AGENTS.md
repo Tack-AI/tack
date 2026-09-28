@@ -14,7 +14,10 @@ or wire protocol without a migration path and a note in `docs/compatibility.md`.
 ## Workspace layout
 
 Ten crates, acyclic dependency direction (`tack-app` depends on all),
-plus an `xtask` automation crate (no library role):
+plus an `xtask` automation crate (no library role). The tack-RPC v3
+language SDKs live outside the Cargo workspace — `sdk/typescript`
+(`@tack/plugin`) and `sdk/python` (`tack-plugin`) — with their protocol
+types generated from `protocol/tack-rpc.openrpc.json`:
 
 | Crate | Role |
 |---|---|

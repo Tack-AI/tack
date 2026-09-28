@@ -4,6 +4,7 @@
 //! truth), or verify freshness with `--check` (used by CI).
 
 mod codegen;
+mod sdk_gen;
 
 use anyhow::Result;
 

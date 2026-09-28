@@ -11,9 +11,11 @@
 
 pub mod host;
 pub mod peer;
+pub mod process;
 
 pub use host::HostClient;
 pub use peer::{JsonRpcPeer, PeerError, PeerHandler};
+pub use process::V3Process;
 
 /// The tack-RPC protocol version this crate speaks (semver; the major
 /// version must match on both sides of the handshake).

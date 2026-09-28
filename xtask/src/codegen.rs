@@ -14,31 +14,38 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-const SCHEMA_PATH: &str = "protocol/tack-rpc.openrpc.json";
+pub(crate) const SCHEMA_PATH: &str = "protocol/tack-rpc.openrpc.json";
 const OUT_PATH: &str = "crates/tack-ext/src/rpc3.rs";
+const TS_OUT_PATH: &str = "sdk/typescript/src/types.d.ts";
+const PY_OUT_PATH: &str = "sdk/python/tack_plugin/types.py";
 
-/// Regenerate (or with `check`, verify) the Rust types from the schema.
+/// Regenerate (or with `check`, verify) the SDK types from the schema.
 pub fn codegen(check: bool) -> Result<()> {
     let root = workspace_root();
     let raw = std::fs::read_to_string(root.join(SCHEMA_PATH))
         .with_context(|| format!("read {SCHEMA_PATH}"))?;
     let doc: Value = serde_json::from_str(&raw).context("parse OpenRPC document")?;
-    let rendered = rustfmt(&generate(&doc)?)?;
-    if check {
-        let current = std::fs::read_to_string(root.join(OUT_PATH)).unwrap_or_default();
-        if current != rendered {
-            bail!("{OUT_PATH} is stale — run `cargo run -p xtask -- codegen`");
+    let outputs: Vec<(&str, String)> = vec![
+        (OUT_PATH, rustfmt(&generate(&doc)?)?),
+        (TS_OUT_PATH, crate::sdk_gen::generate_ts(&doc)?),
+        (PY_OUT_PATH, crate::sdk_gen::generate_py(&doc)?),
+    ];
+    for (path, rendered) in outputs {
+        if check {
+            let current = std::fs::read_to_string(root.join(path)).unwrap_or_default();
+            if current != rendered {
+                bail!("{path} is stale — run `cargo run -p xtask -- codegen`");
+            }
+            println!("{path} is up to date");
+        } else {
+            std::fs::write(root.join(path), &rendered).with_context(|| format!("write {path}"))?;
+            println!("wrote {path}");
         }
-        println!("{OUT_PATH} is up to date");
-    } else {
-        std::fs::write(root.join(OUT_PATH), &rendered)
-            .with_context(|| format!("write {OUT_PATH}"))?;
-        println!("wrote {OUT_PATH}");
     }
     Ok(())
 }
 
-fn workspace_root() -> PathBuf {
+pub(crate) fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("xtask lives in the workspace root")
@@ -118,13 +125,7 @@ fn emit_method_constants(doc: &Value, out: &mut String) -> Result<()> {
             doc_line.push_str(description);
         }
         emit_doc(out, &doc_line, 1);
-        let const_name = name
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .filter(|part| !part.is_empty())
-            .map(field_ident)
-            .collect::<Vec<_>>()
-            .join("_")
-            .to_uppercase();
+        let const_name = method_const_name(name);
         let _ = writeln!(out, "    pub const {const_name}: &str = \"{name}\";\n");
     }
     out.push_str("}\n");
@@ -256,7 +257,41 @@ fn ref_name(reference: &str) -> Result<&str> {
         .with_context(|| format!("unsupported $ref {reference:?}"))
 }
 
-fn string_enum_variants(schema: &Value) -> Option<Vec<String>> {
+/// `tools/execute` → `TOOLS_EXECUTE` (shared by all generators).
+pub(crate) fn method_const_name(method: &str) -> String {
+    method
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(field_ident)
+        .collect::<Vec<_>>()
+        .join("_")
+        .to_uppercase()
+}
+
+/// Schema lookup: `components.schemas` as a map (deterministic order).
+pub(crate) fn component_schemas(doc: &Value) -> Result<&serde_json::Map<String, Value>> {
+    doc.pointer("/components/schemas")
+        .and_then(Value::as_object)
+        .context("components.schemas missing")
+}
+
+/// The methods array of the document.
+pub(crate) fn methods(doc: &Value) -> Result<&Vec<Value>> {
+    doc.get("methods")
+        .and_then(Value::as_array)
+        .context("methods missing")
+}
+
+/// Doc text of a schema/method (empty string when absent).
+pub(crate) fn description_of(value: &Value) -> &str {
+    value
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+/// String-enum variants of a schema, if it is one.
+pub(crate) fn string_enum_variants(schema: &Value) -> Option<Vec<String>> {
     if schema.get("type").and_then(Value::as_str) != Some("string") {
         return None;
     }
@@ -287,7 +322,7 @@ const KEYWORDS: &[&str] = &[
 ];
 
 /// Wire field name (camelCase) → snake_case Rust ident (raw if keyword).
-fn field_ident(wire_name: &str) -> String {
+pub(crate) fn field_ident(wire_name: &str) -> String {
     let mut out = String::new();
     let mut prev_lower_or_digit = false;
     for c in wire_name.chars() {

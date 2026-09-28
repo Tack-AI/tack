@@ -189,6 +189,19 @@ jobs:
         with:
           command: check advisories bans licenses sources
 
+  # Language SDKs for tack-RPC v3: zero-dependency packages tested with
+  # the runners' preinstalled node/python (no install step, no network).
+  # Their generated types are covered by the codegen freshness check in
+  # the check job.
+  sdk-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: node --test test/e2e.test.js
+        working-directory: sdk/typescript
+      - run: python3 -m unittest discover -s tests
+        working-directory: sdk/python
+
   # Bidirectional self-test of the eval suite — pure shell + python3, no
   # model and no network needed (see evals/selftest.sh).
   # Docs/code drift self-audit — grep-level, no model/network. Fails when a

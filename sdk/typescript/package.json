@@ -1,0 +1,20 @@
+{
+  "name": "@tack/plugin",
+  "version": "3.0.0",
+  "description": "SDK for tack-RPC v3 plugins (TypeScript/JavaScript) — build a plugin without ever seeing an envelope",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    }
+  },
+  "files": ["src"],
+  "scripts": {
+    "test": "node --test test/e2e.test.js"
+  },
+  "engines": { "node": ">=18" },
+  "license": "Apache-2.0"
+}

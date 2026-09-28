@@ -27,6 +27,20 @@ notice can parse entries (same convention as TS pi).
   seeing an envelope. See `crates/tack-ext-sdk/examples/hello_rpc3.rs`.
   The v1/v2 protocol is still the live one; the ExtensionManager switch
   and v1/v2 removal land with the loader rework.
+- tack-RPC v3 language SDKs and dev tooling (redesign P2):
+  - `sdk/typescript` (`@tack/plugin`) and `sdk/python` (`tack-plugin`):
+    zero-dependency SDKs with the same builder/handler surface as the
+    Rust SDK; their protocol types are generated from the OpenRPC schema
+    by `xtask codegen` (freshness-checked in CI, plus node/python test
+    jobs).
+  - `tack_ext::v3::V3Process`: the v3 process carrier (spawn, sensitive
+    env stripping, stderr forwarding, graceful shutdown).
+  - New dev subcommands speaking v3 directly: `tack ext new <dir>
+    <rust|ts|python>` (scaffold), `tack ext inspect <dir>` (handshake +
+    capability dump), `tack ext dev <dir> [scenario]` (run against a JSON
+    scenario, or stream plugin logs), `tack ext test <dir> [scenario]`
+    (assertions with recursive subset matching and scripted
+    plugin→host answers; non-zero exit on failure).
 
 ## [1.0.4] - 2026-09-27
 
