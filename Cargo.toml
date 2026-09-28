@@ -86,7 +86,7 @@ zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rand = "0.10"
 uuid = { version = "1", features = ["v4"] }
-dirs = "6"
+dirs = "7"
 
 # crypto (OAuth PKCE / AWS SigV4 / Vertex SA-JWT)
 sha2 = "0.10"
