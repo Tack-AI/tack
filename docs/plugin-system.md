@@ -115,46 +115,76 @@ model by default, overridable via the `model` field.
 - **Everything is fail-open**: hook failure/timeout/bad JSON only produces
   a warning and never stalls the agent.
 
-## 3. tack-ext long-lived plugins (process + WASM carriers)
+## 3. tack-RPC v3 long-lived plugins (process + WASM carriers)
 
-A plugin is an independent process (or WASM module) speaking an NDJSON
-protocol over stdio (three envelope kinds: request / response / event,
-30s call timeout, crash isolation).
+A plugin is an independent process (or WASM module) speaking **tack-RPC
+v3**: JSON-RPC 2.0 over NDJSON stdio (both-directions requests,
+`$/cancelRequest`, 30s call timeout, crash isolation). The protocol's
+single source of truth is
+[`protocol/tack-rpc.openrpc.json`](../protocol/tack-rpc.openrpc.json);
+the host types (`tack_ext::rpc3`) and the SDK types for TypeScript and
+Python are generated from it, so all three SDKs share one schema.
 
 ### 3.1 Capability surface
 
-| Direction | Methods/events |
+Plugins declare **independent, optional capabilities** at the
+`initialize` handshake; undeclared capabilities are never called (the
+host answers `ERR_CAPABILITY_NOT_GRANTED` if it must).
+
+| Direction | Methods/notifications |
 |---|---|
-| host → plugin | `tool.execute`, `command.invoke`, `intercept.tool_call` (allow/deny/**rewrite**), `intercept.context` (gated on subscribing to `"context"`, may replace the full message list), lifecycle events (session/agent/turn/message/tool_execution/model_select/provider boundaries…) |
-| plugin → host | `ui.notify/select/confirm/input/set_status` (TUI dialogs), `session.*` (new/switch/branch/set_model/send_user_message…), `exec` (trust-gated), `provider.register` (dynamically register an LLM provider), `log` |
+| host → plugin | `tools/execute`, `commands/invoke`, `hooks/beforeToolCall` (allow/deny/**rewrite**), `hooks/transformContext` (full-context replacement), `hooks/afterToolCall` (per-field result patch), `approval/review` (approval chain), `autocomplete/provide`, `events/lifecycle` (subscription-gated), `widgets/action` |
+| plugin → host | `ui/notify/select/confirm/input` (TUI dialogs), `session/get`, `session/sendUserMessage`, `snapshot/get` (read-only digest), `config/get`, `exec/run` (trust-gated), `host/registerProvider` (LLM provider bridge), `widgets/update`, `logs/emit`, `warnings/emit` |
+
+SDKs exist for Rust (`tack-ext-sdk`), TypeScript (`@tack/plugin`), and
+Python (`tack-plugin`); `tack ext new` scaffolds any of them, and
+`tack ext dev`/`ext test` drive a plugin against a mock-host scenario
+file without a session.
 
 ### 3.1b Run modes and headless degradation
 
 All four run modes load plugins (see the matrix in §6). Non-TUI modes
-(print/rpc/acp) use headless HostServices: tools, interception, lifecycle
-events, and `exec` (trust-gated) work as usual; requests that need a
-terminal UI **degrade deterministically** — `ui.notify`/`ui.set_status`
-go to the log, `ui.select/confirm/input` return errors, and
-`session.*`/`provider.register` return errors. A plugin learns the host
-mode from `initialize.payload.mode` and must not depend on interactive
-requests for correctness.
+(print/rpc/acp) degrade deterministically: tools, interception,
+lifecycle events, and `exec/run` (trust-gated) work as usual;
+`ui/select|confirm|input` answer `ERR_CAPABILITY_NOT_GRANTED`;
+`session/*` and `host/registerProvider` answer
+`ERR_METHOD_NOT_FOUND`; `ui/notify` goes to the log. A plugin learns
+the mode and the available surfaces from the initialize payload's `mode`
+and `capabilities`.
 
-### 3.2 The two carriers
+### 3.2 Identity, load outcome, and the store
+
+Every plugin has a stable id **`name@source`** (marketplace name, or the
+reserved `user`/`project`/`local` sources). Installs live in the
+versioned store (`extensions/store/<source>/<name>/<version>/`; active =
+`local` else highest semver), atomically staged/swapped with rollback,
+pinned in lockfile v2 with drift checks. `plugins."<id>".enabled`
+disables without uninstalling; `tack ext enable|disable|upgrade|list`
+manage them.
+
+Load failures are **first-class state**: the manager returns every
+discovered plugin as `LoadedPlugin { id, enabled, error, … }` and all
+consumers filter on `is_active()` — a broken plugin shows up in
+`ext list`/doctor instead of vanishing with a log line (Codex's
+`PluginLoadOutcome` pattern).
+
+### 3.3 The two carriers
 
 | | process (default) | wasm |
 |---|---|---|
 | Plugin form | Any executable | WASI p1 module (`.wasm`/`.wat`) |
-| Protocol | NDJSON over stdio, handshake `protocol: 1` | **Same schema**, handshake `protocol: 2` |
+| Protocol | **tack-RPC v3 over stdio** (same schema) | same |
 | Isolation | Process boundary | wasmtime sandbox: no fs/network/environment variables |
-| Resource limits | None (trust gating) | fuel + epoch wall-clock + memory hard caps (manifest `limits`) |
-| Capability grants | — (a process is inherently fully privileged) | Explicit manifest `capabilities` declarations: fs preopen (ro/rw), env (literals or host passthrough), args, network flags (inert under p1 for now); audit log at load time |
+| Resource limits | None (trust gating) | fuel + epoch wall-clock + memory hard caps (manifest `limits`, host-clamped) |
+| Capability grants | — (a process is inherently fully privileged) | Explicit manifest `capabilities` declarations: fs preopen (ro/rw), env (literals or host passthrough), args; audit log at load time |
 
-The WASM carrier reuses the same `PluginPeer` (the transport layer is
-abstracted as AsyncRead/AsyncWrite); handshake, timeout, and fail-fast
-semantics for dead plugins are identical to the subprocess carrier.
-Example: [`examples/extensions/hello-wasm/`](../examples/extensions/hello-wasm/)
-(a handwritten-WAT protocol reference implementation).
+Both carriers share one `JsonRpcPeer` (transport abstracted as
+AsyncRead/AsyncWrite): handshake, timeout, cancellation, and dead-peer
+fail-fast semantics are identical. Example:
+[`examples/extensions/hello-wasm/`](../examples/extensions/hello-wasm/)
+(a handwritten-WAT v3 protocol reference).
 
+## 4. Distribution: bundles + marketplace
 ## 4. Distribution: bundles + marketplace
 
 ### 4.1 Full extension.json field list
@@ -241,34 +271,40 @@ gated**).
 
 | Example | Demonstrates |
 |---|---|
-| `examples/extensions/hello-js/` | Minimal subprocess plugin (Node) |
-| `examples/extensions/hello-wasm/` | **WASM sandbox plugin** (handwritten WAT, protocol reference) |
+| `crates/tack-ext-sdk/examples/hello_rpc3.rs` | Minimal Rust SDK plugin |
+| `tack-v3-demo-plugin` (tack-ext-sdk bin) | Feature-rich fixture: tools, commands, hooks, events, widgets, autocomplete |
+| `sdk/typescript` / `sdk/python` | The TS/Python SDK packages with e2e tests |
+| `examples/extensions/hello-wasm/` | **WASM sandbox plugin** (handwritten WAT, v3 protocol reference) |
 | `examples/extensions/hello-wasm-caps/` | **WASM capability grants** (fs preopen demonstrating readfile; errno without the grant) |
-| `examples/extensions/git-checkpoint/` | Events + exec + commands |
-| `examples/extensions/protected-paths/` | tool_call interception |
-| `examples/extensions/handoff/` | Session control |
-| `tack ext-demo-plugin` | Built-in minimal protocol implementation (e2e fixture) |
+| `tack ext new <dir> <rust|ts|python>` | Scaffolding with a starter scenario |
 
 ## 8. Tests and current state
 
 - hooks engine: 20+ tests (dual-format config parsing, Claude verdict
   protocol, matcher, exit-2/timeout killing, updatedInput merge,
   permissionDecision recording and consumption)
-- tack-ext: 40+ tests (including intercept.context replacement/gating)
-- WASM carrier (tack-ext-wasm): 9 tests (handshake + tool.execute e2e,
-  fuel/epoch wall-clock/memory/table/instance-cap rejections, example
-  WAT) + ExtensionManager load e2e (wasm plugin + bundle collection)
-- Full tack-app: 230+ lib tests + the integration suite, all green
+- tack-RPC v3 (`tack_ext::v3` + `tack-ext-sdk`): peer roundtrips,
+  cancellation, timeouts, dead-peer fail-fast, 12 SDK e2e (handshake,
+  verdicts, capability gating, host services, shutdown) + TS (7) and
+  Python (8) SDK e2e
+- WASM carrier (tack-ext-wasm): 20 tests (v3 handshake + tools/execute
+  e2e, fuel/epoch/memory/table/instance caps, capability grants, example
+  WAT)
+- extension host (tack-app): identity/discovery, store layout, atomic
+  install/upgrade/verify, lockfile v2, enable/disable, marketplace
+  signatures, load outcome (failed/disabled plugins), widget registry,
+  bundle resources, wasm e2e
+- Full tack-app: 410+ lib tests + the integration suite, all green
 
 **Explicitly not done**:
 
 - Direct compatibility with upstream TS pi extensions (an in-process
-  ExtensionAPI and an NDJSON protocol are two different worlds; the
-  viable path is a Node sidecar extension host, not yet a project)
+  ExtensionAPI and an RPC protocol are two different worlds; the viable
+  path is a Node sidecar extension host, not yet a project)
 - `SubagentStart` event emission, and wiring the hooks engine into ACP
   mode (ACP plugins work, but shell hooks do not run there)
 - Hot reload (plugin tools/hooks are woven into the agent loop at session
   start; hot-swapping costs far more than it gains — use `ext install` +
   restart instead)
-- WASM network capabilities actually taking effect (wasmtime-wasi p1 has
-  no socket ABI; the manifest flags are future-facing only)
+- The WIT/component WASM carrier and MCP-server plugins (roadmap P4),
+  enterprise policy (P5), metrics sidecar + distribution sync (P6)

@@ -235,6 +235,20 @@ export interface LifecycleEventParams {
   "payload": any;
 }
 
+/** One item in a listPanel widget. */
+export interface ListPanelItem {
+  "detail"?: string;
+  "icon"?: string;
+  "id": string;
+  "label": string;
+}
+
+/** State of a listPanel widget. The host renders the selection; a user pick is reported back as widgets/action with action select. */
+export interface ListPanelState {
+  "items": Array<ListPanelItem>;
+  "selectedId"?: string;
+}
+
 /** Log/notify levels. */
 export type LogLevel = "info" | "warning" | "error" | "debug";
 
@@ -243,6 +257,11 @@ export type LogLevel = "info" | "warning" | "error" | "debug";
 export interface LogParams {
   "level"?: LogLevel;
   "message": string;
+}
+
+/** State of a markdownPanel widget: markdown source rendered with the host's markdown pipeline. */
+export interface MarkdownPanelState {
+  "markdown": string;
 }
 
 /** One declared metric operation. Identifiers match [a-z][a-z0-9_.]{0,63}; at most 8 dimensions per operation. */
@@ -319,6 +338,17 @@ export interface Snapshot {
   "recentDigest": string;
   "tokenUsage"?: TokenUsage;
 }
+
+/** State of a statusLineSegment widget (widget initial state and widgets/update state for that kind). Empty text hides the segment; the host truncates to one line. */
+export interface StatusLineState {
+  "style"?: StatusStyle;
+  "text": string;
+  "tooltip"?: string;
+}
+
+/** Status line segment style. */
+export type StatusStyle = "default" | "info" | "warning" | "error" | "dim";
+
 
 /** Token accounting snapshot (provider-shaped totals). */
 export interface TokenUsage {

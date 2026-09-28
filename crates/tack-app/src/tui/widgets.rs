@@ -4,7 +4,7 @@
 //! (rendering contract: extensions-v2.md §3.2). Inherent `impl TuiApp`
 //! split out of `mod.rs`, same pattern as the other tui modules.
 
-use tack_ext::{
+use tack_ext::rpc3::{
     ListPanelItem, ListPanelState, MarkdownPanelState, StatusLineState, StatusStyle, WidgetKind,
 };
 use tack_tui::components::markdown::render_markdown;
@@ -46,7 +46,7 @@ pub fn status_segments(widgets: &[WidgetEntry]) -> Vec<(String, Option<StatusSty
     let mut segments: Vec<(i64, usize, String, Option<StatusStyle>)> = widgets
         .iter()
         .enumerate()
-        .filter(|(_, w)| w.spec.kind == WidgetKind::StatusLineSegment)
+        .filter(|(_, w)| w.spec.r#type == WidgetKind::StatusLineSegment)
         .filter_map(|(index, w)| {
             let state: StatusLineState = serde_json::from_value(w.state.clone()?).ok()?;
             if state.text.is_empty() {
@@ -68,10 +68,10 @@ pub fn list_select_action(
     widget_id: &str,
     items: &[ListPanelItem],
     selected: usize,
-) -> Option<tack_ext::WidgetActionPayload> {
+) -> Option<tack_ext::rpc3::WidgetActionParams> {
     items
         .get(selected)
-        .map(|item| tack_ext::WidgetActionPayload {
+        .map(|item| tack_ext::rpc3::WidgetActionParams {
             id: widget_id.to_string(),
             action: "select".to_string(),
             item_id: Some(item.id.clone()),
@@ -107,7 +107,7 @@ impl TuiApp {
             return out;
         }
         for widget in extensions.widgets() {
-            if widget.spec.kind == WidgetKind::StatusLineSegment || !widget.visible {
+            if widget.spec.r#type == WidgetKind::StatusLineSegment || !widget.visible {
                 continue;
             }
             let focused = ext_panel_focus.as_deref() == Some(widget.key.as_str());
@@ -126,7 +126,7 @@ impl TuiApp {
                 ));
             }
             out.push(header);
-            match widget.spec.kind {
+            match widget.spec.r#type {
                 WidgetKind::MarkdownPanel => {
                     render_markdown_panel(theme, ext_panel_ui, widget, &mut out, width)
                 }
@@ -147,7 +147,7 @@ impl TuiApp {
         self.extensions
             .widgets()
             .iter()
-            .filter(|w| w.spec.kind != WidgetKind::StatusLineSegment && w.visible)
+            .filter(|w| w.spec.r#type != WidgetKind::StatusLineSegment && w.visible)
             .map(|w| w.key.clone())
             .collect()
     }
@@ -195,7 +195,7 @@ impl TuiApp {
             self.ext_panel_focus = None;
             return true;
         }
-        match widget.spec.kind {
+        match widget.spec.r#type {
             WidgetKind::ListPanel => {
                 let state = parse_state::<ListPanelState>(&widget).unwrap_or(ListPanelState {
                     items: Vec::new(),
@@ -348,7 +348,7 @@ mod tests {
 
     fn registry_with(plugin: &str, specs: Vec<serde_json::Value>) -> WidgetRegistry {
         let mut registry = WidgetRegistry::default();
-        let specs: Vec<tack_ext::WidgetSpec> = specs
+        let specs: Vec<tack_ext::rpc3::WidgetSpec> = specs
             .into_iter()
             .map(|v| serde_json::from_value(v).unwrap())
             .collect();
@@ -363,18 +363,18 @@ mod tests {
         let registry = registry_with(
             "demo",
             vec![
-                serde_json::json!({"id": "z", "type": "status_line_segment", "priority": 50,
+                serde_json::json!({"id": "z", "type": "statusLineSegment", "priority": 50,
                     "initial": {"text": "seg-z"}}),
-                serde_json::json!({"id": "a", "type": "status_line_segment", "priority": 10,
+                serde_json::json!({"id": "a", "type": "statusLineSegment", "priority": 10,
                     "initial": {"text": "seg-a", "style": "info"}}),
-                serde_json::json!({"id": "b", "type": "status_line_segment", "priority": 10,
+                serde_json::json!({"id": "b", "type": "statusLineSegment", "priority": 10,
                     "initial": {"text": "seg-b", "style": "dim"}}),
-                serde_json::json!({"id": "h", "type": "status_line_segment", "priority": 1,
+                serde_json::json!({"id": "h", "type": "statusLineSegment", "priority": 1,
                     "initial": {"text": ""}}),
-                serde_json::json!({"id": "bad", "type": "status_line_segment", "priority": 1,
+                serde_json::json!({"id": "bad", "type": "statusLineSegment", "priority": 1,
                     "initial": {"markdown": 1}}),
                 // Panels never appear in the status bar.
-                serde_json::json!({"id": "p", "type": "markdown_panel", "title": "t",
+                serde_json::json!({"id": "p", "type": "markdownPanel", "title": "t",
                     "initial": {"markdown": "hi"}}),
             ],
         );
@@ -395,10 +395,10 @@ mod tests {
     fn status_segments_reflect_updates() {
         let mut registry = registry_with(
             "demo",
-            vec![serde_json::json!({"id": "s", "type": "status_line_segment",
+            vec![serde_json::json!({"id": "s", "type": "statusLineSegment",
                 "initial": {"text": "old"}})],
         );
-        let update = tack_ext::WidgetUpdatePayload {
+        let update = tack_ext::rpc3::WidgetUpdateParams {
             id: "s".to_string(),
             state: serde_json::json!({"text": "new", "style": "error"}),
             visible: None,
@@ -409,7 +409,7 @@ mod tests {
             vec![("new".to_string(), Some(StatusStyle::Error))]
         );
         // Empty replacement text hides the segment.
-        let update = tack_ext::WidgetUpdatePayload {
+        let update = tack_ext::rpc3::WidgetUpdateParams {
             id: "s".to_string(),
             state: serde_json::json!({"text": ""}),
             visible: None,

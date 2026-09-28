@@ -1,29 +1,42 @@
-//! Extension host: discovery, lifecycle, and event fan-out for tack-ext
-//! plugins. Layout mirrors skills: each extension is a directory with an
-//! `extension.json` manifest:
+//! Extension host: discovery, identity, lifecycle, and event fan-out for
+//! tack-RPC v3 plugins, plus the install/store/marketplace machinery.
 //!
-//! ```json
-//! { "name": "hello", "command": "node", "args": ["plugin.js"] }
+//! Layout (docs/plugin-roadmap.md §8):
+//!
+//! ```text
+//! ~/.tack/agent/extensions/
+//! ├── store/<source>/<name>/<version>/   # versioned installs (P3+)
+//! ├── data/<source>/<name>/              # writable per-plugin data root
+//! └── <name>/                            # legacy flat installs (pre-P3)
 //! ```
 //!
-//! Discovery order: `~/.tack/agent/extensions/*`, settings `extensionPaths`,
-//! `<project>/.pi/extensions/*` (trust-gated, TS parity). Relative manifest
-//! args resolve against the extension directory.
+//! Plugin identity is `name@source` ([`PluginId`]): reserved sources are
+//! `user` (installed without a marketplace), `project` (`.pi/extensions`),
+//! `local` (settings `extensionPaths`), and marketplace names otherwise.
+//! The active version of a store plugin is `local` when present, else the
+//! highest semver directory.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tack_agent_core::{AgentHooks, AgentTool};
-use tack_ext::{
-    DEFAULT_EVENTS, ExtHooks, ExtTool, HostServices, InitializePayload, PluginProcess,
-    RegisterPayload,
-};
-// Call sites wrap providers via `crate::extension_host::ExtNotifyProvider`
-// so the no-ext stub can substitute a pass-through.
 use serde_json::Value;
-pub use tack_ext::ExtNotifyProvider;
+use tack_agent_core::{AgentHooks, AgentTool};
+use tack_ext::hooks::{ExtHooks, FailMode};
+use tack_ext::plugin_id::PluginId;
+use tack_ext::rpc3::{
+    ErrorObject, HostCapabilities, HostInfo, InitializeParams, InitializeResult, RunMode,
+    WidgetSpec, WidgetUpdateParams,
+};
+use tack_ext::tool::ExtTool;
+use tack_ext::v3::{HostClient, JsonRpcPeer, PeerHandler, V3Process};
 use tokio::sync::{mpsc, oneshot};
+
+pub use tack_ext::ExtNotifyProvider;
+
+// ---------------------------------------------------------------------------
+// Plugin → host service bridges (TUI mode)
+// ---------------------------------------------------------------------------
 
 /// A plugin→host UI/exec request awaiting resolution on the TUI main loop.
 pub struct ExtUiRequest {
@@ -41,11 +54,12 @@ impl std::fmt::Debug for ExtUiRequest {
     }
 }
 
-/// HostServices bridge: plugin requests cross to the TUI main loop via the
-/// app event channel (plugin calls never run on the loop thread).
+/// Host services bridge for the TUI: plugin requests cross to the TUI main
+/// loop via the app event channel (plugin calls never run on the loop
+/// thread). Implements the v3 [`PeerHandler`] surface.
 pub struct TuiExtServices {
     tx: crate::tui::AppEventTx,
-    /// Project trust: `exec` is only honored for trusted contexts.
+    /// Project trust: `exec/run` is only honored for trusted contexts.
     trusted: bool,
 }
 
@@ -63,112 +77,156 @@ impl TuiExtServices {
     }
 }
 
-#[async_trait::async_trait]
-impl HostServices for TuiExtServices {
-    async fn handle_request(&self, method: &str, params: Value) -> Result<Value, String> {
-        match method {
-            "ui.notify" | "ui.select" | "ui.confirm" | "ui.input" | "ui.set_status"
-            | "provider.register" => {
-                let (tx, rx) = oneshot::channel();
-                self.tx
-                    .send(crate::tui::AppEvent::ExtUiRequest(ExtUiRequest {
-                        plugin: String::new(),
-                        method: method.to_string(),
-                        params,
-                        respond: tx,
-                    }))
-                    .map_err(|_| "host is shutting down".to_string())?;
-                rx.await
-                    .map_err(|_| "host closed the request".to_string())?
-            }
-            "exec" => {
-                if !self.trusted {
-                    return Err("exec requires project trust".to_string());
-                }
-                let (tx, rx) = oneshot::channel();
-                self.tx
-                    .send(crate::tui::AppEvent::ExtUiRequest(ExtUiRequest {
-                        plugin: String::new(),
-                        method: method.to_string(),
-                        params,
-                        respond: tx,
-                    }))
-                    .map_err(|_| "host is shutting down".to_string())?;
-                rx.await
-                    .map_err(|_| "host closed the request".to_string())?
-            }
-            other => Err(format!("unknown host method {other}")),
-        }
-    }
-
-    async fn handle_event(&self, event: &str, payload: Value) {
-        if event == "log" {
-            let level = payload
-                .get("level")
-                .and_then(Value::as_str)
-                .unwrap_or("info");
-            let message = payload.get("message").and_then(Value::as_str).unwrap_or("");
-            match level {
-                "error" => tracing::error!(target: "tack_ext::plugin", "{message}"),
-                "warn" => tracing::warn!(target: "tack_ext::plugin", "{message}"),
-                "debug" => tracing::debug!(target: "tack_ext::plugin", "{message}"),
-                _ => tracing::info!(target: "tack_ext::plugin", "{message}"),
-            }
-            return;
-        }
-        // v2.1: plugin → host widget state push. Fire-and-forget into the
-        // TUI main loop (full-state replacement; dropped frames are
-        // harmless by contract). The `plugin` field was injected by
-        // TaggedServices (widget ids are only unique per plugin).
-        if event == "widget.update" {
-            let plugin = payload
-                .get("plugin")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            match serde_json::from_value::<tack_ext::WidgetUpdatePayload>(payload) {
-                Ok(update) => {
-                    let _ = self
-                        .tx
-                        .send(crate::tui::AppEvent::ExtWidgetUpdate { plugin, update });
-                }
-                Err(e) => tracing::warn!("bad widget.update payload: {e}"),
-            }
-        }
-        // Unknown events are ignored by design (protocol tolerance rule).
+fn service_error(code: i64, message: impl Into<String>) -> ErrorObject {
+    ErrorObject {
+        code,
+        message: message.into(),
+        data: None,
     }
 }
 
-/// Per-plugin services wrapper: tags `widget.update` events with the
-/// originating plugin's name before delegating. `HostServices::handle_event`
-/// carries no plugin attribution (one services object fans out to every
-/// plugin), but widget ids are only unique per plugin — the host key is
-/// `<plugin>:<id>`.
+#[async_trait::async_trait]
+impl PeerHandler for TuiExtServices {
+    async fn handle_request(&self, method: &str, params: Value) -> Result<Value, ErrorObject> {
+        use tack_ext::rpc3::{ERR_CAPABILITY_NOT_GRANTED, ERR_METHOD_NOT_FOUND, ERR_POLICY_DENIED};
+        match method {
+            // Interactive dialogs and the provider bridge cross to the TUI.
+            "ui/notify"
+            | "ui/select"
+            | "ui/confirm"
+            | "ui/input"
+            | "session/get"
+            | "session/sendUserMessage"
+            | "host/registerProvider" => {
+                let (tx, rx) = oneshot::channel();
+                self.tx
+                    .send(crate::tui::AppEvent::ExtUiRequest(ExtUiRequest {
+                        plugin: String::new(),
+                        method: method.to_string(),
+                        params,
+                        respond: tx,
+                    }))
+                    .map_err(|_| {
+                        service_error(ERR_CAPABILITY_NOT_GRANTED, "host is shutting down")
+                    })?;
+                rx.await
+                    .map_err(|_| {
+                        service_error(ERR_CAPABILITY_NOT_GRANTED, "host closed the request")
+                    })?
+                    .map_err(|e| service_error(tack_ext::rpc3::ERR_INTERNAL, e))
+            }
+            "exec/run" => {
+                if !self.trusted {
+                    return Err(service_error(
+                        ERR_POLICY_DENIED,
+                        "exec requires project trust",
+                    ));
+                }
+                let (tx, rx) = oneshot::channel();
+                self.tx
+                    .send(crate::tui::AppEvent::ExtUiRequest(ExtUiRequest {
+                        plugin: String::new(),
+                        method: method.to_string(),
+                        params,
+                        respond: tx,
+                    }))
+                    .map_err(|_| {
+                        service_error(ERR_CAPABILITY_NOT_GRANTED, "host is shutting down")
+                    })?;
+                rx.await
+                    .map_err(|_| {
+                        service_error(ERR_CAPABILITY_NOT_GRANTED, "host closed the request")
+                    })?
+                    .map_err(|e| service_error(tack_ext::rpc3::ERR_INTERNAL, e))
+            }
+            other => Err(service_error(
+                ERR_METHOD_NOT_FOUND,
+                format!("unknown host method {other}"),
+            )),
+        }
+    }
+
+    async fn handle_notification(&self, method: &str, payload: Value) {
+        match method {
+            "logs/emit" => {
+                let level = payload
+                    .get("level")
+                    .and_then(Value::as_str)
+                    .unwrap_or("info");
+                let message = payload.get("message").and_then(Value::as_str).unwrap_or("");
+                match level {
+                    "error" => tracing::error!(target: "tack_ext::plugin", "{message}"),
+                    "warn" | "warning" => tracing::warn!(target: "tack_ext::plugin", "{message}"),
+                    "debug" => tracing::debug!(target: "tack_ext::plugin", "{message}"),
+                    _ => tracing::info!(target: "tack_ext::plugin", "{message}"),
+                }
+            }
+            "warnings/emit" => {
+                let message = payload.get("message").and_then(Value::as_str).unwrap_or("");
+                tracing::warn!(target: "tack_ext::plugin", "plugin warning: {message}");
+            }
+            // Widget state push. Fire-and-forget into the TUI main loop
+            // (full-state replacement; dropped frames are harmless). The
+            // `plugin` field was injected by TaggedServices (widget ids are
+            // only unique per plugin).
+            "widgets/update" => {
+                let plugin = payload
+                    .get("plugin")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                match serde_json::from_value::<WidgetUpdateParams>(payload) {
+                    Ok(update) => {
+                        let _ = self
+                            .tx
+                            .send(crate::tui::AppEvent::ExtWidgetUpdate { plugin, update });
+                    }
+                    Err(e) => tracing::warn!("bad widgets/update payload: {e}"),
+                }
+            }
+            // Unknown notifications are ignored by design (protocol
+            // tolerance rule).
+            _ => {}
+        }
+    }
+}
+
+/// Per-plugin services wrapper: tags `widgets/update` notifications with
+/// the originating plugin's id before delegating (widget ids are only
+/// unique per plugin; the host key is `<plugin-id>:<widget-id>`).
 struct TaggedServices {
     plugin: String,
-    inner: Arc<dyn HostServices>,
+    inner: Arc<dyn PeerHandler>,
 }
 
 #[async_trait::async_trait]
-impl HostServices for TaggedServices {
-    async fn handle_request(&self, method: &str, params: Value) -> Result<Value, String> {
+impl PeerHandler for TaggedServices {
+    async fn handle_request(&self, method: &str, params: Value) -> Result<Value, ErrorObject> {
         self.inner.handle_request(method, params).await
     }
-    async fn handle_event(&self, event: &str, mut payload: Value) {
-        if event == "widget.update"
+    async fn handle_notification(&self, method: &str, mut payload: Value) {
+        if method == "widgets/update"
             && let Value::Object(map) = &mut payload
         {
             map.insert("plugin".to_string(), Value::String(self.plugin.clone()));
         }
-        self.inner.handle_event(event, payload).await;
+        self.inner.handle_notification(method, payload).await;
     }
 }
 
-/// One manifest entry. A manifest may also contribute declarative bundle
+// ---------------------------------------------------------------------------
+// Manifest
+// ---------------------------------------------------------------------------
+
+/// One `extension.json`. A manifest may also contribute declarative bundle
 /// resources (hooks/MCP servers/skills) without any running plugin.
 #[derive(Clone, Debug, serde::Deserialize)]
 struct ExtensionManifest {
     name: String,
+    /// Semantic version (semver) of the plugin; becomes the store version
+    /// directory on install. Absent ⇒ the install is `local`.
+    #[serde(default)]
+    version: Option<String>,
     /// Process carrier (default): executable to spawn.
     command: Option<String>,
     #[serde(default)]
@@ -176,8 +234,7 @@ struct ExtensionManifest {
     #[serde(default)]
     env: HashMap<String, String>,
     /// "process" (default) | "wasm": run the plugin as a WASI module in
-    /// the wasmtime sandbox (same NDJSON protocol over WASI stdio).
-    /// Requires the `wasm` cargo feature (default on).
+    /// the wasmtime sandbox (same v3 protocol over WASI stdio).
     #[serde(default)]
     carrier: Option<String>,
     /// WASM carrier: module file (.wasm/.wat), resolved against the
@@ -185,18 +242,18 @@ struct ExtensionManifest {
     #[cfg(feature = "wasm")]
     #[serde(default)]
     module: Option<String>,
-    /// WASM carrier resource limits (defaults: 1e9 fuel, 256MB memory).
+    /// WASM carrier resource limits (host-clamped).
     #[cfg(feature = "wasm")]
     #[serde(default)]
     limits: Option<WasmLimitsJson>,
-    /// WASM carrier capability grants (default: full sandbox — nothing).
-    /// Grants are explicit, self-declared, and audit-logged at load time.
-    /// Trust model: user-dir extensions are trusted like any installed
-    /// program; project extensions only load under project trust, so their
-    /// grants are gated too.
+    /// WASM carrier capability grants (default: full sandbox).
     #[cfg(feature = "wasm")]
     #[serde(default)]
     capabilities: Option<CapabilitiesJson>,
+    /// Hook-failure mode: "open" (default, TS-compatible) | "closed"
+    /// (a broken interceptor blocks the tool call).
+    #[serde(default, rename = "failMode")]
+    fail_mode: Option<String>,
     /// Bundle: hooks.json path(s) (Claude-format hook declarations).
     #[serde(default)]
     hooks: Option<Value>,
@@ -209,12 +266,8 @@ struct ExtensionManifest {
 }
 
 /// True for environment variable names that typically carry credentials
-/// (`OPENAI_API_KEY`, `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`, ...).
-/// Mirrors `is_sensitive_env_key` in tack-ext's process carrier: that
-/// carrier strips these names from plugin child processes, and WASM
-/// guests must not receive the live host values either — a manifest
-/// `env: ["ANTHROPIC_API_KEY"]` pass-through is refused, not injected.
-// Only consumed by the wasm-gated capability lowering (and tests).
+/// (manifest env pass-through must not receive the live host values for
+/// WASM guests — same rule as the process carrier's strip list).
 #[cfg_attr(not(feature = "wasm"), allow(dead_code))]
 fn is_sensitive_env_key(key: &str) -> bool {
     const SUFFIXES: &[&str] = &[
@@ -249,8 +302,7 @@ struct CapabilitiesJson {
     env: Option<Value>,
     /// argv visible to the guest.
     args: Vec<String>,
-    /// Network flags. Inert for WASI p1 guests today (p1 has no socket
-    /// ABI wired in wasmtime-wasi); honored forward-compatibly.
+    /// Network flags. Inert for WASI p1 guests today.
     network: Option<NetworkJson>,
 }
 
@@ -321,9 +373,8 @@ impl CapabilitiesJson {
             }
             Some(Value::Array(names)) => {
                 for name_ in names.iter().filter_map(Value::as_str) {
-                    // Fail closed on host secrets: the process carrier
-                    // strips these names from plugin children; a WASM
-                    // guest must not receive the live values either.
+                    // Fail closed on host secrets (same rule as the
+                    // process carrier's strip list).
                     if is_sensitive_env_key(name_) {
                         tracing::warn!(
                             "extension {name}: env pass-through {name_} matches the \
@@ -358,8 +409,6 @@ impl CapabilitiesJson {
     }
 }
 
-// Deserialized only in wasm builds (the manifest fields are gated too);
-// manifests may still carry these keys in slim builds — serde ignores them.
 #[cfg(feature = "wasm")]
 #[derive(Clone, Copy, Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -398,11 +447,34 @@ impl WasmLimitsJson {
     }
 }
 
+/// Audit-log every non-default capability grant at load time — sandbox
+/// widenings must be greppable in the host log.
+#[cfg(feature = "wasm")]
+fn audit_capability_grants(name: &str, caps: &tack_ext_wasm::WasmCapabilities) {
+    for grant in &caps.preopens {
+        tracing::warn!(
+            "extension {name}: wasm fs grant {} -> {} ({:?})",
+            grant.host_path.display(),
+            grant.guest_path,
+            grant.access,
+        );
+    }
+    if !caps.env.is_empty() {
+        let keys: Vec<&str> = caps.env.iter().map(|(k, _)| k.as_str()).collect();
+        tracing::warn!("extension {name}: wasm env grant {keys:?}");
+    }
+    if caps.network.allow_tcp || caps.network.allow_udp || caps.network.allow_dns {
+        tracing::warn!("extension {name}: wasm network grant {:?}", caps.network);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Running plugins
+// ---------------------------------------------------------------------------
+
 /// A running plugin's carrier handle (process or WASM module).
 pub enum PluginHandle {
-    /// Boxed: `PluginProcess` (~280 B) dwarfs the Wasm variant, so keep it
-    /// off the enum's inline layout (clippy::large_enum_variant).
-    Process(Box<PluginProcess>),
+    Process(V3Process),
     /// Option: shutdown consumes the plugin (take()).
     #[cfg(feature = "wasm")]
     Wasm(Option<tack_ext_wasm::WasmPlugin>),
@@ -419,11 +491,21 @@ impl std::fmt::Debug for PluginHandle {
 }
 
 impl PluginHandle {
-    pub fn peer(&self) -> &Arc<tack_ext::PluginPeer> {
+    pub fn peer(&self) -> &Arc<JsonRpcPeer> {
         match self {
             PluginHandle::Process(process) => &process.peer,
             #[cfg(feature = "wasm")]
             PluginHandle::Wasm(plugin) => &plugin.as_ref().expect("wasm plugin taken").peer,
+        }
+    }
+
+    pub fn client(&self) -> HostClient {
+        match self {
+            PluginHandle::Process(process) => process.client.clone(),
+            #[cfg(feature = "wasm")]
+            PluginHandle::Wasm(plugin) => {
+                plugin.as_ref().expect("wasm plugin taken").client.clone()
+            }
         }
     }
 
@@ -440,43 +522,71 @@ impl PluginHandle {
     }
 }
 
-/// A running plugin.
+/// One discovered plugin (running or not). Failure is first-class state:
+/// a plugin that failed to load stays in the list with `error` set, and
+/// every consumer filters on [`LoadedPlugin::is_active`].
 pub struct LoadedPlugin {
-    pub name: String,
-    pub handle: PluginHandle,
-    pub register: RegisterPayload,
+    pub id: PluginId,
+    /// From settings `plugins."<id>".enabled` (default true).
+    pub enabled: bool,
+    /// Load/handshake failure, when any (capabilities empty then).
+    pub error: Option<String>,
+    /// The handshake result (capabilities), when running.
+    pub register: Option<InitializeResult>,
+    /// The carrier, when running.
+    pub handle: Option<PluginHandle>,
+    /// The store version this plugin was loaded from (`local` or semver).
+    pub version: String,
+    /// The directory the plugin was loaded from.
+    pub dir: PathBuf,
+}
+
+impl LoadedPlugin {
+    pub fn is_active(&self) -> bool {
+        self.enabled && self.error.is_none()
+    }
+
+    /// The plugin name (id's name segment).
+    pub fn name(&self) -> &str {
+        self.id.name()
+    }
+
+    fn capabilities(&self) -> Option<&tack_ext::rpc3::PluginCapabilities> {
+        self.register.as_ref().map(|r| &r.capabilities)
+    }
 }
 
 impl std::fmt::Debug for LoadedPlugin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoadedPlugin")
-            .field("name", &self.name)
+            .field("id", &self.id.to_string())
+            .field("enabled", &self.enabled)
+            .field("error", &self.error)
             .finish()
     }
 }
 
 // ---------------------------------------------------------------------------
-// Declarative widgets (v2.1) and autocomplete providers (v2.2)
+// Declarative widgets and autocomplete providers
 // ---------------------------------------------------------------------------
 
 /// One registered widget: spec + latest full-state snapshot. The host key
-/// is `<plugin>:<id>`; updates are idempotent state replacements.
+/// is `<plugin-id>:<widget-id>`; updates are idempotent state replacements.
 #[derive(Clone, Debug)]
 pub struct WidgetEntry {
     pub key: String,
     pub plugin: String,
-    pub spec: tack_ext::WidgetSpec,
-    /// Latest state (spec.initial, replaced wholesale by widget.update).
+    pub spec: WidgetSpec,
+    /// Latest state (spec.initial, replaced wholesale by widgets/update).
     pub state: Option<Value>,
-    /// Panel visibility (spec.visible, then widget.update.visible).
+    /// Panel visibility (spec.visible, then widgets/update.visible).
     pub visible: bool,
     /// Bumped on each applied update (TUI render-cache key).
     pub rev: u64,
 }
 
-/// Host-side widget registry (v2.1). Plugins declare widgets at register
-/// time; the TUI renders from this snapshot and applies widget.update
-/// events here. A dead plugin's widgets are removed (no UI residue).
+/// Host-side widget registry. A dead plugin's widgets are removed (no UI
+/// residue).
 #[derive(Default, Debug)]
 pub struct WidgetRegistry {
     entries: Vec<WidgetEntry>,
@@ -484,7 +594,7 @@ pub struct WidgetRegistry {
 
 impl WidgetRegistry {
     /// Register a plugin's declared widgets (called after the handshake).
-    pub(crate) fn register_plugin(&mut self, plugin: &str, widgets: &[tack_ext::WidgetSpec]) {
+    pub(crate) fn register_plugin(&mut self, plugin: &str, widgets: &[WidgetSpec]) {
         for spec in widgets {
             self.entries.push(WidgetEntry {
                 key: format!("{plugin}:{}", spec.id),
@@ -497,9 +607,9 @@ impl WidgetRegistry {
         }
     }
 
-    /// Apply a widget.update (full-state replacement). False = unknown
+    /// Apply a widgets/update (full-state replacement). False = unknown
     /// widget id (the caller warns and ignores).
-    pub fn apply_update(&mut self, plugin: &str, update: &tack_ext::WidgetUpdatePayload) -> bool {
+    pub fn apply_update(&mut self, plugin: &str, update: &WidgetUpdateParams) -> bool {
         let Some(entry) = self
             .entries
             .iter_mut()
@@ -532,16 +642,15 @@ impl WidgetRegistry {
     }
 }
 
-/// A registered autocomplete provider (v2.2). Cloneable so queries can run
-/// on spawned tasks off the TUI main loop (the TUI adds a 300ms UI-level
-/// timeout on top of the protocol's 30s request timeout).
+/// A registered autocomplete provider. Cloneable so queries can run on
+/// spawned tasks off the TUI main loop.
 #[derive(Clone)]
 pub struct ExtAutocompleteProvider {
-    /// Host key `<plugin>:<id>`.
+    /// Host key `<plugin-id>:<provider-id>`.
     pub key: String,
     pub plugin: String,
-    pub spec: tack_ext::AutocompleteProviderSpec,
-    peer: Arc<tack_ext::PluginPeer>,
+    pub spec: tack_ext::rpc3::AutocompleteProviderSpec,
+    client: HostClient,
 }
 
 impl std::fmt::Debug for ExtAutocompleteProvider {
@@ -553,59 +662,79 @@ impl std::fmt::Debug for ExtAutocompleteProvider {
 }
 
 impl ExtAutocompleteProvider {
-    /// Query the plugin's `autocomplete.provide`. Contract degradation:
-    /// dead plugins, error responses (e.g. a v1 plugin that doesn't know
-    /// the method) and malformed results all yield no suggestions.
+    /// Query the plugin's `autocomplete/provide`. Contract degradation:
+    /// dead plugins, error responses, and malformed results all yield no
+    /// suggestions.
     pub async fn provide(
         &self,
         query: &str,
         cursor_offset: usize,
-    ) -> Vec<tack_ext::AutocompleteSuggestion> {
-        let params = tack_ext::AutocompleteProvideParams {
+    ) -> Vec<tack_ext::rpc3::AutocompleteSuggestion> {
+        let params = tack_ext::rpc3::AutocompleteProvideParams {
             provider_id: self.spec.id.clone(),
             query: query.to_string(),
-            cursor_offset,
+            cursor_offset: cursor_offset as u64,
         };
-        let Ok(params) = serde_json::to_value(params) else {
-            return Vec::new();
-        };
-        let Ok(result) = self.peer.call("autocomplete.provide", params).await else {
-            return Vec::new();
-        };
-        serde_json::from_value::<tack_ext::AutocompleteProvideResult>(result)
+        self.client
+            .autocomplete_provide(&params)
+            .await
             .map(|r| r.suggestions)
             .unwrap_or_default()
     }
 }
 
 /// Spawn a watcher firing `on_dead` once the plugin's peer observes EOF
-/// (process exit / guest trap). The TUI uses it to drop the plugin's
-/// widgets — a dead plugin leaves no UI residue (extensions-v2.md §3.2).
-/// Also fires on graceful shutdown; by then the receiver is gone and the
-/// send fails silently.
-pub fn watch_plugin_death(
-    peer: Arc<tack_ext::PluginPeer>,
-    on_dead: impl FnOnce() + Send + 'static,
-) {
+/// (carrier exit / guest trap). The TUI uses it to drop the plugin's
+/// widgets — a dead plugin leaves no UI residue.
+pub fn watch_plugin_death(peer: Arc<JsonRpcPeer>, on_dead: impl FnOnce() + Send + 'static) {
     tokio::spawn(async move {
         peer.wait_dead().await;
         on_dead();
     });
 }
 
+// ---------------------------------------------------------------------------
+// Lifecycle events (host → plugins)
+// ---------------------------------------------------------------------------
+
+/// Well-known lifecycle event names (the `events/lifecycle` `event`
+/// field). Plugins subscribe via `capabilities.events`; an absent/empty
+/// list means the default set below.
+pub const DEFAULT_EVENTS: &[&str] = &[
+    "sessionStart",
+    "sessionShutdown",
+    "agentStart",
+    "agentEnd",
+    "turnStart",
+    "turnEnd",
+    "messageStart",
+    "messageEnd",
+    "toolExecutionStart",
+    "toolExecutionEnd",
+    "modelSelect",
+    "thinkingLevelSelect",
+];
+
+// ---------------------------------------------------------------------------
+// ExtensionManager
+// ---------------------------------------------------------------------------
+
 #[derive(Default)]
 pub struct ExtensionManager {
+    /// All discovered plugins, including disabled and failed ones.
     pub plugins: Vec<LoadedPlugin>,
+    /// Capability-level load warnings (a bad hooks file, one malformed
+    /// MCP entry, an invalid tool schema…).
+    pub load_warnings: Vec<String>,
     /// command name → plugin index.
     commands: HashMap<String, usize>,
-    /// Declarative widget registry (v2.1), keyed `<plugin>:<id>`.
+    /// Declarative widget registry, keyed `<plugin-id>:<widget-id>`.
     widgets: WidgetRegistry,
     /// Bundle contributions from installed extensions (merged by callers).
     pub bundle_hooks: crate::shell_hooks::HookConfig,
     pub bundle_mcp_servers: Vec<tack_tools::mcp::McpServerSpec>,
     pub bundle_skill_dirs: Vec<PathBuf>,
-    /// Shared wasmtime engine for WASM-carrier plugins (kept alive for the
-    /// epoch ticker driving wall-clock limits).
+    /// Shared wasmtime engine for WASM-carrier plugins.
     #[cfg(feature = "wasm")]
     wasm_carrier: Option<tack_ext_wasm::WasmCarrier>,
 }
@@ -618,129 +747,374 @@ impl std::fmt::Debug for ExtensionManager {
     }
 }
 
-/// Discover extension manifests (user dir → extensionPaths → project dir).
-fn discover(cwd: &Path, agent_dir: &Path) -> Vec<(String, PathBuf)> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    let user_ext = agent_dir.join("extensions");
-    if let Ok(read) = std::fs::read_dir(&user_ext) {
-        dirs.extend(read.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+/// One discovered plugin directory: its id, version, and path.
+#[derive(Debug)]
+struct Discovered {
+    id: PluginId,
+    version: String,
+    dir: PathBuf,
+}
+
+/// The store root (`<agentDir>/extensions/store`).
+fn store_root(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("extensions").join("store")
+}
+
+/// The per-plugin data root (`<agentDir>/extensions/data/<source>/<name>`).
+pub fn plugin_data_dir(agent_dir: &Path, id: &PluginId) -> PathBuf {
+    agent_dir
+        .join("extensions")
+        .join("data")
+        .join(id.source())
+        .join(id.name())
+}
+
+/// Parse a version directory name: `local` or a semver triple.
+fn is_version_dir(name: &str) -> bool {
+    name == "local" || parse_semver(name).is_some()
+}
+
+fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
     }
+    Some((major, minor, patch))
+}
+
+/// The active version directory of `store/<source>/<name>`: `local` when
+/// present, else the highest semver directory. None when the plugin has
+/// no version dirs.
+fn active_version_dir(source_dir: &Path) -> Option<(String, PathBuf)> {
+    let read = std::fs::read_dir(source_dir).ok()?;
+    let mut local: Option<PathBuf> = None;
+    let mut best: Option<((u64, u64, u64), String, PathBuf)> = None;
+    for entry in read.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == "local" {
+            local = Some(path);
+        } else if let Some(version) = parse_semver(&name) {
+            let candidate = (version, name, path);
+            if best
+                .as_ref()
+                .is_none_or(|(current, _, _)| candidate.0 > *current)
+            {
+                best = Some(candidate);
+            }
+        }
+    }
+    if let Some(path) = local {
+        return Some(("local".to_string(), path));
+    }
+    best.map(|(_, name, path)| (name, path))
+}
+
+/// Enumerate installed store plugins as (id, version, dir).
+fn discover_store(agent_dir: &Path) -> Vec<Discovered> {
+    let mut out = Vec::new();
+    let root = store_root(agent_dir);
+    let Ok(sources) = std::fs::read_dir(&root) else {
+        return out;
+    };
+    for source_entry in sources.flatten() {
+        let source_path = source_entry.path();
+        if !source_path.is_dir() {
+            continue;
+        }
+        let source = source_entry.file_name().to_string_lossy().to_string();
+        let Ok(names) = std::fs::read_dir(&source_path) else {
+            continue;
+        };
+        for name_entry in names.flatten() {
+            let name_path = name_entry.path();
+            if !name_path.is_dir() {
+                continue;
+            }
+            let name = name_entry.file_name().to_string_lossy().to_string();
+            let Some((version, dir)) = active_version_dir(&name_path) else {
+                continue;
+            };
+            if !dir.join("extension.json").is_file() {
+                continue;
+            }
+            let Ok(id) = PluginId::new(&name, &source) else {
+                tracing::warn!("ignoring store entry with invalid id {name}@{source}");
+                continue;
+            };
+            out.push(Discovered { id, version, dir });
+        }
+    }
+    out
+}
+
+/// Discover all plugin directories: store → legacy flat user dir →
+/// settings extensionPaths → project dir (trust-gated).
+fn discover(cwd: &Path, agent_dir: &Path) -> Vec<Discovered> {
+    let mut out = discover_store(agent_dir);
+    // Legacy flat user dir: <agentDir>/extensions/<name>/ (pre-P3
+    // installs) loads as name@user, shadowed by a store install of the
+    // same id.
+    let user_root = agent_dir.join("extensions");
+    if let Ok(read) = std::fs::read_dir(&user_root) {
+        for entry in read.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "store" || name == "data" {
+                continue;
+            }
+            if !path.join("extension.json").is_file() {
+                continue;
+            }
+            let Ok(id) = PluginId::new(&name, "user") else {
+                continue;
+            };
+            if out.iter().any(|d| d.id == id) {
+                continue;
+            }
+            out.push(Discovered {
+                id,
+                version: "local".to_string(),
+                dir: path,
+            });
+        }
+    }
+    // settings extensionPaths → @local (single ext dir or a parent dir).
     for extra in crate::settings::Settings::extra_paths(agent_dir, "extensionPaths") {
         let path = PathBuf::from(extra);
-        if path.is_dir() {
-            if path.join("extension.json").is_file() {
-                dirs.push(path);
-            } else if let Ok(read) = std::fs::read_dir(&path) {
-                dirs.extend(read.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
-            }
+        let candidates: Vec<PathBuf> = if path.join("extension.json").is_file() {
+            vec![path]
+        } else if path.is_dir() {
+            std::fs::read_dir(&path)
+                .map(|read| {
+                    read.flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.is_dir() && p.join("extension.json").is_file())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        for dir in candidates {
+            let Some(name) = dir.file_name().map(|n| n.to_string_lossy().to_string()) else {
+                continue;
+            };
+            let Ok(id) = PluginId::new(&name, "local") else {
+                continue;
+            };
+            out.push(Discovered {
+                id,
+                version: "local".to_string(),
+                dir,
+            });
         }
     }
     // Project extensions: trust-gated (they execute code).
     if crate::project_trust::is_trusted(cwd, agent_dir) {
         let project_ext = cwd.join(".pi").join("extensions");
         if let Ok(read) = std::fs::read_dir(project_ext) {
-            dirs.extend(read.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+            for entry in read.flatten() {
+                let path = entry.path();
+                if !path.is_dir() || !path.join("extension.json").is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                let Ok(id) = PluginId::new(&name, "project") else {
+                    continue;
+                };
+                out.push(Discovered {
+                    id,
+                    version: "local".to_string(),
+                    dir: path,
+                });
+            }
         }
     }
-
-    let mut manifests = Vec::new();
-    for dir in dirs {
-        let manifest_path = dir.join("extension.json");
-        let Ok(content) = std::fs::read_to_string(&manifest_path) else {
-            continue;
-        };
-        match serde_json::from_str::<ExtensionManifest>(&content) {
-            Ok(manifest) => manifests.push((manifest.name.clone(), dir)),
-            Err(e) => tracing::warn!(
-                "ignoring bad extension manifest {}: {e}",
-                manifest_path.display()
-            ),
-        }
-    }
-    manifests
+    out
 }
 
-/// Audit-log every non-default capability grant at load time — sandbox
-/// widenings must be greppable in the host log.
-#[cfg(feature = "wasm")]
-fn audit_capability_grants(name: &str, caps: &tack_ext_wasm::WasmCapabilities) {
-    for grant in &caps.preopens {
-        tracing::warn!(
-            "extension {name}: wasm fs grant {} -> {} ({:?})",
-            grant.host_path.display(),
-            grant.guest_path,
-            grant.access,
-        );
+/// The `plugins."<id>".enabled` map from settings (delegates to
+/// [`crate::settings::Settings::plugin_enabled_map`]; missing entries
+/// default to enabled).
+fn plugin_enabled_map(cwd: &Path, agent_dir: &Path) -> HashMap<String, bool> {
+    crate::settings::Settings::plugin_enabled_map(cwd, agent_dir)
+}
+
+/// Write the enabled flag for one plugin id into the user settings file
+/// (`tack ext enable|disable`).
+pub fn set_plugin_enabled(agent_dir: &Path, id: &str, enabled: bool) -> anyhow::Result<()> {
+    id.parse::<PluginId>()?;
+    let path = agent_dir.join("settings.json");
+    let mut raw: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !raw.is_object() {
+        raw = serde_json::json!({});
     }
-    if !caps.env.is_empty() {
-        let keys: Vec<&str> = caps.env.iter().map(|(k, _)| k.as_str()).collect();
-        tracing::warn!("extension {name}: wasm env grant {keys:?}");
-    }
-    if caps.network.allow_tcp || caps.network.allow_udp || caps.network.allow_dns {
-        tracing::warn!("extension {name}: wasm network grant {:?}", caps.network);
-    }
+    let plugins = raw
+        .as_object_mut()
+        .expect("object")
+        .entry("plugins".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let plugins = plugins
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("settings `plugins` is not an object"))?;
+    let entry = plugins
+        .entry(id.to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let entry = entry
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("settings entry for {id} is not an object"))?;
+    entry.insert("enabled".to_string(), Value::Bool(enabled));
+    std::fs::create_dir_all(agent_dir)?;
+    std::fs::write(&path, serde_json::to_string_pretty(&raw)?)?;
+    Ok(())
 }
 
 impl ExtensionManager {
-    /// Discover and start all extensions. Failures are logged and skipped —
-    /// a broken plugin must never fail session creation (TS loader semantics).
+    /// Discover, enable-filter, and start all extensions. Failures are
+    /// recorded per plugin (`LoadedPlugin::error`) and never fail session
+    /// creation; capability-level problems become `load_warnings`.
     pub async fn load(
         cwd: &Path,
         agent_dir: &Path,
         mode: &str,
-        services: Arc<dyn HostServices>,
+        services: Arc<dyn PeerHandler>,
         lock_required: bool,
     ) -> Self {
         let mut manager = ExtensionManager::default();
         let trusted = crate::project_trust::is_trusted(cwd, agent_dir);
-        let manifests = discover(cwd, agent_dir);
-        // Supply-chain gate: user-dir extensions installed via `ext install`
-        // carry a lockfile entry pinning the resolved commit. A plugin whose
-        // checkout drifted from the pin is skipped (default) or merely warned
-        // about (settings extensionLockRequired=false). Plugins without a
-        // lock entry (manually copied, local-dir installs) are unaffected.
+        let enabled_map = plugin_enabled_map(cwd, agent_dir);
+        let discovered = discover(cwd, agent_dir);
         let lock = read_lock(agent_dir).unwrap_or_else(|e| {
             tracing::warn!("ignoring unreadable extensions lockfile: {e}");
             ExtensionsLock::default()
         });
-        let user_root = agent_dir.join("extensions");
-        for (name, dir) in manifests {
-            if !lock_allows(&dir, &user_root, &lock, lock_required) {
+        for entry in discovered {
+            let id_string = entry.id.to_string();
+            let enabled = enabled_map.get(&id_string).copied().unwrap_or(true);
+            // Read the manifest first: it is needed for bundle resources
+            // even when the plugin is disabled.
+            let manifest_path = entry.dir.join("extension.json");
+            let manifest: Option<ExtensionManifest> = match std::fs::read_to_string(&manifest_path)
+            {
+                Ok(content) => match serde_json::from_str::<ExtensionManifest>(&content) {
+                    Ok(manifest) => Some(manifest),
+                    Err(e) => {
+                        manager.plugins.push(LoadedPlugin {
+                            id: entry.id,
+                            enabled,
+                            error: Some(format!("bad extension.json: {e}")),
+                            register: None,
+                            handle: None,
+                            version: entry.version,
+                            dir: entry.dir,
+                        });
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    manager.plugins.push(LoadedPlugin {
+                        id: entry.id,
+                        enabled,
+                        error: Some(format!("cannot read extension.json: {e}")),
+                        register: None,
+                        handle: None,
+                        version: entry.version,
+                        dir: entry.dir,
+                    });
+                    continue;
+                }
+            };
+            let manifest = manifest.expect("manifest checked");
+
+            if !enabled {
+                manager.plugins.push(LoadedPlugin {
+                    id: entry.id,
+                    enabled: false,
+                    error: None,
+                    register: None,
+                    handle: None,
+                    version: entry.version,
+                    dir: entry.dir,
+                });
                 continue;
             }
-            let manifest_path = dir.join("extension.json");
-            let Ok(content) = std::fs::read_to_string(&manifest_path) else {
+
+            // Supply-chain gate: store installs with a lock entry pinned
+            // to a resolved commit are skipped when the checkout drifted.
+            if (entry.id.source() == "user" || !entry.id.is_reserved_source())
+                && !lock_allows(&entry, &lock, lock_required)
+            {
+                manager.plugins.push(LoadedPlugin {
+                    id: entry.id,
+                    enabled,
+                    error: Some(
+                        "checkout drifted from the locked commit (extensionLockRequired)"
+                            .to_string(),
+                    ),
+                    register: None,
+                    handle: None,
+                    version: entry.version,
+                    dir: entry.dir,
+                });
                 continue;
-            };
-            let Ok(manifest) = serde_json::from_str::<ExtensionManifest>(&content) else {
-                continue;
-            };
-            // Bundle contributions are collected even when the manifest has
-            // no runnable plugin (a hooks/skills/MCP-only bundle is valid).
-            manager.collect_bundle_resources(&name, &dir, &manifest);
-            // Tag this plugin's events (widget.update needs the origin).
-            let services: Arc<dyn HostServices> = Arc::new(TaggedServices {
-                plugin: name.clone(),
+            }
+
+            // Bundle contributions (hooks/MCP/skills) are collected for
+            // every enabled plugin, even when its carrier fails to start.
+            manager.collect_bundle_resources(&id_string, &entry.dir, &manifest);
+
+            // Tag this plugin's notifications (widgets/update needs the
+            // origin).
+            let services: Arc<dyn PeerHandler> = Arc::new(TaggedServices {
+                plugin: id_string.clone(),
                 inner: services.clone(),
             });
-
             let carrier = manifest.carrier.as_deref().unwrap_or("process");
             let mut handle = match carrier {
                 "wasm" => {
                     #[cfg(feature = "wasm")]
                     {
                         let Some(module) = &manifest.module else {
-                            tracing::warn!("extension {name}: carrier wasm requires `module`");
+                            manager.plugins.push(LoadedPlugin {
+                                id: entry.id,
+                                enabled,
+                                error: Some("carrier wasm requires `module`".to_string()),
+                                register: None,
+                                handle: None,
+                                version: entry.version,
+                                dir: entry.dir,
+                            });
                             continue;
                         };
-                        let module_path = dir.join(module);
+                        let module_path = entry.dir.join(module);
                         let wasm = match std::fs::read(&module_path) {
                             Ok(bytes) => bytes,
                             Err(e) => {
-                                tracing::warn!(
-                                    "extension {name}: cannot read {}: {e}",
-                                    module_path.display()
-                                );
+                                manager.plugins.push(LoadedPlugin {
+                                    id: entry.id,
+                                    enabled,
+                                    error: Some(format!(
+                                        "cannot read {}: {e}",
+                                        module_path.display()
+                                    )),
+                                    register: None,
+                                    handle: None,
+                                    version: entry.version,
+                                    dir: entry.dir,
+                                });
                                 continue;
                             }
                         };
@@ -748,7 +1122,15 @@ impl ExtensionManager {
                             match tack_ext_wasm::WasmCarrier::new() {
                                 Ok(carrier) => manager.wasm_carrier = Some(carrier),
                                 Err(e) => {
-                                    tracing::warn!("extension {name}: wasmtime unavailable: {e}");
+                                    manager.plugins.push(LoadedPlugin {
+                                        id: entry.id,
+                                        enabled,
+                                        error: Some(format!("wasmtime unavailable: {e}")),
+                                        register: None,
+                                        handle: None,
+                                        version: entry.version,
+                                        dir: entry.dir,
+                                    });
                                     continue;
                                 }
                             }
@@ -757,9 +1139,9 @@ impl ExtensionManager {
                         let limits = manifest.limits.map(|l| l.to_limits()).unwrap_or_default();
                         let capabilities = manifest
                             .capabilities
-                            .map(|c| c.into_capabilities(&name, &dir))
+                            .map(|c| c.into_capabilities(&id_string, &entry.dir))
                             .unwrap_or_default();
-                        audit_capability_grants(&name, &capabilities);
+                        audit_capability_grants(&id_string, &capabilities);
                         match carrier_engine
                             .spawn_with_capabilities(
                                 &wasm,
@@ -771,102 +1153,174 @@ impl ExtensionManager {
                         {
                             Ok(plugin) => PluginHandle::Wasm(Some(plugin)),
                             Err(e) => {
-                                tracing::warn!("extension {name} failed to start (wasm): {e}");
+                                manager.plugins.push(LoadedPlugin {
+                                    id: entry.id,
+                                    enabled,
+                                    error: Some(format!("failed to start (wasm): {e}")),
+                                    register: None,
+                                    handle: None,
+                                    version: entry.version,
+                                    dir: entry.dir,
+                                });
                                 continue;
                             }
                         }
                     }
                     #[cfg(not(feature = "wasm"))]
                     {
-                        tracing::warn!(
-                            "extension {name}: carrier wasm requested, but this build \
-                             has no wasm support (built with --no-default-features)"
-                        );
+                        manager.plugins.push(LoadedPlugin {
+                            id: entry.id,
+                            enabled,
+                            error: Some(
+                                "carrier wasm requested, but this build has no wasm support"
+                                    .to_string(),
+                            ),
+                            register: None,
+                            handle: None,
+                            version: entry.version,
+                            dir: entry.dir,
+                        });
                         continue;
                     }
                 }
                 "process" => {
                     let Some(command) = &manifest.command else {
-                        // Bundle-only extension (no runnable plugin).
+                        // Bundle-only extension (no runnable plugin):
+                        // bundle resources were already collected.
                         continue;
                     };
                     let args: Vec<String> = manifest
                         .args
                         .iter()
                         .map(|a| {
-                            // Only path-like args resolve against the extension dir;
-                            // plain words (subcommands, flags, node args) pass through.
                             let path_like =
                                 a.contains('/') || a.contains('\\') || a.starts_with('.');
                             if path_like && !PathBuf::from(a).is_absolute() {
-                                dir.join(a).to_string_lossy().to_string()
+                                entry.dir.join(a).to_string_lossy().to_string()
                             } else {
                                 a.clone()
                             }
                         })
                         .collect();
                     let env: Vec<(String, String)> = manifest.env.clone().into_iter().collect();
-                    match PluginProcess::spawn(command, &args, &env, &dir, services.clone()).await {
-                        Ok(process) => PluginHandle::Process(Box::new(process)),
+                    match V3Process::spawn(command, &args, &env, &entry.dir, services.clone()).await
+                    {
+                        Ok(process) => PluginHandle::Process(process),
                         Err(e) => {
-                            tracing::warn!("extension {name} failed to start: {e}");
+                            manager.plugins.push(LoadedPlugin {
+                                id: entry.id,
+                                enabled,
+                                error: Some(format!("failed to start: {e}")),
+                                register: None,
+                                handle: None,
+                                version: entry.version,
+                                dir: entry.dir,
+                            });
                             continue;
                         }
                     }
                 }
                 other => {
-                    tracing::warn!("extension {name}: unknown carrier {other:?}");
+                    manager.plugins.push(LoadedPlugin {
+                        id: entry.id,
+                        enabled,
+                        error: Some(format!("unknown carrier {other:?}")),
+                        register: None,
+                        handle: None,
+                        version: entry.version,
+                        dir: entry.dir,
+                    });
                     continue;
                 }
             };
-            // v2.1: every carrier negotiates protocol 2. The declarative
-            // widget / autocomplete surface (extensions-v2.md §3) is
-            // carrier-orthogonal, and a v1 plugin simply ignores the higher
-            // number (register parsing tolerates unknown fields both ways).
-            let protocol = 2;
-            let init = InitializePayload {
-                protocol,
-                mode: mode.to_string(),
+
+            // Handshake (v3 initialize).
+            let run_mode = match mode {
+                "tui" => RunMode::Tui,
+                "print" => RunMode::Print,
+                "rpc" => RunMode::Rpc,
+                "acp" => RunMode::Acp,
+                _ => RunMode::Print,
+            };
+            let init = InitializeParams {
+                protocol_version: tack_ext::v3::PROTOCOL_VERSION.to_string(),
+                host: HostInfo {
+                    name: "tack".to_string(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                },
+                mode: run_mode,
                 cwd: cwd.to_string_lossy().to_string(),
                 trusted,
-                host: format!("tack/{}", env!("CARGO_PKG_VERSION")),
+                capabilities: HostCapabilities {
+                    widgets: Some(true),
+                    autocomplete: Some(true),
+                    session_control: Some(true),
+                    snapshot: Some(false),
+                    ui_dialogs: Some(mode == "tui"),
+                    exec: Some(trusted),
+                    provider_registration: Some(true),
+                    metrics: None,
+                },
+                config: None,
             };
-            match handle.peer().initialize(init).await {
+            let client = handle.client();
+            match client.initialize(&init).await {
                 Ok(mut register) => {
                     // Reject malformed tool parameter schemas at
-                    // registration (upstream pi #9300): a non-object schema
-                    // would break provider request serialization.
-                    register
-                        .tools
-                        .retain(|spec| match spec.validate_parameters(&name) {
-                            Ok(()) => true,
-                            Err(e) => {
-                                tracing::warn!("extension {name}: {e}");
+                    // registration: a non-object schema would break
+                    // provider request serialization.
+                    if let Some(tools) = &mut register.capabilities.tools {
+                        let name = id_string.clone();
+                        let warnings = &mut manager.load_warnings;
+                        tools.retain(|spec| {
+                            if spec.parameters.is_object() {
+                                true
+                            } else {
+                                warnings.push(format!(
+                                    "Tool {:?} registered by extension {name} must define an object parameter schema.",
+                                    spec.name
+                                ));
                                 false
                             }
                         });
-                    tracing::info!(
-                        "extension {} loaded ({} tools, {} commands, carrier {})",
-                        name,
-                        register.tools.len(),
-                        register.commands.len(),
-                        carrier,
-                    );
-                    for command in &register.commands {
-                        manager
-                            .commands
-                            .insert(command.name.clone(), manager.plugins.len());
                     }
-                    manager.widgets.register_plugin(&name, &register.widgets);
+                    tracing::info!(
+                        "extension {} loaded (carrier {}, version {})",
+                        id_string,
+                        carrier,
+                        entry.version,
+                    );
+                    if let Some(commands) = &register.capabilities.commands {
+                        for command in commands {
+                            manager
+                                .commands
+                                .insert(command.name.clone(), manager.plugins.len());
+                        }
+                    }
+                    if let Some(widgets) = &register.capabilities.widgets {
+                        manager.widgets.register_plugin(&id_string, widgets);
+                    }
                     manager.plugins.push(LoadedPlugin {
-                        name,
-                        handle,
-                        register,
+                        id: entry.id,
+                        enabled,
+                        error: None,
+                        register: Some(register),
+                        handle: Some(handle),
+                        version: entry.version,
+                        dir: entry.dir,
                     });
                 }
                 Err(e) => {
-                    tracing::warn!("extension {name} handshake failed: {e}");
                     handle.shutdown().await;
+                    manager.plugins.push(LoadedPlugin {
+                        id: entry.id,
+                        enabled,
+                        error: Some(format!("handshake failed: {e}")),
+                        register: None,
+                        handle: None,
+                        version: entry.version,
+                        dir: entry.dir,
+                    });
                 }
             }
         }
@@ -874,15 +1328,17 @@ impl ExtensionManager {
     }
 
     /// Collect a manifest's declarative bundle resources (hooks / MCP
-    /// servers / skill dirs) into the manager. Paths resolve against the
-    /// extension directory.
+    /// servers / skill dirs). Paths resolve against the extension
+    /// directory.
     fn collect_bundle_resources(&mut self, name: &str, dir: &Path, manifest: &ExtensionManifest) {
         if let Some(hooks) = &manifest.hooks {
             let paths: Vec<&str> = match hooks {
                 Value::String(path) => vec![path.as_str()],
                 Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
                 _ => {
-                    tracing::warn!("extension {name}: `hooks` must be a path or a list of paths");
+                    self.load_warnings.push(format!(
+                        "extension {name}: `hooks` must be a path or a list of paths"
+                    ));
                     vec![]
                 }
             };
@@ -891,14 +1347,15 @@ impl ExtensionManager {
                 match std::fs::read_to_string(&path) {
                     Ok(content) => match crate::shell_hooks::parse_hooks_file(&content) {
                         Ok(config) => self.bundle_hooks.extend(config),
-                        Err(e) => tracing::warn!(
+                        Err(e) => self.load_warnings.push(format!(
                             "extension {name}: bad hooks file {}: {e}",
                             path.display()
-                        ),
+                        )),
                     },
-                    Err(e) => {
-                        tracing::warn!("extension {name}: cannot read {}: {e}", path.display())
-                    }
+                    Err(e) => self.load_warnings.push(format!(
+                        "extension {name}: cannot read {}: {e}",
+                        path.display()
+                    )),
                 }
             }
         }
@@ -914,14 +1371,15 @@ impl ExtensionManager {
                                     &path.display().to_string(),
                                 ))
                         }
-                        Err(e) => tracing::warn!(
+                        Err(e) => self.load_warnings.push(format!(
                             "extension {name}: bad MCP servers file {}: {e}",
                             path.display()
-                        ),
+                        )),
                     },
-                    Err(e) => {
-                        tracing::warn!("extension {name}: cannot read {}: {e}", path.display())
-                    }
+                    Err(e) => self.load_warnings.push(format!(
+                        "extension {name}: cannot read {}: {e}",
+                        path.display()
+                    )),
                 }
             }
             Some(value @ Value::Object(_)) => {
@@ -932,7 +1390,9 @@ impl ExtensionManager {
                     ));
             }
             Some(_) => {
-                tracing::warn!("extension {name}: `mcpServers` must be a path or an object");
+                self.load_warnings.push(format!(
+                    "extension {name}: `mcpServers` must be a path or an object"
+                ));
             }
             None => {}
         }
@@ -942,59 +1402,83 @@ impl ExtensionManager {
                 if path.is_dir() {
                     self.bundle_skill_dirs.push(path);
                 } else {
-                    tracing::warn!("extension {name}: skill dir {} missing", path.display());
+                    self.load_warnings.push(format!(
+                        "extension {name}: skill dir {} missing",
+                        path.display()
+                    ));
                 }
             }
         }
     }
 
-    /// All plugin tools for the agent loop.
+    /// All active plugins' tools for the agent loop.
     pub fn tools(&self) -> Vec<Arc<dyn AgentTool>> {
         let mut tools: Vec<Arc<dyn AgentTool>> = Vec::new();
-        for plugin in &self.plugins {
-            for spec in &plugin.register.tools {
-                tools.push(Arc::new(ExtTool::new(
-                    &plugin.name,
-                    spec.clone(),
-                    plugin.handle.peer().clone(),
-                )));
+        for plugin in self.plugins.iter().filter(|p| p.is_active()) {
+            let Some(handle) = &plugin.handle else {
+                continue;
+            };
+            let Some(capabilities) = plugin.capabilities() else {
+                continue;
+            };
+            if let Some(specs) = &capabilities.tools {
+                for spec in specs {
+                    tools.push(Arc::new(ExtTool::new(
+                        &plugin.id.to_string(),
+                        spec.clone(),
+                        handle.client(),
+                    )));
+                }
             }
         }
         tools
     }
 
-    /// Per-plugin hook bridges (tool_call interception).
+    /// Per-plugin hook bridges (tool-call interception, context
+    /// transform, result patching) for active plugins that declared the
+    /// capabilities.
     pub fn hooks(&self) -> Vec<Arc<dyn AgentHooks>> {
         self.plugins
             .iter()
-            .map(|p| {
-                Arc::new(ExtHooks::new(
-                    p.handle.peer().clone(),
-                    &p.register.subscriptions,
-                )) as Arc<dyn AgentHooks>
+            .filter(|p| p.is_active())
+            .filter_map(|p| {
+                let capabilities = p.capabilities()?.hooks.clone()?;
+                let handle = p.handle.as_ref()?;
+                let fail_mode = std::fs::read_to_string(p.dir.join("extension.json"))
+                    .ok()
+                    .and_then(|c| serde_json::from_str::<ExtensionManifest>(&c).ok())
+                    .and_then(|m| m.fail_mode);
+                let fail_mode = FailMode::from_setting(fail_mode.as_deref());
+                Some(Arc::new(ExtHooks::with_fail_mode(
+                    handle.client(),
+                    capabilities,
+                    fail_mode,
+                )) as Arc<dyn AgentHooks>)
             })
             .collect()
     }
 
-    /// No plugins loaded — callers can skip per-event payload
-    /// serialization (e.g. the TUI's event fan-out).
+    /// No active plugins — callers can skip per-event payload
+    /// serialization.
     pub fn is_empty(&self) -> bool {
-        self.plugins.is_empty()
+        !self.plugins.iter().any(|p| p.is_active())
     }
 
-    /// Fan an event out to subscribed plugins (fire-and-forget).
+    /// Fan a lifecycle event out to subscribed plugins (fire-and-forget).
     pub async fn notify(&self, event: &str, payload: Value) {
-        for plugin in &self.plugins {
-            let subscribed = if plugin.register.subscriptions.is_empty() {
-                DEFAULT_EVENTS.contains(&event)
-            } else {
-                plugin.register.subscriptions.iter().any(|s| s == event)
+        for plugin in self.plugins.iter().filter(|p| p.is_active()) {
+            let Some(handle) = &plugin.handle else {
+                continue;
+            };
+            let subscribed = match plugin.capabilities().and_then(|c| c.events.as_ref()) {
+                None => DEFAULT_EVENTS.contains(&event),
+                Some(events) if events.is_empty() => DEFAULT_EVENTS.contains(&event),
+                Some(events) => events.iter().any(|s| s == event),
             };
             if subscribed {
-                let _ = plugin
-                    .handle
-                    .peer()
-                    .send_event(event, payload.clone())
+                let _ = handle
+                    .client()
+                    .lifecycle_event(event, payload.clone())
                     .await;
             }
         }
@@ -1005,58 +1489,79 @@ impl ExtensionManager {
         self.commands.keys().cloned().collect()
     }
 
-    /// Declarative widgets (v2.1): spec + current state, keyed `<plugin>:<id>`.
+    /// Invoke an extension command (run by the TUI command dispatcher).
+    pub async fn invoke_command(&self, name: &str, args: &str) -> Result<Value, String> {
+        let Some(index) = self.commands.get(name) else {
+            return Err(format!("unknown extension command {name:?}"));
+        };
+        let plugin = &self.plugins[*index];
+        let Some(handle) = &plugin.handle else {
+            return Err(format!("extension of command {name:?} is not running"));
+        };
+        handle
+            .client()
+            .command_invoke(&tack_ext::rpc3::CommandInvokeParams {
+                name: name.to_string(),
+                args: Some(args.to_string()),
+            })
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Declarative widgets: spec + current state, keyed `<plugin-id>:<id>`.
     pub fn widgets(&self) -> &[WidgetEntry] {
         self.widgets.entries()
     }
 
-    /// Apply a plugin's widget.update (full-state replacement). False =
-    /// unknown widget id — the caller warns and ignores (a plugin racing
-    /// its own death, or a typo'd id, must never break the UI).
-    pub fn apply_widget_update(
-        &mut self,
-        plugin: &str,
-        update: &tack_ext::WidgetUpdatePayload,
-    ) -> bool {
+    /// Apply a plugin's widgets/update (full-state replacement). False =
+    /// unknown widget id.
+    pub fn apply_widget_update(&mut self, plugin: &str, update: &WidgetUpdateParams) -> bool {
         self.widgets.apply_update(plugin, update)
     }
 
-    /// A plugin died (peer EOF): its widgets vanish with it. Returns the
-    /// removed host keys so the UI can drop focus/scroll state.
+    /// A plugin died (peer EOF): its widgets vanish with it.
     pub fn remove_plugin_widgets(&mut self, plugin: &str) -> Vec<String> {
         self.widgets.remove_plugin(plugin)
     }
 
     /// Test hook: register a widget without a running plugin.
     #[doc(hidden)]
-    pub fn test_insert_widget(&mut self, plugin: &str, spec: tack_ext::WidgetSpec) {
+    pub fn test_insert_widget(&mut self, plugin: &str, spec: WidgetSpec) {
         self.widgets.register_plugin(plugin, &[spec]);
     }
 
-    /// Registered autocomplete providers (v2.2), in register order.
+    /// Registered autocomplete providers, in register order.
     pub fn autocomplete_providers(&self) -> Vec<ExtAutocompleteProvider> {
         let mut out = Vec::new();
-        for plugin in &self.plugins {
-            for spec in &plugin.register.autocomplete_providers {
-                out.push(ExtAutocompleteProvider {
-                    key: format!("{}:{}", plugin.name, spec.id),
-                    plugin: plugin.name.clone(),
-                    spec: spec.clone(),
-                    peer: plugin.handle.peer().clone(),
-                });
+        for plugin in self.plugins.iter().filter(|p| p.is_active()) {
+            let Some(handle) = &plugin.handle else {
+                continue;
+            };
+            let Some(capabilities) = plugin.capabilities() else {
+                continue;
+            };
+            if let Some(providers) = &capabilities.autocomplete_providers {
+                for spec in providers {
+                    out.push(ExtAutocompleteProvider {
+                        key: format!("{}:{}", plugin.id, spec.id),
+                        plugin: plugin.id.to_string(),
+                        spec: spec.clone(),
+                        client: handle.client(),
+                    });
+                }
             }
         }
         out
     }
 
-    /// Query one autocomplete provider by host key. Unknown key, dead
-    /// plugin or error response → no suggestions (contract degradation).
+    /// Query one autocomplete provider by host key (contract degradation:
+    /// unknown key / dead plugin → no suggestions).
     pub async fn autocomplete_provide(
         &self,
         provider_key: &str,
         query: &str,
         cursor_offset: usize,
-    ) -> Vec<tack_ext::AutocompleteSuggestion> {
+    ) -> Vec<tack_ext::rpc3::AutocompleteSuggestion> {
         let Some(provider) = self
             .autocomplete_providers()
             .into_iter()
@@ -1067,44 +1572,19 @@ impl ExtensionManager {
         provider.provide(query, cursor_offset).await
     }
 
-    /// Report a widget interaction (e.g. a list selection) back to the
-    /// OWNING plugin only — widget.action is not subscription-gated and
-    /// never broadcast (fire-and-forget; dead plugins silently drop).
-    pub async fn notify_widget_action(&self, plugin: &str, action: tack_ext::WidgetActionPayload) {
-        let Some(plugin) = self.plugins.iter().find(|p| p.name == plugin) else {
+    /// Report a widget interaction back to the OWNING plugin only.
+    pub async fn notify_widget_action(
+        &self,
+        plugin: &str,
+        action: tack_ext::rpc3::WidgetActionParams,
+    ) {
+        let Some(plugin) = self.plugins.iter().find(|p| p.id.to_string() == plugin) else {
             return;
         };
-        let Ok(payload) = serde_json::to_value(action) else {
+        let Some(handle) = &plugin.handle else {
             return;
         };
-        let _ = plugin
-            .handle
-            .peer()
-            .send_event("widget.action", payload)
-            .await;
-    }
-
-    /// All registered shortcuts as (action, plugin index) — wired into the
-    /// keybinding registry by the TUI.
-    pub fn shortcut_actions(&self) -> Vec<(String, usize)> {
-        let mut out = Vec::new();
-        for (index, plugin) in self.plugins.iter().enumerate() {
-            for shortcut in &plugin.register.shortcuts {
-                out.push((shortcut.action.clone(), index));
-            }
-        }
-        out
-    }
-
-    /// Notify one plugin that its shortcut fired.
-    pub async fn notify_shortcut(&self, plugin_index: usize, action: &str) {
-        if let Some(plugin) = self.plugins.get(plugin_index) {
-            let _ = plugin
-                .handle
-                .peer()
-                .send_event("shortcut", serde_json::json!({ "action": action }))
-                .await;
-        }
+        let _ = handle.client().widget_action(&action).await;
     }
 
     /// A shareable event sink for the provider-events wrapper.
@@ -1112,20 +1592,34 @@ impl ExtensionManager {
         ExtSinkHandle::spawn(
             self.plugins
                 .iter()
-                .map(|p| (p.handle.peer().clone(), p.register.subscriptions.clone()))
+                .filter(|p| p.is_active())
+                .filter_map(|p| {
+                    let handle = p.handle.as_ref()?;
+                    let subscriptions = p.capabilities().and_then(|c| c.events.clone());
+                    Some((handle.client(), subscriptions))
+                })
                 .collect(),
         )
     }
+
+    /// Gracefully stop all running plugins.
+    pub async fn shutdown(&mut self) {
+        for plugin in &mut self.plugins {
+            if let Some(handle) = &mut plugin.handle {
+                handle.shutdown().await;
+            }
+        }
+    }
 }
 
-/// A cheap-cloneable event sink sharing the plugins' peers (for the
+/// A cheap-cloneable event sink sharing the plugins' clients (for the
 /// provider-events wrapper, which outlives borrows of the manager).
 ///
 /// `notify` is sync fire-and-forget called from provider code — one task
 /// spawn PER EVENT used to flood the runtime under streaming load. Instead
-/// events go into a single bounded queue drained by ONE consumer task
-/// (spawned with the sink); a full queue drops events (they are
-/// best-effort lifecycle notifications, never required for correctness).
+/// events go into a single bounded queue drained by ONE consumer task; a
+/// full queue drops events (they are best-effort lifecycle notifications,
+/// never required for correctness).
 #[derive(Debug)]
 pub struct ExtSinkHandle {
     queue: mpsc::Sender<(String, Value)>,
@@ -1135,18 +1629,20 @@ pub struct ExtSinkHandle {
 const EXT_EVENT_QUEUE_DEPTH: usize = 256;
 
 impl ExtSinkHandle {
-    fn spawn(peers: Vec<(Arc<tack_ext::PluginPeer>, Vec<String>)>) -> Arc<Self> {
+    fn spawn(peers: Vec<(HostClient, Option<Vec<String>>)>) -> Arc<Self> {
         let (tx, mut rx) = mpsc::channel::<(String, Value)>(EXT_EVENT_QUEUE_DEPTH);
         tokio::spawn(async move {
             while let Some((event, payload)) = rx.recv().await {
-                for (peer, subscriptions) in &peers {
-                    let subscribed = if subscriptions.is_empty() {
-                        DEFAULT_EVENTS.contains(&event.as_str())
-                    } else {
-                        subscriptions.iter().any(|s| s == &event)
+                for (client, subscriptions) in &peers {
+                    let subscribed = match subscriptions {
+                        None => DEFAULT_EVENTS.contains(&event.as_str()),
+                        Some(events) if events.is_empty() => {
+                            DEFAULT_EVENTS.contains(&event.as_str())
+                        }
+                        Some(events) => events.iter().any(|s| s == &event),
                     };
                     if subscribed {
-                        let _ = peer.send_event(&event, payload.clone()).await;
+                        let _ = client.lifecycle_event(&event, payload.clone()).await;
                     }
                 }
             }
@@ -1165,257 +1661,12 @@ impl tack_ext::EventSink for ExtSinkHandle {
     }
 }
 
-impl ExtensionManager {
-    /// Invoke an extension command (run by the TUI command dispatcher).
-    pub async fn invoke_command(&self, name: &str, args: &str) -> Result<Value, String> {
-        let Some(index) = self.commands.get(name) else {
-            return Err(format!("unknown extension command {name:?}"));
-        };
-        let plugin = &self.plugins[*index];
-        plugin
-            .handle
-            .peer()
-            .call(
-                "command.invoke",
-                serde_json::json!({ "name": name, "args": args }),
-            )
-            .await
-    }
-
-    /// Gracefully stop all plugins.
-    pub async fn shutdown(&mut self) {
-        for plugin in &mut self.plugins {
-            plugin.handle.shutdown().await;
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Install channel (tack ext install/list/remove)
+// Store layout, lockfile, install, upgrade, verify
 // ---------------------------------------------------------------------------
 
-fn extensions_root(cwd: &Path, agent_dir: &Path, local: bool) -> PathBuf {
-    if local {
-        cwd.join(".pi").join("extensions")
-    } else {
-        agent_dir.join("extensions")
-    }
-}
-
-fn copy_dir_recursive(source: &Path, target: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(target)?;
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let dest = target.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir_recursive(&entry.path(), &dest)?;
-        } else {
-            std::fs::copy(entry.path(), &dest)?;
-        }
-    }
-    Ok(())
-}
-
-/// Split a `<git-url>[#<ref>]` install source into (url, ref). The ref may
-/// be a tag, branch, or full/short commit sha. Returns the source unchanged
-/// when no usable `#ref` suffix is present.
-pub fn split_source_ref(source: &str) -> (String, Option<String>) {
-    match source.rsplit_once('#') {
-        Some((url, git_ref)) if !url.is_empty() && !git_ref.is_empty() => {
-            (url.to_string(), Some(git_ref.to_string()))
-        }
-        _ => (source.to_string(), None),
-    }
-}
-
-/// Extension and marketplace names become filesystem paths
-/// (`extensions/<name>`, `marketplaces/<name>.json`): reject anything
-/// that could escape the target directory or hide (path separators,
-/// `.`/`..`, leading dots, empty).
-pub fn validate_extension_name(name: &str) -> anyhow::Result<()> {
-    if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\']) || name.contains('\0')
-    {
-        anyhow::bail!(
-            "invalid extension name {name:?}: must be a plain directory name \
-             (no path separators, no leading dot)"
-        );
-    }
-    Ok(())
-}
-
-/// Install an extension from a git URL or a local directory. Returns the
-/// installed directory.
-pub fn install_extension(
-    source: &str,
-    cwd: &Path,
-    agent_dir: &Path,
-    local: bool,
-) -> anyhow::Result<PathBuf> {
-    install_extension_named(source, cwd, agent_dir, local, None, None, None)
-}
-
-/// Derive the install directory name from a git source: the last path
-/// segment with any trailing `.git` stripped. Split on both separator
-/// kinds (and `:` for scp-style git@host:user/repo sources): a local
-/// source path on Windows arrives with backslashes (C:\path\upstream.git).
-fn git_source_name(source: &str) -> String {
-    source
-        .trim_end_matches(['/', '\\'])
-        .trim_end_matches(".git")
-        .rsplit(['/', '\\', ':'])
-        .next()
-        .unwrap_or("extension")
-        .to_string()
-}
-
-/// Install with an optional name override (marketplace installs use the
-/// plugin's marketplace key instead of the source-derived name), an optional
-/// git ref pin (`rev`), and the originating marketplace name (recorded in
-/// the lockfile).
-///
-/// Git installs keep their `.git` directory so `ext verify` (and the startup
-/// lock check) can compare `HEAD` against the lockfile's resolved commit.
-/// User-dir installs write/update a lockfile entry; project-local (`--local`)
-/// installs are trust-gated already and stay out of the lockfile.
-pub fn install_extension_named(
-    source: &str,
-    cwd: &Path,
-    agent_dir: &Path,
-    local: bool,
-    name_override: Option<&str>,
-    rev: Option<&str>,
-    marketplace: Option<&str>,
-) -> anyhow::Result<PathBuf> {
-    let root = extensions_root(cwd, agent_dir, local);
-    std::fs::create_dir_all(&root)?;
-
-    let is_git = source.starts_with("http://")
-        || source.starts_with("https://")
-        || source.starts_with("git@")
-        || source.ends_with(".git");
-    if is_git {
-        let name = name_override
-            .map(str::to_string)
-            .unwrap_or_else(|| git_source_name(source));
-        validate_extension_name(&name)?;
-        let target = root.join(&name);
-        if target.exists() {
-            anyhow::bail!("{} already exists (remove it first)", target.display());
-        }
-        // A pinned rev may point at an arbitrary commit, so it needs a full
-        // clone; unpinned installs stay shallow. The clone must be bounded
-        // with piped stdio (never bare `.status()`): an unbounded wait on a
-        // wedged child (credential prompt nobody answers, hung transport)
-        // stalls the caller forever, and with INHERITED stdio the orphaned
-        // child keeps the parent's/test-runner's stdout pipe open past any
-        // kill — the wedge that repeatedly stalled the ubuntu CI job.
-        let mut clone = std::process::Command::new("git");
-        clone.arg("clone");
-        if rev.is_none() {
-            clone.args(["--depth", "1"]);
-        }
-        let output = crate::sync_process::output_with_timeout(
-            clone.arg(source).arg(&target),
-            std::time::Duration::from_secs(600),
-        )
-        .map_err(|e| anyhow::anyhow!("failed to run git: {e}"))?;
-        if !output.status.success() {
-            let _ = std::fs::remove_dir_all(&target);
-            anyhow::bail!(
-                "git clone failed with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        if let Some(rev) = rev {
-            let output = crate::sync_process::output_with_timeout(
-                std::process::Command::new("git")
-                    .args(["checkout", rev])
-                    .current_dir(&target),
-                std::time::Duration::from_secs(60),
-            )
-            .map_err(|e| anyhow::anyhow!("failed to run git: {e}"))?;
-            if !output.status.success() {
-                let _ = std::fs::remove_dir_all(&target);
-                anyhow::bail!(
-                    "git checkout {rev} failed with {}: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        }
-        validate_extension(&target)?;
-        if !local {
-            let resolved = git_head_commit(&target);
-            lock_record_install(agent_dir, &name, source, rev, resolved, marketplace)?;
-        }
-        return Ok(target);
-    }
-
-    if rev.is_some() {
-        anyhow::bail!("`#<ref>` pinning only applies to git URLs; {source} is a local directory");
-    }
-    let source_dir = PathBuf::from(source);
-    if !source_dir.is_dir() {
-        anyhow::bail!("{source} is neither a git URL nor an existing directory");
-    }
-    let name = name_override.map(str::to_string).unwrap_or_else(|| {
-        source_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "extension".to_string())
-    });
-    validate_extension_name(&name)?;
-    let target = root.join(&name);
-    if target.exists() {
-        anyhow::bail!("{} already exists (remove it first)", target.display());
-    }
-    copy_dir_recursive(&source_dir, &target)?;
-    validate_extension(&target)?;
-    if !local {
-        // Local-directory installs carry no commit to pin.
-        lock_record_install(agent_dir, &name, source, None, None, marketplace)?;
-    }
-    Ok(target)
-}
-
-fn validate_extension(dir: &Path) -> anyhow::Result<()> {
-    let manifest = dir.join("extension.json");
-    if !manifest.is_file() {
-        let _ = std::fs::remove_dir_all(dir);
-        anyhow::bail!(
-            "no extension.json in {} — not an extension directory",
-            dir.display()
-        );
-    }
-    Ok(())
-}
-
-/// Remove an installed extension by directory name.
-pub fn remove_extension(
-    name: &str,
-    cwd: &Path,
-    agent_dir: &Path,
-    local: bool,
-) -> anyhow::Result<()> {
-    validate_extension_name(name)?;
-    let target = extensions_root(cwd, agent_dir, local).join(name);
-    if !target.is_dir() {
-        anyhow::bail!("no extension named {name:?} installed");
-    }
-    std::fs::remove_dir_all(&target)?;
-    if !local {
-        lock_remove(agent_dir, name)?;
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Extensions lockfile (~/.tack/agent/extensions-lock.json): pins every
-// user-dir `ext install` to the commit that was actually installed, so
-// `ext verify` and the startup check can detect post-install tampering.
-// ---------------------------------------------------------------------------
-
+/// Extensions lockfile (~/.tack/agent/extensions-lock.json), v2: pins
+/// every store install to the commit that was actually installed.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ExtensionsLock {
     pub version: u32,
@@ -1426,7 +1677,7 @@ pub struct ExtensionsLock {
 impl Default for ExtensionsLock {
     fn default() -> Self {
         ExtensionsLock {
-            version: 1,
+            version: 2,
             plugins: BTreeMap::new(),
         }
     }
@@ -1434,7 +1685,10 @@ impl Default for ExtensionsLock {
 
 /// One locked plugin. `rev` is the user-requested ref (tag/branch/sha),
 /// `resolved_commit` the 40-char sha HEAD actually resolved to (null for
-/// local-directory installs), `installed_at` unix seconds.
+/// local-directory installs), `version` the store version directory,
+/// `store` whether the install lives in the versioned store (v2 installs)
+/// or the legacy flat directory (v1 installs), `installed_at` unix
+/// seconds.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LockEntry {
@@ -1442,6 +1696,11 @@ pub struct LockEntry {
     pub rev: Option<String>,
     pub resolved_commit: Option<String>,
     pub installed_at: u64,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub store: bool,
+    #[serde(default)]
     pub marketplace: Option<String>,
 }
 
@@ -1450,13 +1709,32 @@ pub fn lock_path(agent_dir: &Path) -> PathBuf {
 }
 
 /// Read the lockfile; a missing file is an empty lock (not an error).
+/// v1 files (bare-name keys, no `store`/`version` fields) are upgraded in
+/// memory: their plugins are `name@user` legacy flat installs.
 fn read_lock(agent_dir: &Path) -> anyhow::Result<ExtensionsLock> {
     let path = lock_path(agent_dir);
     let Ok(content) = std::fs::read_to_string(&path) else {
         return Ok(ExtensionsLock::default());
     };
-    let lock: ExtensionsLock = serde_json::from_str(&content)
+    let mut lock: ExtensionsLock = serde_json::from_str(&content)
         .map_err(|e| anyhow::anyhow!("bad extensions lockfile {}: {e}", path.display()))?;
+    if lock.version < 2 {
+        // v1 → v2 key upgrade (bare names are @user installs).
+        let upgraded: BTreeMap<String, LockEntry> = lock
+            .plugins
+            .into_iter()
+            .map(|(name, entry)| {
+                let id = if name.contains('@') {
+                    name
+                } else {
+                    format!("{name}@user")
+                };
+                (id, entry)
+            })
+            .collect();
+        lock.plugins = upgraded;
+        lock.version = 2;
+    }
     Ok(lock)
 }
 
@@ -1471,10 +1749,11 @@ fn write_lock(agent_dir: &Path, lock: &ExtensionsLock) -> anyhow::Result<()> {
 /// Upsert the lock entry for a freshly installed extension.
 fn lock_record_install(
     agent_dir: &Path,
-    name: &str,
+    id: &PluginId,
     source: &str,
     rev: Option<&str>,
     resolved_commit: Option<String>,
+    version: &str,
     marketplace: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut lock = read_lock(agent_dir)?;
@@ -1483,12 +1762,14 @@ fn lock_record_install(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     lock.plugins.insert(
-        name.to_string(),
+        id.to_string(),
         LockEntry {
             source: source.to_string(),
             rev: rev.map(str::to_string),
             resolved_commit,
             installed_at,
+            version: Some(version.to_string()),
+            store: true,
             marketplace: marketplace.map(str::to_string),
         },
     );
@@ -1496,9 +1777,9 @@ fn lock_record_install(
 }
 
 /// Drop a removed extension's lock entry (no-op when absent).
-fn lock_remove(agent_dir: &Path, name: &str) -> anyhow::Result<()> {
+fn lock_remove(agent_dir: &Path, id: &str) -> anyhow::Result<()> {
     let mut lock = read_lock(agent_dir)?;
-    if lock.plugins.remove(name).is_some() {
+    if lock.plugins.remove(id).is_some() {
         write_lock(agent_dir, &lock)?;
     }
     Ok(())
@@ -1525,12 +1806,7 @@ fn git_head_commit(dir: &Path) -> Option<String> {
 }
 
 /// `git status --porcelain` of a checkout: Some(true) when the working
-/// tree is clean (no modified tracked files, no untracked files),
-/// Some(false) when dirty, None when git itself fails.
-///
-/// HEAD alone proves nothing about tampering: in-place edits without a
-/// commit leave `rev-parse HEAD` unchanged, so the lockfile gate also
-/// requires a clean tree.
+/// tree is clean, Some(false) when dirty, None when git itself fails.
 fn git_worktree_clean(dir: &Path) -> Option<bool> {
     let output = crate::sync_process::output_with_timeout(
         std::process::Command::new("git")
@@ -1543,6 +1819,18 @@ fn git_worktree_clean(dir: &Path) -> Option<bool> {
         return None;
     }
     Some(output.stdout.iter().all(|b| b.is_ascii_whitespace()))
+}
+
+/// The directory a lock entry points at (store layout vs legacy flat).
+fn lock_entry_dir(agent_dir: &Path, id: &PluginId, entry: &LockEntry) -> PathBuf {
+    if entry.store {
+        store_root(agent_dir)
+            .join(id.source())
+            .join(id.name())
+            .join(entry.version.as_deref().unwrap_or("local"))
+    } else {
+        agent_dir.join("extensions").join(id.name())
+    }
 }
 
 /// Outcome of checking one lock entry against the installed directory.
@@ -1559,16 +1847,18 @@ pub enum VerifyStatus {
 }
 
 /// Check every lock entry with a resolved commit against its install
-/// directory (`tack ext verify`). Entries without a resolved commit
-/// (local-directory installs) have nothing to check and are skipped.
+/// directory (`tack ext verify`).
 pub fn verify_extensions(agent_dir: &Path) -> anyhow::Result<Vec<(String, VerifyStatus)>> {
     let lock = read_lock(agent_dir)?;
     let mut out = Vec::new();
-    for (name, entry) in &lock.plugins {
+    for (id_string, entry) in &lock.plugins {
         let Some(expected) = &entry.resolved_commit else {
             continue;
         };
-        let dir = agent_dir.join("extensions").join(name);
+        let Ok(id) = id_string.parse::<PluginId>() else {
+            continue;
+        };
+        let dir = lock_entry_dir(agent_dir, &id, entry);
         let status = if !dir.is_dir() {
             VerifyStatus::Missing
         } else if !dir.join(".git").exists() {
@@ -1577,8 +1867,6 @@ pub fn verify_extensions(agent_dir: &Path) -> anyhow::Result<Vec<(String, Verify
             match git_head_commit(&dir) {
                 Some(actual) if &actual == expected => match git_worktree_clean(&dir) {
                     Some(true) => VerifyStatus::Ok(actual),
-                    // HEAD matches but the tree was edited in place
-                    // (uncommitted tracked changes or untracked files).
                     Some(false) => VerifyStatus::Changed {
                         expected: expected.clone(),
                         actual: format!("{actual} (+ uncommitted changes)"),
@@ -1592,27 +1880,22 @@ pub fn verify_extensions(agent_dir: &Path) -> anyhow::Result<Vec<(String, Verify
                 None => VerifyStatus::NotAGitRepo,
             }
         };
-        out.push((name.clone(), status));
+        out.push((id_string.clone(), status));
     }
     Ok(out)
 }
 
-/// Startup gate for ExtensionManager::load: may this discovered extension
-/// directory load? Only user-dir extensions with a lock entry carrying a
-/// resolved commit are gated; everything else loads unconditionally.
-fn lock_allows(dir: &Path, user_root: &Path, lock: &ExtensionsLock, required: bool) -> bool {
-    if dir.parent() != Some(user_root) {
-        return true;
-    }
-    let Some(name) = dir.file_name().map(|n| n.to_string_lossy().to_string()) else {
-        return true;
-    };
-    let Some(entry) = lock.plugins.get(&name) else {
+/// Startup gate: may this discovered plugin load, given the lockfile?
+/// Only installs with a lock entry carrying a resolved commit are gated.
+fn lock_allows(discovered: &Discovered, lock: &ExtensionsLock, required: bool) -> bool {
+    let id_string = discovered.id.to_string();
+    let Some(entry) = lock.plugins.get(&id_string) else {
         return true;
     };
     let Some(expected) = &entry.resolved_commit else {
         return true;
     };
+    let dir = &discovered.dir;
     let actual = if dir.join(".git").exists() {
         git_head_commit(dir)
     } else {
@@ -1622,10 +1905,8 @@ fn lock_allows(dir: &Path, user_root: &Path, lock: &ExtensionsLock, required: bo
         Some(actual) if &actual == expected => match git_worktree_clean(dir) {
             Some(true) => true,
             dirty => {
-                // HEAD matches but the tree was edited in place (or can't
-                // be inspected): treat as tampering, like a HEAD drift.
                 tracing::warn!(
-                    "extension {name}: HEAD matches the locked commit {expected} but {} — {}",
+                    "extension {id_string}: HEAD matches the locked commit {expected} but {} — {}",
                     if dirty == Some(false) {
                         "the working tree has uncommitted/untracked changes"
                     } else {
@@ -1642,7 +1923,7 @@ fn lock_allows(dir: &Path, user_root: &Path, lock: &ExtensionsLock, required: bo
         },
         Some(actual) => {
             tracing::warn!(
-                "extension {name}: HEAD {actual} differs from locked commit {expected} — {}",
+                "extension {id_string}: HEAD {actual} differs from locked commit {expected} — {}",
                 if required {
                     "skipping (extensionLockRequired)"
                 } else {
@@ -1653,7 +1934,7 @@ fn lock_allows(dir: &Path, user_root: &Path, lock: &ExtensionsLock, required: bo
         }
         None => {
             tracing::warn!(
-                "extension {name}: locked to commit {expected} but the install is not a git \
+                "extension {id_string}: locked to commit {expected} but the install is not a git \
                  checkout — {}",
                 if required {
                     "skipping (extensionLockRequired)"
@@ -1666,195 +1947,519 @@ fn lock_allows(dir: &Path, user_root: &Path, lock: &ExtensionsLock, required: bo
     }
 }
 
-/// List installed extensions (name + manifest description source dir).
-pub fn list_extensions(cwd: &Path, agent_dir: &Path) -> Vec<(String, PathBuf, bool)> {
-    let mut out = Vec::new();
-    for (dir, local) in [
-        (agent_dir.join("extensions"), false),
-        (cwd.join(".pi").join("extensions"), true),
-    ] {
-        if let Ok(read) = std::fs::read_dir(&dir) {
-            for entry in read.flatten() {
-                let path = entry.path();
-                if path.is_dir() && path.join("extension.json").is_file() {
-                    out.push((entry.file_name().to_string_lossy().to_string(), path, local));
-                }
-            }
-        }
-    }
-    out.sort();
-    out
-}
+// ---------------------------------------------------------------------------
+// Install channel (tack ext install/upgrade/remove)
+// ---------------------------------------------------------------------------
 
-/// A tiny tack-ext plugin speaking NDJSON on stdio: registers one tool
-/// (`echo`), one command (`hello`), and subscriptions; echoes tool arguments
-/// back, answers `ui.notify` on agent_start, and allows every intercepted
-/// tool call. Serves as the protocol reference for plugin authors.
-pub async fn run_demo_plugin() -> anyhow::Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    let mut out = tokio::io::stdout();
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    // Expect initialize.
-    let Some(init) = lines.next_line().await? else {
-        anyhow::bail!("no initialize")
-    };
-    let init: tack_ext::Envelope = serde_json::from_str(&init)?;
-    let tack_ext::Envelope::Event { event, .. } = init else {
-        anyhow::bail!("expected initialize")
-    };
-    anyhow::ensure!(event == "initialize");
-
-    let register = tack_ext::Envelope::event(
-        "register",
-        serde_json::json!({
-            "name": "demo",
-            "tools": [{
-                "name": "echo",
-                "description": "Echo the arguments back",
-                "parameters": { "type": "object", "properties": { "text": { "type": "string" } } }
-            }],
-            "commands": [{ "name": "hello", "description": "Say hello" }],
-            "subscriptions": ["agent_start", "message_end", "tool_call"],
-            // v2.1: declarative widgets — a status segment and a list panel.
-            "widgets": [
-                { "id": "demo-status", "type": "status_line_segment", "priority": 10,
-                  "initial": { "text": "demo:ok", "style": "info" } },
-                { "id": "demo-list", "type": "list_panel", "title": "Demo items",
-                  "visible": true,
-                  "initial": { "items": [
-                      { "id": "a", "label": "Alpha", "detail": "first" },
-                      { "id": "b", "label": "Beta" }
-                  ] } }
-            ],
-            // v2.2: an autocomplete provider on the '#' trigger.
-            "autocompleteProviders": [
-                { "id": "hash", "trigger": "#", "description": "Demo tags" }
-            ],
-        }),
-    );
-    out.write_all(format!("{}\n", serde_json::to_string(&register)?).as_bytes())
-        .await?;
-    out.flush().await?;
-
-    while let Ok(Some(line)) = lines.next_line().await {
-        let Ok(envelope) = serde_json::from_str::<tack_ext::Envelope>(&line) else {
-            continue;
-        };
-        match envelope {
-            tack_ext::Envelope::Request { id, method, params } => {
-                let response = match method.as_str() {
-                    "tool.execute" => {
-                        let text = params
-                            .get("arguments")
-                            .and_then(|a| a.get("text"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        tack_ext::Envelope::result(
-                            id,
-                            serde_json::json!({ "content": format!("echo: {text}") }),
-                        )
-                    }
-                    "command.invoke" => {
-                        // Ask the host to notify the user, then answer.
-                        let notify = tack_ext::Envelope::request(
-                            9001,
-                            "ui.notify",
-                            serde_json::json!({ "message": "hello from the demo plugin!" }),
-                        );
-                        out.write_all(format!("{}\n", serde_json::to_string(&notify)?).as_bytes())
-                            .await?;
-                        out.flush().await?;
-                        tack_ext::Envelope::result(id, serde_json::json!({ "ok": true }))
-                    }
-                    "intercept.tool_call" => {
-                        tack_ext::Envelope::result(id, serde_json::json!({ "action": "allow" }))
-                    }
-                    "autocomplete.provide" => {
-                        // v2.2: filter the demo tags by the query.
-                        let query = params
-                            .get("query")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_lowercase();
-                        let tags = ["#alpha", "#beta", "#wasm"];
-                        let suggestions: Vec<Value> = tags
-                            .iter()
-                            .filter(|t| query.is_empty() || t.contains(&query))
-                            .map(|t| {
-                                serde_json::json!({
-                                    "value": t,
-                                    "label": format!("{t} demo tag"),
-                                    "detail": "demo",
-                                })
-                            })
-                            .collect();
-                        tack_ext::Envelope::result(
-                            id,
-                            serde_json::json!({ "suggestions": suggestions }),
-                        )
-                    }
-                    other => tack_ext::Envelope::error(id, format!("unknown method {other}")),
-                };
-                out.write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
-                    .await?;
-                out.flush().await?;
-            }
-            tack_ext::Envelope::Event { event, .. } if event == "agent_start" => {
-                let notify = tack_ext::Envelope::request(
-                    9002,
-                    "ui.notify",
-                    serde_json::json!({ "message": "demo plugin saw agent_start" }),
-                );
-                out.write_all(format!("{}\n", serde_json::to_string(&notify)?).as_bytes())
-                    .await?;
-                out.flush().await?;
-            }
-            // v2.1: the host reports a list-panel selection; echo it back
-            // via ui.notify so e2e tests can observe the round-trip.
-            tack_ext::Envelope::Event { event, payload } if event == "widget.action" => {
-                let notify = tack_ext::Envelope::request(
-                    9003,
-                    "ui.notify",
-                    serde_json::json!({ "message": format!("demo plugin saw widget.action {payload}") }),
-                );
-                out.write_all(format!("{}\n", serde_json::to_string(&notify)?).as_bytes())
-                    .await?;
-                out.flush().await?;
-            }
-            tack_ext::Envelope::Event { event, .. } if event == "shutdown" => break,
-            _ => {}
+fn copy_dir_recursive(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let dest = target.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), &dest)?;
         }
     }
     Ok(())
 }
 
+/// Split a `<git-url>[#<ref>]` install source into (url, ref).
+pub fn split_source_ref(source: &str) -> (String, Option<String>) {
+    match source.rsplit_once('#') {
+        Some((url, git_ref)) if !url.is_empty() && !git_ref.is_empty() => {
+            (url.to_string(), Some(git_ref.to_string()))
+        }
+        _ => (source.to_string(), None),
+    }
+}
+
+/// Clone a git source into `target` (bounded, piped stdio, scrubbed git
+/// environment: no terminal prompt, no inherited GIT_* config).
+fn git_clone(source: &str, rev: Option<&str>, target: &Path) -> anyhow::Result<()> {
+    let mut clone = std::process::Command::new("git");
+    clone
+        .arg("clone")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_EXEC_PATH")
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_CONFIG_GLOBAL")
+        .env_remove("GIT_CONFIG_SYSTEM")
+        .env_remove("GIT_CONFIG_COUNT");
+    if rev.is_none() {
+        clone.args(["--depth", "1"]);
+    }
+    let output = crate::sync_process::output_with_timeout(
+        clone.arg(source).arg(target),
+        std::time::Duration::from_secs(600),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to run git: {e}"))?;
+    if !output.status.success() {
+        let _ = std::fs::remove_dir_all(target);
+        anyhow::bail!(
+            "git clone failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if let Some(rev) = rev {
+        let output = crate::sync_process::output_with_timeout(
+            std::process::Command::new("git")
+                .args(["checkout", rev])
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .current_dir(target),
+            std::time::Duration::from_secs(60),
+        )
+        .map_err(|e| anyhow::anyhow!("failed to run git: {e}"))?;
+        if !output.status.success() {
+            let _ = std::fs::remove_dir_all(target);
+            anyhow::bail!(
+                "git checkout {rev} failed with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The store version for an install: the manifest's `version` when it is
+/// a semver, else the install rev stripped of a leading `v` when that is
+/// a semver, else `local`.
+fn install_version(manifest: &ExtensionManifest, rev: Option<&str>) -> String {
+    if let Some(version) = &manifest.version
+        && parse_semver(version).is_some()
+    {
+        return version.clone();
+    }
+    if let Some(rev) = rev {
+        let stripped = rev.strip_prefix('v').unwrap_or(rev);
+        if parse_semver(stripped).is_some() {
+            return stripped.to_string();
+        }
+    }
+    "local".to_string()
+}
+
+/// Install an extension from a git URL or a local directory. Returns the
+/// installed directory (the active version dir).
+pub fn install_extension(
+    source: &str,
+    cwd: &Path,
+    agent_dir: &Path,
+    local: bool,
+) -> anyhow::Result<PathBuf> {
+    install_extension_named(source, cwd, agent_dir, local, None, None, None)
+}
+
+/// Install with an optional name override (marketplace installs use the
+/// plugin's marketplace key), an optional git ref pin, and the originating
+/// marketplace name (recorded in the lockfile).
+///
+/// Git installs keep their `.git` directory so `ext verify` (and the
+/// startup lock check) can compare `HEAD` against the lockfile's resolved
+/// commit. User-dir installs land in the versioned store and write a
+/// lockfile entry; project-local (`--local`) installs stay flat under
+/// `.pi/extensions` and out of the lockfile.
+pub fn install_extension_named(
+    source: &str,
+    cwd: &Path,
+    agent_dir: &Path,
+    local: bool,
+    name_override: Option<&str>,
+    rev: Option<&str>,
+    marketplace: Option<&str>,
+) -> anyhow::Result<PathBuf> {
+    let is_git = source.starts_with("http://")
+        || source.starts_with("https://")
+        || source.starts_with("git@")
+        || source.ends_with(".git");
+
+    // Stage: fetch the plugin into a temporary sibling directory, then
+    // validate and activate atomically.
+    if local {
+        // Project installs stay flat (trust-gated, no lockfile).
+        let root = cwd.join(".pi").join("extensions");
+        std::fs::create_dir_all(&root)?;
+        let staging = root.join(format!(".staging-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&staging);
+        if is_git {
+            git_clone(source, rev, &staging)?;
+        } else {
+            if rev.is_some() {
+                anyhow::bail!(
+                    "`#<ref>` pinning only applies to git URLs; {source} is a local directory"
+                );
+            }
+            let source_dir = PathBuf::from(source);
+            if !source_dir.is_dir() {
+                anyhow::bail!("{source} is neither a git URL nor an existing directory");
+            }
+            copy_dir_recursive(&source_dir, &staging)?;
+        }
+        let manifest = read_and_check_manifest(&staging)?;
+        let name = name_override
+            .map(str::to_string)
+            .unwrap_or_else(|| manifest.name.clone());
+        let id = PluginId::new(&name, "project")?;
+        let target = root.join(id.name());
+        activate_staging(&staging, &target)?;
+        return Ok(target);
+    }
+
+    let id_source = marketplace.unwrap_or("user");
+    if let Some(marketplace) = marketplace {
+        tack_ext::plugin_id::validate_marketplace_name(marketplace)?;
+    }
+    let staging_parent = store_root(agent_dir).join(id_source);
+    std::fs::create_dir_all(&staging_parent)?;
+
+    // Stage under a scratch name; the manifest decides the plugin name.
+    let staging = staging_parent.join(format!(".staging-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    if is_git {
+        git_clone(source, rev, &staging)?;
+    } else {
+        if rev.is_some() {
+            anyhow::bail!(
+                "`#<ref>` pinning only applies to git URLs; {source} is a local directory"
+            );
+        }
+        let source_dir = PathBuf::from(source);
+        if !source_dir.is_dir() {
+            anyhow::bail!("{source} is neither a git URL nor an existing directory");
+        }
+        copy_dir_recursive(&source_dir, &staging)?;
+    }
+
+    let manifest = read_and_check_manifest(&staging)?;
+    let name = name_override
+        .map(str::to_string)
+        .unwrap_or_else(|| manifest.name.clone());
+    let id = PluginId::new(&name, id_source)?;
+    let version = install_version(&manifest, rev);
+    let plugin_root = store_root(agent_dir).join(id.source()).join(id.name());
+    std::fs::create_dir_all(&plugin_root)?;
+    let target = plugin_root.join(&version);
+    activate_staging(&staging, &target)?;
+
+    // Record the pin and prune superseded versions.
+    let resolved = if is_git {
+        git_head_commit(&target)
+    } else {
+        None
+    };
+    lock_record_install(agent_dir, &id, source, rev, resolved, &version, marketplace)?;
+    prune_versions(&plugin_root, &version);
+    Ok(target)
+}
+
+/// Read the staged manifest and require the staged content to be stable
+/// across the read (TOCTOU package-swap defense): the manifest is parsed
+/// twice and must be byte-identical.
+fn read_and_check_manifest(staging: &Path) -> anyhow::Result<ExtensionManifest> {
+    let path = staging.join("extension.json");
+    let first = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("no extension.json in {}: {e}", staging.display()))?;
+    let second = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("extension.json vanished mid-install: {e}"))?;
+    if first != second {
+        let _ = std::fs::remove_dir_all(staging);
+        anyhow::bail!("extension.json changed during install (possible package swap)");
+    }
+    let manifest: ExtensionManifest =
+        serde_json::from_str(&first).map_err(|e| anyhow::anyhow!("bad extension.json: {e}"))?;
+    // The manifest name feeds the store path — validate it now.
+    PluginId::new(&manifest.name, "user")?;
+    Ok(manifest)
+}
+
+/// Move a staged directory into place. An existing target is swapped out
+/// to a backup first (rename), then the staging is renamed in; any
+/// failure rolls the backup back.
+fn activate_staging(staging: &Path, target: &Path) -> anyhow::Result<()> {
+    if target.exists() {
+        let backup = target.with_extension(format!("backup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&backup);
+        std::fs::rename(target, &backup)?;
+        if let Err(e) = std::fs::rename(staging, target) {
+            let _ = std::fs::rename(&backup, target);
+            return Err(e.into());
+        }
+        let _ = std::fs::remove_dir_all(&backup);
+    } else {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(staging, target)?;
+    }
+    Ok(())
+}
+
+/// Remove version directories superseded by `keep` (`local` is never
+/// pruned unless it IS `keep`). Prune failures are logged, never fatal.
+fn prune_versions(plugin_root: &Path, keep: &str) {
+    let Ok(read) = std::fs::read_dir(plugin_root) else {
+        return;
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == keep || name.starts_with(".staging-") || !is_version_dir(&name) {
+            continue;
+        }
+        if name == "local" {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_dir_all(&path) {
+            tracing::warn!("failed to prune superseded version {}: {e}", path.display());
+        }
+    }
+}
+
+/// Remove an installed extension by id (`name@source`) or bare name
+/// (matches a unique user/marketplace install).
+pub fn remove_extension(
+    name: &str,
+    cwd: &Path,
+    agent_dir: &Path,
+    local: bool,
+) -> anyhow::Result<()> {
+    if local {
+        let target = cwd.join(".pi").join("extensions").join(name);
+        if !target.is_dir() {
+            anyhow::bail!("no extension named {name:?} installed");
+        }
+        std::fs::remove_dir_all(&target)?;
+        return Ok(());
+    }
+    let id = resolve_installed_id(name, agent_dir)?;
+    let plugin_root = store_root(agent_dir).join(id.source()).join(id.name());
+    let legacy = agent_dir.join("extensions").join(id.name());
+    let legacy_exists = id.source() == "user" && legacy.is_dir();
+    if !plugin_root.is_dir() && !legacy_exists {
+        anyhow::bail!("no extension named {name:?} installed");
+    }
+    if plugin_root.is_dir() {
+        std::fs::remove_dir_all(&plugin_root)?;
+    }
+    // A legacy flat install of the same name may also exist.
+    if legacy_exists {
+        std::fs::remove_dir_all(&legacy)?;
+    }
+    lock_remove(agent_dir, &id.to_string())?;
+    let _ = std::fs::remove_dir_all(plugin_data_dir(agent_dir, &id));
+    Ok(())
+}
+
+/// Resolve a CLI name (id or bare name) to an installed plugin id.
+fn resolve_installed_id(name: &str, agent_dir: &Path) -> anyhow::Result<PluginId> {
+    if let Ok(id) = name.parse::<PluginId>() {
+        return Ok(id);
+    }
+    // Bare name: search the store for a unique match.
+    let mut matches = Vec::new();
+    for discovered in discover_store(agent_dir) {
+        if discovered.id.name() == name {
+            matches.push(discovered.id);
+        }
+    }
+    let legacy = agent_dir.join("extensions").join(name);
+    if legacy.is_dir()
+        && !matches.iter().any(|id| id.source() == "user")
+        && let Ok(id) = PluginId::new(name, "user")
+    {
+        matches.push(id);
+    }
+    match matches.len() {
+        0 => anyhow::bail!("no extension named {name:?} installed"),
+        1 => Ok(matches.remove(0)),
+        _ => anyhow::bail!(
+            "extension name {name:?} is ambiguous (installed from several sources); use the full id name@source"
+        ),
+    }
+}
+
+/// Upgrade installed store extensions: re-fetch the locked source and
+/// install the new resolved version. `name` selects one plugin (id or
+/// bare name); None upgrades every git-sourced store install. Returns
+/// (id, outcome) pairs.
+pub fn upgrade_extensions(
+    agent_dir: &Path,
+    name: Option<&str>,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let lock = read_lock(agent_dir)?;
+    let mut out = Vec::new();
+    for (id_string, entry) in lock.plugins.clone() {
+        if !entry.store {
+            continue;
+        }
+        let Ok(id) = id_string.parse::<PluginId>() else {
+            continue;
+        };
+        if let Some(name) = name {
+            let want = resolve_installed_id(name, agent_dir)?;
+            if id != want {
+                continue;
+            }
+        }
+        let source = entry.source.clone();
+        let is_git = source.starts_with("http://")
+            || source.starts_with("https://")
+            || source.starts_with("git@")
+            || source.ends_with(".git");
+        if !is_git {
+            out.push((id_string.clone(), "skipped (not a git install)".to_string()));
+            continue;
+        }
+        // Stage a fresh clone and compare the resolved commit first
+        // (fingerprint idempotence: nothing to do).
+        let staging = store_root(agent_dir)
+            .join(id.source())
+            .join(format!(".staging-upgrade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&staging);
+        if let Err(e) = git_clone(&source, entry.rev.as_deref(), &staging) {
+            out.push((id_string.clone(), format!("failed: {e}")));
+            continue;
+        }
+        let resolved = git_head_commit(&staging);
+        if resolved.is_some() && resolved == entry.resolved_commit {
+            let _ = std::fs::remove_dir_all(&staging);
+            out.push((id_string.clone(), "up to date".to_string()));
+            continue;
+        }
+        let manifest = match read_and_check_manifest(&staging) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                out.push((id_string.clone(), format!("failed: {e}")));
+                continue;
+            }
+        };
+        let version = install_version(&manifest, entry.rev.as_deref());
+        let plugin_root = store_root(agent_dir).join(id.source()).join(id.name());
+        std::fs::create_dir_all(&plugin_root)?;
+        let target = plugin_root.join(&version);
+        if let Err(e) = activate_staging(&staging, &target) {
+            out.push((id_string.clone(), format!("failed: {e}")));
+            continue;
+        }
+        lock_record_install(
+            agent_dir,
+            &id,
+            &source,
+            entry.rev.as_deref(),
+            resolved,
+            &version,
+            entry.marketplace.as_deref(),
+        )?;
+        prune_versions(&plugin_root, &version);
+        out.push((id_string.clone(), format!("upgraded to {version}")));
+    }
+    Ok(out)
+}
+
+/// Installed extensions, for `tack ext list`: id, active version dir,
+/// store vs legacy layout, enabled state, lock drift marker.
+#[derive(Debug)]
+pub struct InstalledInfo {
+    pub id: String,
+    pub dir: PathBuf,
+    pub version: String,
+    pub legacy: bool,
+    pub enabled: bool,
+    pub locked_commit: Option<String>,
+}
+
+/// List installed extensions across the store, legacy dir, and project
+/// dir (display layer; the session loader applies the same discovery).
+pub fn list_extensions(cwd: &Path, agent_dir: &Path) -> Vec<InstalledInfo> {
+    let enabled_map = plugin_enabled_map(cwd, agent_dir);
+    let lock = read_lock(agent_dir).unwrap_or_default();
+    let mut out = Vec::new();
+    for discovered in discover_store(agent_dir) {
+        let id_string = discovered.id.to_string();
+        out.push(InstalledInfo {
+            locked_commit: lock
+                .plugins
+                .get(&id_string)
+                .and_then(|e| e.resolved_commit.clone()),
+            enabled: enabled_map.get(&id_string).copied().unwrap_or(true),
+            id: id_string,
+            dir: discovered.dir,
+            version: discovered.version,
+            legacy: false,
+        });
+    }
+    // Legacy flat installs not shadowed by a store install.
+    let user_root = agent_dir.join("extensions");
+    if let Ok(read) = std::fs::read_dir(&user_root) {
+        for entry in read.flatten() {
+            let path = entry.path();
+            if !path.is_dir() || !path.join("extension.json").is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "store" || name == "data" {
+                continue;
+            }
+            let Ok(id) = PluginId::new(&name, "user") else {
+                continue;
+            };
+            if out.iter().any(|i| i.id == id.to_string()) {
+                continue;
+            }
+            let id_string = id.to_string();
+            out.push(InstalledInfo {
+                locked_commit: lock
+                    .plugins
+                    .get(&id_string)
+                    .and_then(|e| e.resolved_commit.clone()),
+                enabled: enabled_map.get(&id_string).copied().unwrap_or(true),
+                id: id_string,
+                dir: path,
+                version: "local".to_string(),
+                legacy: true,
+            });
+        }
+    }
+    // Project installs.
+    let project_root = cwd.join(".pi").join("extensions");
+    if let Ok(read) = std::fs::read_dir(&project_root) {
+        for entry in read.flatten() {
+            let path = entry.path();
+            if !path.is_dir() || !path.join("extension.json").is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Ok(id) = PluginId::new(&name, "project") else {
+                continue;
+            };
+            let id_string = id.to_string();
+            out.push(InstalledInfo {
+                locked_commit: None,
+                enabled: enabled_map.get(&id_string).copied().unwrap_or(true),
+                id: id_string,
+                dir: path,
+                version: "local".to_string(),
+                legacy: true,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
 // ---------------------------------------------------------------------------
-// Marketplaces (tack ext marketplace …): named JSON catalogs mapping
-// plugin names to install sources, stored in <agentDir>/marketplaces/.
-// A marketplace file looks like:
-//
-// ```json
-// {
-//   "name": "acme-tools",
-//   "plugins": {
-//     "code-review": { "source": "https://github.com/acme/tack-ext-review.git",
-//                      "description": "review buddy", "rev": "v1.2.0" },
-//     "policies":    { "source": "/opt/acme/tack-ext-policies" }
-//   },
-//   "signature": { "algorithm": "ed25519", "value": "<hex>" }
-// }
-// ```
-//
-// Install with `tack ext install <plugin>@<marketplace>`.
-//
-// Signatures: the signed payload is the canonical catalog — the JSON with
-// the top-level `signature` key removed, reserialized via serde_json
-// (Map = BTreeMap, so object keys sort lexicographically). Registration is
-// TOFU: the first `--public-key` that verifies is pinned to
-// `<name>.key` next to the catalog, and every later install re-verifies the
-// catalog against the pinned key.
+// Marketplaces (kept from the pre-v3 design; names now use the PluginId
+// grammar)
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, serde::Deserialize)]
 struct MarketplaceFile {
@@ -1876,7 +2481,6 @@ struct MarketplaceSignature {
 struct MarketplacePlugin {
     source: String,
     #[serde(default)]
-    #[allow(dead_code)]
     description: Option<String>,
     /// Optional git ref (tag/branch/sha) the plugin is pinned to.
     #[serde(default)]
@@ -1969,8 +2573,7 @@ fn verify_marketplace_signature(
         .map_err(|e| anyhow::anyhow!("marketplace signature verification failed: {e}"))
 }
 
-/// Enforce the signature policy for an already-registered catalog: a signed
-/// catalog must verify against its pinned key (TOFU, see add_marketplace).
+/// Enforce the signature policy for an already-registered catalog.
 fn verify_registered_marketplace(
     agent_dir: &Path,
     marketplace: &str,
@@ -1989,19 +2592,14 @@ fn verify_registered_marketplace(
     verify_marketplace_signature(content, signature, &key)
 }
 
-/// Register a marketplace from a local JSON file or an http(s) URL. The
-/// catalog is copied into `<agentDir>/marketplaces/<name>.json`.
-///
-/// A signed catalog (`signature` field) requires `--public-key <hex>` on
-/// first registration (or an already pinned key); the verifying key is
-/// pinned to `<name>.key` (TOFU) and re-checked on every install.
+/// Register a marketplace from a local JSON file or an http(s) URL.
 pub async fn add_marketplace(
     name: &str,
     source: &str,
     agent_dir: &Path,
     public_key: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
-    validate_extension_name(name)?;
+    tack_ext::plugin_id::validate_marketplace_name(name)?;
     let root = marketplaces_root(agent_dir);
     std::fs::create_dir_all(&root)?;
     let target = root.join(format!("{name}.json"));
@@ -2024,8 +2622,6 @@ pub async fn add_marketplace(
         }
         std::fs::copy(&path, &target)?;
     }
-    // Validate (and verify, when signed) before accepting; on any failure
-    // the catalog is not registered.
     let validation = (|| -> anyhow::Result<Option<String>> {
         let (parsed, content) = parse_marketplace_with_content(&target)?;
         match &parsed.signature {
@@ -2092,7 +2688,7 @@ pub fn list_marketplaces(agent_dir: &Path) -> Vec<(String, PathBuf)> {
 
 /// Remove a registered marketplace.
 pub fn remove_marketplace(name: &str, agent_dir: &Path) -> anyhow::Result<()> {
-    validate_extension_name(name)?;
+    tack_ext::plugin_id::validate_marketplace_name(name)?;
     let path = marketplaces_root(agent_dir).join(format!("{name}.json"));
     if !path.is_file() {
         anyhow::bail!("no marketplace named {name}");
@@ -2106,7 +2702,7 @@ pub fn marketplace_plugins(
     agent_dir: &Path,
     marketplace: &str,
 ) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
-    validate_extension_name(marketplace)?;
+    tack_ext::plugin_id::validate_marketplace_name(marketplace)?;
     let path = marketplaces_root(agent_dir).join(format!("{marketplace}.json"));
     if !path.is_file() {
         anyhow::bail!("no marketplace named {marketplace}");
@@ -2124,7 +2720,7 @@ pub fn marketplace_plugins(
 /// A resolved `<plugin>@<marketplace>` spec.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarketplaceResolution {
-    /// Plugin name (marketplace key; also the install directory name).
+    /// Plugin name (marketplace key; also the install name).
     pub plugin: String,
     /// Install source from the catalog.
     pub source: String,
@@ -2134,8 +2730,8 @@ pub struct MarketplaceResolution {
     pub marketplace: String,
 }
 
-/// Resolve a `<plugin>@<marketplace>` spec. A signed catalog is re-verified
-/// against its pinned key before anything is resolved from it.
+/// Resolve a `<plugin>@<marketplace>` spec. A signed catalog is
+/// re-verified against its pinned key before anything is resolved.
 pub fn resolve_marketplace_spec(
     spec: &str,
     agent_dir: &Path,
@@ -2143,8 +2739,8 @@ pub fn resolve_marketplace_spec(
     let Some((plugin, marketplace)) = spec.rsplit_once('@') else {
         return Ok(None);
     };
-    // Not a marketplace spec: ssh-style git URLs (git@host:path) contain an
-    // '@' too; marketplace names are bare file stems.
+    // Not a marketplace spec: ssh-style git URLs (git@host:path) contain
+    // an '@' too; marketplace names are bare file stems.
     if marketplace.contains(['/', '\\', ':']) {
         return Ok(None);
     }
@@ -2160,9 +2756,9 @@ pub fn resolve_marketplace_spec(
     let Some(entry) = parsed.plugins.get(plugin) else {
         anyhow::bail!("marketplace {marketplace} has no plugin named {plugin}");
     };
-    // The catalog key becomes the install directory name — a hostile
-    // catalog must not escape extensions/ via `../` or separators.
-    validate_extension_name(plugin)?;
+    // The catalog key becomes the install name — a hostile catalog must
+    // not escape the store via `../` or separators.
+    PluginId::new(plugin, marketplace)?;
     Ok(Some(MarketplaceResolution {
         plugin: plugin.to_string(),
         source: entry.source.clone(),
@@ -2171,344 +2767,400 @@ pub fn resolve_marketplace_spec(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
-    /// Manifest-declared WASM limits are plugin-supplied data: they may
-    /// tighten the sandbox but never exceed the host's hard caps.
-    #[test]
-    #[cfg(feature = "wasm")]
-    fn wasm_limits_are_clamped_to_host_caps() {
-        let greedy = WasmLimitsJson {
-            max_fuel: Some(u64::MAX),
-            max_memory_bytes: Some(usize::MAX),
-            max_execution_ms: None,
-        }
-        .to_limits();
-        assert_eq!(greedy.max_fuel, HARD_MAX_FUEL);
-        assert_eq!(greedy.max_memory_bytes, HARD_MAX_MEMORY_BYTES);
-
-        // Tighter-than-cap values pass through untouched.
-        let tight = WasmLimitsJson {
-            max_fuel: Some(1_000),
-            max_memory_bytes: Some(4096),
-            max_execution_ms: None,
-        }
-        .to_limits();
-        assert_eq!(tight.max_fuel, 1_000);
-        assert_eq!(tight.max_memory_bytes, 4096);
-
-        // Defaults stay below the caps.
-        let defaults = WasmLimitsJson::default().to_limits();
-        assert!(defaults.max_fuel <= HARD_MAX_FUEL);
-        assert!(defaults.max_memory_bytes <= HARD_MAX_MEMORY_BYTES);
-    }
-
-    /// Undeclared fields fall back to the tack-ext-wasm engine defaults
-    /// exactly (1e9 fuel, 256 MiB memory, 10-minute hang watchdog).
-    #[test]
-    #[cfg(feature = "wasm")]
-    fn wasm_limits_defaults_match_engine_defaults() {
-        let limits = WasmLimitsJson::default().to_limits();
-        let engine_defaults = tack_ext_wasm::WasmLimits::default();
-        assert_eq!(limits.max_fuel, engine_defaults.max_fuel);
-        assert_eq!(limits.max_memory_bytes, engine_defaults.max_memory_bytes);
-        assert_eq!(limits.max_execution, engine_defaults.max_execution);
-        assert_eq!(limits.max_fuel, 1_000_000_000);
-        assert_eq!(limits.max_memory_bytes, 256 * 1024 * 1024);
-        assert_eq!(
-            limits.max_execution,
-            Some(tack_ext_wasm::DEFAULT_MAX_EXECUTION)
-        );
-    }
-
-    /// Values exactly AT the hard caps are not reduced (min with an
-    /// equal value is a no-op).
-    #[test]
-    #[cfg(feature = "wasm")]
-    fn wasm_limits_values_at_cap_pass_through() {
-        let limits = WasmLimitsJson {
-            max_fuel: Some(HARD_MAX_FUEL),
-            max_memory_bytes: Some(HARD_MAX_MEMORY_BYTES),
-            max_execution_ms: None,
-        }
-        .to_limits();
-        assert_eq!(limits.max_fuel, HARD_MAX_FUEL);
-        assert_eq!(limits.max_memory_bytes, HARD_MAX_MEMORY_BYTES);
-    }
-
-    /// One past the cap is already clamped down to the cap.
-    #[test]
-    #[cfg(feature = "wasm")]
-    fn wasm_limits_one_above_cap_is_clamped() {
-        let limits = WasmLimitsJson {
-            max_fuel: Some(HARD_MAX_FUEL + 1),
-            max_memory_bytes: Some(HARD_MAX_MEMORY_BYTES + 1),
-            max_execution_ms: None,
-        }
-        .to_limits();
-        assert_eq!(limits.max_fuel, HARD_MAX_FUEL);
-        assert_eq!(limits.max_memory_bytes, HARD_MAX_MEMORY_BYTES);
-    }
-
-    /// Zero is the tightest possible declaration and passes through
-    /// untouched — the host never LOOSENS a declared limit.
-    #[test]
-    #[cfg(feature = "wasm")]
-    fn wasm_limits_zero_is_honored() {
-        let limits = WasmLimitsJson {
-            max_fuel: Some(0),
-            max_memory_bytes: Some(0),
-            max_execution_ms: Some(0),
-        }
-        .to_limits();
-        assert_eq!(limits.max_fuel, 0);
-        assert_eq!(limits.max_memory_bytes, 0);
-        assert_eq!(limits.max_execution, Some(std::time::Duration::ZERO));
-    }
-
-    /// Each field is clamped independently: an over-cap fuel declaration
-    /// must not disturb a tight memory declaration (and vice versa), and
-    /// undeclared fields keep their defaults.
-    #[test]
-    #[cfg(feature = "wasm")]
-    fn wasm_limits_fields_clamp_independently() {
-        let greedy_fuel = WasmLimitsJson {
-            max_fuel: Some(u64::MAX),
-            max_memory_bytes: Some(1024),
-            max_execution_ms: None,
-        }
-        .to_limits();
-        assert_eq!(greedy_fuel.max_fuel, HARD_MAX_FUEL);
-        assert_eq!(greedy_fuel.max_memory_bytes, 1024);
-        // Undeclared execution limit keeps the engine default watchdog.
-        assert_eq!(
-            greedy_fuel.max_execution,
-            Some(tack_ext_wasm::DEFAULT_MAX_EXECUTION)
-        );
-
-        let greedy_memory = WasmLimitsJson {
-            max_fuel: Some(1_000),
-            max_memory_bytes: Some(usize::MAX),
-            max_execution_ms: Some(5_000),
-        }
-        .to_limits();
-        assert_eq!(greedy_memory.max_fuel, 1_000);
-        assert_eq!(greedy_memory.max_memory_bytes, HARD_MAX_MEMORY_BYTES);
-        assert_eq!(
-            greedy_memory.max_execution,
-            Some(std::time::Duration::from_millis(5_000))
-        );
-    }
-
-    /// max_execution_ms has NO host-side hard cap (there is no `.min`
-    /// on this field): it converts to a Duration verbatim, and a missing
-    /// value leaves the engine default (10-minute hang watchdog).
-    #[test]
-    #[cfg(feature = "wasm")]
-    fn wasm_limits_execution_ms_is_not_capped() {
-        let huge = u64::from(u32::MAX) + 1;
-        let limits = WasmLimitsJson {
-            max_fuel: None,
-            max_memory_bytes: None,
-            max_execution_ms: Some(huge),
-        }
-        .to_limits();
-        assert_eq!(
-            limits.max_execution,
-            Some(std::time::Duration::from_millis(huge))
-        );
-        assert_eq!(
-            WasmLimitsJson::default().to_limits().max_execution,
-            Some(tack_ext_wasm::DEFAULT_MAX_EXECUTION)
-        );
-    }
-
-    /// The manifest JSON uses camelCase keys (maxFuel / maxMemoryBytes /
-    /// maxExecutionMs); unknown keys are ignored and missing fields keep
-    /// their defaults.
-    #[test]
-    #[cfg(feature = "wasm")]
-    fn wasm_limits_deserialize_from_manifest_json() {
-        let json: WasmLimitsJson = serde_json::from_str(
-            r#"{"maxFuel": 500, "maxMemoryBytes": 2048, "maxExecutionMs": 30, "extra": true}"#,
+    fn git(dir: &Path, args: &[&str]) {
+        // Tests also commit into fresh clones, which do not inherit the
+        // source repo's local identity; CI runners have no global one.
+        let output = crate::sync_process::output_with_timeout(
+            std::process::Command::new("git")
+                .args(["-c", "user.email=test@example.com", "-c", "user.name=test"])
+                .args(args)
+                .current_dir(dir),
+            std::time::Duration::from_secs(30),
         )
         .unwrap();
-        let limits = json.to_limits();
-        assert_eq!(limits.max_fuel, 500);
-        assert_eq!(limits.max_memory_bytes, 2048);
-        assert_eq!(
-            limits.max_execution,
-            Some(std::time::Duration::from_millis(30))
-        );
-
-        let partial: WasmLimitsJson = serde_json::from_str(r#"{"maxFuel": 500}"#).unwrap();
-        let limits = partial.to_limits();
-        assert_eq!(limits.max_fuel, 500);
-        assert_eq!(
-            limits.max_memory_bytes,
-            tack_ext_wasm::WasmLimits::default().max_memory_bytes
-        );
-        assert_eq!(
-            limits.max_execution,
-            Some(tack_ext_wasm::DEFAULT_MAX_EXECUTION)
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
-    #[test]
-    #[cfg(feature = "wasm")]
-    fn capabilities_deserialize_and_lower() {
-        let dir = Path::new("/ext/dir");
-        let json: CapabilitiesJson = serde_json::from_str(
-            r#"{
-                "fs": [
-                    {"host": "data", "guest": "/data"},
-                    {"host": "/abs/out", "guest": "/out", "access": "read-write"},
-                    {"host": "no-guest"}
-                ],
-                "env": {"A": "1"},
-                "args": ["--verbose"],
-                "network": {"tcp": true}
-            }"#,
-        )
-        .unwrap();
-        let caps = json.into_capabilities("test", dir);
-        // The grant without a guest path is skipped (never widened).
-        assert_eq!(caps.preopens.len(), 2);
-        // Relative host resolves against the extension dir; default ro.
-        assert_eq!(caps.preopens[0].host_path, Path::new("/ext/dir/data"));
-        assert!(matches!(
-            caps.preopens[0].access,
-            tack_ext_wasm::PreopenAccess::ReadOnly
-        ));
-        assert!(matches!(
-            caps.preopens[1].access,
-            tack_ext_wasm::PreopenAccess::ReadWrite
-        ));
-        assert_eq!(caps.env, vec![("A".to_string(), "1".to_string())]);
-        assert_eq!(caps.args, vec!["--verbose".to_string()]);
-        assert!(caps.network.allow_tcp);
-        assert!(!caps.network.allow_udp);
-        assert!(!caps.network.allow_dns);
+    fn make_git_extension(repo: &Path) {
+        make_git_extension_named(repo, "demo", None);
     }
 
-    #[test]
-    #[cfg(feature = "wasm")]
-    fn capabilities_env_passthrough_and_empty_default() {
-        // Default (no `capabilities` key) = full sandbox.
-        let caps = CapabilitiesJson::default().into_capabilities("test", Path::new("/x"));
-        assert!(caps.preopens.is_empty());
-        assert!(caps.env.is_empty());
-        assert!(caps.args.is_empty());
-        assert!(!caps.network.allow_tcp);
-
-        // Array form passes host env through; unset names are skipped.
-        // (PATH is universal; the lib target forbids `unsafe` set_var.)
-        let json: CapabilitiesJson =
-            serde_json::from_str(r#"{"env": ["PATH", "TACK_TEST_CAP_ENV_MISSING"]}"#).unwrap();
-        let caps = json.into_capabilities("test", Path::new("/x"));
-        assert_eq!(caps.env.len(), 1);
-        assert_eq!(caps.env[0].0, "PATH");
-    }
-
-    #[test]
-    fn sensitive_env_names_are_detected() {
-        // Same patterns the tack-ext process carrier strips.
-        assert!(is_sensitive_env_key("ANTHROPIC_API_KEY"));
-        assert!(is_sensitive_env_key("GITHUB_TOKEN"));
-        assert!(is_sensitive_env_key("AWS_SECRET_ACCESS_KEY"));
-        assert!(is_sensitive_env_key("app_password")); // case-insensitive
-        assert!(!is_sensitive_env_key("PATH"));
-        assert!(!is_sensitive_env_key("TOKENIZER_THREADS")); // no _TOKEN suffix
-        assert!(!is_sensitive_env_key("SECRETARY_NAME"));
-    }
-
-    /// A manifest `env: ["*_API_KEY", ...]` pass-through must NOT inject
-    /// live host secrets into a WASM guest: sensitive names are skipped
-    /// with a warning (fail closed on the secret, not the extension).
-    #[test]
-    #[cfg(feature = "wasm")]
-    fn capabilities_env_passthrough_refuses_sensitive_names() {
-        let json: CapabilitiesJson =
-            serde_json::from_str(r#"{"env": ["ANTHROPIC_API_KEY", "NPM_TOKEN", "PATH"]}"#).unwrap();
-        let caps = json.into_capabilities("test", Path::new("/x"));
-        assert_eq!(caps.env.len(), 1, "env: {:?}", caps.env);
-        assert_eq!(caps.env[0].0, "PATH");
+    fn make_git_extension_named(repo: &Path, name: &str, version: Option<&str>) {
+        std::fs::create_dir_all(repo).unwrap();
+        git(repo, &["init", "-q", "-b", "main"]);
+        let manifest = match version {
+            Some(version) => serde_json::json!({"name": name, "version": version}).to_string(),
+            None => serde_json::json!({"name": name}).to_string(),
+        };
+        std::fs::write(repo.join("extension.json"), manifest).unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "initial"]);
     }
 
     struct NoopServices;
 
     #[async_trait::async_trait]
-    impl HostServices for NoopServices {
-        async fn handle_request(&self, _method: &str, _params: Value) -> Result<Value, String> {
-            Ok(Value::Null)
+    impl PeerHandler for NoopServices {}
+
+    // ---- store layout ----
+
+    #[test]
+    fn active_version_prefers_local_then_highest_semver() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for dir in ["1.0.0", "1.2.0", "0.9.9"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
         }
-        async fn handle_event(&self, _event: &str, _payload: Value) {}
+        let (version, _) = active_version_dir(root).unwrap();
+        assert_eq!(version, "1.2.0");
+        std::fs::create_dir_all(root.join("local")).unwrap();
+        let (version, _) = active_version_dir(root).unwrap();
+        assert_eq!(version, "local");
     }
 
-    /// e2e: a wasm-carrier extension (hand-written WAT) is discovered,
-    /// instantiated in the sandbox, completes the handshake, and answers
-    /// tool.execute / command.invoke through the shared PluginPeer.
-    #[tokio::test(flavor = "multi_thread")]
-    #[cfg(feature = "wasm")]
-    async fn wasm_carrier_extension_loads_and_answers() {
+    #[test]
+    fn semver_parsing() {
+        assert_eq!(parse_semver("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_semver("0.0.1"), Some((0, 0, 1)));
+        assert!(parse_semver("v1.2.3").is_none());
+        assert!(parse_semver("1.2").is_none());
+        assert!(parse_semver("local").is_none());
+        assert!(parse_semver("1.2.3.4").is_none());
+    }
+
+    // ---- install / lock / verify / upgrade ----
+
+    #[test]
+    fn local_install_lands_in_store_and_writes_lock() {
         let tmp = tempfile::tempdir().unwrap();
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("extension.json"), r#"{"name":"plain"}"#).unwrap();
         let agent_dir = tmp.path().join("agent");
-        let ext_dir = agent_dir.join("extensions").join("hello-wasm");
-        std::fs::create_dir_all(&ext_dir).unwrap();
-        std::fs::write(
-            ext_dir.join("extension.json"),
-            r#"{
-  "name": "hello-wasm",
-  "carrier": "wasm",
-  "module": "plugin.wat",
-  "limits": { "maxFuel": 100000000, "maxMemoryBytes": 16777216 }
-}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            ext_dir.join("plugin.wat"),
-            include_str!("../../../examples/extensions/hello-wasm/plugin.wat"),
-        )
-        .unwrap();
         let cwd = tmp.path().join("cwd");
         std::fs::create_dir_all(&cwd).unwrap();
 
-        let mut manager =
-            ExtensionManager::load(&cwd, &agent_dir, "tui", Arc::new(NoopServices), true).await;
-        assert_eq!(manager.plugins.len(), 1, "wasm plugin must load");
-        assert!(matches!(manager.plugins[0].handle, PluginHandle::Wasm(_)));
+        let target = install_extension(plain.to_str().unwrap(), &cwd, &agent_dir, false).unwrap();
+        assert_eq!(
+            target,
+            store_root(&agent_dir)
+                .join("user")
+                .join("plain")
+                .join("local"),
+            "unversioned local installs land in the store's local dir"
+        );
+        assert!(target.join("extension.json").is_file());
 
-        // Protocol 2 was negotiated for the wasm carrier — and the plugin
-        // registered its tool and command.
-        let tools = manager.tools();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name(), "ext__hello-wasm__ping");
-        let result = tools[0]
-            .execute(
-                "call-1",
-                serde_json::json!({}),
-                tokio_util::sync::CancellationToken::new(),
-                &|_| {},
-            )
-            .await
-            .unwrap();
-        let tack_ai::InputContentBlock::Text { text, .. } = &result.content[0] else {
-            panic!("expected text")
-        };
-        assert_eq!(text, "pong from the WASM sandbox");
+        let lock = read_lock(&agent_dir).unwrap();
+        assert_eq!(lock.version, 2);
+        let entry = lock.plugins.get("plain@user").expect("lock entry");
+        assert_eq!(entry.version.as_deref(), Some("local"));
+        assert!(entry.store);
+        assert_eq!(entry.resolved_commit, None);
 
-        let command_result = manager.invoke_command("hello-wasm", "").await.unwrap();
-        assert_eq!(command_result["ok"], serde_json::json!(true));
-
-        manager.shutdown().await;
+        // A bare-name remove resolves to the store install.
+        remove_extension("plain", &cwd, &agent_dir, false).unwrap();
+        assert!(!target.exists());
+        assert!(read_lock(&agent_dir).unwrap().plugins.is_empty());
     }
 
-    /// A process-carrier manifest with bundle resources contributes hooks,
-    /// MCP servers and skill dirs even when the plugin itself fails to
-    /// start (unknown command).
+    #[test]
+    fn git_install_writes_lock_and_verifies_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("upstream.git");
+        make_git_extension(&repo);
+        let agent_dir = tmp.path().join("agent");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let target = install_extension(repo.to_str().unwrap(), &cwd, &agent_dir, false).unwrap();
+        assert!(target.join(".git").exists(), "git installs keep .git");
+        let head = git_head_commit(&target).unwrap();
+
+        let lock = read_lock(&agent_dir).unwrap();
+        let entry = lock.plugins.get("demo@user").expect("lock entry");
+        assert_eq!(entry.source, repo.to_string_lossy());
+        assert_eq!(entry.resolved_commit.as_deref(), Some(head.as_str()));
+
+        let results = verify_extensions(&agent_dir).unwrap();
+        assert_eq!(
+            results,
+            vec![("demo@user".to_string(), VerifyStatus::Ok(head))]
+        );
+    }
+
+    /// Moving HEAD in the installed checkout makes verify report changed.
+    #[test]
+    fn verify_detects_head_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("upstream.git");
+        make_git_extension(&repo);
+        let agent_dir = tmp.path().join("agent");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let target = install_extension(repo.to_str().unwrap(), &cwd, &agent_dir, false).unwrap();
+        let locked = git_head_commit(&target).unwrap();
+
+        std::fs::write(target.join("extra.txt"), "tampered").unwrap();
+        git(&target, &["add", "."]);
+        git(&target, &["commit", "-q", "-m", "tamper"]);
+
+        let results = verify_extensions(&agent_dir).unwrap();
+        let [(id, VerifyStatus::Changed { expected, actual })] = results.as_slice() else {
+            panic!("expected one changed entry, got {results:?}");
+        };
+        assert_eq!(id, "demo@user");
+        assert_eq!(expected, &locked);
+        assert_ne!(actual, &locked);
+    }
+
+    /// `#<ref>` pins the checkout; a semver tag becomes the store version.
+    #[test]
+    fn rev_pin_checks_out_and_versions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("upstream.git");
+        make_git_extension(&repo);
+        let first = git_head_commit(&repo).unwrap();
+        git(&repo, &["tag", "v1.2.0"]);
+        std::fs::write(repo.join("v2.txt"), "v2").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "second"]);
+
+        let (source, rev) = split_source_ref(&format!("{}#v1.2.0", repo.display()));
+        assert_eq!(rev.as_deref(), Some("v1.2.0"));
+
+        let agent_dir = tmp.path().join("agent");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let target =
+            install_extension_named(&source, &cwd, &agent_dir, false, None, rev.as_deref(), None)
+                .unwrap();
+        assert_eq!(git_head_commit(&target).unwrap(), first);
+        assert_eq!(
+            target,
+            store_root(&agent_dir)
+                .join("user")
+                .join("demo")
+                .join("1.2.0"),
+            "a semver tag rev becomes the store version"
+        );
+        let lock = read_lock(&agent_dir).unwrap();
+        assert_eq!(
+            lock.plugins.get("demo@user").unwrap().version.as_deref(),
+            Some("1.2.0")
+        );
+    }
+
+    /// upgrade is fingerprint-idempotent, then installs the new commit
+    /// when upstream advances.
+    #[test]
+    fn upgrade_is_idempotent_then_advances() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("upstream.git");
+        make_git_extension(&repo);
+        let agent_dir = tmp.path().join("agent");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        install_extension(repo.to_str().unwrap(), &cwd, &agent_dir, false).unwrap();
+
+        let outcomes = upgrade_extensions(&agent_dir, None).unwrap();
+        assert_eq!(
+            outcomes,
+            vec![("demo@user".to_string(), "up to date".to_string())]
+        );
+
+        // Advance upstream: the next upgrade replaces the local dir.
+        std::fs::write(repo.join("v2.txt"), "v2").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "second"]);
+        let outcomes = upgrade_extensions(&agent_dir, None).unwrap();
+        assert_eq!(
+            outcomes,
+            vec![("demo@user".to_string(), "upgraded to local".to_string())]
+        );
+        let target = store_root(&agent_dir)
+            .join("user")
+            .join("demo")
+            .join("local");
+        assert!(target.join("v2.txt").is_file());
+        let lock = read_lock(&agent_dir).unwrap();
+        assert_eq!(
+            lock.plugins
+                .get("demo@user")
+                .unwrap()
+                .resolved_commit
+                .as_deref(),
+            git_head_commit(&target).as_deref()
+        );
+    }
+
+    // ---- enable / disable ----
+
+    #[test]
+    fn enable_disable_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        set_plugin_enabled(&agent_dir, "demo@user", false).unwrap();
+        assert_eq!(
+            plugin_enabled_map(&cwd, &agent_dir).get("demo@user"),
+            Some(&false)
+        );
+        set_plugin_enabled(&agent_dir, "demo@user", true).unwrap();
+        assert_eq!(
+            plugin_enabled_map(&cwd, &agent_dir).get("demo@user"),
+            Some(&true)
+        );
+        // Bad ids are rejected before touching the file.
+        assert!(set_plugin_enabled(&agent_dir, "../escape", false).is_err());
+    }
+
+    // ---- marketplace signatures (ported) ----
+
+    #[tokio::test]
+    async fn signed_marketplace_pins_key_and_rejects_tampering() {
+        use ed25519_dalek::Signer as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let key_hex = hex_encode(signing.verifying_key().as_bytes());
+
+        // Build a catalog with one plugin, sign the canonical payload.
+        let plugin_dir = tmp.path().join("plugin");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("extension.json"), r#"{"name":"demo"}"#).unwrap();
+        let catalog = serde_json::json!({
+            "name": "acme",
+            "plugins": {
+                "demo": { "source": plugin_dir.to_string_lossy() }
+            }
+        });
+        let canonical = serde_json::to_string(&catalog).unwrap();
+        let signature = signing.sign(canonical.as_bytes());
+        let mut signed_catalog = catalog.clone();
+        signed_catalog["signature"] = serde_json::json!({
+            "algorithm": "ed25519",
+            "value": hex_encode(&signature.to_bytes()),
+        });
+        let catalog_path = tmp.path().join("acme.json");
+        std::fs::write(
+            &catalog_path,
+            serde_json::to_string(&signed_catalog).unwrap(),
+        )
+        .unwrap();
+
+        // Registration without the key is rejected.
+        let err = add_marketplace("acme", catalog_path.to_str().unwrap(), &agent_dir, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("--public-key"), "{err}");
+
+        // With the key: registered and pinned (TOFU).
+        add_marketplace(
+            "acme",
+            catalog_path.to_str().unwrap(),
+            &agent_dir,
+            Some(&key_hex),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(marketplace_key_path(&agent_dir, "acme"))
+                .unwrap()
+                .trim(),
+            key_hex
+        );
+
+        // Resolve through the signed catalog: verifies, yields the source.
+        let resolution = resolve_marketplace_spec("demo@acme", &agent_dir)
+            .unwrap()
+            .expect("resolves");
+        assert_eq!(resolution.source, plugin_dir.to_string_lossy());
+        assert_eq!(resolution.marketplace, "acme");
+
+        // Tamper with the catalog after registration: resolution fails.
+        let mut tampered = catalog.clone();
+        tampered["plugins"]["demo"]["source"] = serde_json::json!("/tmp/evil");
+        let tampered_canonical = serde_json::to_string(&tampered).unwrap();
+        tampered["signature"] = signed_catalog["signature"].clone();
+        let _ = tampered_canonical; // (the signature no longer matches)
+        std::fs::write(
+            marketplaces_root(&agent_dir).join("acme.json"),
+            serde_json::to_string(&tampered).unwrap(),
+        )
+        .unwrap();
+        let err = resolve_marketplace_spec("demo@acme", &agent_dir).unwrap_err();
+        assert!(err.to_string().contains("signature"), "{err}");
+    }
+
+    // ---- widget registry ----
+
+    #[test]
+    fn widget_registry_lifecycle() {
+        let mut registry = WidgetRegistry::default();
+        registry.register_plugin(
+            "demo@user",
+            &[WidgetSpec {
+                id: "status".to_string(),
+                r#type: tack_ext::rpc3::WidgetKind::StatusLineSegment,
+                priority: Some(5),
+                title: None,
+                visible: None,
+                initial: Some(serde_json::json!({"text": "ok"})),
+            }],
+        );
+        assert_eq!(registry.entries().len(), 1);
+        assert_eq!(registry.entries()[0].key, "demo@user:status");
+        assert!(registry.entries()[0].visible);
+
+        assert!(registry.apply_update(
+            "demo@user",
+            &WidgetUpdateParams {
+                id: "status".to_string(),
+                state: serde_json::json!({"text": "busy"}),
+                visible: Some(false),
+            },
+        ));
+        assert_eq!(
+            registry.entries()[0].state,
+            Some(serde_json::json!({"text": "busy"}))
+        );
+        assert!(!registry.entries()[0].visible);
+        assert_eq!(registry.entries()[0].rev, 1);
+
+        assert!(!registry.apply_update(
+            "demo@user",
+            &WidgetUpdateParams {
+                id: "nope".to_string(),
+                state: serde_json::json!({}),
+                visible: None,
+            },
+        ));
+
+        let removed = registry.remove_plugin("demo@user");
+        assert_eq!(removed, vec!["demo@user:status"]);
+        assert!(registry.entries().is_empty());
+    }
+
+    // ---- bundle resources (v3 load) ----
+
+    /// A bundle-only manifest contributes hooks/MCP/skills without running
+    /// a plugin process.
     #[tokio::test(flavor = "multi_thread")]
     async fn bundle_resources_are_collected() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2538,7 +3190,7 @@ mod tests {
         let cwd = tmp.path().join("cwd");
         std::fs::create_dir_all(&cwd).unwrap();
 
-        let mut manager =
+        let manager =
             ExtensionManager::load(&cwd, &agent_dir, "tui", Arc::new(NoopServices), true).await;
         assert!(
             manager.plugins.is_empty(),
@@ -2553,12 +3205,180 @@ mod tests {
         );
         assert_eq!(manager.bundle_mcp_servers.len(), 1);
         assert_eq!(manager.bundle_skill_dirs.len(), 1);
+    }
+
+    /// A plugin that fails its handshake stays in the outcome with the
+    /// error recorded (failure is first-class state, not a skip).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_plugin_is_listed_with_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let ext_dir = agent_dir.join("extensions").join("broken");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(
+            ext_dir.join("extension.json"),
+            r#"{"name": "broken", "command": "definitely-not-a-real-command-xyz"}"#,
+        )
+        .unwrap();
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let manager =
+            ExtensionManager::load(&cwd, &agent_dir, "tui", Arc::new(NoopServices), true).await;
+        assert_eq!(manager.plugins.len(), 1);
+        let plugin = &manager.plugins[0];
+        assert!(!plugin.is_active());
+        assert!(
+            plugin
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("failed to start"),
+            "{plugin:?}"
+        );
+        assert!(manager.is_empty(), "no ACTIVE plugins");
+    }
+
+    /// A disabled plugin is discovered but never spawned.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disabled_plugin_is_not_spawned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let ext_dir = agent_dir.join("extensions").join("demo");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(
+            ext_dir.join("extension.json"),
+            r#"{"name": "demo", "command": "definitely-not-a-real-command-xyz"}"#,
+        )
+        .unwrap();
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        set_plugin_enabled(&agent_dir, "demo@user", false).unwrap();
+
+        let manager =
+            ExtensionManager::load(&cwd, &agent_dir, "tui", Arc::new(NoopServices), true).await;
+        assert_eq!(manager.plugins.len(), 1);
+        let plugin = &manager.plugins[0];
+        assert!(!plugin.enabled);
+        assert!(plugin.error.is_none(), "disabled is not an error");
+        assert!(plugin.handle.is_none(), "disabled plugins never spawn");
+    }
+
+    // ---- wasm manifest limits (ported) ----
+
+    /// Manifest-declared WASM limits are plugin-supplied data: they may
+    /// tighten the sandbox but never exceed the host's hard caps.
+    #[test]
+    #[cfg(feature = "wasm")]
+    fn wasm_limits_are_clamped_to_host_caps() {
+        let greedy = WasmLimitsJson {
+            max_fuel: Some(u64::MAX),
+            max_memory_bytes: Some(usize::MAX),
+            max_execution_ms: None,
+        }
+        .to_limits();
+        assert_eq!(greedy.max_fuel, HARD_MAX_FUEL);
+        assert_eq!(greedy.max_memory_bytes, HARD_MAX_MEMORY_BYTES);
+
+        let tight = WasmLimitsJson {
+            max_fuel: Some(1_000),
+            max_memory_bytes: Some(4096),
+            max_execution_ms: None,
+        }
+        .to_limits();
+        assert_eq!(tight.max_fuel, 1_000);
+        assert_eq!(tight.max_memory_bytes, 4096);
+    }
+
+    /// The manifest JSON uses camelCase keys; unknown keys are ignored.
+    #[test]
+    #[cfg(feature = "wasm")]
+    fn wasm_limits_deserialize_from_manifest_json() {
+        let json: WasmLimitsJson = serde_json::from_str(
+            r#"{"maxFuel": 500, "maxMemoryBytes": 2048, "maxExecutionMs": 30, "extra": true}"#,
+        )
+        .unwrap();
+        let limits = json.to_limits();
+        assert_eq!(limits.max_fuel, 500);
+        assert_eq!(limits.max_memory_bytes, 2048);
+        assert_eq!(
+            limits.max_execution,
+            Some(std::time::Duration::from_millis(30))
+        );
+    }
+
+    /// WASM capability declarations lower correctly, and sensitive env
+    /// pass-through names are refused.
+    #[test]
+    #[cfg(feature = "wasm")]
+    fn capabilities_env_passthrough_refuses_sensitive_names() {
+        let json: CapabilitiesJson =
+            serde_json::from_str(r#"{"env": ["ANTHROPIC_API_KEY", "NPM_TOKEN", "PATH"]}"#).unwrap();
+        let caps = json.into_capabilities("test", Path::new("/x"));
+        assert_eq!(caps.env.len(), 1, "env: {:?}", caps.env);
+        assert_eq!(caps.env[0].0, "PATH");
+    }
+
+    /// e2e: a wasm-carrier extension is discovered, instantiated,
+    /// handshakes (v3), and answers tools/execute + commands/invoke.
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "wasm")]
+    async fn wasm_carrier_extension_loads_and_answers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let ext_dir = agent_dir.join("extensions").join("hello-wasm");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(
+            ext_dir.join("extension.json"),
+            r#"{
+  "name": "hello-wasm",
+  "carrier": "wasm",
+  "module": "plugin.wat",
+  "limits": { "maxFuel": 100000000, "maxMemoryBytes": 16777216 }
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ext_dir.join("plugin.wat"),
+            include_str!("../../../examples/extensions/hello-wasm/plugin.wat"),
+        )
+        .unwrap();
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let mut manager =
+            ExtensionManager::load(&cwd, &agent_dir, "tui", Arc::new(NoopServices), true).await;
+        assert_eq!(manager.plugins.len(), 1, "wasm plugin must load");
+        assert!(matches!(
+            manager.plugins[0].handle,
+            Some(PluginHandle::Wasm(_))
+        ));
+
+        let tools = manager.tools();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name(), "ext__hello-wasm_user__ping");
+        let result = tools[0]
+            .execute(
+                "call-1",
+                serde_json::json!({}),
+                tokio_util::sync::CancellationToken::new(),
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        let tack_ai::InputContentBlock::Text { text, .. } = &result.content[0] else {
+            panic!("expected text")
+        };
+        assert_eq!(text, "pong from the WASM sandbox");
+
+        let command_result = manager.invoke_command("hello-wasm", "").await.unwrap();
+        assert_eq!(command_result["ok"], serde_json::json!(true));
+
         manager.shutdown().await;
     }
 
     /// e2e: `capabilities.fs` preopens the extension's data dir into the
-    /// guest (readfile answers with the host file's content); without the
-    /// grant the same module gets an errno — no ambient authority.
+    /// guest; without the grant the same module gets an errno.
     #[tokio::test(flavor = "multi_thread")]
     #[cfg(feature = "wasm")]
     async fn wasm_capability_fs_grant_readfile() {
@@ -2568,7 +3388,6 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let wat = include_str!("../../../examples/extensions/hello-wasm-caps/plugin.wat");
 
-        // With the grant: the tool reads data/hello.txt through the preopen.
         let ext_dir = agent_dir.join("extensions").join("hello-wasm-caps");
         std::fs::create_dir_all(ext_dir.join("data")).unwrap();
         std::fs::write(
@@ -2591,11 +3410,10 @@ mod tests {
 
         let mut manager =
             ExtensionManager::load(&cwd, &agent_dir, "tui", Arc::new(NoopServices), true).await;
-        assert_eq!(manager.plugins.len(), 1, "wasm plugin must load");
         let tools = manager.tools();
         let readfile = tools
             .iter()
-            .find(|t| t.name() == "ext__hello-wasm-caps__readfile")
+            .find(|t| t.name() == "ext__hello-wasm-caps_user__readfile")
             .expect("readfile tool registered");
         let result = readfile
             .execute(
@@ -2632,7 +3450,7 @@ mod tests {
         let tools = manager.tools();
         let readfile = tools
             .iter()
-            .find(|t| t.name() == "ext__hello-wasm-caps__readfile")
+            .find(|t| t.name() == "ext__hello-wasm-caps_user__readfile")
             .expect("readfile tool registered");
         let result = readfile
             .execute(
@@ -2651,701 +3469,5 @@ mod tests {
             "sandbox denial should surface as errno, got: {text}"
         );
         manager.shutdown().await;
-    }
-
-    // ---- install pinning / lockfile / verify / signatures ----
-
-    #[test]
-    fn git_source_name_handles_windows_and_url_forms() {
-        // URLs and scp-style sources.
-        assert_eq!(git_source_name("https://example.com/x.git"), "x");
-        assert_eq!(git_source_name("git@example.com:user/repo.git"), "repo");
-        assert_eq!(git_source_name("https://example.com/x/y/"), "y");
-        // Local paths: POSIX and Windows (the source string is passed
-        // through verbatim, so backslashes must split too).
-        assert_eq!(git_source_name("/tmp/upstream.git"), "upstream");
-        assert_eq!(git_source_name("C:\\Users\\u\\upstream.git"), "upstream");
-        assert_eq!(git_source_name("C:\\Users\\u\\repo"), "repo");
-        assert!(validate_extension_name(&git_source_name("C:\\Users\\u\\upstream.git")).is_ok());
-    }
-
-    #[test]
-    fn extension_names_are_validated_before_path_joins() {
-        // Plain names pass.
-        assert!(validate_extension_name("demo").is_ok());
-        assert!(validate_extension_name("my-ext.v2").is_ok());
-        // Traversal, separators, hidden/empty names are rejected.
-        for bad in [
-            "",
-            "..",
-            ".",
-            ".hidden",
-            "../escape",
-            "a/b",
-            "a\\b",
-            "up..\\..\\x",
-        ] {
-            assert!(
-                validate_extension_name(bad).is_err(),
-                "{bad:?} must be rejected"
-            );
-        }
-
-        // A marketplace key / name override flows into the install path:
-        // a hostile value must error, not escape extensions/.
-        let tmp = tempfile::tempdir().unwrap();
-        let cwd = tmp.path().join("cwd");
-        let agent_dir = tmp.path().join("agent");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let err = install_extension_named(
-            "https://example.com/x.git",
-            &cwd,
-            &agent_dir,
-            false,
-            Some("../escape"),
-            None,
-            None,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("invalid extension name"), "{err}");
-
-        // remove_extension must never delete outside extensions/ either.
-        let err = remove_extension("..", &cwd, &agent_dir, false).unwrap_err();
-        assert!(err.to_string().contains("invalid extension name"), "{err}");
-
-        // Marketplace names become marketplaces/<name>.json paths.
-        let err = marketplace_plugins(&agent_dir, "../settings").unwrap_err();
-        assert!(err.to_string().contains("invalid extension name"), "{err}");
-        let err = remove_marketplace("a/b", &agent_dir).unwrap_err();
-        assert!(err.to_string().contains("invalid extension name"), "{err}");
-    }
-
-    /// A marketplace catalog whose plugin KEY contains a path separator
-    /// resolves to an error (the key becomes the install directory name).
-    #[tokio::test]
-    async fn marketplace_rejects_hostile_plugin_names() {
-        let tmp = tempfile::tempdir().unwrap();
-        let agent_dir = tmp.path().join("agent");
-        let catalog = tmp.path().join("catalog.json");
-        std::fs::write(
-            &catalog,
-            r#"{"name":"acme","plugins":{"../escape":{"source":"https://example.com/x.git"}}}"#,
-        )
-        .unwrap();
-        add_marketplace("acme", catalog.to_str().unwrap(), &agent_dir, None)
-            .await
-            .unwrap();
-        let err = resolve_marketplace_spec("../escape@acme", &agent_dir).unwrap_err();
-        assert!(err.to_string().contains("invalid extension name"), "{err}");
-    }
-
-    /// Marketplace registration rejects names that would escape
-    /// marketplaces/ (or write hidden files).
-    #[tokio::test]
-    async fn add_marketplace_validates_name() {
-        let tmp = tempfile::tempdir().unwrap();
-        let agent_dir = tmp.path().join("agent");
-        let catalog = tmp.path().join("catalog.json");
-        std::fs::write(&catalog, r#"{"name":"acme","plugins":{}}"#).unwrap();
-        for bad in ["../evil", ".hidden", "a\\b", ""] {
-            let err = add_marketplace(bad, catalog.to_str().unwrap(), &agent_dir, None)
-                .await
-                .unwrap_err();
-            assert!(
-                err.to_string().contains("invalid extension name"),
-                "{bad:?}: {err}"
-            );
-        }
-        assert!(list_marketplaces(&agent_dir).is_empty());
-    }
-
-    fn git(dir: &Path, args: &[&str]) {
-        // Tests also commit into fresh clones, which do not inherit the
-        // source repo's local identity; CI runners have no global one. The
-        // call must stay bounded with piped stdio (output_with_timeout):
-        // a bare `.status()` inherits the test's stdout/stderr, so a git
-        // child that never exits keeps those pipes open — killing the test
-        // then still wedges the runner waiting for pipe EOF (the repeated
-        // ubuntu CI stall).
-        let output = crate::sync_process::output_with_timeout(
-            std::process::Command::new("git")
-                .args(["-c", "user.email=test@example.com", "-c", "user.name=test"])
-                .args(args)
-                .current_dir(dir),
-            std::time::Duration::from_secs(30),
-        )
-        .unwrap();
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    /// A git repo (named *.git so the installer treats it as a git source)
-    /// with one commit containing a bundle-only extension manifest.
-    fn make_git_extension(repo: &Path) {
-        std::fs::create_dir_all(repo.join("skills").join("demo")).unwrap();
-        git(repo, &["init", "-q", "-b", "main"]);
-        std::fs::write(
-            repo.join("extension.json"),
-            r#"{"name":"demo","skills":["skills"]}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            repo.join("skills").join("demo").join("SKILL.md"),
-            "---\nname: demo\ndescription: bundle skill\n---\nbody\n",
-        )
-        .unwrap();
-        git(repo, &["add", "."]);
-        git(repo, &["commit", "-q", "-m", "initial"]);
-    }
-
-    /// Installing from a git source keeps .git, writes a lockfile entry with
-    /// the resolved HEAD commit, and verifies ok.
-    #[test]
-    fn git_install_writes_lock_and_verifies_ok() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("upstream.git");
-        make_git_extension(&repo);
-        let agent_dir = tmp.path().join("agent");
-        let cwd = tmp.path().join("cwd");
-        std::fs::create_dir_all(&cwd).unwrap();
-
-        let target = install_extension(repo.to_str().unwrap(), &cwd, &agent_dir, false).unwrap();
-        assert!(
-            target.join(".git").exists(),
-            "git installs keep .git so verify can compare HEAD"
-        );
-        let head = git_head_commit(&target).unwrap();
-        assert_eq!(head.len(), 40);
-
-        let lock: ExtensionsLock =
-            serde_json::from_str(&std::fs::read_to_string(lock_path(&agent_dir)).unwrap()).unwrap();
-        assert_eq!(lock.version, 1);
-        let entry = lock.plugins.get("upstream").expect("lock entry");
-        assert_eq!(entry.source, repo.to_string_lossy());
-        assert_eq!(entry.rev, None);
-        assert_eq!(entry.resolved_commit.as_deref(), Some(head.as_str()));
-        assert_eq!(entry.marketplace, None);
-        assert!(entry.installed_at > 0);
-
-        let results = verify_extensions(&agent_dir).unwrap();
-        assert_eq!(
-            results,
-            vec![("upstream".to_string(), VerifyStatus::Ok(head))]
-        );
-    }
-
-    /// Moving HEAD in the installed checkout makes verify report changed;
-    /// removing the extension drops its lock entry.
-    #[test]
-    fn verify_detects_head_drift_and_remove_clears_lock() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("upstream.git");
-        make_git_extension(&repo);
-        let agent_dir = tmp.path().join("agent");
-        let cwd = tmp.path().join("cwd");
-        std::fs::create_dir_all(&cwd).unwrap();
-
-        let target = install_extension(repo.to_str().unwrap(), &cwd, &agent_dir, false).unwrap();
-        let locked = git_head_commit(&target).unwrap();
-
-        // Tamper: an extra commit inside the installed checkout.
-        std::fs::write(target.join("extra.txt"), "tampered").unwrap();
-        git(&target, &["add", "."]);
-        git(&target, &["commit", "-q", "-m", "tamper"]);
-
-        let results = verify_extensions(&agent_dir).unwrap();
-        let [(name, VerifyStatus::Changed { expected, actual })] = results.as_slice() else {
-            panic!("expected one changed entry, got {results:?}");
-        };
-        assert_eq!(name, "upstream");
-        assert_eq!(expected, &locked);
-        assert_ne!(actual, &locked);
-
-        remove_extension("upstream", &cwd, &agent_dir, false).unwrap();
-        assert!(verify_extensions(&agent_dir).unwrap().is_empty());
-
-        // A deleted install directory reports missing.
-        let target = install_extension(repo.to_str().unwrap(), &cwd, &agent_dir, false).unwrap();
-        std::fs::remove_dir_all(&target).unwrap();
-        let results = verify_extensions(&agent_dir).unwrap();
-        assert_eq!(
-            results,
-            vec![("upstream".to_string(), VerifyStatus::Missing)]
-        );
-    }
-
-    /// `#<ref>` pins the checkout to the requested commit; the lock records
-    /// both the requested rev and the resolved sha. Local directories reject
-    /// ref pins.
-    #[test]
-    fn rev_pin_checks_out_requested_commit() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("upstream.git");
-        make_git_extension(&repo);
-        let first = git_head_commit(&repo).unwrap();
-        std::fs::write(repo.join("v2.txt"), "v2").unwrap();
-        git(&repo, &["add", "."]);
-        git(&repo, &["commit", "-q", "-m", "second"]);
-        let second = git_head_commit(&repo).unwrap();
-        assert_ne!(first, second);
-
-        let (source, rev) = split_source_ref(&format!("{}#{first}", repo.display()));
-        assert_eq!(rev.as_deref(), Some(first.as_str()));
-        // No ref suffix: source passes through unchanged.
-        assert_eq!(
-            split_source_ref("https://x/y.git"),
-            ("https://x/y.git".to_string(), None)
-        );
-
-        let agent_dir = tmp.path().join("agent");
-        let cwd = tmp.path().join("cwd");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let target =
-            install_extension_named(&source, &cwd, &agent_dir, false, None, rev.as_deref(), None)
-                .unwrap();
-        assert_eq!(git_head_commit(&target).unwrap(), first);
-
-        let lock: ExtensionsLock =
-            serde_json::from_str(&std::fs::read_to_string(lock_path(&agent_dir)).unwrap()).unwrap();
-        let entry = lock.plugins.get("upstream").unwrap();
-        assert_eq!(entry.rev.as_deref(), Some(first.as_str()));
-        assert_eq!(entry.resolved_commit.as_deref(), Some(first.as_str()));
-
-        // Local directory installs reject ref pins.
-        let plain = tmp.path().join("plain");
-        std::fs::create_dir_all(&plain).unwrap();
-        std::fs::write(plain.join("extension.json"), r#"{"name":"plain"}"#).unwrap();
-        let err = install_extension_named(
-            plain.to_str().unwrap(),
-            &cwd,
-            &agent_dir,
-            false,
-            None,
-            Some("v1.0.0"),
-            None,
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("pinning only applies to git URLs"),
-            "{err}"
-        );
-
-        // A plain local-directory install locks with resolvedCommit: null.
-        install_extension(plain.to_str().unwrap(), &cwd, &agent_dir, false).unwrap();
-        let lock: ExtensionsLock =
-            serde_json::from_str(&std::fs::read_to_string(lock_path(&agent_dir)).unwrap()).unwrap();
-        let entry = lock.plugins.get("plain").unwrap();
-        assert_eq!(entry.resolved_commit, None);
-        // Nothing to verify for unpinned entries.
-        let results = verify_extensions(&agent_dir).unwrap();
-        assert_eq!(
-            results.len(),
-            1,
-            "only the git entry is verifiable: {results:?}"
-        );
-    }
-
-    /// Signed marketplace: registration pins the ed25519 key (TOFU), resolve
-    /// re-verifies, and a tampered catalog is rejected.
-    #[tokio::test]
-    async fn signed_marketplace_pins_key_and_rejects_tampering() {
-        use ed25519_dalek::Signer as _;
-        let tmp = tempfile::tempdir().unwrap();
-        let agent_dir = tmp.path().join("agent");
-        let signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let key_hex = hex_encode(signing.verifying_key().as_bytes());
-
-        // Sign the canonical (unsigned) serialization, then attach the signature.
-        let unsigned = serde_json::json!({
-            "name": "acme",
-            "plugins": {
-                "demo": { "source": "https://example.com/demo.git", "rev": "v1.0.0" }
-            }
-        });
-        let canonical = serde_json::to_string(&unsigned).unwrap();
-        let signature = signing.sign(canonical.as_bytes());
-        let mut signed = unsigned.clone();
-        signed["signature"] = serde_json::json!({
-            "algorithm": "ed25519",
-            "value": hex_encode(&signature.to_bytes()),
-        });
-        let catalog = tmp.path().join("catalog.json");
-        std::fs::write(&catalog, serde_json::to_string_pretty(&signed).unwrap()).unwrap();
-
-        // A signed catalog without --public-key is refused.
-        let err = add_marketplace("acme", catalog.to_str().unwrap(), &agent_dir, None)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("--public-key"), "{err}");
-        assert!(list_marketplaces(&agent_dir).is_empty());
-
-        // A wrong key is refused too.
-        let wrong = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
-        let err = add_marketplace(
-            "acme",
-            catalog.to_str().unwrap(),
-            &agent_dir,
-            Some(&hex_encode(wrong.verifying_key().as_bytes())),
-        )
-        .await
-        .unwrap_err();
-        assert!(err.to_string().contains("verification failed"), "{err}");
-
-        // Correct key: registered and pinned (TOFU).
-        add_marketplace(
-            "acme",
-            catalog.to_str().unwrap(),
-            &agent_dir,
-            Some(&key_hex),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            read_pinned_key(&agent_dir, "acme").as_deref(),
-            Some(key_hex.as_str())
-        );
-
-        // Resolve re-verifies and surfaces the catalog's rev pin.
-        let resolved = resolve_marketplace_spec("demo@acme", &agent_dir)
-            .unwrap()
-            .unwrap();
-        assert_eq!(resolved.plugin, "demo");
-        assert_eq!(resolved.source, "https://example.com/demo.git");
-        assert_eq!(resolved.rev.as_deref(), Some("v1.0.0"));
-        assert_eq!(resolved.marketplace, "acme");
-
-        // Re-registration with the pinned key alone (no --public-key) works.
-        add_marketplace("acme", catalog.to_str().unwrap(), &agent_dir, None)
-            .await
-            .unwrap();
-
-        // Tampering with the registered catalog breaks verification.
-        let registered = marketplaces_root(&agent_dir).join("acme.json");
-        let tampered = std::fs::read_to_string(&registered)
-            .unwrap()
-            .replace("demo.git", "evil.git");
-        std::fs::write(&registered, tampered).unwrap();
-        let err = resolve_marketplace_spec("demo@acme", &agent_dir).unwrap_err();
-        assert!(err.to_string().contains("verification failed"), "{err}");
-    }
-
-    /// Startup gate: a plugin whose HEAD drifted from the lockfile is skipped
-    /// when the lock is required, loads (with a warning) when it is not, and
-    /// plugins without lock entries are never gated.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn lock_gate_skips_drifted_plugin_unless_disabled() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("upstream.git");
-        make_git_extension(&repo);
-        let agent_dir = tmp.path().join("agent");
-        let cwd = tmp.path().join("cwd");
-        std::fs::create_dir_all(&cwd).unwrap();
-
-        let target = install_extension(repo.to_str().unwrap(), &cwd, &agent_dir, false).unwrap();
-
-        // Undrifted: loads.
-        let manager =
-            ExtensionManager::load(&cwd, &agent_dir, "tui", Arc::new(NoopServices), true).await;
-        assert_eq!(manager.bundle_skill_dirs.len(), 1);
-
-        // Drift the installed checkout.
-        std::fs::write(target.join("extra.txt"), "tampered").unwrap();
-        git(&target, &["add", "."]);
-        git(&target, &["commit", "-q", "-m", "tamper"]);
-
-        let manager =
-            ExtensionManager::load(&cwd, &agent_dir, "tui", Arc::new(NoopServices), true).await;
-        assert!(
-            manager.bundle_skill_dirs.is_empty(),
-            "drifted plugin must be skipped when the lock is required"
-        );
-
-        let manager =
-            ExtensionManager::load(&cwd, &agent_dir, "tui", Arc::new(NoopServices), false).await;
-        assert_eq!(
-            manager.bundle_skill_dirs.len(),
-            1,
-            "extensionLockRequired=false downgrades to a warning"
-        );
-
-        // A manually placed extension (no lock entry) is never gated.
-        let manual = agent_dir.join("extensions").join("manual");
-        std::fs::create_dir_all(manual.join("skills").join("demo")).unwrap();
-        std::fs::write(
-            manual.join("extension.json"),
-            r#"{"name":"manual","skills":["skills"]}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            manual.join("skills").join("demo").join("SKILL.md"),
-            "---\nname: demo\ndescription: manual skill\n---\nbody\n",
-        )
-        .unwrap();
-        let manager =
-            ExtensionManager::load(&cwd, &agent_dir, "tui", Arc::new(NoopServices), true).await;
-        assert_eq!(
-            manager.bundle_skill_dirs.len(),
-            1,
-            "only the lock-less manual extension loads"
-        );
-    }
-
-    /// In-place edits WITHOUT a commit leave HEAD unchanged; the lock
-    /// gate and `ext verify` must still catch them via the clean-tree
-    /// requirement (the lockfile's stated purpose is detecting
-    /// post-install tampering).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn dirty_worktree_defeats_verify_and_lock_gate() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("upstream.git");
-        make_git_extension(&repo);
-        let agent_dir = tmp.path().join("agent");
-        let cwd = tmp.path().join("cwd");
-        std::fs::create_dir_all(&cwd).unwrap();
-
-        let target = install_extension(repo.to_str().unwrap(), &cwd, &agent_dir, false).unwrap();
-        let locked = git_head_commit(&target).unwrap();
-
-        // Tamper in place: edit a tracked file, no commit — HEAD still
-        // equals the locked commit.
-        std::fs::write(target.join("skills").join("demo").join("SKILL.md"), "pwned").unwrap();
-        assert_eq!(git_head_commit(&target).unwrap(), locked);
-
-        let results = verify_extensions(&agent_dir).unwrap();
-        let [(name, VerifyStatus::Changed { expected, actual })] = results.as_slice() else {
-            panic!("expected one changed entry, got {results:?}");
-        };
-        assert_eq!(name, "upstream");
-        assert_eq!(expected, &locked);
-        assert!(actual.contains("uncommitted"), "{actual}");
-
-        let manager =
-            ExtensionManager::load(&cwd, &agent_dir, "tui", Arc::new(NoopServices), true).await;
-        assert!(
-            manager.bundle_skill_dirs.is_empty(),
-            "dirty-tree plugin must be skipped when the lock is required"
-        );
-
-        // Restoring the tree to the locked commit verifies ok again.
-        git(&target, &["checkout", "--", "."]);
-        let results = verify_extensions(&agent_dir).unwrap();
-        assert_eq!(
-            results,
-            vec![("upstream".to_string(), VerifyStatus::Ok(locked))]
-        );
-    }
-
-    /// v2.1 registry: widgets register keyed `<plugin>:<id>`; widget.update
-    /// is an idempotent full-state replacement (state + visibility, rev
-    /// bumped); unknown ids are tolerated (false, no mutation); a dead
-    /// plugin's widgets are all removed.
-    #[test]
-    fn widget_registry_lifecycle() {
-        let mut registry = WidgetRegistry::default();
-        let spec = |id: &str, priority: i64| tack_ext::WidgetSpec {
-            id: id.to_string(),
-            kind: tack_ext::WidgetKind::StatusLineSegment,
-            priority: Some(priority),
-            title: None,
-            visible: None,
-            initial: Some(serde_json::json!({ "text": "init" })),
-        };
-        registry.register_plugin("alpha", &[spec("s1", 10), spec("s2", 20)]);
-        registry.register_plugin("beta", &[spec("s1", 30)]);
-        assert_eq!(registry.entries().len(), 3);
-        assert_eq!(registry.entries()[0].key, "alpha:s1");
-        assert!(registry.entries()[0].visible);
-
-        // Update: full-state replacement + visibility, scoped by plugin
-        // (beta:s1 is a different widget than alpha:s1).
-        let update = tack_ext::WidgetUpdatePayload {
-            id: "s1".to_string(),
-            state: serde_json::json!({ "text": "new" }),
-            visible: Some(false),
-        };
-        assert!(registry.apply_update("alpha", &update));
-        let entry = &registry.entries()[0];
-        assert_eq!(entry.state, Some(serde_json::json!({ "text": "new" })));
-        assert!(!entry.visible);
-        assert_eq!(entry.rev, 1);
-        assert_eq!(
-            registry.entries()[2].state,
-            Some(serde_json::json!({ "text": "init" })),
-            "beta:s1 must not be touched by alpha's update"
-        );
-
-        // Idempotent: applying the same snapshot twice only bumps rev.
-        assert!(registry.apply_update("alpha", &update));
-        assert_eq!(registry.entries()[0].rev, 2);
-
-        // Unknown widget id / unknown plugin: tolerated, no mutation.
-        let unknown = tack_ext::WidgetUpdatePayload {
-            id: "nope".to_string(),
-            state: serde_json::json!({}),
-            visible: None,
-        };
-        assert!(!registry.apply_update("alpha", &unknown));
-        assert!(!registry.apply_update("ghost", &update));
-        assert_eq!(registry.entries().len(), 3);
-
-        // Plugin death: only that plugin's widgets vanish.
-        let removed = registry.remove_plugin("alpha");
-        assert_eq!(
-            removed,
-            vec!["alpha:s1".to_string(), "alpha:s2".to_string()]
-        );
-        assert_eq!(registry.entries().len(), 1);
-        assert_eq!(registry.entries()[0].key, "beta:s1");
-    }
-
-    /// widget.update routing: TaggedServices injects the plugin name and
-    /// TuiExtServices forwards the parsed update onto the app event bus.
-    #[tokio::test]
-    async fn widget_update_event_is_tagged_and_routed() {
-        let (tx, rx) = crate::tui::app_event_bus();
-        let inner: Arc<dyn HostServices> = Arc::new(TuiExtServices::new(tx, false));
-        let tagged = TaggedServices {
-            plugin: "alpha".to_string(),
-            inner,
-        };
-        tagged
-            .handle_event(
-                "widget.update",
-                serde_json::json!({ "id": "s1", "state": { "text": "hi" }, "visible": true }),
-            )
-            .await;
-        let Some(crate::tui::AppEvent::ExtWidgetUpdate { plugin, update }) = rx.try_recv() else {
-            panic!("expected ExtWidgetUpdate");
-        };
-        assert_eq!(plugin, "alpha");
-        assert_eq!(update.id, "s1");
-        assert_eq!(update.visible, Some(true));
-
-        // Bad payloads warn and are dropped (no event, no panic).
-        tagged
-            .handle_event("widget.update", serde_json::json!({ "state": 1 }))
-            .await;
-        assert!(rx.try_recv().is_none());
-    }
-
-    /// Peer EOF (plugin death) fires the death watcher used to drop widgets.
-    #[tokio::test]
-    async fn plugin_death_watcher_fires_on_eof() {
-        let (plugin_out, host_in) = tokio::io::duplex(4096);
-        let (host_out, plugin_in) = tokio::io::duplex(4096);
-        let peer = tack_ext::PluginPeer::new(host_in, host_out, Arc::new(NoopServices));
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
-        watch_plugin_death(peer, move || {
-            let _ = tx.try_send(());
-        });
-        // The plugin vanishes (process exit closes both pipe ends).
-        drop(plugin_out);
-        drop(plugin_in);
-        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await
-            .expect("death watcher must fire on EOF")
-            .expect("channel open");
-    }
-
-    /// v2.2: autocomplete.provide round-trips over the peer; error
-    /// responses (v1 plugins answering "unknown method") and UI-level
-    /// timeouts both degrade to no suggestions.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn autocomplete_provide_contract() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-        let (plugin_out, host_in) = tokio::io::duplex(4096);
-        let (host_out, plugin_in) = tokio::io::duplex(4096);
-        let peer = tack_ext::PluginPeer::new(host_in, host_out, Arc::new(NoopServices));
-        let provider = ExtAutocompleteProvider {
-            key: "demo:hash".to_string(),
-            plugin: "demo".to_string(),
-            spec: tack_ext::AutocompleteProviderSpec {
-                id: "good".to_string(),
-                trigger: "#".to_string(),
-                description: None,
-            },
-            peer,
-        };
-        // The plugin: answer autocomplete.provide for provider "good",
-        // error on "bad", and never answer "slow" (30s protocol timeout
-        // would be far too slow for the UI — the TUI's 300ms cap applies).
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(plugin_in).lines();
-            let mut out = plugin_out;
-            while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(tack_ext::Envelope::Request { id, method, params }) =
-                    serde_json::from_str::<tack_ext::Envelope>(&line)
-                else {
-                    continue;
-                };
-                assert_eq!(method, "autocomplete.provide");
-                let provider_id = params
-                    .get("providerId")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let response = match provider_id.as_str() {
-                    "good" => tack_ext::Envelope::result(
-                        id,
-                        serde_json::json!({ "suggestions": [
-                            { "value": "#wasm", "label": "#wasm WASM carrier", "detail": "demo" }
-                        ] }),
-                    ),
-                    "slow" => continue, // never answers
-                    _ => tack_ext::Envelope::error(id, "unknown method autocomplete.provide"),
-                };
-                out.write_all(
-                    format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes(),
-                )
-                .await
-                .unwrap();
-                out.flush().await.unwrap();
-            }
-        });
-
-        // Round-trip.
-        let suggestions = provider.provide("wa", 2).await;
-        assert_eq!(suggestions.len(), 1);
-        assert_eq!(suggestions[0].value, "#wasm");
-        assert_eq!(suggestions[0].detail.as_deref(), Some("demo"));
-
-        // Error response → no suggestions.
-        let bad = ExtAutocompleteProvider {
-            spec: tack_ext::AutocompleteProviderSpec {
-                id: "bad".to_string(),
-                ..provider.spec.clone()
-            },
-            ..provider.clone()
-        };
-        assert!(bad.provide("x", 0).await.is_empty());
-
-        // UI-level timeout (the TUI wraps provide in a 300ms cap): a silent
-        // plugin degrades to no suggestions instead of stalling the input.
-        let slow = ExtAutocompleteProvider {
-            spec: tack_ext::AutocompleteProviderSpec {
-                id: "slow".to_string(),
-                ..provider.spec.clone()
-            },
-            ..provider.clone()
-        };
-        let timed =
-            tokio::time::timeout(std::time::Duration::from_millis(100), slow.provide("x", 0)).await;
-        assert!(
-            timed.is_err(),
-            "the 30s protocol timeout must not fire first"
-        );
-
-        // Unknown provider key on an empty manager → no suggestions.
-        let manager = ExtensionManager::default();
-        assert!(
-            manager
-                .autocomplete_provide("ghost:hash", "x", 0)
-                .await
-                .is_empty()
-        );
     }
 }

@@ -258,6 +258,12 @@ plugin; with `false` it only warns but still loads. Plugins without a lock
 entry are unaffected (see docs/extensions.md §1c). The managed tier can
 force this value either way.
 
+Also: `plugins` (object) — per-plugin settings keyed by plugin id
+(`name@source`, see docs/plugin-roadmap.md). Today the only per-plugin key
+is `enabled` (bool, default `true`): a disabled plugin stays installed but
+is never spawned (its metadata still shows up in `ext list`). Manage it
+with `tack ext enable|disable <id>` or edit the file directly.
+
 ### Managed-tier-only keys
 
 Effective only in managed-settings.json:

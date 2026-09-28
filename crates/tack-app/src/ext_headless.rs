@@ -1,30 +1,41 @@
-//! Headless `HostServices` for non-TUI run modes (print / rpc / acp).
+//! Headless host services for non-TUI run modes (print / rpc / acp),
+//! implementing the v3 [`PeerHandler`] surface.
 //!
-//! Plugins keep working in headless modes — tools, intercepts, lifecycle
-//! events, `exec` (trust-gated) — but anything that needs a terminal UI is
-//! degraded deterministically:
+//! Plugins keep working in headless modes — tools, interception,
+//! lifecycle events, `exec/run` (trust-gated) — but anything that needs a
+//! terminal UI is degraded deterministically:
 //!
-//! - `ui.notify` / `ui.set_status`: accepted, forwarded to the tracing log
-//!   (fire-and-forget semantics preserved);
-//! - `ui.select` / `ui.confirm` / `ui.input`: error — there is no user to
-//!   ask. Plugins must treat these as optional capabilities (the
-//!   `initialize` payload's `mode` field tells them which mode hosts them);
-//! - `session.*` / `provider.register`: error in v1 headless support —
-//!   session control needs a live session UI/owner;
-//! - `exec`: honored when the context is trusted, run inline (no TUI main
-//!   loop to route through) with the same shell + timeout semantics as the
-//!   TUI path (`run_ext_exec` is shared).
+//! - `ui/notify`: accepted, forwarded to the tracing log;
+//! - `ui/select` / `ui/confirm` / `ui/input`: `ERR_CAPABILITY_NOT_GRANTED`
+//!   — there is no user to ask (the initialize payload's `mode` and
+//!   `capabilities` tell the plugin);
+//! - `session/*`, `snapshot/get`, `host/registerProvider`: not available
+//!   in headless support — session control needs a live session UI/owner;
+//! - `exec/run`: honored when the context is trusted, run inline with the
+//!   same shell + timeout semantics as the TUI path (`run_ext_exec` is
+//!   shared).
 
 use std::sync::Arc;
 
 use serde_json::Value;
-use tack_ext::HostServices;
+use tack_ext::rpc3::{
+    ERR_CAPABILITY_NOT_GRANTED, ERR_METHOD_NOT_FOUND, ERR_POLICY_DENIED, ErrorObject,
+};
+use tack_ext::v3::PeerHandler;
 
-/// Plugin `exec` request via the platform shell with a timeout. Shared by
-/// the TUI bridge and the headless services.
+fn service_error(code: i64, message: impl Into<String>) -> ErrorObject {
+    ErrorObject {
+        code,
+        message: message.into(),
+        data: None,
+    }
+}
+
+/// Plugin `exec/run` request via the platform shell with a timeout.
+/// Shared by the TUI bridge and the headless services.
 pub(crate) async fn run_ext_exec(
-    params: &tack_ext::protocol::ExecParams,
-) -> tack_ext::protocol::ExecResult {
+    params: &tack_ext::rpc3::ExecRunParams,
+) -> tack_ext::rpc3::ExecRunResult {
     use tokio::io::AsyncReadExt as _;
     let (program, args) = if cfg!(windows) {
         ("cmd", vec!["/c".to_string(), params.command.clone()])
@@ -41,7 +52,7 @@ pub(crate) async fn run_ext_exec(
     {
         Ok(child) => child,
         Err(e) => {
-            return tack_ext::protocol::ExecResult {
+            return tack_ext::rpc3::ExecRunResult {
                 stdout: String::new(),
                 stderr: e.to_string(),
                 code: -1,
@@ -64,12 +75,12 @@ pub(crate) async fn run_ext_exec(
         buf
     });
     match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) => tack_ext::protocol::ExecResult {
+        Ok(Ok(status)) => tack_ext::rpc3::ExecRunResult {
             stdout: String::from_utf8_lossy(&out_task.await.unwrap_or_default()).to_string(),
             stderr: String::from_utf8_lossy(&err_task.await.unwrap_or_default()).to_string(),
             code: status.code().unwrap_or(-1),
         },
-        Ok(Err(e)) => tack_ext::protocol::ExecResult {
+        Ok(Err(e)) => tack_ext::rpc3::ExecRunResult {
             stdout: String::new(),
             stderr: e.to_string(),
             code: -1,
@@ -80,7 +91,7 @@ pub(crate) async fn run_ext_exec(
             // then wait to reap it — no stray plugin processes, no zombie.
             tack_tools::shell::kill_process_tree(pid);
             let _ = child.wait().await;
-            tack_ext::protocol::ExecResult {
+            tack_ext::rpc3::ExecRunResult {
                 stdout: String::new(),
                 stderr: format!("exec timed out after {}ms", timeout.as_millis()),
                 code: -1,
@@ -93,7 +104,7 @@ pub(crate) async fn run_ext_exec(
 /// run-mode label ("print" | "rpc" | "acp") used in error messages.
 pub struct HeadlessExtServices {
     mode: &'static str,
-    /// Project trust: `exec` is only honored for trusted contexts.
+    /// Project trust: `exec/run` is only honored for trusted contexts.
     trusted: bool,
 }
 
@@ -113,60 +124,71 @@ impl HeadlessExtServices {
 }
 
 #[async_trait::async_trait]
-impl HostServices for HeadlessExtServices {
-    async fn handle_request(&self, method: &str, params: Value) -> Result<Value, String> {
+impl PeerHandler for HeadlessExtServices {
+    async fn handle_request(&self, method: &str, params: Value) -> Result<Value, ErrorObject> {
         match method {
             // Fire-and-forget UI primitives degrade to log lines.
-            "ui.notify" => {
+            "ui/notify" => {
                 let message = params.get("message").and_then(Value::as_str).unwrap_or("");
                 tracing::info!(target: "tack_ext::plugin", "notify: {message}");
                 Ok(Value::Null)
             }
-            "ui.set_status" => Ok(Value::Null),
-            "ui.select" | "ui.confirm" | "ui.input" => Err(format!(
-                "{method} needs an interactive terminal; not available in {} mode",
-                self.mode
+            "ui/select" | "ui/confirm" | "ui/input" => Err(service_error(
+                ERR_CAPABILITY_NOT_GRANTED,
+                format!(
+                    "{method} needs an interactive terminal; not available in {} mode",
+                    self.mode
+                ),
             )),
-            "exec" => {
+            "exec/run" => {
                 if !self.trusted {
-                    return Err("exec requires project trust".to_string());
+                    return Err(service_error(
+                        ERR_POLICY_DENIED,
+                        "exec requires project trust",
+                    ));
                 }
-                match serde_json::from_value::<tack_ext::protocol::ExecParams>(params) {
+                match serde_json::from_value::<tack_ext::rpc3::ExecRunParams>(params) {
                     Ok(parsed) => {
                         let result = run_ext_exec(&parsed).await;
-                        serde_json::to_value(result).map_err(|e| e.to_string())
+                        serde_json::to_value(result)
+                            .map_err(|e| service_error(ERR_CAPABILITY_NOT_GRANTED, e.to_string()))
                     }
-                    Err(_) => Err("bad exec params".to_string()),
+                    Err(e) => Err(service_error(
+                        tack_ext::rpc3::ERR_INVALID_PARAMS,
+                        format!("bad exec params: {e}"),
+                    )),
                 }
             }
-            other if other.starts_with("session.") => Err(format!(
-                "{other} needs a live session UI; not available in {} mode",
-                self.mode
+            other => Err(service_error(
+                ERR_METHOD_NOT_FOUND,
+                format!("{other} is not available in {} mode", self.mode),
             )),
-            "provider.register" => Err(format!(
-                "provider.register is not available in {} mode",
-                self.mode
-            )),
-            other => Err(format!("unknown host method {other}")),
         }
     }
 
-    async fn handle_event(&self, event: &str, payload: Value) {
-        if event == "log" {
-            let level = payload
-                .get("level")
-                .and_then(Value::as_str)
-                .unwrap_or("info");
-            let message = payload.get("message").and_then(Value::as_str).unwrap_or("");
-            match level {
-                "error" => tracing::error!(target: "tack_ext::plugin", "{message}"),
-                "warn" => tracing::warn!(target: "tack_ext::plugin", "{message}"),
-                "debug" => tracing::debug!(target: "tack_ext::plugin", "{message}"),
-                _ => tracing::info!(target: "tack_ext::plugin", "{message}"),
+    async fn handle_notification(&self, method: &str, payload: Value) {
+        match method {
+            "logs/emit" => {
+                let level = payload
+                    .get("level")
+                    .and_then(Value::as_str)
+                    .unwrap_or("info");
+                let message = payload.get("message").and_then(Value::as_str).unwrap_or("");
+                match level {
+                    "error" => tracing::error!(target: "tack_ext::plugin", "{message}"),
+                    "warn" | "warning" => tracing::warn!(target: "tack_ext::plugin", "{message}"),
+                    "debug" => tracing::debug!(target: "tack_ext::plugin", "{message}"),
+                    _ => tracing::info!(target: "tack_ext::plugin", "{message}"),
+                }
             }
+            "warnings/emit" => {
+                let message = payload.get("message").and_then(Value::as_str).unwrap_or("");
+                tracing::warn!(target: "tack_ext::plugin", "plugin warning: {message}");
+            }
+            // widgets/update: headless modes accept and ignore widget
+            // state (widgets are best-effort UI, never load-bearing).
+            _ => {}
         }
-        // widget.update: headless modes accept and ignore widget state (the
-        // protocol contract — widgets are best-effort UI, never load-bearing).
     }
 }
 
@@ -180,10 +202,10 @@ mod tests {
     async fn exec_requires_trust() {
         let services = HeadlessExtServices::new("print", false);
         let err = services
-            .handle_request("exec", serde_json::json!({"command": "echo hi"}))
+            .handle_request("exec/run", serde_json::json!({"command": "echo hi"}))
             .await
             .unwrap_err();
-        assert!(err.contains("trust"), "{err}");
+        assert_eq!(err.code, ERR_POLICY_DENIED);
     }
 
     #[tokio::test]
@@ -191,8 +213,8 @@ mod tests {
         let services = HeadlessExtServices::new("print", true);
         let value = services
             .handle_request(
-                "exec",
-                serde_json::json!({"command": "echo hi", "timeout_ms": 5000}),
+                "exec/run",
+                serde_json::json!({"command": "echo hi", "timeoutMs": 5000}),
             )
             .await
             .unwrap();
@@ -203,14 +225,14 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn exec_timeout_kills_the_child() {
-        // F19: a timed-out exec must not leave the shell (or its children)
+        // A timed-out exec must not leave the shell (or its children)
         // running — the timeout branch kills the process tree and reaps it.
         let services = HeadlessExtServices::new("print", true);
         let started = std::time::Instant::now();
         let value = services
             .handle_request(
-                "exec",
-                serde_json::json!({"command": "sleep 60", "timeout_ms": 300}),
+                "exec/run",
+                serde_json::json!({"command": "sleep 60", "timeoutMs": 300}),
             )
             .await
             .unwrap();
@@ -226,41 +248,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interactive_ui_is_an_explicit_error() {
+    async fn interactive_ui_is_capability_not_granted() {
         let services = HeadlessExtServices::new("rpc", true);
-        for method in ["ui.select", "ui.confirm", "ui.input"] {
+        for method in ["ui/select", "ui/confirm", "ui/input"] {
             let err = services
                 .handle_request(method, serde_json::json!({}))
                 .await
                 .unwrap_err();
-            assert!(err.contains("rpc mode"), "{method}: {err}");
+            assert_eq!(err.code, ERR_CAPABILITY_NOT_GRANTED, "{method}");
+            assert!(err.message.contains("rpc mode"), "{method}: {err:?}");
         }
-        // notify / set_status degrade silently.
+        // notify degrades silently.
         services
-            .handle_request("ui.notify", serde_json::json!({"message": "hi"}))
-            .await
-            .unwrap();
-        services
-            .handle_request("ui.set_status", serde_json::json!({"text": "x"}))
+            .handle_request("ui/notify", serde_json::json!({"message": "hi"}))
             .await
             .unwrap();
     }
 
     #[tokio::test]
-    async fn session_control_and_provider_register_are_errors() {
+    async fn session_control_and_provider_register_are_method_not_found() {
         let services = HeadlessExtServices::new("acp", true);
         let err = services
-            .handle_request(
-                "session.send_user_message",
-                serde_json::json!({"text": "x"}),
-            )
+            .handle_request("session/sendUserMessage", serde_json::json!({"text": "x"}))
             .await
             .unwrap_err();
-        assert!(err.contains("acp mode"), "{err}");
+        assert_eq!(err.code, ERR_METHOD_NOT_FOUND);
+        assert!(err.message.contains("acp mode"), "{err:?}");
         let err = services
-            .handle_request("provider.register", serde_json::json!({}))
+            .handle_request("host/registerProvider", serde_json::json!({}))
             .await
             .unwrap_err();
-        assert!(err.contains("acp mode"), "{err}");
+        assert_eq!(err.code, ERR_METHOD_NOT_FOUND);
     }
 }

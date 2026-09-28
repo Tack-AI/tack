@@ -10,7 +10,7 @@ impl TuiApp {
         &mut self,
         request: crate::extension_host::ExtUiRequest,
     ) {
-        use tack_ext::protocol;
+        use tack_ext::rpc3 as protocol;
         let crate::extension_host::ExtUiRequest {
             method,
             params,
@@ -22,34 +22,29 @@ impl TuiApp {
         // that tool call, and overwriting pending_ext_ui strands the earlier
         // plugin's responder. Decline with a busy error instead — the same
         // policy as the McpElicitation arm in mod.rs.
-        if matches!(method.as_str(), "ui.select" | "ui.confirm" | "ui.input")
+        if matches!(method.as_str(), "ui/select" | "ui/confirm" | "ui/input")
             && (self.dialog.is_some() || self.pending_ext_ui.is_some())
         {
             let _ = respond.send(Err("ui busy: a dialog is already open".to_string()));
             return;
         }
         match method.as_str() {
-            "ui.notify" => {
-                let parsed: protocol::NotifyParams =
-                    serde_json::from_value(params).unwrap_or(protocol::NotifyParams {
+            "ui/notify" => {
+                let parsed: protocol::UiNotifyParams =
+                    serde_json::from_value(params).unwrap_or(protocol::UiNotifyParams {
                         message: "(bad notify params)".to_string(),
-                        level: "warning".to_string(),
+                        level: Some(protocol::LogLevel::Warning),
                     });
-                let kind = match parsed.level.as_str() {
-                    "warning" => NoticeKind::Warning,
-                    "error" => NoticeKind::Error,
+                let kind = match parsed.level {
+                    Some(protocol::LogLevel::Warning) => NoticeKind::Warning,
+                    Some(protocol::LogLevel::Error) => NoticeKind::Error,
                     _ => NoticeKind::Info,
                 };
                 self.notice(parsed.message, kind);
                 let _ = respond.send(Ok(serde_json::Value::Null));
             }
-            "ui.set_status" => {
-                let parsed: Option<protocol::SetStatusParams> = serde_json::from_value(params).ok();
-                self.ext_label = parsed.and_then(|p| p.text);
-                let _ = respond.send(Ok(serde_json::Value::Null));
-            }
-            "ui.select" => {
-                let parsed: Result<protocol::SelectParams, _> = serde_json::from_value(params);
+            "ui/select" => {
+                let parsed: Result<protocol::UiSelectParams, _> = serde_json::from_value(params);
                 match parsed {
                     Ok(parsed) if !parsed.options.is_empty() => {
                         let items = parsed
@@ -75,8 +70,8 @@ impl TuiApp {
                     }
                 }
             }
-            "ui.confirm" => {
-                let parsed: Result<protocol::ConfirmParams, _> = serde_json::from_value(params);
+            "ui/confirm" => {
+                let parsed: Result<protocol::UiConfirmParams, _> = serde_json::from_value(params);
                 match parsed {
                     Ok(parsed) => {
                         use tack_tui::components::select_list::SelectItem;
@@ -97,8 +92,8 @@ impl TuiApp {
                     }
                 }
             }
-            "ui.input" => {
-                let parsed: Result<protocol::InputParams, _> = serde_json::from_value(params);
+            "ui/input" => {
+                let parsed: Result<protocol::UiInputParams, _> = serde_json::from_value(params);
                 match parsed {
                     Ok(parsed) => {
                         self.pending_ext_ui = Some(("input".to_string(), respond));
@@ -113,8 +108,8 @@ impl TuiApp {
                     }
                 }
             }
-            "exec" => {
-                let parsed: Result<protocol::ExecParams, _> = serde_json::from_value(params);
+            "exec/run" => {
+                let parsed: Result<protocol::ExecRunParams, _> = serde_json::from_value(params);
                 match parsed {
                     Ok(parsed) => {
                         // Shell exec can run up to timeout_ms — never
@@ -130,9 +125,13 @@ impl TuiApp {
                     }
                 }
             }
-            "provider.register" => {
+            "host/registerProvider" => {
+                let provider = params
+                    .get("provider")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 let parsed: Result<tack_ai::providers::RuntimeProviderSpec, _> =
-                    serde_json::from_value(params);
+                    serde_json::from_value(provider);
                 match parsed {
                     Ok(spec) => {
                         let id = spec.id.clone();
@@ -154,11 +153,11 @@ impl TuiApp {
                         }
                     }
                     Err(e) => {
-                        let _ = respond.send(Err(format!("bad provider.register params: {e}")));
+                        let _ = respond.send(Err(format!("bad host/registerProvider params: {e}")));
                     }
                 }
             }
-            method if method.starts_with("session.") => {
+            method if method.starts_with("session/") => {
                 let result = self.handle_ext_session_method(method, params).await;
                 let _ = respond.send(result);
             }
@@ -168,19 +167,22 @@ impl TuiApp {
         }
     }
 
-    /// Plugin session-control methods (tack-ext `session.*`), executed on the
-    /// TUI main loop.
+    /// Plugin session methods (tack-RPC v3 `session/*`), executed on the
+    /// TUI main loop. The v3 surface is deliberately small: session/get +
+    /// session/sendUserMessage.
     async fn handle_ext_session_method(
         &mut self,
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         match method {
-            "session.get_info" => {
+            "session/get" => {
                 let context = self.state.session.build_session_context();
                 Ok(serde_json::json!({
                     "sessionId": self.state.session.session_id(),
+                    "mode": "tui",
                     "cwd": self.cwd.to_string_lossy(),
+                    "trusted": true,
                     "provider": self.state.model.provider,
                     "modelId": self.state.model.id,
                     "thinking": self.state.thinking.map(|t| t.as_str()).unwrap_or("off"),
@@ -188,76 +190,11 @@ impl TuiApp {
                     "running": self.running,
                 }))
             }
-            "session.new" => {
-                self.run_command("new").await;
-                Ok(serde_json::Value::Null)
-            }
-            "session.switch" => {
-                let arg = params
-                    .get("session")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or("session.switch needs {session: path|id}")?;
-                let dir = tack_session::default_session_dir(&self.cwd, &self.agent_dir);
-                let path = tack_session::resolve_session_arg(arg, &dir)
-                    .ok_or_else(|| format!("no session matching {arg:?}"))?;
-                let session = SessionManager::open(&path, Some(dir)).map_err(|e| e.to_string())?;
-                self.state.session = session;
-                self.replay_transcript();
-                Ok(serde_json::Value::Null)
-            }
-            "session.branch" => {
-                let entry_id = params
-                    .get("entryId")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or("session.branch needs {entryId}")?;
-                self.summarize_abandoned_branch(entry_id).await;
-                self.state
-                    .session
-                    .branch(entry_id)
-                    .map_err(|e| e.to_string())?;
-                self.replay_transcript();
-                Ok(serde_json::Value::Null)
-            }
-            "session.set_model" => {
-                let provider = params
-                    .get("provider")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or("session.set_model needs {provider, modelId}")?;
-                let model_id = params
-                    .get("modelId")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or("session.set_model needs {provider, modelId}")?;
-                self.apply_select(
-                    commands::SelectPurpose::Model,
-                    &format!("{provider}/{model_id}"),
-                )
-                .await;
-                Ok(serde_json::Value::Null)
-            }
-            "session.set_thinking" => {
-                let level = params
-                    .get("level")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or("session.set_thinking needs {level}")?;
-                self.apply_thinking(level).await;
-                Ok(serde_json::Value::Null)
-            }
-            "session.set_name" => {
-                let name = params
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or("session.set_name needs {name}")?;
-                self.state
-                    .session
-                    .append_session_info(Some(name.to_string()))
-                    .map_err(|e| e.to_string())?;
-                Ok(serde_json::Value::Null)
-            }
-            "session.send_user_message" => {
+            "session/sendUserMessage" => {
                 let text = params
                     .get("text")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or("session.send_user_message needs {text}")?;
+                    .ok_or("session/sendUserMessage needs {text}")?;
                 if text.trim().is_empty() {
                     return Err("empty message".to_string());
                 }

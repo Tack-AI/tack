@@ -321,6 +321,49 @@
         },
         "required": ["id", "trigger"]
       },
+      "StatusStyle": {
+        "description": "Status line segment style.",
+        "type": "string",
+        "enum": ["default", "info", "warning", "error", "dim"]
+      },
+      "StatusLineState": {
+        "description": "State of a statusLineSegment widget (widget initial state and widgets/update state for that kind). Empty text hides the segment; the host truncates to one line.",
+        "type": "object",
+        "properties": {
+          "text": { "type": "string" },
+          "style": { "$ref": "#/components/schemas/StatusStyle" },
+          "tooltip": { "type": "string" }
+        },
+        "required": ["text"]
+      },
+      "MarkdownPanelState": {
+        "description": "State of a markdownPanel widget: markdown source rendered with the host's markdown pipeline.",
+        "type": "object",
+        "properties": {
+          "markdown": { "type": "string" }
+        },
+        "required": ["markdown"]
+      },
+      "ListPanelItem": {
+        "description": "One item in a listPanel widget.",
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "label": { "type": "string" },
+          "detail": { "type": "string" },
+          "icon": { "type": "string" }
+        },
+        "required": ["id", "label"]
+      },
+      "ListPanelState": {
+        "description": "State of a listPanel widget. The host renders the selection; a user pick is reported back as widgets/action with action select.",
+        "type": "object",
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/ListPanelItem" } },
+          "selectedId": { "type": "string" }
+        },
+        "required": ["items"]
+      },
       "ConfigDeclaration": {
         "description": "Per-plugin configuration declaration: a JSON Schema the host validates settings plugins.\"<id>\".config against at load time.",
         "type": "object",

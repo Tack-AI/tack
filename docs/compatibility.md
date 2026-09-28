@@ -173,35 +173,40 @@ the version per the ACP spec. ACP-side breaking changes arrive only via
 upstream crate upgrades, are called out in the CHANGELOG, and are tracked
 in `docs/upstream-alignment.md` (§5).
 
-### 2.5 Extension protocols — `tack-ext` & `tack-ext-wasm` (tier: versioned)
+### 2.5 Extension protocols — tack-RPC & the WASM carrier (tier: versioned)
 
 **Current state (evidence).**
 
-- Subprocess plugins speak NDJSON over stdio — one JSON object per line,
-  three envelope kinds (`request` / `response` / `event`) — defined in
-  `crates/tack-ext/src/protocol.rs`. `PROTOCOL_VERSION: u32 = 1` ("bump on
-  breaking changes").
-- **Version handshake exists**: the host sends `initialize` carrying
-  `protocol`, `mode`, `cwd`, trust state; the plugin answers with a
-  `register` event carrying an optional `protocol`
-  (`crates/tack-ext/src/protocol.rs`). Enforcement in
-  `crates/tack-ext/src/process.rs`: a plugin requiring a **newer** protocol
-  is rejected with "upgrade the host"; a plugin speaking an **older**
-  protocol loads with a warning; a plugin reporting **no** version
-  (pre-versioning plugins) loads with a warning, assumed compatible.
-- `crates/tack-ext-wasm` is a wasmtime (WASI preview1) carrier for the
-  **same NDJSON protocol** — "v2" refers to the carrier, not a wire
-  version; a `.wasm` plugin speaks the identical protocol over its
-  stdin/stdout pipe (`crates/tack-ext-wasm/src/lib.rs`).
+- Plugins (process or WASI carrier) speak **tack-RPC v3**: JSON-RPC 2.0
+  over NDJSON stdio, defined by the OpenRPC document
+  `protocol/tack-rpc.openrpc.json` (the single source of truth; Rust types
+  in `crates/tack-ext/src/rpc3.rs` and the TS/Python SDK types are
+  generated from it by `cargo run -p xtask -- codegen`, freshness-checked
+  in CI).
+- **Version handshake**: the host sends `initialize` with a semver
+  `protocolVersion` ("3.0.0"); compatibility requires the same major
+  version and a minor not newer than the host's
+  (`crates/tack-ext/src/v3/mod.rs`).
+- The v1/v2 NDJSON protocol (`{"type":"request|response|event"}`) was
+  **removed** in the v3 release: the host no longer speaks it, and the
+  lifecycle surface was deliberately reduced (`session/*` is
+  `session/get` + `session/sendUserMessage`; plugin-registered shortcuts
+  and `ui.set_status` were dropped; lifecycle event names are now
+  camelCase).
+- Lockfiles: `extensions-lock.json` v1 is upgraded in memory on read
+  (bare-name keys become `name@user`, `store: false`) and rewritten as v2
+  on the next install/upgrade. The legacy flat `extensions/<name>/`
+  layout keeps loading as `name@user`; new installs land in the versioned
+  store (`extensions/store/<source>/<name>/<version>/`).
 
 **Commitment.**
 
-- Extension protocol v1 is additive: new methods, events, and optional
-  payload fields are minor-release changes on both sides (host must
-  tolerate unknown plugin requests, plugins must tolerate unknown events).
-- A breaking wire change bumps `PROTOCOL_VERSION` and follows §4.3; the
-  existing "reject newer, warn on older" handshake is the compatibility
-  mechanism and must keep working for mixed-version host/plugin pairs.
+- tack-RPC is additive within a major version: new methods, notifications,
+  and optional fields are minor-release changes on both sides (peers must
+  tolerate unknown methods/notifications and unknown fields).
+- A breaking wire change bumps the major protocol version and follows
+  §4.3; the semver handshake (same major, peer minor ≤ host minor) is the
+  compatibility mechanism and must keep working for mixed-version pairs.
 
 ### 2.6 Hooks (tier: versioned, upstream-following)
 

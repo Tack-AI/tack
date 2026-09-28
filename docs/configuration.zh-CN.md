@@ -209,7 +209,9 @@ Tack 从四级读取配置，**后加载的层级覆盖先加载的**（部分�
 | `prompts` | 额外 prompt 模板目录 |
 | `themes` | 额外主题目录 |
 
-另：`extensionLockRequired`（bool，默认 `true`）——扩展供应链锁定：用户目录下经 `ext install` 安装的插件在启动时校验 git HEAD 与 `extensions-lock.json` 中的 resolvedCommit，不一致则 warn 并跳过该插件；设为 `false` 时仅 warn 仍加载。无 lock 条目的插件不受影响（见 docs/extensions.md §1c）。managed 层可双向强制该值。
+另：`extensionLockRequired`（bool，默认 `true`）——扩展供应链锁定：用户目录下经 `ext install` 安装的插件在启动时校验 git HEAD 与 `extensions-lock.json` 中的 resolvedCommit，不一致则 warn 并跳过该插件；设为 `false` 时仅 warn 仍加载。无 lock 条目的插件不受影响（见 docs/extensions.zh-CN.md §1c）。managed 层可双向强制该值。
+
+另：`plugins`（对象）——按插件 id（`name@source`，见 docs/plugin-roadmap.zh-CN.md）设置的插件级配置。目前唯一的插件级键是 `enabled`（bool，默认 `true`）：被禁用的插件保持安装但不会被拉起（其元数据仍在 `ext list` 中可见）。可用 `tack ext enable|disable <id>` 管理，也可直接编辑配置文件。
 
 ### Managed 层专属键
 

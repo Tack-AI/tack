@@ -372,17 +372,8 @@ impl TuiApp {
         self.editor.set_text(&preview);
     }
 
-    /// Global keybindings: plugin-registered shortcuts first (a plugin may
-    /// override), then the app actions. Returns true when consumed.
+    /// Global keybindings. Returns true when consumed.
     async fn handle_global_key(&mut self, key: &tack_tui::KeyEvent) -> bool {
-        // tack-ext: plugin-registered shortcuts fire first (plugin may override).
-        let ext_actions = self.extensions.shortcut_actions();
-        for (action, plugin_index) in ext_actions {
-            if self.kb.matches(&action, key) {
-                self.extensions.notify_shortcut(plugin_index, &action).await;
-                return true;
-            }
-        }
         if self.kb.matches("app.interrupt", key) {
             self.handle_escape().await;
             return true;
@@ -467,7 +458,7 @@ impl TuiApp {
                 .extensions
                 .widgets()
                 .iter()
-                .any(|w| w.spec.kind != tack_ext::WidgetKind::StatusLineSegment)
+                .any(|w| w.spec.r#type != tack_ext::rpc3::WidgetKind::StatusLineSegment)
             {
                 self.ext_panels_hidden = !self.ext_panels_hidden;
                 if self.ext_panels_hidden {

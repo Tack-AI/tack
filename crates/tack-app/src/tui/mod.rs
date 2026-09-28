@@ -172,7 +172,7 @@ pub enum AppEvent {
     #[cfg(feature = "ext")]
     ExtWidgetUpdate {
         plugin: String,
-        update: tack_ext::WidgetUpdatePayload,
+        update: tack_ext::rpc3::WidgetUpdateParams,
     },
     /// v2.1: a plugin's peer hit EOF — drop its widgets (no UI residue).
     ExtPluginDead(String),
@@ -825,8 +825,11 @@ impl TuiApp {
         // tack-ext: a dead plugin's widgets vanish (peer EOF → AppEvent).
         #[cfg(feature = "ext")]
         for plugin in &app.extensions.plugins {
-            let peer = plugin.handle.peer().clone();
-            let name = plugin.name.clone();
+            let Some(handle) = &plugin.handle else {
+                continue;
+            };
+            let peer = handle.peer().clone();
+            let name = plugin.id.to_string();
             let tx = app.event_tx.clone();
             crate::extension_host::watch_plugin_death(peer, move || {
                 let _ = tx.send(AppEvent::ExtPluginDead(name));
@@ -1239,16 +1242,6 @@ impl TuiApp {
                 }
             });
         }
-        // tack-ext: register plugin shortcuts into the keybinding registry.
-        #[cfg(feature = "ext")]
-        for plugin in &self.extensions.plugins {
-            for shortcut in &plugin.register.shortcuts {
-                self.kb.register(
-                    &shortcut.action,
-                    &shortcut.keys.iter().map(String::as_str).collect::<Vec<_>>(),
-                );
-            }
-        }
         self.welcome_banner();
         // Startup update check: background GitHub query (24h cache; skipped
         // offline / when settings updateCheck is false). Never blocks.
@@ -1516,7 +1509,7 @@ impl TuiApp {
     /// Test helper: register an ext widget without a running plugin.
     #[cfg(feature = "ext")]
     #[doc(hidden)]
-    pub fn test_register_ext_widget(&mut self, plugin: &str, spec: tack_ext::WidgetSpec) {
+    pub fn test_register_ext_widget(&mut self, plugin: &str, spec: tack_ext::rpc3::WidgetSpec) {
         self.extensions.test_insert_widget(plugin, spec);
     }
 
@@ -1657,9 +1650,10 @@ impl TuiApp {
                     // list-panel selection cursor on each update.
                     let key = format!("{plugin}:{}", update.id);
                     if let Some(widget) = self.extensions.widgets().iter().find(|w| w.key == key)
-                        && widget.spec.kind == tack_ext::WidgetKind::ListPanel
+                        && widget.spec.r#type == tack_ext::rpc3::WidgetKind::ListPanel
                         && let Some(state) = widget.state.clone()
-                        && let Ok(state) = serde_json::from_value::<tack_ext::ListPanelState>(state)
+                        && let Ok(state) =
+                            serde_json::from_value::<tack_ext::rpc3::ListPanelState>(state)
                         && let Some(selected_id) = state.selected_id
                         && let Some(pos) = state.items.iter().position(|i| i.id == selected_id)
                     {

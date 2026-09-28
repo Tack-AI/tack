@@ -158,32 +158,36 @@ Rust workspace 的各个 crate **不发布到 crates.io**，也不提供 semver
 ACP 侧的破坏性变更只通过上游 crate 升级进入，会在 CHANGELOG 中
 明确指出，并在 `docs/upstream-alignment.md`（§5）中跟踪。
 
-### 2.5 扩展协议 —— `tack-ext` 与 `tack-ext-wasm`（级别：版本化）
+### 2.5 扩展协议 —— tack-RPC 与 WASM 载体（级别：版本化）
 
 **当前状态（证据）。**
 
-- 子进程插件通过 stdio 说 NDJSON —— 每行一个 JSON 对象，三种信封
-  类型（`request` / `response` / `event`）—— 定义于
-  `crates/tack-ext/src/protocol.rs`。`PROTOCOL_VERSION: u32 = 1`
-  （"破坏性变更时提升"）。
-- **已存在版本握手**：宿主发送携带 `protocol`、`mode`、`cwd`、
-  信任状态的 `initialize`；插件以携带可选 `protocol` 的 `register`
-  事件应答（`crates/tack-ext/src/protocol.rs`）。强制执行位于
-  `crates/tack-ext/src/process.rs`：要求**更新**协议的插件会被
-  "请升级宿主"拒绝；说**更旧**协议的插件带警告加载；报告**无**
-  版本的插件（版本化之前的插件）带警告加载，按兼容处理。
-- `crates/tack-ext-wasm` 是**同一 NDJSON 协议**的 wasmtime
-  （WASI preview1）载体 —— "v2" 指载体而非线上版本；`.wasm` 插件
-  在其 stdin/stdout 管道上说完全相同的协议
-  （`crates/tack-ext-wasm/src/lib.rs`）。
+- 插件（进程或 WASI 载体）说 **tack-RPC v3**：NDJSON stdio 上的
+  JSON-RPC 2.0，由 OpenRPC 文档 `protocol/tack-rpc.openrpc.json`
+  定义（单一事实来源；`crates/tack-ext/src/rpc3.rs` 中的 Rust 类型与
+  TS/Python SDK 类型由 `cargo run -p xtask -- codegen` 从它生成，
+  CI 做新鲜度检查）。
+- **版本握手**：宿主在 `initialize` 中发送 semver
+  `protocolVersion`（"3.0.0"）；兼容要求 major 版本相同且对端
+  minor 不超过宿主（`crates/tack-ext/src/v3/mod.rs`）。
+- v1/v2 NDJSON 协议（`{"type":"request|response|event"}`）已在 v3
+  版本中**移除**：宿主不再说它，且生命周期面被刻意收缩
+  （`session/*` 只剩 `session/get` 与 `session/sendUserMessage`；
+  插件注册的快捷键与 `ui.set_status` 被移除；生命周期事件名改为
+  camelCase）。
+- 锁文件：`extensions-lock.json` v1 在读取时于内存中升级（裸名键
+  变为 `name@user`、`store: false`），并在下一次安装/升级时改写为
+  v2。旧版平铺 `extensions/<name>/` 布局继续以 `name@user` 加载；
+  新安装进入版本化 store
+  （`extensions/store/<source>/<name>/<version>/`）。
 
 **承诺。**
 
-- 扩展协议 v1 是只增的：新方法、事件和可选载荷字段在两侧都是
-  minor 版本变更（宿主必须容忍未知插件请求，插件必须容忍未知事件）。
-- 线上破坏性变更提升 `PROTOCOL_VERSION` 并遵循 §4.3；现有的"拒绝
-  更新者、警告更旧者"握手就是兼容机制，必须对混合版本的宿主/插件
-  组合持续有效。
+- tack-RPC 在同一 major 版本内只增：新方法、新通知与可选字段在两侧
+  都是 minor 版本变更（两端都必须容忍未知方法/通知与未知字段）。
+- 线上破坏性变更提升 major 协议版本并遵循 §4.3；semver 握手（major
+  相同、对端 minor ≤ 宿主 minor）就是兼容机制，必须对混合版本组合
+  持续有效。
 
 ### 2.6 Hooks（级别：版本化，跟随上游）
 

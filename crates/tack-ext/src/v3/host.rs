@@ -23,6 +23,7 @@ use crate::rpc3::{
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The host's view of one v3 plugin: typed calls host → plugin.
+#[derive(Clone)]
 pub struct HostClient {
     peer: Arc<JsonRpcPeer>,
 }

@@ -296,10 +296,6 @@ enum Command {
     },
     /// Compact the most recent session for this directory
     Compact,
-    /// Run a tiny built-in demo plugin (tack-ext protocol over stdio). Hidden:
-    /// used by tests and as a protocol reference implementation.
-    #[command(hide = true)]
-    ExtDemoPlugin,
     /// Probe terminal image protocols (kitty/iterm2/half-block). Hidden.
     #[command(hide = true)]
     DebugImage,
@@ -364,6 +360,23 @@ enum ExtCommand {
         /// Remove from the project's .pi/extensions instead of the user dir
         #[arg(short = 'l', long)]
         local: bool,
+    },
+    /// Enable a previously disabled extension (writes settings
+    /// `plugins."<id>".enabled=true`)
+    Enable {
+        /// Plugin id (`name@source`) or bare name when unambiguous
+        name: String,
+    },
+    /// Disable an extension without uninstalling it (new sessions skip it)
+    Disable {
+        /// Plugin id (`name@source`) or bare name when unambiguous
+        name: String,
+    },
+    /// Upgrade installed extensions by re-fetching their locked source
+    /// (no-op when the resolved commit is unchanged)
+    Upgrade {
+        /// Plugin id or bare name; omit to upgrade all git installs
+        name: Option<String>,
     },
     /// List installed extensions
     List,
@@ -668,16 +681,6 @@ async fn async_main() -> Result<()> {
             let cwd = std::env::current_dir()?;
             let code = tack_app::print_mode::run_compact(cwd).await?;
             std::process::exit(code);
-        }
-        Some(Command::ExtDemoPlugin) => {
-            #[cfg(feature = "ext")]
-            {
-                return tack_app::extension_host::run_demo_plugin().await;
-            }
-            #[cfg(not(feature = "ext"))]
-            {
-                anyhow::bail!("tack was built without extension support (feature `ext` disabled)");
-            }
         }
         Some(Command::DebugImage) => {
             return tack_app::debug_image::run();
@@ -1110,6 +1113,29 @@ async fn cmd_client(
 /// `tack ext ...`: manage tack-ext extensions (install/list/remove) and
 /// marketplaces.
 #[cfg(feature = "ext")]
+fn resolve_ext_id(
+    cwd: &std::path::Path,
+    agent_dir: &std::path::Path,
+    name: &str,
+) -> Result<String> {
+    if name.parse::<tack_ext::plugin_id::PluginId>().is_ok() {
+        return Ok(name.to_string());
+    }
+    let matches: Vec<String> = tack_app::extension_host::list_extensions(cwd, agent_dir)
+        .into_iter()
+        .filter(|info| info.id.starts_with(&format!("{name}@")))
+        .map(|info| info.id)
+        .collect();
+    match matches.len() {
+        0 => anyhow::bail!("no extension named {name:?} installed"),
+        1 => Ok(matches.into_iter().next().expect("one match")),
+        _ => anyhow::bail!(
+            "extension name {name:?} is ambiguous across sources; use the full id name@source"
+        ),
+    }
+}
+
+#[cfg(feature = "ext")]
 async fn cmd_ext(command: &ExtCommand) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let agent_dir = tack_session::default_agent_dir();
@@ -1158,13 +1184,41 @@ async fn cmd_ext(command: &ExtCommand) -> Result<()> {
             if extensions.is_empty() {
                 println!("no extensions installed");
             } else {
-                for (name, path, local) in extensions {
+                for info in extensions {
+                    let state = if info.enabled { "active" } else { "disabled" };
+                    let layout = if info.legacy { "legacy" } else { "store" };
                     println!(
-                        "{name}\t{}{}",
-                        path.display(),
-                        if local { " (project)" } else { "" }
+                        "{}\t{}\t{}\t{}\t{}",
+                        info.id,
+                        state,
+                        info.version,
+                        layout,
+                        info.dir.display()
                     );
                 }
+            }
+            Ok(())
+        }
+        ExtCommand::Enable { name } => {
+            let id = resolve_ext_id(&cwd, &agent_dir, name)?;
+            tack_app::extension_host::set_plugin_enabled(&agent_dir, &id, true)?;
+            println!("enabled {id}");
+            Ok(())
+        }
+        ExtCommand::Disable { name } => {
+            let id = resolve_ext_id(&cwd, &agent_dir, name)?;
+            tack_app::extension_host::set_plugin_enabled(&agent_dir, &id, false)?;
+            println!("disabled {id}");
+            Ok(())
+        }
+        ExtCommand::Upgrade { name } => {
+            let outcomes =
+                tack_app::extension_host::upgrade_extensions(&agent_dir, name.as_deref())?;
+            if outcomes.is_empty() {
+                println!("nothing to upgrade");
+            }
+            for (id, outcome) in outcomes {
+                println!("{id}\t{outcome}");
             }
             Ok(())
         }

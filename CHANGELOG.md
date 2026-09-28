@@ -6,6 +6,32 @@ notice can parse entries (same convention as TS pi).
 
 ## [Unreleased]
 
+### Changed
+
+- **Plugin system rework (redesign P3): the ExtensionManager now speaks
+  tack-RPC v3** and the v1/v2 NDJSON protocol is removed. Plugins are
+  identified as `name@source` (marketplace name, or reserved
+  `user`/`project`/`local`); installs land in a versioned store
+  (`~/.tack/agent/extensions/store/<source>/<name>/<version>/`, active =
+  `local` else highest semver) with atomic stage-verify-swap-rollback
+  installs and fingerprint-idempotent upgrades. The lockfile is v2 (v1
+  auto-upgraded in memory: bare keys become `name@user`); legacy flat
+  `extensions/<name>/` installs keep loading. Load failures are
+  first-class state (`LoadedPlugin{id, enabled, error}` — broken or
+  disabled plugins are visible in `ext list` instead of vanishing). New
+  CLI: `tack ext enable|disable <id>` (persisted as settings
+  `plugins."<id>".enabled`), `tack ext upgrade [id]`, richer `ext list`
+  (id/state/version/layout). New manifest fields: `version` (semver,
+  becomes the store version), `failMode` (hook failures block). Git
+  installs/upgrades run with a scrubbed git environment.
+- Deliberate surface reductions with the v3 switch: plugin-registered
+  shortcuts, `ui.set_status`, and the v1 `session.*` control methods are
+  gone (v3 keeps `session/get` + `session/sendUserMessage`); lifecycle
+  event names are camelCase now (`agentStart`, `turnEnd`, …). The hidden
+  `tack ext-demo-plugin` command and the v1 example extensions
+  (hello-js, git-checkpoint, handoff, protected-paths) were removed; the
+  WASM examples were ported to v3.
+
 ### Added
 
 - tack-RPC v3 groundwork (plugin system redesign P0, see

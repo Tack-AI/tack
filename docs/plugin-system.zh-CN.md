@@ -100,41 +100,66 @@ LLM 评估经独立的 provider 适配器（不经扩展事件通道，不对插
   `additionalContext` 累加。
 - **一切 fail-open**：hook 失败/超时/坏 JSON 只产生警告，永不卡住 agent。
 
-## 3. tack-ext 长驻插件（process + WASM 载体）
+## 3. tack-RPC v3 长驻插件（process + WASM 载体）
 
-插件是独立进程（或 WASM 模块），stdio 上跑 NDJSON 协议（request /
-response / event 三种 envelope，30s 调用超时，崩溃隔离）。
+插件是讲 **tack-RPC v3** 的独立进程（或 WASM 模块）：NDJSON stdio 上
+的 JSON-RPC 2.0（双向并发请求、`$/cancelRequest`、30s 调用超时、崩
+溃隔离）。协议的单一事实来源是
+[`protocol/tack-rpc.openrpc.json`](../protocol/tack-rpc.openrpc.json)；
+宿主类型（`tack_ext::rpc3`）与 TypeScript、Python SDK 的类型都从它
+生成，三个 SDK 共享一份 schema。
 
 ### 3.1 能力面
 
-| 方向 | 方法/事件 |
+插件在 `initialize` 握手时声明**相互独立、全部可选**的能力；未声明
+的能力宿主从不调用（必须应答时返回 `ERR_CAPABILITY_NOT_GRANTED`）。
+
+| 方向 | 方法/通知 |
 |---|---|
-| host → 插件 | `tool.execute`、`command.invoke`、`intercept.tool_call`（allow/deny/**rewrite**）、`intercept.context`（订阅 `"context"` 门控，可替换完整消息列表）、生命周期事件（session/agent/turn/message/tool_execution/model_select/provider 边界…） |
-| 插件 → host | `ui.notify/select/confirm/input/set_status`（TUI 对话框）、`session.*`（new/switch/branch/set_model/send_user_message…）、`exec`（trust 门控）、`provider.register`（动态注册 LLM provider）、`log` |
+| 宿主 → 插件 | `tools/execute`、`commands/invoke`、`hooks/beforeToolCall`（allow/deny/**rewrite**）、`hooks/transformContext`（整体替换上下文）、`hooks/afterToolCall`（按字段结果补丁）、`approval/review`（审批链）、`autocomplete/provide`、`events/lifecycle`（订阅门控）、`widgets/action` |
+| 插件 → 宿主 | `ui/notify/select/confirm/input`（TUI 对话框）、`session/get`、`session/sendUserMessage`、`snapshot/get`（只读摘要）、`config/get`、`exec/run`（信任门控）、`host/registerProvider`（LLM provider 桥）、`widgets/update`、`logs/emit`、`warnings/emit` |
 
-### 3.1b 运行模式与 headless 降级
+SDK 覆盖 Rust（`tack-ext-sdk`）、TypeScript（`@tack/plugin`）、
+Python（`tack-plugin`）；`tack ext new` 生成任一脚手架，
+`tack ext dev`/`ext test` 用 mock-host 场景文件驱动插件，无需会话。
 
-四种运行模式都加载插件（见 §6 矩阵）。非 TUI 模式（print/rpc/acp）用
-headless HostServices：工具、拦截、生命周期事件、`exec`（trust 门控）
-照常工作；需要终端 UI 的请求**确定性降级**——`ui.notify`/`ui.set_status`
-进日志，`ui.select/confirm/input` 返回错误，`session.*`/`provider.register`
-返回错误。插件从 `initialize.payload.mode` 得知宿主模式，不得把交互
-请求当成正确性依赖。
+### 3.1b 运行模式与无头降级
 
-### 3.2 两种载体
+四种运行模式都加载插件（矩阵见 §6）。非 TUI 模式（print/rpc/acp）
+确定性降级：工具、拦截、生命周期事件、`exec/run`（信任门控）照常；
+`ui/select|confirm|input` 返回 `ERR_CAPABILITY_NOT_GRANTED`；
+`session/*` 与 `host/registerProvider` 返回
+`ERR_METHOD_NOT_FOUND`；`ui/notify` 进日志。插件从 initialize
+payload 的 `mode` 与 `capabilities` 获知当前模式与可用表面。
+
+### 3.2 身份、加载结果与 store
+
+每个插件有稳定的 id **`name@source`**（市场名，或保留的
+`user`/`project`/`local` 来源）。安装进入版本化 store
+（`extensions/store/<source>/<name>/<version>/`；激活 = 有 `local`
+优先，否则最高 semver），安装/升级原子 staging/交换可回滚，锁文件
+v2 锁定并做漂移检查。`plugins."<id>".enabled` 不卸载即可禁用；
+`tack ext enable|disable|upgrade|list` 负责管理。
+
+加载失败是**一等状态**：manager 把每个发现的插件以
+`LoadedPlugin { id, enabled, error, … }` 返回，所有消费方按
+`is_active()` 过滤——坏插件出现在 `ext list`/doctor 中，而不是带
+着一行日志消失（Codex 的 `PluginLoadOutcome` 模式）。
+
+### 3.3 两种载体
 
 | | process（默认） | wasm |
 |---|---|---|
-| 插件形态 | 任意可执行文件 | WASI p1 模块（`.wasm`/`.wat`） |
-| 协议 | NDJSON over stdio，握手 `protocol: 1` | **同一 schema**，握手 `protocol: 2` |
-| 隔离 | 进程边界 | wasmtime 沙箱：无 fs/网络/环境变量 |
-| 资源限制 | 无（trust 门控） | fuel + epoch 墙钟 + 内存硬上限（manifest `limits`） |
-| 能力授予 | —（进程天然全权限） | manifest `capabilities` 显式声明：fs preopen（ro/rw）、env（字面量或 host 透传）、args、network 标志（p1 暂 inert）；加载时审计日志 |
+| 插件形态 | 任意可执行体 | WASI p1 模块（`.wasm`/`.wat`） |
+| 协议 | **stdio 上的 tack-RPC v3**（同一 schema） | 相同 |
+| 隔离 | 进程边界 | wasmtime 沙箱：无文件系统/网络/环境变量 |
+| 资源限制 | 无（信任门控） | fuel + epoch 墙钟 + 内存硬上限（manifest `limits`，宿主钳制） |
+| 能力授权 | —（进程天然全权限） | manifest `capabilities` 显式声明：fs preopen（ro/rw）、env（字面量或宿主透传）、args；加载时记审计日志 |
 
-WASM 载体复用同一个 `PluginPeer`（传输层抽象为 AsyncRead/AsyncWrite），
-握手、超时、死插件 fail-fast 语义与子进程完全一致。示例：
-[`examples/extensions/hello-wasm/`](../examples/extensions/hello-wasm/)
-（手写 WAT 的协议参考实现）。
+两种载体共享同一个 `JsonRpcPeer`（传输层抽象为
+AsyncRead/AsyncWrite）：握手、超时、取消、死插件 fail-fast 语义完全
+一致。示例：[`examples/extensions/hello-wasm/`](../examples/extensions/hello-wasm/)
+（手写 WAT 的 v3 协议参考实现）。
 
 ## 4. 分发：bundle + marketplace
 
@@ -213,31 +238,34 @@ tack ext marketplace remove acme
 
 | 示例 | 演示 |
 |---|---|
-| `examples/extensions/hello-js/` | 最小子进程插件（Node） |
-| `examples/extensions/hello-wasm/` | **WASM 沙箱插件**（手写 WAT，协议参考） |
+| `crates/tack-ext-sdk/examples/hello_rpc3.rs` | 最小 Rust SDK 插件 |
+| `tack-v3-demo-plugin`（tack-ext-sdk bin） | 全功能 fixture：工具、命令、hooks、事件、widget、自动补全 |
+| `sdk/typescript` / `sdk/python` | TS/Python SDK 包及其 e2e 测试 |
+| `examples/extensions/hello-wasm/` | **WASM 沙箱插件**（手写 WAT，v3 协议参考） |
 | `examples/extensions/hello-wasm-caps/` | **WASM 能力授予**（fs preopen 演示 readfile；无授予则 errno） |
-| `examples/extensions/git-checkpoint/` | 事件 + exec + 命令 |
-| `examples/extensions/protected-paths/` | tool_call 拦截 |
-| `examples/extensions/handoff/` | 会话控制 |
-| `tack ext-demo-plugin` | 内置最小协议实现（e2e fixture） |
+| `tack ext new <dir> <rust|ts|python>` | 带起步场景的脚手架 |
 
 ## 8. 测试与现状
 
 - hooks 引擎：20+ 个测试（配置双格式解析、Claude verdict 协议、matcher、
   exit-2/超时杀进程、updatedInput 合并、permissionDecision 记录与消费）
-- tack-ext：40+ 个测试（含 intercept.context 替换/门控）
-- WASM 载体（tack-ext-wasm）：9 个测试（握手 + tool.execute e2e、fuel/epoch
-  墙钟/内存/表/实例上限拒绝、示例 WAT）+ ExtensionManager 加载 e2e
-  （wasm 插件 + bundle 收集）
-- tack-app 全量：230+ lib 测试 + 集成套件全绿
+- tack-RPC v3（`tack_ext::v3` + `tack-ext-sdk`）：peer 往返、取消、超时、
+  死插件 fail-fast，12 个 SDK e2e（握手、verdict、能力门控、宿主服务、
+  关闭）+ TS（7）与 Python（8）SDK e2e
+- WASM 载体（tack-ext-wasm）：20 个测试（v3 握手 + tools/execute e2e、
+  fuel/epoch/内存/表/实例上限、能力授权、示例 WAT）
+- 扩展宿主（tack-app）：身份/发现、store 布局、原子安装/升级/校验、
+  锁文件 v2、启用/禁用、市场签名、加载结果（失败/禁用插件）、widget
+  注册表、bundle 资源、wasm e2e
+- tack-app 全量：410+ lib 测试 + 集成套件全绿
 
 **明确未做**：
 
-- 上游 TS pi 扩展的直接兼容（进程内 ExtensionAPI 与 NDJSON 协议是两种
+- 上游 TS pi 扩展的直接兼容（进程内 ExtensionAPI 与 RPC 协议是两种
   世界；可行的路径是 Node sidecar 扩展宿主，未立项）
 - `SubagentStart` 事件发射、ACP 模式的 hooks 引擎接线（ACP 插件可用，
   但不跑 shell hooks）
 - 热重载（插件工具/hooks 在会话启动时织入 agent loop，热替换成本远超
   收益；用 `ext install` + 重启代替）
-- WASM 网络能力的实际生效（wasmtime-wasi p1 无 socket ABI，manifest
-  标志仅面向未来）
+- WIT/组件 WASM 载体与 MCP server 插件（路线图 P4）、企业策略（P5）、
+  指标 sidecar 与分发同步（P6）

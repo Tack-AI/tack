@@ -1,5 +1,0 @@
-{
-  "name": "protected-paths",
-  "command": "node",
-  "args": ["plugin.js"]
-}

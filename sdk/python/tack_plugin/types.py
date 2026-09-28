@@ -209,6 +209,20 @@ class LifecycleEventParams(TypedDict):
     payload: Any
 
 
+class ListPanelItem(TypedDict):
+    """One item in a listPanel widget."""
+    detail: NotRequired[str]
+    icon: NotRequired[str]
+    id: str
+    label: str
+
+
+class ListPanelState(TypedDict):
+    """State of a listPanel widget. The host renders the selection; a user pick is reported back as widgets/action with action select."""
+    items: list["ListPanelItem"]
+    selectedId: NotRequired[str]
+
+
 class LogLevel(str, Enum):
     """Log/notify levels."""
     INFO = "info"
@@ -221,6 +235,11 @@ class LogParams(TypedDict):
     """logs/emit params."""
     level: NotRequired["LogLevel"]
     message: str
+
+
+class MarkdownPanelState(TypedDict):
+    """State of a markdownPanel widget: markdown source rendered with the host's markdown pipeline."""
+    markdown: str
 
 
 class MetricOperation(TypedDict):
@@ -294,6 +313,22 @@ class Snapshot(TypedDict):
     messageCount: int
     recentDigest: str
     tokenUsage: NotRequired["TokenUsage"]
+
+
+class StatusLineState(TypedDict):
+    """State of a statusLineSegment widget (widget initial state and widgets/update state for that kind). Empty text hides the segment; the host truncates to one line."""
+    style: NotRequired["StatusStyle"]
+    text: str
+    tooltip: NotRequired[str]
+
+
+class StatusStyle(str, Enum):
+    """Status line segment style."""
+    DEFAULT = "default"
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    DIM = "dim"
 
 
 class TokenUsage(TypedDict):

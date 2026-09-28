@@ -1,10 +1,10 @@
-//! tack-ext-wasm: sandboxed WASM carrier for the tack-ext plugin protocol (v2).
+//! tack-ext-wasm: sandboxed WASM carrier for tack-RPC v3 plugins.
 //!
 //! A plugin is a WASI preview1 core module (`.wasm` or `.wat`) speaking the
-//! exact same NDJSON protocol as v1 subprocess plugins (`tack-ext`) over its
+//! exact same JSON-RPC 2.0 / NDJSON protocol as process-carrier plugins over its
 //! WASI stdin/stdout. The host side wires the module's stdio to in-memory
 //! tokio duplex pipes and hands the other ends to tack-ext's transport-
-//! agnostic [`PluginPeer`], so handshake, request/response matching,
+//! agnostic [`JsonRpcPeer`], so handshake, request/response matching,
 //! timeouts, and fail-fast semantics are shared verbatim with the process
 //! carrier — only the "spawn a child process" step is replaced by
 //! "instantiate a wasm module".
@@ -37,8 +37,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use serde_json::Value;
-use tack_ext::process::{HostServices, PluginPeer, SHUTDOWN_WRITE_TIMEOUT};
+use tack_ext::v3::{HostClient, JsonRpcPeer, PeerHandler};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf};
 use wasmtime::{CallHook, Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::cli::{AsyncStdinStream, AsyncStdoutStream};
@@ -417,7 +416,7 @@ impl WasmCarrier {
     }
 
     /// Instantiate a WASI p1 plugin module (`.wasm` binary or `.wat` text)
-    /// with the given limits and wire its stdio to a fresh [`PluginPeer`].
+    /// with the given limits and wire its stdio to a fresh [`JsonRpcPeer`].
     ///
     /// The guest runs with the full default sandbox (no preopens, env,
     /// args, or network). This is
@@ -426,7 +425,7 @@ impl WasmCarrier {
         &self,
         wasm: &[u8],
         limits: &WasmLimits,
-        services: Arc<dyn HostServices>,
+        services: Arc<dyn PeerHandler>,
     ) -> Result<WasmPlugin, String> {
         self.spawn_with_capabilities(wasm, limits, services, &WasmCapabilities::default())
             .await
@@ -442,7 +441,7 @@ impl WasmCarrier {
         &self,
         wasm: &[u8],
         limits: &WasmLimits,
-        services: Arc<dyn HostServices>,
+        services: Arc<dyn PeerHandler>,
         capabilities: &WasmCapabilities,
     ) -> Result<WasmPlugin, String> {
         if wasm.len() > self.caps.max_module_bytes {
@@ -612,8 +611,12 @@ impl WasmCarrier {
             let _demand = guard;
             run_module(store, linker, module).await
         });
-        let peer = PluginPeer::new(host_stdout, host_stdin, services);
-        Ok(WasmPlugin { peer, task })
+        let peer = JsonRpcPeer::new(host_stdout, host_stdin, services);
+        Ok(WasmPlugin {
+            client: HostClient::new(peer.clone()),
+            peer,
+            task,
+        })
     }
 }
 
@@ -678,8 +681,11 @@ async fn forward_stderr(reader: impl AsyncRead + Unpin) {
 /// peer (or guest exit) closes the pipes and tears the other side down,
 /// mirroring v1's process-death semantics.
 pub struct WasmPlugin {
-    /// Protocol peer: same handshake/call/event API as v1 plugins.
-    pub peer: Arc<PluginPeer>,
+    /// Typed host → plugin calls (handshake, tools, hooks, …).
+    pub client: HostClient,
+    /// Protocol peer: same dead-peer/cancellation semantics as the
+    /// process carrier.
+    pub peer: Arc<JsonRpcPeer>,
     task: tokio::task::JoinHandle<Result<(), String>>,
 }
 
@@ -692,14 +698,11 @@ impl std::fmt::Debug for WasmPlugin {
 }
 
 impl WasmPlugin {
-    /// Graceful shutdown: `shutdown` event, brief grace, then the guest
+    /// Graceful shutdown: `shutdown` request, brief grace, then the guest
     /// task is aborted (wasmtime destruction is safe at any point — unlike
-    /// v1's force kill, there is no OS process to reap).
+    /// a process force kill, there is no OS process to reap).
     pub async fn shutdown(mut self) {
-        // A guest that stopped reading stdin must not stall shutdown
-        // behind the 30s general write bound (see SHUTDOWN_WRITE_TIMEOUT).
-        self.peer.set_write_timeout(SHUTDOWN_WRITE_TIMEOUT);
-        let _ = self.peer.send_event("shutdown", Value::Null).await;
+        let _ = self.client.shutdown().await;
         if tokio::time::timeout(Duration::from_secs(2), &mut self.task)
             .await
             .is_err()
@@ -730,7 +733,10 @@ impl WasmPlugin {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use tack_ext::protocol::InitializePayload;
+    use serde_json::Value;
+    use tack_ext::rpc3::{
+        HostCapabilities, HostInfo, InitializeParams, RunMode, ToolExecuteParams,
+    };
 
     /// Records events; echoes requests back (plugin→host direction unused
     /// by the WAT fixtures below, but required by the trait).
@@ -760,12 +766,16 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl HostServices for RecordingServices {
-        async fn handle_request(&self, method: &str, params: Value) -> Result<Value, String> {
+    impl PeerHandler for RecordingServices {
+        async fn handle_request(
+            &self,
+            method: &str,
+            params: Value,
+        ) -> Result<Value, tack_ext::rpc3::ErrorObject> {
             Ok(serde_json::json!({ "method": method, "echo": params }))
         }
-        async fn handle_event(&self, event: &str, payload: Value) {
-            self.events.lock().await.push((event.to_string(), payload));
+        async fn handle_notification(&self, method: &str, params: Value) {
+            self.events.lock().await.push((method.to_string(), params));
         }
     }
 
@@ -865,14 +875,14 @@ mod tests {
         (br_if $done (i32.ge_u (local.get $i) (local.get $n)))
         (local.set $i (i32.add (local.get $i) (i32.const 1)))
         (br $l))))
-  (data (i32.const 64) "{\"type\":\"event\",\"event\":\"tick\",\"payload\":null}\0a")
+  (data (i32.const 64) "{\"jsonrpc\":\"2.0\",\"method\":\"tick\",\"params\":null}\0a")
   (func (export "_start")
     (loop $main
       (if (call $read_line)
         (then
           (call $spin (i32.const 100000))
           (i32.store (i32.const 0) (i32.const 64))   ;; iov base
-          (i32.store (i32.const 4) (i32.const 47))   ;; iov len (46 chars + \n)
+          (i32.store (i32.const 4) (i32.const 48))   ;; iov len (47 chars + \n)
           (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 12)))
           (br $main)))))
 )"#;
@@ -881,13 +891,18 @@ mod tests {
     const BIG_MEMORY_WAT: &str =
         r#"(module (memory (export "memory") 512) (func (export "_start")))"#;
 
-    fn initialize_payload() -> InitializePayload {
-        InitializePayload {
-            protocol: 1,
-            mode: "tui".to_string(),
+    fn initialize_params() -> InitializeParams {
+        InitializeParams {
+            protocol_version: tack_ext::v3::PROTOCOL_VERSION.to_string(),
+            host: HostInfo {
+                name: "tack-ext-wasm-test".to_string(),
+                version: "test".to_string(),
+            },
+            mode: RunMode::Tui,
             cwd: "/tmp".to_string(),
             trusted: true,
-            host: "tack-ext-wasm-test".to_string(),
+            capabilities: HostCapabilities::default(),
+            config: None,
         }
     }
 
@@ -909,35 +924,38 @@ mod tests {
 
         plugin
             .peer
-            .send_event("initialize", serde_json::json!({"protocol": 1}))
+            .notify("initialize", serde_json::json!({"protocol": 3}))
             .await
             .unwrap();
-        // The echo comes back as an event with the SAME name/payload and
-        // is dispatched to HostServices by the peer's read pump.
+        // The echo comes back as a notification with the SAME
+        // method/payload and is dispatched to the handler by the pump.
         let payload = services.wait_for_event("initialize").await;
-        assert_eq!(payload, serde_json::json!({"protocol": 1}));
+        assert_eq!(payload, serde_json::json!({"protocol": 3}));
         plugin.shutdown().await;
     }
 
-    /// Protocol proof: the v1 handshake (initialize → register) and a
-    /// tool.execute request/response run unchanged over the WASM carrier.
+    /// Protocol proof: the v3 handshake (initialize request/result) and a
+    /// tools/execute request/response run over the WASM carrier.
     #[tokio::test(flavor = "multi_thread")]
     async fn handshake_and_tool_execute_over_wasm() {
-        let register = tack_ext::protocol::Envelope::event(
-            "register",
-            serde_json::json!({
-                "name": "wat-script",
-                "tools": [{"name": "ping", "description": "Ping",
-                           "parameters": {"type": "object", "properties": {}}}],
-                "commands": [], "shortcuts": [], "subscriptions": [],
-            }),
-        );
-        let register_line = serde_json::to_string(&register).unwrap();
-        let response_line = serde_json::to_string(&tack_ext::protocol::Envelope::result(
-            1, // first request after the handshake: PluginPeer ids start at 1
-            serde_json::json!({"content": "pong"}),
-        ))
-        .unwrap();
+        // The host sends initialize (id 1) then tools/execute (id 2).
+        let register_line = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {
+                "protocolVersion": tack_ext::v3::PROTOCOL_VERSION,
+                "plugin": {"name": "wat-script"},
+                "capabilities": {
+                    "tools": [{"name": "ping", "description": "Ping",
+                               "parameters": {"type": "object", "properties": {}}}],
+                },
+            },
+        })
+        .to_string();
+        let response_line = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2,
+            "result": {"content": [{"type": "text", "text": "pong"}]},
+        })
+        .to_string();
         let wat = scripted_plugin_wat(&register_line, &response_line);
 
         let carrier = WasmCarrier::new().unwrap();
@@ -947,20 +965,26 @@ mod tests {
             .await
             .unwrap();
 
-        let register = plugin.peer.initialize(initialize_payload()).await.unwrap();
-        assert_eq!(register.name.as_deref(), Some("wat-script"));
-        assert_eq!(register.tools.len(), 1);
-        assert_eq!(register.tools[0].name, "ping");
-
-        let result = plugin
-            .peer
-            .call(
-                "tool.execute",
-                serde_json::json!({"name": "ping", "toolCallId": "call_1", "arguments": {}}),
-            )
+        let register = plugin
+            .client
+            .initialize(&initialize_params())
             .await
             .unwrap();
-        assert_eq!(result, serde_json::json!({"content": "pong"}));
+        assert_eq!(register.plugin.name, "wat-script");
+        let tools = register.capabilities.tools.expect("tools declared");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "ping");
+
+        let output = plugin
+            .client
+            .tool_execute(&ToolExecuteParams {
+                name: "ping".to_string(),
+                tool_call_id: "call_1".to_string(),
+                arguments: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.content[0].text.as_deref(), Some("pong"));
 
         plugin.shutdown().await;
     }
@@ -1007,7 +1031,7 @@ mod tests {
             .await
             .unwrap();
         for _ in 0..REQUESTS {
-            plugin.peer.send_event("poke", Value::Null).await.unwrap();
+            plugin.peer.notify("poke", Value::Null).await.unwrap();
         }
         let mut answered = 0;
         for _ in 0..500 {
@@ -1663,11 +1687,11 @@ mod tests {
             .unwrap();
         plugin
             .peer
-            .send_event("initialize", serde_json::json!({"protocol": 1}))
+            .notify("initialize", serde_json::json!({"protocol": 3}))
             .await
             .unwrap();
         let payload = services.wait_for_event("initialize").await;
-        assert_eq!(payload, serde_json::json!({"protocol": 1}));
+        assert_eq!(payload, serde_json::json!({"protocol": 3}));
         plugin.shutdown().await;
     }
 }

@@ -20,7 +20,8 @@ shell 命令或 LLM 评估在 agent 关键事件点介入。配置来源（按�
 |---|---|---|---|
 | `PreToolUse` | 工具调用前 | 工具名 | block、`updatedInput` 改参数、`permissionDecision` |
 | `PermissionRequest` | 即将弹权限框时 | 工具名 | `permissionDecision` 代替用户回答 |
-| `PostToolUse` | 工具执行后 | 工具名 | block（原因反馈给模型）、`additionalContext` |
+| `PostToolUse` | 工具执行后（成功或失败，带 `is_error`） | 工具名 | block（原因反馈给模型）、`additionalContext` |
+| `PostToolUseFailure` | 仅在工具调用出错后 | 工具名 | block（原因反馈给模型）、`additionalContext` |
 | `UserPromptSubmit` | 用户提交 prompt 后 | — | block（丢弃 prompt）、`additionalContext` |
 | `SessionStart` | 会话创建 | — | `additionalContext` 注入系统提示 |
 | `SessionEnd` | 会话退出 | — | fire-and-forget |

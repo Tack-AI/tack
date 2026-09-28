@@ -33,7 +33,7 @@ impl std::fmt::Debug for ExtUiRequest {
     }
 }
 
-/// HostServices bridge (real impl routes plugin UI calls to the TUI main
+/// PeerHandler bridge (real impl routes plugin UI calls to the TUI main
 /// loop). Without extensions no plugin exists to call it.
 #[derive(Debug)]
 pub struct TuiExtServices {

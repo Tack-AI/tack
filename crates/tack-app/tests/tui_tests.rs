@@ -1636,7 +1636,7 @@ async fn fullscreen_scroll_far_up_large_transcript_after_run() {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "ext")]
-fn ext_widget(spec: serde_json::Value) -> tack_ext::WidgetSpec {
+fn ext_widget(spec: serde_json::Value) -> tack_ext::rpc3::WidgetSpec {
     serde_json::from_value(spec).unwrap()
 }
 
@@ -1649,23 +1649,23 @@ async fn ext_status_segments_render_sorted_and_hidden() {
     let mut app = test_app(cwd.path()).await;
     app.test_register_ext_widget(
         "demo",
-        ext_widget(serde_json::json!({"id": "z", "type": "status_line_segment",
+        ext_widget(serde_json::json!({"id": "z", "type": "statusLineSegment",
             "priority": 50, "initial": {"text": "seg-z"}})),
     );
     app.test_register_ext_widget(
         "demo",
-        ext_widget(serde_json::json!({"id": "a", "type": "status_line_segment",
+        ext_widget(serde_json::json!({"id": "a", "type": "statusLineSegment",
             "priority": 10, "initial": {"text": "seg-a", "style": "info"}})),
     );
     app.test_register_ext_widget(
         "demo",
-        ext_widget(serde_json::json!({"id": "h", "type": "status_line_segment",
+        ext_widget(serde_json::json!({"id": "h", "type": "statusLineSegment",
             "priority": 1, "initial": {"text": "seg-hidden"}})),
     );
     // Hidden text starts empty; "seg-hidden" must never appear.
     app.test_app_event(tack_app::tui::AppEvent::ExtWidgetUpdate {
         plugin: "demo".to_string(),
-        update: tack_ext::WidgetUpdatePayload {
+        update: tack_ext::rpc3::WidgetUpdateParams {
             id: "h".to_string(),
             state: serde_json::json!({"text": ""}),
             visible: None,
@@ -1692,12 +1692,12 @@ async fn ext_widget_update_and_plugin_death() {
     let mut app = test_app(cwd.path()).await;
     app.test_register_ext_widget(
         "demo",
-        ext_widget(serde_json::json!({"id": "s", "type": "status_line_segment",
+        ext_widget(serde_json::json!({"id": "s", "type": "statusLineSegment",
             "initial": {"text": "old-state"}})),
     );
     app.test_app_event(tack_app::tui::AppEvent::ExtWidgetUpdate {
         plugin: "demo".to_string(),
-        update: tack_ext::WidgetUpdatePayload {
+        update: tack_ext::rpc3::WidgetUpdateParams {
             id: "s".to_string(),
             state: serde_json::json!({"text": "new-state"}),
             visible: None,
@@ -1711,7 +1711,7 @@ async fn ext_widget_update_and_plugin_death() {
     // Unknown widget id / unknown plugin: warn + ignore, no panic.
     app.test_app_event(tack_app::tui::AppEvent::ExtWidgetUpdate {
         plugin: "demo".to_string(),
-        update: tack_ext::WidgetUpdatePayload {
+        update: tack_ext::rpc3::WidgetUpdateParams {
             id: "nope".to_string(),
             state: serde_json::json!({"text": "x"}),
             visible: None,
@@ -1720,7 +1720,7 @@ async fn ext_widget_update_and_plugin_death() {
     .await;
     app.test_app_event(tack_app::tui::AppEvent::ExtWidgetUpdate {
         plugin: "ghost".to_string(),
-        update: tack_ext::WidgetUpdatePayload {
+        update: tack_ext::rpc3::WidgetUpdateParams {
             id: "s".to_string(),
             state: serde_json::json!({"text": "x"}),
             visible: None,
@@ -1749,7 +1749,7 @@ async fn ext_list_panel_focus_navigation_and_toggle() {
     let mut app = test_app(cwd.path()).await;
     app.test_register_ext_widget(
         "demo",
-        ext_widget(serde_json::json!({"id": "files", "type": "list_panel",
+        ext_widget(serde_json::json!({"id": "files", "type": "listPanel",
         "title": "Changed files", "visible": true,
         "initial": {"items": [
             {"id": "a", "label": "Alpha", "detail": "first"},
@@ -1809,7 +1809,7 @@ async fn ext_markdown_panel_renders_and_updates() {
     let mut app = test_app(cwd.path()).await;
     app.test_register_ext_widget(
         "demo",
-        ext_widget(serde_json::json!({"id": "notes", "type": "markdown_panel",
+        ext_widget(serde_json::json!({"id": "notes", "type": "markdownPanel",
             "title": "Notes", "visible": true,
             "initial": {"markdown": "# Heading\nsome **bold** text"}})),
     );
@@ -1819,7 +1819,7 @@ async fn ext_markdown_panel_renders_and_updates() {
 
     app.test_app_event(tack_app::tui::AppEvent::ExtWidgetUpdate {
         plugin: "demo".to_string(),
-        update: tack_ext::WidgetUpdatePayload {
+        update: tack_ext::rpc3::WidgetUpdateParams {
             id: "notes".to_string(),
             state: serde_json::json!({"markdown": "replacement body"}),
             visible: None,

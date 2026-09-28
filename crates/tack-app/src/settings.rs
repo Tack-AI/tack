@@ -1027,6 +1027,37 @@ impl Settings {
             .unwrap_or_default()
     }
 
+    /// The `plugins."<id>".enabled` map from settings (global user
+    /// settings + project .pi/settings.json, project winning). Missing
+    /// entries default to enabled. Used by the extension host to skip
+    /// disabled plugins without uninstalling them.
+    pub fn plugin_enabled_map(
+        cwd: &Path,
+        agent_dir: &Path,
+    ) -> std::collections::HashMap<String, bool> {
+        let mut out = std::collections::HashMap::new();
+        for path in [
+            agent_dir.join("settings.json"),
+            cwd.join(".pi").join("settings.json"),
+        ] {
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(raw) = serde_json::from_str::<serde_json::Value>(&content) else {
+                continue;
+            };
+            let Some(plugins) = raw.get("plugins").and_then(|p| p.as_object()) else {
+                continue;
+            };
+            for (id, value) in plugins {
+                if let Some(enabled) = value.get("enabled").and_then(|e| e.as_bool()) {
+                    out.insert(id.clone(), enabled);
+                }
+            }
+        }
+        out
+    }
+
     /// Persist one key into the global settings file (deep-merges onto the
     /// existing content).
     pub fn save_global(

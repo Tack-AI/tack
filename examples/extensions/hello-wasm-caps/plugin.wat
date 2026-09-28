@@ -167,44 +167,45 @@
     (if (i32.ge_s (local.get $len) (i32.const 0))
       (then
         (call $sanitize (local.get $len))
-        (call $write (i32.const 43200) (i32.const 22))   ;; ,"result":{"content":"
+        (call $write (i32.const 43200) (i32.const 45))   ;; ,"result":{"content":[{"type":"text","text":"
         (call $write (i32.const 44000) (local.get $len))
-        (call $write (i32.const 43240) (i32.const 4)))   ;; "}} \n
+        (call $write (i32.const 43300) (i32.const 6)))   ;; "}]}} \n
       (else
-        (call $write (i32.const 43300) (i32.const 41))   ;; ..."read failed: errno
+        (call $write (i32.const 43400) (i32.const 64))   ;; ..."read failed: errno
         (call $write_u32 (i32.sub (i32.const 0) (local.get $len)))
-        (call $write (i32.const 43240) (i32.const 4)))))
+        (call $write (i32.const 43300) (i32.const 6)))))
 
-  (data (i32.const 40000) "{\"type\":\"event\",\"event\":\"register\",\"payload\":{\"name\":\"hello-wasm-caps\",\"tools\":[{\"name\":\"ping\",\"description\":\"Answer with a pong from the WASM sandbox\",\"parameters\":{\"type\":\"object\",\"properties\":{}}},{\"name\":\"readfile\",\"description\":\"Read hello.txt from the preopened /data dir\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}],\"commands\":[{\"name\":\"hello-wasm-caps\",\"description\":\"Greet from the sandboxed WASM plugin\"}],\"subscriptions\":[]}}\0a")
-  (data (i32.const 41000) "{\"type\":\"response\",\"id\":")
-  (data (i32.const 41100) ",\"result\":{\"content\":\"pong from the WASM sandbox\"}}\0a")
+  (data (i32.const 40000) "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"3.0.0\",\"plugin\":{\"name\":\"hello-wasm-caps\"},\"capabilities\":{\"tools\":[{\"name\":\"ping\",\"description\":\"Answer with a pong from the WASM sandbox\",\"parameters\":{\"type\":\"object\",\"properties\":{}}},{\"name\":\"readfile\",\"description\":\"Read hello.txt from the preopened /data dir\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}],\"commands\":[{\"name\":\"hello-wasm-caps\",\"description\":\"Greet from the sandboxed WASM plugin\"}]}}}\0a")
+  (data (i32.const 41000) "{\"jsonrpc\":\"2.0\",\"id\":")
+  (data (i32.const 41100) ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"pong from the WASM sandbox\"}]}}\0a")
   (data (i32.const 41200) ",\"result\":{\"ok\":true,\"note\":\"hello from the WASM sandbox\"}}\0a")
-  (data (i32.const 41300) "\"type\":\"request\"")
-  (data (i32.const 41320) "tool.execute")
+  (data (i32.const 41300) "\"method\":\"")
+  (data (i32.const 41320) "tools/execute")
   (data (i32.const 41340) "\"id\":")
   (data (i32.const 41360) "readfile")
   (data (i32.const 43000) "hello.txt")
-  (data (i32.const 43200) ",\"result\":{\"content\":\"")
-  (data (i32.const 43240) "\"}}\0a")
-  (data (i32.const 43300) ",\"result\":{\"content\":\"read failed: errno ")
+  (data (i32.const 43200) ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"")
+  (data (i32.const 43300) "\"}]}}\0a")
+  (data (i32.const 43400) ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"read failed: errno ")
 
   (func (export "_start")
-    ;; Handshake: consume `initialize`, answer `register`.
+    ;; Handshake: consume the `initialize` request, answer with the
+    ;; capabilities result (id 1 — the host's first request).
     (drop (call $read_line))
-    (call $write (i32.const 40000) (i32.const 442))
+    (call $write (i32.const 40000) (i32.const 465))
     ;; Main loop: answer requests until EOF (host shutdown closes stdin).
     (loop $main
       (if (call $read_line)
         (then
-          (if (i32.ge_s (call $find (i32.const 41300) (i32.const 16)) (i32.const 0))
+          (if (i32.ge_s (call $find (i32.const 41300) (i32.const 10)) (i32.const 0))
             (then
-              (call $write (i32.const 41000) (i32.const 24))
+              (call $write (i32.const 41000) (i32.const 22))
               (call $write_u32 (call $parse_id))
               (if (i32.ge_s (call $find (i32.const 41360) (i32.const 8)) (i32.const 0))
                 (then (call $answer_readfile))
                 (else
-                  (if (i32.ge_s (call $find (i32.const 41320) (i32.const 12)) (i32.const 0))
-                    (then (call $write (i32.const 41100) (i32.const 52)))
+                  (if (i32.ge_s (call $find (i32.const 41320) (i32.const 13)) (i32.const 0))
+                    (then (call $write (i32.const 41100) (i32.const 77)))
                     (else (call $write (i32.const 41200) (i32.const 60))))))))
           (br $main))))
 )

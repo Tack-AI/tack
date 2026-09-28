@@ -209,7 +209,7 @@ pub mod method {
 }
 
 /// hooks/afterToolCall params.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AfterToolCallParams {
     #[serde(rename = "isError")]
     pub is_error: bool,
@@ -220,7 +220,7 @@ pub struct AfterToolCallParams {
 }
 
 /// Per-field patch; absent fields are untouched. Later plugins in the chain win per field.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AfterToolCallPatch {
     #[serde(rename = "content")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -242,7 +242,7 @@ pub struct AfterToolCallPatch {
 }
 
 /// A claimed approval decision (a null method result passes to the next reviewer).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalDecision {
     #[serde(rename = "action")]
     pub action: ApprovalDecisionAction,
@@ -252,8 +252,9 @@ pub struct ApprovalDecision {
 }
 
 /// Approval outcomes a reviewer can return.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApprovalDecisionAction {
+    #[default]
     #[serde(rename = "allow")]
     Allow,
     #[serde(rename = "reviewed")]
@@ -263,7 +264,7 @@ pub enum ApprovalDecisionAction {
 }
 
 /// approval/review params.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalReviewParams {
     #[serde(rename = "approvalId")]
     pub approval_id: String,
@@ -279,7 +280,7 @@ pub struct ApprovalReviewParams {
 }
 
 /// autocomplete/provide params.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AutocompleteProvideParams {
     #[serde(rename = "cursorOffset")]
     pub cursor_offset: u64,
@@ -290,14 +291,14 @@ pub struct AutocompleteProvideParams {
 }
 
 /// An empty suggestions list is a legal no-suggestions answer.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AutocompleteProvideResult {
     #[serde(rename = "suggestions")]
     pub suggestions: Vec<AutocompleteSuggestion>,
 }
 
 /// An autocomplete provider for the input line.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AutocompleteProviderSpec {
     #[serde(rename = "description")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -310,7 +311,7 @@ pub struct AutocompleteProviderSpec {
 }
 
 /// One suggestion. insertText absent = insert value.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AutocompleteSuggestion {
     #[serde(rename = "detail")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -325,7 +326,7 @@ pub struct AutocompleteSuggestion {
 }
 
 /// hooks/beforeToolCall params.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BeforeToolCallParams {
     /// The assistant message that issued the call (provider-shaped JSON).
     #[serde(rename = "assistantMessage")]
@@ -336,7 +337,7 @@ pub struct BeforeToolCallParams {
 }
 
 /// commands/invoke params.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CommandInvokeParams {
     #[serde(rename = "args")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -346,7 +347,7 @@ pub struct CommandInvokeParams {
 }
 
 /// A contributed slash command.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CommandSpec {
     #[serde(rename = "description")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -356,7 +357,7 @@ pub struct CommandSpec {
 }
 
 /// Per-plugin configuration declaration: a JSON Schema the host validates settings plugins."\<id\>".config against at load time.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConfigDeclaration {
     /// JSON Schema (object) of the plugin configuration.
     #[serde(rename = "schema")]
@@ -364,7 +365,7 @@ pub struct ConfigDeclaration {
 }
 
 /// config/get result.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConfigResult {
     /// Effective per-plugin config (host-validated; defaults when the user config was invalid).
     #[serde(rename = "config")]
@@ -372,7 +373,7 @@ pub struct ConfigResult {
 }
 
 /// One tool output content block. Fields not matching kind are absent (text blocks carry text; image blocks carry mimeType + data).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContentBlock {
     /// Base64 payload for image blocks.
     #[serde(rename = "data")]
@@ -389,8 +390,9 @@ pub struct ContentBlock {
 }
 
 /// Tool output content block kinds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContentBlockKind {
+    #[default]
     #[serde(rename = "text")]
     Text,
     #[serde(rename = "image")]
@@ -398,7 +400,7 @@ pub enum ContentBlockKind {
 }
 
 /// exec/run params.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExecRunParams {
     #[serde(rename = "command")]
     pub command: String,
@@ -408,7 +410,7 @@ pub struct ExecRunParams {
 }
 
 /// exec/run result.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExecRunResult {
     #[serde(rename = "code")]
     pub code: i32,
@@ -419,7 +421,7 @@ pub struct ExecRunResult {
 }
 
 /// Opt-in hook surfaces. Absent boolean means not implemented (the host skips the call entirely).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HookCapabilities {
     #[serde(rename = "afterToolCall")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -436,7 +438,7 @@ pub struct HookCapabilities {
 }
 
 /// What this host supports in the current mode. Absent boolean means unsupported; a plugin must check before depending on a surface.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostCapabilities {
     #[serde(rename = "autocomplete")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -465,7 +467,7 @@ pub struct HostCapabilities {
 }
 
 /// Host identification (for user agents and logs).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostInfo {
     #[serde(rename = "name")]
     pub name: String,
@@ -474,7 +476,7 @@ pub struct HostInfo {
 }
 
 /// Host -\> plugin handshake.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct InitializeParams {
     #[serde(rename = "capabilities")]
     pub capabilities: HostCapabilities,
@@ -497,7 +499,7 @@ pub struct InitializeParams {
 }
 
 /// Plugin -\> host handshake answer.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct InitializeResult {
     #[serde(rename = "capabilities")]
     pub capabilities: PluginCapabilities,
@@ -508,7 +510,7 @@ pub struct InitializeResult {
 }
 
 /// events/lifecycle params. event is the lifecycle event name; payload is event-shaped JSON.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LifecycleEventParams {
     #[serde(rename = "event")]
     pub event: String,
@@ -516,9 +518,35 @@ pub struct LifecycleEventParams {
     pub payload: Value,
 }
 
+/// One item in a listPanel widget.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ListPanelItem {
+    #[serde(rename = "detail")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(rename = "icon")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(rename = "id")]
+    pub id: String,
+    #[serde(rename = "label")]
+    pub label: String,
+}
+
+/// State of a listPanel widget. The host renders the selection; a user pick is reported back as widgets/action with action select.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ListPanelState {
+    #[serde(rename = "items")]
+    pub items: Vec<ListPanelItem>,
+    #[serde(rename = "selectedId")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_id: Option<String>,
+}
+
 /// Log/notify levels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogLevel {
+    #[default]
     #[serde(rename = "info")]
     Info,
     #[serde(rename = "warning")]
@@ -530,7 +558,7 @@ pub enum LogLevel {
 }
 
 /// logs/emit params.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LogParams {
     #[serde(rename = "level")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -539,8 +567,15 @@ pub struct LogParams {
     pub message: String,
 }
 
+/// State of a markdownPanel widget: markdown source rendered with the host's markdown pipeline.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MarkdownPanelState {
+    #[serde(rename = "markdown")]
+    pub markdown: String,
+}
+
 /// One declared metric operation. Identifiers match \[a-z\]\[a-z0-9_.\]{0,63}; at most 8 dimensions per operation.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MetricOperation {
     #[serde(rename = "description")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -552,14 +587,14 @@ pub struct MetricOperation {
 }
 
 /// Declared telemetry schema for the metrics sidecar. Any violation voids the whole declaration with a load warning.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MetricsDeclaration {
     #[serde(rename = "operations")]
     pub operations: BTreeMap<String, MetricOperation>,
 }
 
 /// Metrics sidecar host support: the plugin appends NDJSON measurements to scratchFile; the host validates the drain against the declared operations schema.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MetricsHostCapability {
     /// Absolute path of the per-session scratch file (WASM carrier: inside the dedicated preopen).
     #[serde(rename = "scratchFile")]
@@ -567,7 +602,7 @@ pub struct MetricsHostCapability {
 }
 
 /// Everything a plugin contributes. Every field is optional and independent; an absent field contributes nothing and costs nothing.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PluginCapabilities {
     #[serde(rename = "autocompleteProviders")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -597,7 +632,7 @@ pub struct PluginCapabilities {
 }
 
 /// Plugin identification.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PluginInfo {
     #[serde(rename = "description")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -610,15 +645,16 @@ pub struct PluginInfo {
 }
 
 /// host/registerProvider params: a provider registry entry (provider-shaped JSON).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RegisterProviderParams {
     #[serde(rename = "provider")]
     pub provider: Value,
 }
 
 /// Host run mode, reported at initialize so a plugin never depends on interactive requests for correctness.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunMode {
+    #[default]
     #[serde(rename = "tui")]
     Tui,
     #[serde(rename = "print")]
@@ -630,14 +666,14 @@ pub enum RunMode {
 }
 
 /// session/sendUserMessage params.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SendUserMessageParams {
     #[serde(rename = "text")]
     pub text: String,
 }
 
 /// session/get result.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionInfo {
     #[serde(rename = "cwd")]
     pub cwd: String,
@@ -658,7 +694,7 @@ pub struct SessionInfo {
 }
 
 /// snapshot/get result: a digest, not a transcript (full-history use cases are served by event subscriptions).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     /// Bumped on every compaction.
     #[serde(rename = "compactionRevision")]
@@ -676,8 +712,37 @@ pub struct Snapshot {
     pub token_usage: Option<TokenUsage>,
 }
 
+/// State of a statusLineSegment widget (widget initial state and widgets/update state for that kind). Empty text hides the segment; the host truncates to one line.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct StatusLineState {
+    #[serde(rename = "style")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<StatusStyle>,
+    #[serde(rename = "text")]
+    pub text: String,
+    #[serde(rename = "tooltip")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tooltip: Option<String>,
+}
+
+/// Status line segment style.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StatusStyle {
+    #[default]
+    #[serde(rename = "default")]
+    Default,
+    #[serde(rename = "info")]
+    Info,
+    #[serde(rename = "warning")]
+    Warning,
+    #[serde(rename = "error")]
+    Error,
+    #[serde(rename = "dim")]
+    Dim,
+}
+
 /// Token accounting snapshot (provider-shaped totals).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     #[serde(rename = "cacheRead")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -694,7 +759,7 @@ pub struct TokenUsage {
 }
 
 /// A tool call in flight.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     #[serde(rename = "arguments")]
     pub arguments: Value,
@@ -705,7 +770,7 @@ pub struct ToolCall {
 }
 
 /// tools/execute params.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ToolExecuteParams {
     /// Validated against the tool's parameter schema by the host.
     #[serde(rename = "arguments")]
@@ -717,7 +782,7 @@ pub struct ToolExecuteParams {
 }
 
 /// Tool execution result.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ToolOutput {
     #[serde(rename = "content")]
     pub content: Vec<ContentBlock>,
@@ -731,7 +796,7 @@ pub struct ToolOutput {
 }
 
 /// A contributed tool. parameters must be a JSON object schema; anything else is rejected at registration.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ToolSpec {
     #[serde(rename = "description")]
     pub description: String,
@@ -746,21 +811,21 @@ pub struct ToolSpec {
 }
 
 /// hooks/transformContext params. Messages are session-entry shaped JSON.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TransformContextParams {
     #[serde(rename = "messages")]
     pub messages: Vec<Value>,
 }
 
 /// null = unchanged; a list replaces the context every later hook (and the loop) sees.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TransformContextResult {
     #[serde(rename = "messages")]
     pub messages: Vec<Value>,
 }
 
 /// ui/confirm params.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct UiConfirmParams {
     #[serde(rename = "message")]
     pub message: String,
@@ -769,7 +834,7 @@ pub struct UiConfirmParams {
 }
 
 /// ui/input params.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct UiInputParams {
     #[serde(rename = "placeholder")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -779,7 +844,7 @@ pub struct UiInputParams {
 }
 
 /// ui/notify params.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct UiNotifyParams {
     #[serde(rename = "level")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -789,7 +854,7 @@ pub struct UiNotifyParams {
 }
 
 /// ui/select params.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct UiSelectParams {
     #[serde(rename = "options")]
     pub options: Vec<String>,
@@ -798,7 +863,7 @@ pub struct UiSelectParams {
 }
 
 /// Interception verdict. deny carries reason (becomes the error tool result); rewrite carries arguments (the full replacement).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Verdict {
     #[serde(rename = "action")]
     pub action: VerdictAction,
@@ -811,8 +876,9 @@ pub struct Verdict {
 }
 
 /// Interception verdict actions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VerdictAction {
+    #[default]
     #[serde(rename = "allow")]
     Allow,
     #[serde(rename = "deny")]
@@ -822,7 +888,7 @@ pub enum VerdictAction {
 }
 
 /// warnings/emit params.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WarningParams {
     /// Structured context shown in the warning details.
     #[serde(rename = "context")]
@@ -833,7 +899,7 @@ pub struct WarningParams {
 }
 
 /// widgets/action params (for example action select for list panels).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WidgetActionParams {
     #[serde(rename = "action")]
     pub action: String,
@@ -845,8 +911,9 @@ pub struct WidgetActionParams {
 }
 
 /// Declarative widget kinds; the host owns rendering and layout.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WidgetKind {
+    #[default]
     #[serde(rename = "statusLineSegment")]
     StatusLineSegment,
     #[serde(rename = "markdownPanel")]
@@ -856,7 +923,7 @@ pub enum WidgetKind {
 }
 
 /// A declared long-lived UI unit. The host keys it as \<plugin\>:\<id\>; the plugin pushes full-state snapshots via widgets/update.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WidgetSpec {
     #[serde(rename = "id")]
     pub id: String,
@@ -881,7 +948,7 @@ pub struct WidgetSpec {
 }
 
 /// widgets/update params: idempotent full-state replacement, shaped per the widget kind.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WidgetUpdateParams {
     #[serde(rename = "id")]
     pub id: String,

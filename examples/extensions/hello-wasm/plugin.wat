@@ -1,8 +1,9 @@
-;; hello-wasm: a tack-ext plugin as a WASI p1 module, hand-written WAT.
-;; Speaks the tack-ext NDJSON protocol over stdin/stdout: reads the
-;; `initialize` event, answers `register`, then loops answering
-;; tool.execute / command.invoke requests (ids parsed from the request
-;; line). Events and unknown lines are ignored; EOF (shutdown) exits.
+;; hello-wasm: a tack-RPC v3 plugin as a WASI p1 module, hand-written WAT.
+;; Speaks JSON-RPC 2.0 over NDJSON stdin/stdout: answers the `initialize`
+;; request (id 1, the host's first) with the plugin's capabilities, then
+;; loops answering tools/execute / commands/invoke requests (ids parsed
+;; from the request line). Notifications and unknown lines are ignored;
+;; EOF (shutdown) exits.
 (module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
@@ -95,28 +96,29 @@
       (br_if $loop (i32.gt_u (local.get $n) (i32.const 0))))
     (call $write (local.get $pos) (i32.sub (i32.const 48) (local.get $pos))))
 
-  (data (i32.const 40000) "{\"type\":\"event\",\"event\":\"register\",\"payload\":{\"name\":\"hello-wasm\",\"tools\":[{\"name\":\"ping\",\"description\":\"Answer with a pong from the WASM sandbox\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}],\"commands\":[{\"name\":\"hello-wasm\",\"description\":\"Greet from the WASM sandbox\"}],\"subscriptions\":[]}}\0a")
-  (data (i32.const 41000) "{\"type\":\"response\",\"id\":")
-  (data (i32.const 41100) ",\"result\":{\"content\":\"pong from the WASM sandbox\"}}\0a")
+  (data (i32.const 40000) "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"3.0.0\",\"plugin\":{\"name\":\"hello-wasm\"},\"capabilities\":{\"tools\":[{\"name\":\"ping\",\"description\":\"Answer with a pong from the WASM sandbox\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}],\"commands\":[{\"name\":\"hello-wasm\",\"description\":\"Greet from the WASM sandbox\"}]}}}\0a")
+  (data (i32.const 41000) "{\"jsonrpc\":\"2.0\",\"id\":")
+  (data (i32.const 41100) ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"pong from the WASM sandbox\"}]}}\0a")
   (data (i32.const 41200) ",\"result\":{\"ok\":true,\"note\":\"hello from the WASM sandbox\"}}\0a")
-  (data (i32.const 41300) "\"type\":\"request\"")
-  (data (i32.const 41320) "tool.execute")
+  (data (i32.const 41300) "\"method\":\"")
+  (data (i32.const 41320) "tools/execute")
   (data (i32.const 41340) "\"id\":")
 
   (func (export "_start")
-    ;; Handshake: consume `initialize`, answer `register`.
+    ;; Handshake: consume the `initialize` request, answer with the
+    ;; capabilities result (id 1 — the host's first request).
     (drop (call $read_line))
-    (call $write (i32.const 40000) (i32.const 296))
+    (call $write (i32.const 40000) (i32.const 319))
     ;; Main loop: answer requests until EOF (host shutdown closes stdin).
     (loop $main
       (if (call $read_line)
         (then
-          (if (i32.ge_s (call $find (i32.const 41300) (i32.const 16)) (i32.const 0))
+          (if (i32.ge_s (call $find (i32.const 41300) (i32.const 10)) (i32.const 0))
             (then
-              (call $write (i32.const 41000) (i32.const 24))
+              (call $write (i32.const 41000) (i32.const 22))
               (call $write_u32 (call $parse_id))
-              (if (i32.ge_s (call $find (i32.const 41320) (i32.const 12)) (i32.const 0))
-                (then (call $write (i32.const 41100) (i32.const 52)))
+              (if (i32.ge_s (call $find (i32.const 41320) (i32.const 13)) (i32.const 0))
+                (then (call $write (i32.const 41100) (i32.const 77)))
                 (else (call $write (i32.const 41200) (i32.const 60))))))
           (br $main))))
 )

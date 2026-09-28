@@ -142,9 +142,14 @@ fn emit_named_type(name: &str, schema: &Value, out: &mut String) -> Result<()> {
         emit_doc(out, description, 0);
     }
     if let Some(variants) = string_enum_variants(schema) {
-        out.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]\n");
+        out.push_str(
+            "#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]\n",
+        );
         let _ = writeln!(out, "pub enum {name} {{");
-        for variant in &variants {
+        for (index, variant) in variants.iter().enumerate() {
+            if index == 0 {
+                out.push_str("    #[default]\n");
+            }
             let _ = writeln!(out, "    #[serde(rename = \"{variant}\")]");
             let _ = writeln!(out, "    {},", pascal_case(variant));
         }
@@ -157,7 +162,7 @@ fn emit_named_type(name: &str, schema: &Value, out: &mut String) -> Result<()> {
             .and_then(Value::as_array)
             .map(|list| list.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
-        out.push_str("#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]\n");
+        out.push_str("#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]\n");
         let _ = writeln!(out, "pub struct {name} {{");
         for (wire_name, property) in properties {
             emit_field(

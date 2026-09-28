@@ -1,34 +1,31 @@
-//! End-to-end tack-ext test: spawn the built-in demo plugin via
-//! ExtensionManager, verify handshake, tool registration/execution, command
-//! invocation, event fan-out, and the UI request bridge.
+//! End-to-end extension-host test (v3): spawn the built-in v3 demo
+//! plugin via ExtensionManager, verify handshake, tool registration/
+//! execution, command invocation, interception, event fan-out, widgets,
+//! autocomplete, and the UI request bridge.
 #![cfg(feature = "ext")]
 #![allow(clippy::unwrap_used)]
-#![allow(clippy::await_holding_lock)]
 #![allow(unsafe_code)]
 
 /// The tests below all mutate the process-global `TACK_AGENT_DIR` — run
 /// them under a shared lock so parallel test threads don't swap each
-/// other's agent dir mid-load (flaky "demo plugin should load").
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// other's agent dir mid-load.
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 use std::sync::Arc;
 
 use serde_json::Value;
 use tack_app::extension_host::ExtensionManager;
-use tack_ext::HostServices;
+use tack_ext::rpc3::ErrorObject;
+use tack_ext::v3::PeerHandler;
 use tokio::sync::Mutex;
 
-/// Capture plugin→host traffic for assertions.
+/// Capture plugin→host requests for assertions.
 #[derive(Default)]
 struct FakeServices {
     requests: Mutex<Vec<(String, Value)>>,
 }
 
 impl FakeServices {
-    /// Poll the recorded requests until `pred` holds (20ms interval, 5s
-    /// timeout) instead of a fixed sleep; modeled on `wait_for_event` in the
-    /// tack-ext-wasm tests. Returns a snapshot for assertions; panics on
-    /// timeout.
     async fn wait_for_requests(
         &self,
         what: &str,
@@ -48,30 +45,46 @@ impl FakeServices {
 }
 
 #[async_trait::async_trait]
-impl HostServices for FakeServices {
-    async fn handle_request(&self, method: &str, params: Value) -> Result<Value, String> {
+impl PeerHandler for FakeServices {
+    async fn handle_request(&self, method: &str, params: Value) -> Result<Value, ErrorObject> {
         self.requests
             .lock()
             .await
             .push((method.to_string(), params));
         Ok(Value::Null)
     }
-    async fn handle_event(&self, _event: &str, _payload: Value) {}
+}
+
+/// Path of the built v3 demo-plugin bin (fixture), derived from the test
+/// binary location (…/target/<profile>/deps/…).
+fn demo_plugin_bin() -> String {
+    let mut path = std::env::current_exe().unwrap();
+    path.pop(); // deps/
+    path.pop(); // profile/
+    path.push(format!(
+        "tack-v3-demo-plugin{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    assert!(
+        path.is_file(),
+        "demo plugin bin missing: {}",
+        path.display()
+    );
+    path.to_string_lossy().to_string()
 }
 
 async fn load_demo(
     cwd: &std::path::Path,
     agent_dir: &std::path::Path,
 ) -> (ExtensionManager, Arc<FakeServices>) {
-    // Manifest running THIS test binary's tack with the demo plugin.
     let ext_dir = agent_dir.join("extensions").join("demo");
     std::fs::create_dir_all(&ext_dir).unwrap();
     std::fs::write(
         ext_dir.join("extension.json"),
         serde_json::json!({
             "name": "demo",
-            "command": env!("CARGO_BIN_EXE_tack"),
-            "args": ["ext-demo-plugin"],
+            "command": demo_plugin_bin(),
+            "args": [],
         })
         .to_string(),
     )
@@ -81,23 +94,30 @@ async fn load_demo(
     (manager, services)
 }
 
-#[tokio::test]
-async fn demo_plugin_full_lifecycle() {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+fn setup() -> (tempfile::TempDir, tempfile::TempDir) {
     let agent_dir = tempfile::tempdir().unwrap();
     unsafe { std::env::set_var("TACK_AGENT_DIR", agent_dir.path()) };
     let cwd = tempfile::tempdir().unwrap();
-    // Trust the project so its (empty) .pi dir passes the gate; the demo
-    // plugin lives in the user extensions dir anyway.
     tack_app::project_trust::set_decision(agent_dir.path(), cwd.path(), true, false);
+    (agent_dir, cwd)
+}
+
+#[tokio::test]
+async fn demo_plugin_full_lifecycle() {
+    let _guard = ENV_LOCK.lock().await;
+    let (agent_dir, cwd) = setup();
 
     let (mut manager, services) = load_demo(cwd.path(), agent_dir.path()).await;
     assert_eq!(manager.plugins.len(), 1, "demo plugin should load");
+    let plugin = &manager.plugins[0];
+    assert!(plugin.is_active(), "plugin must be active: {plugin:?}");
+    assert_eq!(plugin.id.to_string(), "demo@user");
+    assert_eq!(plugin.version, "local");
 
-    // Tools: registered and named ext__demo__echo.
+    // Tools: registered and sanitized (ext__demo_user__hello_echo).
     let tools = manager.tools();
-    assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].name(), "ext__demo__echo");
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0].name(), "ext__demo_user__hello_echo");
 
     // Tool execution crosses to the plugin and back.
     let result = tools[0]
@@ -117,35 +137,35 @@ async fn demo_plugin_full_lifecycle() {
             _ => None,
         })
         .collect::<String>();
-    assert_eq!(text, "echo: hello-ext");
+    assert_eq!(text, "echo: {\"text\":\"hello-ext\"}");
 
-    // Command invocation + its ui.notify side request.
+    // Command invocation + its ui/notify side request.
     assert!(manager.command_names().contains(&"hello".to_string()));
     manager.invoke_command("hello", "").await.unwrap();
     let requests = services
-        .wait_for_requests("ui.notify", |reqs| {
-            reqs.iter().any(|(m, _)| m == "ui.notify")
+        .wait_for_requests("ui/notify", |reqs| {
+            reqs.iter().any(|(m, _)| m == "ui/notify")
         })
         .await;
     assert!(
-        requests.iter().any(|(m, _)| m == "ui.notify"),
-        "plugin's ui.notify should reach the host: {requests:?}"
+        requests.iter().any(|(m, _)| m == "ui/notify"),
+        "plugin's ui/notify should reach the host: {requests:?}"
     );
 
-    // Event fan-out: agent_start triggers the plugin's ui.notify request.
-    manager.notify("agent_start", serde_json::json!({})).await;
+    // Event fan-out: agentStart triggers the plugin's ui/notify request.
+    manager.notify("agentStart", serde_json::json!({})).await;
     let requests = services
-        .wait_for_requests("second ui.notify", |reqs| {
-            reqs.iter().filter(|(m, _)| m == "ui.notify").count() >= 2
+        .wait_for_requests("second ui/notify", |reqs| {
+            reqs.iter().filter(|(m, _)| m == "ui/notify").count() >= 2
         })
         .await;
-    let notify_count = requests.iter().filter(|(m, _)| m == "ui.notify").count();
+    let notify_count = requests.iter().filter(|(m, _)| m == "ui/notify").count();
     assert!(
         notify_count >= 2,
-        "agent_start should trigger another notify: {requests:?}"
+        "agentStart should trigger another notify: {requests:?}"
     );
 
-    // tool_call interception (subscribed): verdict allow passes through.
+    // tool_call interception (declared): verdict allow passes through.
     let hooks = manager.hooks();
     assert_eq!(hooks.len(), 1);
     let ctx_msg = tack_ai::AssistantMessage::pending(
@@ -173,16 +193,11 @@ async fn demo_plugin_full_lifecycle() {
     manager.shutdown().await;
 }
 
-/// Headless run modes (print/rpc/acp) load the same plugins with degraded
-/// UI services: tools/commands/events keep working, `ui.notify` is accepted
-/// silently instead of hanging on a dialog.
+/// Headless run modes load the same plugins with degraded UI services.
 #[tokio::test]
 async fn demo_plugin_in_headless_mode() {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let agent_dir = tempfile::tempdir().unwrap();
-    unsafe { std::env::set_var("TACK_AGENT_DIR", agent_dir.path()) };
-    let cwd = tempfile::tempdir().unwrap();
-    tack_app::project_trust::set_decision(agent_dir.path(), cwd.path(), true, false);
+    let _guard = ENV_LOCK.lock().await;
+    let (agent_dir, cwd) = setup();
 
     let ext_dir = agent_dir.path().join("extensions").join("demo");
     std::fs::create_dir_all(&ext_dir).unwrap();
@@ -190,8 +205,8 @@ async fn demo_plugin_in_headless_mode() {
         ext_dir.join("extension.json"),
         serde_json::json!({
             "name": "demo",
-            "command": env!("CARGO_BIN_EXE_tack"),
-            "args": ["ext-demo-plugin"],
+            "command": demo_plugin_bin(),
+            "args": [],
         })
         .to_string(),
     )
@@ -201,9 +216,8 @@ async fn demo_plugin_in_headless_mode() {
         ExtensionManager::load(cwd.path(), agent_dir.path(), "print", services, true).await;
     assert_eq!(manager.plugins.len(), 1, "demo plugin should load headless");
 
-    // Tools work identically in headless mode.
     let tools = manager.tools();
-    assert_eq!(tools.len(), 1);
+    assert_eq!(tools.len(), 2);
     let result = tools[0]
         .execute(
             "call-1",
@@ -221,83 +235,79 @@ async fn demo_plugin_in_headless_mode() {
             _ => None,
         })
         .collect::<String>();
-    assert_eq!(text, "echo: headless");
+    assert_eq!(text, "echo: {\"text\":\"headless\"}");
 
-    // The demo plugin's `hello` command fires ui.notify; headless services
-    // resolve it immediately (degraded) instead of routing to a dialog.
     manager.invoke_command("hello", "").await.unwrap();
-
     manager.shutdown().await;
 }
 
-/// v2.1/v2.2 e2e: the demo plugin's declared widgets land in the host
-/// registry keyed `<plugin>:<id>`; autocomplete.provide round-trips; a
-/// widget.action is delivered back to the owning plugin.
+/// Widgets land in the host registry keyed `<plugin-id>:<widget-id>`;
+/// autocomplete round-trips; widget actions go back to the owning plugin.
 #[tokio::test]
 async fn demo_plugin_widgets_and_autocomplete() {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let agent_dir = tempfile::tempdir().unwrap();
-    unsafe { std::env::set_var("TACK_AGENT_DIR", agent_dir.path()) };
-    let cwd = tempfile::tempdir().unwrap();
-    tack_app::project_trust::set_decision(agent_dir.path(), cwd.path(), true, false);
+    let _guard = ENV_LOCK.lock().await;
+    let (agent_dir, cwd) = setup();
 
     let (mut manager, services) = load_demo(cwd.path(), agent_dir.path()).await;
     assert_eq!(manager.plugins.len(), 1, "demo plugin should load");
 
-    // v2.1: widgets registered from the register payload.
     let keys: Vec<&str> = manager.widgets().iter().map(|w| w.key.as_str()).collect();
-    assert_eq!(keys, vec!["demo:demo-status", "demo:demo-list"]);
+    assert_eq!(keys, vec!["demo@user:demo-status", "demo@user:demo-list"]);
     let status = &manager.widgets()[0];
-    assert_eq!(status.spec.kind, tack_ext::WidgetKind::StatusLineSegment);
+    assert_eq!(
+        status.spec.r#type,
+        tack_ext::rpc3::WidgetKind::StatusLineSegment
+    );
     assert_eq!(
         status.state,
         Some(serde_json::json!({"text": "demo:ok", "style": "info"}))
     );
     assert!(manager.widgets()[1].visible, "panel defaults to visible");
 
-    // widget.update via the manager: full-state replacement; unknown ids
+    // widgets/update via the manager: full-state replacement; unknown ids
     // tolerated.
-    let update = tack_ext::WidgetUpdatePayload {
+    let update = tack_ext::rpc3::WidgetUpdateParams {
         id: "demo-status".to_string(),
         state: serde_json::json!({"text": "demo:busy", "style": "warning"}),
         visible: None,
     };
-    assert!(manager.apply_widget_update("demo", &update));
+    assert!(manager.apply_widget_update("demo@user", &update));
     assert_eq!(
         manager.widgets()[0].state,
         Some(serde_json::json!({"text": "demo:busy", "style": "warning"}))
     );
-    assert!(!manager.apply_widget_update("demo", &{
-        tack_ext::WidgetUpdatePayload {
+    assert!(!manager.apply_widget_update(
+        "demo@user",
+        &tack_ext::rpc3::WidgetUpdateParams {
             id: "nope".to_string(),
             state: serde_json::json!({}),
             visible: None,
         }
-    }));
+    ));
 
-    // v2.2: providers listed in register order; provide round-trips.
+    // Providers listed in register order; provide round-trips.
     let providers = manager.autocomplete_providers();
     assert_eq!(providers.len(), 1);
-    assert_eq!(providers[0].key, "demo:hash");
+    assert_eq!(providers[0].key, "demo@user:hash");
     assert_eq!(providers[0].spec.trigger, "#");
-    let suggestions = manager.autocomplete_provide("demo:hash", "wa", 2).await;
+    let suggestions = manager
+        .autocomplete_provide("demo@user:hash", "wa", 2)
+        .await;
     assert_eq!(suggestions.len(), 1);
     assert_eq!(suggestions[0].value, "#wasm");
-    assert_eq!(suggestions[0].label, "#wasm demo tag");
-    // Unknown provider key → no suggestions (never an error to the UI).
     assert!(
         manager
-            .autocomplete_provide("demo:nope", "x", 0)
+            .autocomplete_provide("demo@user:nope", "x", 0)
             .await
             .is_empty()
     );
 
-    // v2.1: widget.action is delivered to the owning plugin; the demo
-    // plugin echoes it back as a ui.notify request.
+    // widget actions are delivered to the owning plugin; the demo plugin
+    // echoes the action back as a ui/notify request.
     manager
         .notify_widget_action(
-            "demo",
-            tack_ext::WidgetActionPayload {
+            "demo@user",
+            tack_ext::rpc3::WidgetActionParams {
                 id: "demo-list".to_string(),
                 action: "select".to_string(),
                 item_id: Some("b".to_string()),
@@ -305,27 +315,23 @@ async fn demo_plugin_widgets_and_autocomplete() {
         )
         .await;
     let requests = services
-        .wait_for_requests("widget.action echo", |reqs| {
+        .wait_for_requests("widget action echo", |reqs| {
             reqs.iter().any(|(m, p)| {
-                m == "ui.notify"
+                m == "ui/notify"
                     && p.get("message")
                         .and_then(Value::as_str)
-                        .is_some_and(|msg| msg.contains("widget.action"))
+                        .is_some_and(|msg| msg.contains("widget.action select b"))
             })
         })
         .await;
-    let echo = requests
-        .iter()
-        .filter(|(m, _)| m == "ui.notify")
-        .filter_map(|(_, p)| p.get("message").and_then(Value::as_str).map(str::to_string))
-        .find(|msg| msg.contains("widget.action"))
-        .unwrap_or_default();
-    assert!(echo.contains("demo-list"), "action id missing: {echo}");
-    assert!(echo.contains("\"itemId\":\"b\""), "item id missing: {echo}");
+    assert!(
+        requests.iter().any(|(m, _)| m == "ui/notify"),
+        "widget action echo should reach the host: {requests:?}"
+    );
 
     // Plugin death cleanup: after shutdown the registry can be drained.
     manager.shutdown().await;
-    let removed = manager.remove_plugin_widgets("demo");
+    let removed = manager.remove_plugin_widgets("demo@user");
     assert_eq!(removed.len(), 2);
     assert!(manager.widgets().is_empty());
 }

@@ -13,7 +13,13 @@ pub mod cron;
 pub mod debug_image;
 pub mod doctor;
 pub mod eval;
+#[cfg(feature = "ext")]
 pub mod ext_dev;
+#[cfg(not(feature = "ext"))]
+#[doc(hidden)]
+pub mod ext_dev_stub;
+#[cfg(not(feature = "ext"))]
+pub use ext_dev_stub as ext_dev;
 #[cfg(feature = "ext")]
 pub mod ext_headless;
 #[cfg(not(feature = "ext"))]

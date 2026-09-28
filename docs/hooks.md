@@ -22,7 +22,8 @@ With `managedHooksOnly: true` (settings), only managed hooks are kept
 |---|---|---|---|
 | `PreToolUse` | Before a tool call | tool name | block, `updatedInput` argument rewriting, `permissionDecision` |
 | `PermissionRequest` | Just before a permission dialog pops | tool name | `permissionDecision` answers in place of the user |
-| `PostToolUse` | After tool execution | tool name | block (reason fed back to the model), `additionalContext` |
+| `PostToolUse` | After tool execution (success or failure, with `is_error`) | tool name | block (reason fed back to the model), `additionalContext` |
+| `PostToolUseFailure` | Only after a tool call that errored | tool name | block (reason fed back to the model), `additionalContext` |
 | `UserPromptSubmit` | After the user submits a prompt | — | block (discards the prompt), `additionalContext` |
 | `SessionStart` | Session creation | — | `additionalContext` injected into the system prompt |
 | `SessionEnd` | Session exit | — | fire-and-forget |
