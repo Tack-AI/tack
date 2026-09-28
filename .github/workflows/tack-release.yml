@@ -170,7 +170,7 @@ jobs:
         if: matrix.target == 'aarch64-pc-windows-msvc'
         shell: pwsh
         run: Write-Host "skipping smoke test for ${{ matrix.target }} (cross-compiled, cannot run on x64 runner)"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: |
