@@ -30,9 +30,12 @@ pub type SharedConn = Rc<RefCell<Option<Rc<AgentSideConnection>>>>;
 pub async fn serve(overrides: &agent::AcpOverrides) -> anyhow::Result<()> {
     let shared_conn: SharedConn = Rc::new(RefCell::new(None));
     let agent = TackAcpAgent::new(shared_conn.clone(), overrides);
+    // Kept alive past the connection so session plugins can be shut down
+    // once the client disconnects (graceful stop + final metrics drain).
+    let sessions = agent.sessions();
 
     let local = tokio::task::LocalSet::new();
-    local
+    let result = local
         .run_until(async move {
             let stdout = tokio::io::stdout().compat_write();
             let stdin = tokio::io::stdin().compat();
@@ -45,5 +48,16 @@ pub async fn serve(overrides: &agent::AcpOverrides) -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("ACP connection error: {e}"))
         })
-        .await
+        .await;
+
+    // The connection ended (client disconnect or io error). ACP has no
+    // session/close handshake, so this is the only teardown point for the
+    // per-session ExtensionManagers; without it every session's plugins
+    // (processes/connections) and their final metrics flush leaked until
+    // process exit. Runs inside the LocalSet: plugin shutdown may
+    // spawn_local.
+    local
+        .run_until(session::shutdown_all_sessions(&sessions))
+        .await;
+    result
 }

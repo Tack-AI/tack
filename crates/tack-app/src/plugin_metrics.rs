@@ -3,7 +3,7 @@
 //! dimension enums at initialize; the host hands over a sandbox-
 //! authorized scratch file (WASI-stdio WASM: a dedicated preopen,
 //! audited) and validates every drain strictly — byte/line caps, exact
-//! dimension sets, enum values, finite numbers, dedup — before anything
+//! dimension sets, enum values, finite numbers — before anything
 //! enters telemetry with plugin attribution (target `plugin_metrics`,
 //! shipped via observability JSONL + the managed auditSink).
 //!
@@ -18,7 +18,7 @@
 //! declarations are voided with a load warning until a typed metrics
 //! export lands in a future world version.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 
@@ -142,17 +142,51 @@ pub fn validate_declaration(declaration: &MetricsDeclaration) -> Result<(), Stri
 }
 
 /// The scratch file location inside the plugin's data root:
-/// `<data>/metrics/metrics.ndjson` (the parent dir doubles as the
-/// dedicated WASM preopen).
-pub fn scratch_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("metrics").join("metrics.ndjson")
+/// `<data>/metrics/<instance>/metrics.ndjson`. `instance` is unique per
+/// live ExtensionManager (pid + counter): concurrent sessions and
+/// concurrent tack processes sharing one agent_dir must never truncate
+/// or double-drain each other's live sidecar. The instance directory
+/// also keeps a WASI guest (preopen = the instance dir) away from
+/// other sessions' files.
+pub fn scratch_path(data_dir: &Path, instance: &str) -> PathBuf {
+    data_dir
+        .join("metrics")
+        .join(instance)
+        .join("metrics.ndjson")
 }
 
+/// Instance dirs whose newest file is older than this are reclaimed
+/// when a new scratch is created (best-effort; a crashed session's
+/// leftover is small but should not accumulate forever).
+const STALE_INSTANCE_SECS: u64 = 24 * 60 * 60;
+
 /// Create/truncate the per-session scratch file; returns its host path.
-pub fn create_scratch(data_dir: &Path) -> std::io::Result<PathBuf> {
-    let path = scratch_path(data_dir);
+pub fn create_scratch(data_dir: &Path, instance: &str) -> std::io::Result<PathBuf> {
+    let path = scratch_path(data_dir, instance);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        // Best-effort GC of stale instance dirs (never the live one:
+        // every live manager holds a unique instance id).
+        if let Some(grandparent) = parent.parent()
+            && let Ok(entries) = std::fs::read_dir(grandparent)
+        {
+            let now = std::time::SystemTime::now();
+            for entry in entries.flatten() {
+                let entry_path = entry.path();
+                if entry_path == parent || !entry_path.is_dir() {
+                    continue;
+                }
+                let stale = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|mtime| now.duration_since(mtime).ok())
+                    .is_some_and(|age| age.as_secs() > STALE_INSTANCE_SECS);
+                if stale {
+                    let _ = std::fs::remove_dir_all(&entry_path);
+                }
+            }
+        }
     }
     std::fs::File::create(&path)?;
     Ok(path)
@@ -234,6 +268,19 @@ fn validate_line(
 /// drain is called from the interval task and from shutdown, never on a
 /// hot path.
 pub fn drain(sidecar: &mut MetricsSidecar) {
+    drain_impl(sidecar, false);
+}
+
+/// Final drain at shutdown: a trailing partial line is flushed too —
+/// the plugin will never finish it now, and silently dropping the last
+/// record of every session made slow writers invisible. An invalid
+/// final fragment is logged, not stricken (a kill mid-write is not
+/// plugin malice, and strikes no longer matter at teardown).
+pub fn drain_final(sidecar: &mut MetricsSidecar) {
+    drain_impl(sidecar, true);
+}
+
+fn drain_impl(sidecar: &mut MetricsSidecar, final_flush: bool) {
     if sidecar.disabled {
         return;
     }
@@ -273,30 +320,56 @@ pub fn drain(sidecar: &mut MetricsSidecar) {
         sidecar.offset = len; // drop the excess unvalidated
         return;
     }
+    // Bound the READ, not just the metadata check: a plugin appending
+    // between the metadata call and the read must not make the drain
+    // allocate past the cap.
     let mut bytes = Vec::new();
     {
         let Ok(mut file) = std::fs::File::open(&sidecar.path) else {
             return;
         };
+        let sought = file.seek(std::io::SeekFrom::Start(sidecar.offset));
+        if sought.is_err() {
+            return;
+        }
         if file
-            .seek(std::io::SeekFrom::Start(sidecar.offset))
-            .and_then(|_| file.read_to_end(&mut bytes))
+            .take(DRAIN_MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
             .is_err()
         {
             return;
         }
     }
+    if bytes.len() as u64 > DRAIN_MAX_BYTES {
+        violation(
+            sidecar,
+            format!(
+                "drain grew to {} bytes at read time (cap {DRAIN_MAX_BYTES})",
+                bytes.len()
+            ),
+        );
+        sidecar.offset = len;
+        return;
+    }
     // A trailing partial line is the plugin mid-write: hold it for the
-    // next drain rather than parsing a torn record.
+    // next drain rather than parsing a torn record — except in the
+    // final flush, where it is the last record the plugin will ever
+    // write.
     let complete_up_to = bytes
         .iter()
         .rposition(|b| *b == b'\n')
         .map(|p| p + 1)
         .unwrap_or(0);
-    if complete_up_to == 0 {
+    if complete_up_to == 0 && !final_flush {
         return;
     }
-    let text = String::from_utf8_lossy(&bytes[..complete_up_to]);
+    let tail_is_partial = complete_up_to < bytes.len();
+    let text_end = if final_flush {
+        bytes.len()
+    } else {
+        complete_up_to
+    };
+    let text = String::from_utf8_lossy(&bytes[..text_end]);
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.len() > DRAIN_MAX_LINES {
         violation(
@@ -309,20 +382,14 @@ pub fn drain(sidecar: &mut MetricsSidecar) {
         sidecar.offset = len;
         return;
     }
-    let mut seen: HashSet<(String, String, u64)> = HashSet::new();
-    for line in lines {
+    let last_complete_line = if tail_is_partial {
+        lines.len().saturating_sub(1)
+    } else {
+        lines.len()
+    };
+    for (index, line) in lines.iter().enumerate() {
         match validate_line(line, &sidecar.operations) {
             Ok(measurement) => {
-                // Dedup within the drain: identical (operation, dims,
-                // value) triples collapse to one emission.
-                let key = (
-                    measurement.operation.clone(),
-                    serde_json::to_string(&measurement.dimensions).unwrap_or_default(),
-                    measurement.value.to_bits(),
-                );
-                if !seen.insert(key) {
-                    continue;
-                }
                 tracing::info!(
                     target: "plugin_metrics",
                     plugin = %sidecar.plugin,
@@ -336,6 +403,16 @@ pub fn drain(sidecar: &mut MetricsSidecar) {
                 );
             }
             Err(detail) => {
+                if final_flush && index >= last_complete_line {
+                    // The torn final fragment is invalid on its own —
+                    // expected when the plugin was killed mid-write.
+                    tracing::warn!(
+                        target: "plugin_metrics",
+                        plugin = %sidecar.plugin,
+                        "dropping incomplete final metric line: {detail}"
+                    );
+                    continue;
+                }
                 violation(sidecar, detail);
                 if sidecar.disabled {
                     break;
@@ -343,7 +420,11 @@ pub fn drain(sidecar: &mut MetricsSidecar) {
             }
         }
     }
-    sidecar.offset += complete_up_to as u64;
+    sidecar.offset = if final_flush {
+        len
+    } else {
+        sidecar.offset + complete_up_to as u64
+    };
 }
 
 #[cfg(test)]
@@ -415,7 +496,7 @@ mod tests {
     fn drain_consumes_validates_and_holds_partials() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
-        let path = create_scratch(&data_dir).unwrap();
+        let path = create_scratch(&data_dir, "inst-1").unwrap();
         let mut sidecar = MetricsSidecar::new("demo@user".to_string(), path.clone(), declaration());
 
         std::fs::write(&path, "{\"operation\": \"review.run\", \"value\": 1, \"dimensions\": {\"outcome\": \"ok\"}}\n{\"operation\": \"review.cache_hit\", \"value\": 2}\n{\"operation\": \"review.run\", \"val").unwrap();
@@ -471,7 +552,7 @@ mod tests {
     #[test]
     fn over_cap_drain_is_a_violation() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = create_scratch(tmp.path()).unwrap();
+        let path = create_scratch(tmp.path(), "inst-1").unwrap();
         let flood = format!(
             "{}\n",
             "{{\"operation\": \"review.cache_hit\", \"value\": 1}}".repeat(DRAIN_MAX_LINES + 1)
@@ -485,5 +566,48 @@ mod tests {
             std::fs::metadata(&path).unwrap().len(),
             "the excess is dropped, not parsed"
         );
+    }
+
+    /// Scratch files are unique per manager instance: two live managers
+    /// sharing one plugin data dir never truncate or double-drain each
+    /// other's file.
+    #[test]
+    fn scratch_files_are_isolated_per_instance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = create_scratch(tmp.path(), "111-1").unwrap();
+        let b = create_scratch(tmp.path(), "111-2").unwrap();
+        assert_ne!(a, b);
+        std::fs::write(&a, "{\"operation\": \"review.cache_hit\", \"value\": 1}\n").unwrap();
+        assert_eq!(
+            std::fs::metadata(&b).unwrap().len(),
+            0,
+            "instance b's scratch is untouched by instance a"
+        );
+    }
+
+    /// The final flush consumes a trailing partial line (the plugin's
+    /// last record, written without a newline before exit) instead of
+    /// holding it for a next drain that never comes.
+    #[test]
+    fn final_flush_consumes_the_partial_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = create_scratch(tmp.path(), "inst-1").unwrap();
+        std::fs::write(&path, "{\"operation\": \"review.cache_hit\", \"value\": 1}").unwrap();
+        let mut sidecar = MetricsSidecar::new("demo@user".to_string(), path.clone(), declaration());
+        drain(&mut sidecar);
+        assert_eq!(sidecar.offset, 0, "regular drain holds the partial line");
+        drain_final(&mut sidecar);
+        assert_eq!(
+            sidecar.offset,
+            std::fs::metadata(&path).unwrap().len(),
+            "final flush consumes it"
+        );
+        assert_eq!(sidecar.violations, 0, "a valid final fragment is no strike");
+
+        // An invalid final fragment is logged, not stricken.
+        std::fs::write(&path, "{\"operation\": \"review.cache_hit\", \"val").unwrap();
+        let mut sidecar = MetricsSidecar::new("demo@user".to_string(), path, declaration());
+        drain_final(&mut sidecar);
+        assert_eq!(sidecar.violations, 0, "a kill mid-write is not malice");
     }
 }

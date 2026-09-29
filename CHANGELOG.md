@@ -172,6 +172,70 @@ notice can parse entries (same convention as TS pi).
     (assertions with recursive subset matching and scripted
     plugin→host answers; non-zero exit on failure).
 
+### Fixed
+
+- **Plugin security hardening (post-redesign review).**
+  - Pinned marketplaces now REFUSE an unsigned replacement catalog
+    (previously only warned) — a signature-stripping downgrade can no
+    longer void the TOFU pin and push code via `installed-by-default`.
+  - The plugin approval chain no longer approves mutating calls once
+    untrusted web/MCP content entered the context (the human is asked,
+    matching the distrust already applied to allow rules/allow-always),
+    and a PreToolUse `permissionDecision: "ask"` verdict now forces the
+    human dialog past the chain. `askUser` no longer terminates the
+    chain: every reviewer is consulted, the first `allow`/`reviewed`
+    claim wins.
+  - Plugin `hooks/beforeToolCall` bridges now run BEFORE the permission
+    layer in every surface (TUI/rpc/print/subagent), so declarative
+    deny rules, the mode gate, the approval chain, and the prompt
+    dialog all see the FINAL post-rewrite arguments — a plugin rewrite
+    can no longer smuggle content past deny rules or an approval.
+  - MCP-carrier plugins now time out like the process carrier (30s per
+    call, 15s connect+initialize): a wedged MCP server fails the call
+    instead of hanging the agent turn or the whole startup. ACP turns
+    wrap MCP-carrier plugin (and config-file MCP) tool output as
+    untrusted and re-prompt for mutating calls, closing the ACP gap in
+    the prompt-injection defense.
+  - Managed plugin policy: a malformed managed-settings file now logs a
+    loud warning that the policy is INACTIVE (previously silent);
+    managed audit targets (`plugin_policy`/`plugin_approval`/
+    `plugin_metrics`/`plugin_load`) are pinned at INFO for the managed
+    auditSink so a user-set log level cannot suppress them; `ext
+    upgrade` re-checks the per-plugin policy gate, not just the source
+    list; `hostPattern` rules match credential-embedded and `ssh://`
+    git URLs (userinfo is stripped before matching); install-time deny
+    audit events carry the plugin/source in `subject`.
+  - The extensions lockfile is written atomically and read-modify-write
+    sequences take a cross-process guard — concurrent tack processes
+    (e.g. background marketplace default-installs vs `ext install`)
+    can no longer tear the JSON or lose each other's entries.
+  - All plugin-store git invocations (clone/checkout/rev-parse/status)
+    now scrub the inherited git environment (`GIT_DIR` and friends):
+    running tack from a git hook no longer misreads other repos, which
+    previously recorded wrong lockfile commits and falsely reported
+    checkout drift for every git-installed plugin at startup.
+  - Plugin metrics scratch files are unique per live session/process
+    (concurrent sessions no longer truncate or double-drain each
+    other's sidecar), the shutdown drain flushes a trailing partial
+    line instead of dropping it, and ACP sessions shut their plugins
+    down (graceful stop + final drain) when the client connection ends.
+  - Marketplace sync: tag/sha-pinned git catalogs fingerprint cheaply
+    again (a sha pin needs no network round-trip at all) instead of
+    full-cloning every startup; `catalog.json?token=…` URLs classify
+    correctly; a missing live catalog self-heals from its `.bak`;
+    stale sync locks are reclaimed race-free; `ext marketplace add`
+    caps the catalog download; leaked `.staged-*.json` files no longer
+    appear as phantom marketplaces.
+  - Smaller correctness fixes: `tack ext bundle pack` rejects path-like
+    manifest versions instead of writing outside the cwd; duplicate
+    sanitized plugin tool names now warn and skip instead of silently
+    shadowing; a disabled plugin with a broken manifest reports
+    "disabled" instead of a spurious "failed"; the v3 peer no longer
+    leaks completed incoming-request handles and reports local
+    cancellation distinctly; BOM-saved component WAT routes to the
+    component carrier; dead-at-handshake MCP/component carriers report
+    Dead instead of registering as loaded.
+
 ## [1.0.4] - 2026-09-27
 
 ### Added

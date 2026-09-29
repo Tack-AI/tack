@@ -1,7 +1,8 @@
 //! Plugin approval chain (tack-RPC `approval/review`): when the built-in
 //! permission flow is about to prompt a human, active plugins that declared
 //! `capabilities.hooks.approvalReview` get first crack at the decision —
-//! first-claim-wins, a pass (null) moves to the next reviewer.
+//! every reviewer is consulted in load order, the first `allow`/`reviewed`
+//! claim wins, and a pass (null) or `askUser` moves to the next reviewer.
 //!
 //! Composition with the built-in permission modes (the roadmap's "approval
 //! chain scope" question, resolved here):
@@ -15,13 +16,27 @@
 //! The chain is consulted exactly at the point where the flow would ask a
 //! human — never for calls an allow rule or mode already approved (plugins
 //! observe those via `hooks/beforeToolCall` instead), and never in bypass
-//! mode or headless print runs (no approval is needed there).
+//! mode or headless print runs (no approval is needed there). Two more
+//! guards sit in front of it:
+//!
+//! - Prompt-injection defense: once untrusted web/MCP content entered the
+//!   context this run, mutating (non-read-only) calls skip the chain — the
+//!   human must be asked; a chain claim must not silently approve.
+//! - A PreToolUse `permissionDecision: "ask"` verdict forces the human
+//!   dialog past every fast path, the chain included.
+//!
+//! Plugin `hooks/beforeToolCall` bridges run BEFORE the permission layer in
+//! every surface's hook chain, so the reviewers (and the dialog) see the
+//! FINAL, post-rewrite arguments.
 //!
 //! Claimed decisions map to the wire actions: `allow`/`reviewed` both approve
 //! the call (one-shot; nothing is persisted into allow-always state) —
 //! `reviewed` exists so a reviewer that performed its own vetting (e.g. an
 //! LLM pass or its own UI) is distinguishable from a blanket auto-allow in
-//! the audit event. `askUser` claims nothing: the built-in prompt still runs.
+//! the audit event. `askUser` claims nothing: it is logged for audit and
+//! iteration continues — an early cautious reviewer must not wedge a later
+//! auto-approver (and vice versa, no reviewer can veto the human's option:
+//! if nobody claims `allow`/`reviewed`, the built-in prompt still runs).
 //!
 //! Failure discipline: a reviewer error (including `unsupported_capability`
 //! from carriers that do not implement `approval/review`, and the standard
@@ -120,13 +135,31 @@ impl ApprovalChain {
         self.reviewers.push((plugin_id, reviewer));
     }
 
-    /// Offer the request to each reviewer in load order; the first claim
-    /// wins. `None` means every reviewer passed (built-in prompt decides).
+    /// Offer the request to EVERY reviewer in load order; the first
+    /// `allow`/`reviewed` claim wins. `askUser` is logged (audit) but does
+    /// not terminate the chain — it claims nothing. `None` means no
+    /// reviewer claimed approval (built-in prompt decides).
     pub async fn review(&self, request: &ApprovalRequest) -> Option<ChainDecision> {
         for (plugin_id, reviewer) in &self.reviewers {
             let Some(decision) = reviewer.review(request).await else {
                 continue;
             };
+            if decision.action == ChainAction::AskUser {
+                // Deferred to the human, but the chain continues: a later
+                // reviewer may still claim allow/reviewed.
+                tracing::info!(
+                    target: "plugin_approval",
+                    decision = "deferred",
+                    plugin = plugin_id.as_str(),
+                    action = decision.action.as_str(),
+                    continues = true,
+                    approval_id = request.approval_id.as_str(),
+                    tool = request.tool_name.as_str(),
+                    policy = request.approval_policy.as_str(),
+                    reason = decision.reason.as_deref().unwrap_or(""),
+                );
+                continue;
+            }
             tracing::info!(
                 target: "plugin_approval",
                 decision = "claimed",
@@ -242,15 +275,30 @@ mod tests {
         assert_eq!(c.calls.load(Ordering::Relaxed), 0);
     }
 
+    /// askUser claims nothing: it does NOT terminate the chain. A lone
+    /// askUser reviewer leaves the chain undecided (None => built-in
+    /// prompt), and a later reviewer's allow/reviewed claim still wins.
     #[tokio::test]
-    async fn ask_user_is_a_claim_not_a_pass() {
+    async fn ask_user_is_not_a_claim() {
+        let mut chain = ApprovalChain::empty();
+        let a = Arc::new(FakeReviewer::claiming(ChainAction::AskUser));
+        chain.push("a".into(), a.clone());
+        assert_eq!(chain.review(&request()).await, None);
+        assert_eq!(a.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn ask_user_defers_and_later_claim_wins() {
         let mut chain = ApprovalChain::empty();
         let a = Arc::new(FakeReviewer::claiming(ChainAction::AskUser));
         let b = Arc::new(FakeReviewer::claiming(ChainAction::Allow));
         chain.push("a".into(), a.clone());
         chain.push("b".into(), b.clone());
-        let decision = chain.review(&request()).await.expect("a claims");
-        assert_eq!(decision.action, ChainAction::AskUser);
-        assert_eq!(b.calls.load(Ordering::Relaxed), 0);
+        let decision = chain.review(&request()).await.expect("b claims");
+        assert_eq!(decision.action, ChainAction::Allow);
+        // Both reviewers were consulted: the early askUser did not wedge
+        // the later auto-approver.
+        assert_eq!(a.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(b.calls.load(Ordering::Relaxed), 1);
     }
 }

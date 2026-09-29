@@ -70,7 +70,7 @@ pub(crate) async fn spawn_prompt(
         )
     };
     let shell_config;
-    let tools = {
+    let (tools, untrusted_seen) = {
         let checkpoints = tack_tools::checkpoint::CheckpointManager::new();
         if settings.features.checkpoints {
             checkpoints.enable(agent_dir.join("checkpoints").join(&session_id));
@@ -182,7 +182,13 @@ pub(crate) async fn spawn_prompt(
             let extensions = state_guard.extensions.lock().await;
             extensions.tools_with_untrusted(Some(services.untrusted_seen.clone()))
         });
-        crate::cli_flags::filter_feature_tools(tools, &settings.features)
+        // The permission hooks need the same untrusted-content flag the
+        // tools got (prompt-injection defense for mutating calls).
+        let untrusted_seen = services.untrusted_seen.clone();
+        (
+            crate::cli_flags::filter_feature_tools(tools, &settings.features),
+            untrusted_seen,
+        )
     };
     let (tools, tool_pool) =
         crate::cli_flags::split_for_tool_search(tools, settings.mcp_defer_threshold);
@@ -377,7 +383,15 @@ pub(crate) async fn spawn_prompt(
                 .with_post_failure(post_failure_groups),
             ));
         }
-        // permissions.deny applies headless too (CI safety net).
+        // tack-ext plugin hook bridges run BEFORE the permission layer so
+        // `hooks/beforeToolCall` rewrites land before approval: declarative
+        // deny, the mode gate, the approval chain and the client prompt all
+        // see (and the prompt displays) the FINAL arguments. A plugin Allow
+        // is not terminal (HooksChain: Allow continues), so this cannot
+        // bypass deny rules or the mode gate.
+        hook_list.extend(ext_hooks);
+        // permissions.deny applies headless too (CI safety net) — now over
+        // the post-rewrite arguments.
         let deny_rules = crate::permissions::PermissionRules::load(settings, &agent_dir);
         if !deny_rules.deny.is_empty() {
             hook_list.push(Arc::new(crate::permissions::DenyRulesHooks {
@@ -399,11 +413,9 @@ pub(crate) async fn spawn_prompt(
                 event_sink,
                 cancel.clone(),
                 approval_chain,
+                untrusted_seen,
             ));
         }
-        // tack-ext plugin hooks see the final arguments after every other
-        // hook in the chain.
-        hook_list.extend(ext_hooks);
         Arc::new(HooksChain::new(hook_list))
     };
 

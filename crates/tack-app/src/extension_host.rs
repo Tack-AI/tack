@@ -1013,7 +1013,6 @@ pub const DEFAULT_EVENTS: &[&str] = &[
 // ExtensionManager
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
 pub struct ExtensionManager {
     /// All discovered plugins, including disabled and failed ones.
     pub plugins: Vec<LoadedPlugin>,
@@ -1036,12 +1035,53 @@ pub struct ExtensionManager {
     metrics_sidecars: std::sync::Arc<std::sync::Mutex<Vec<crate::plugin_metrics::MetricsSidecar>>>,
     /// Stop signal for the drain task (set by shutdown and Drop).
     metrics_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Unique-per-manager tag for metrics scratch isolation
+    /// (pid + counter): concurrent sessions (ACP keeps one manager per
+    /// session) and concurrent tack processes sharing one agent_dir
+    /// must never truncate or double-drain each other's live sidecar.
+    metrics_instance: String,
+}
+
+impl Default for ExtensionManager {
+    fn default() -> Self {
+        static INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        ExtensionManager {
+            plugins: Vec::new(),
+            load_warnings: Vec::new(),
+            commands: HashMap::new(),
+            widgets: WidgetRegistry::default(),
+            bundle_hooks: crate::shell_hooks::HookConfig::default(),
+            bundle_mcp_servers: Vec::new(),
+            bundle_skill_dirs: Vec::new(),
+            #[cfg(feature = "wasm")]
+            wasm_carrier: None,
+            metrics_sidecars: Default::default(),
+            metrics_stop: Default::default(),
+            metrics_instance: format!(
+                "{}-{}",
+                std::process::id(),
+                INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+        }
+    }
 }
 
 impl Drop for ExtensionManager {
     fn drop(&mut self) {
-        self.metrics_stop
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let already_stopped = self
+            .metrics_stop
+            .swap(true, std::sync::atomic::Ordering::Relaxed);
+        if !already_stopped {
+            // shutdown() never ran (a surface dropped the manager
+            // without teardown): flush synchronously here rather than
+            // losing the final batch — draining is plain sync file I/O.
+            if let Ok(mut sidecars) = self.metrics_sidecars.lock() {
+                for sidecar in sidecars.iter_mut() {
+                    crate::plugin_metrics::drain_final(sidecar);
+                }
+            }
+        }
     }
 }
 
@@ -1425,6 +1465,14 @@ impl ExtensionManager {
                     continue;
                 }
             }
+            // A disabled plugin needs no manifest: skip the parse so a
+            // broken extension.json in a deliberately-disabled plugin
+            // reports "disabled", not a spurious "failed" that doctor
+            // would warn about forever.
+            if !enabled {
+                manager.plugins.push(LoadedPlugin::row(entry, false));
+                continue;
+            }
             let manifest_path = entry.dir.join("extension.json");
             let manifest: Option<ExtensionManifest> = match std::fs::read_to_string(&manifest_path)
             {
@@ -1451,11 +1499,6 @@ impl ExtensionManager {
                 }
             };
             let manifest = manifest.expect("manifest checked");
-
-            if !enabled {
-                manager.plugins.push(LoadedPlugin::row(entry, false));
-                continue;
-            }
 
             // Supply-chain gate: store installs with a lock entry pinned
             // to a resolved commit are skipped when the checkout drifted.
@@ -1498,6 +1541,31 @@ impl ExtensionManager {
                         ));
                         continue;
                     };
+                    // Managed `plugins.mcpServers` narrowing applies to
+                    // the plugin's OWN server too — for an mcp-carrier
+                    // plugin the server IS the plugin, so a policy list
+                    // that excludes it blocks the load outright (it was
+                    // previously accepted but silently not enforced).
+                    if let Some(policy) = &policy
+                        && let Some(allow) = policy.narrowed_mcp_servers(&id_string)
+                        && !allow.iter().any(|name| name == &id_string)
+                    {
+                        policy.audit_narrow(
+                            &id_string,
+                            "plugins.mcpServers",
+                            std::slice::from_ref(&id_string),
+                        );
+                        manager.plugins.push(LoadedPlugin::policy_blocked(
+                            entry,
+                            enabled,
+                            format!(
+                                "the plugin's own MCP server is not in the managed \
+                                 plugins.mcpServers allow-list ({})",
+                                policy.origin
+                            ),
+                        ));
+                        continue;
+                    }
                     let Some(mut spec) = crate::mcp_config::spec_from_entry(
                         &id_string,
                         server,
@@ -1589,9 +1657,10 @@ impl ExtensionManager {
                         if !is_component {
                             // Metrics sidecar: a dedicated preopen for the
                             // scratch file (audited with the other grants).
-                            match crate::plugin_metrics::create_scratch(&plugin_data_dir(
-                                agent_dir, &entry.id,
-                            )) {
+                            match crate::plugin_metrics::create_scratch(
+                                &plugin_data_dir(agent_dir, &entry.id),
+                                &manager.metrics_instance,
+                            ) {
                                 Ok(path) => {
                                     let host_dir =
                                         path.parent().map(PathBuf::from).unwrap_or_default();
@@ -1689,9 +1758,10 @@ impl ExtensionManager {
                     {
                         Ok(process) => {
                             // Metrics sidecar: per-session scratch file.
-                            match crate::plugin_metrics::create_scratch(&plugin_data_dir(
-                                agent_dir, &entry.id,
-                            )) {
+                            match crate::plugin_metrics::create_scratch(
+                                &plugin_data_dir(agent_dir, &entry.id),
+                                &manager.metrics_instance,
+                            ) {
                                 Ok(path) => {
                                     let absolute =
                                         path.canonicalize().unwrap_or_else(|_| path.clone());
@@ -2020,6 +2090,12 @@ impl ExtensionManager {
         untrusted: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Vec<Arc<dyn AgentTool>> {
         let mut tools: Vec<Arc<dyn AgentTool>> = Vec::new();
+        // Sanitized tool names are NOT injective (`my.plugin@ac-me` and
+        // `my-plugin@ac.me` sanitize identically) and dispatch is
+        // first-match-wins — without a collision check, one plugin
+        // silently shadows another's tool. First registration wins;
+        // the duplicate is skipped loudly.
+        let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
         for plugin in self.plugins.iter().filter(|p| p.is_active()) {
             let Some(handle) = &plugin.handle else {
                 continue;
@@ -2036,6 +2112,15 @@ impl ExtensionManager {
                             flag.clone(),
                             format!("mcp://{}/{}", plugin.id, spec.name),
                         );
+                    }
+                    if !seen.insert(tool.name()) {
+                        tracing::warn!(
+                            "extension {}: tool name {} collides with an already-registered \
+                             tool; skipping the duplicate",
+                            plugin.id,
+                            tool.name()
+                        );
+                        continue;
                     }
                     tools.push(Arc::new(tool));
                 }
@@ -2248,7 +2333,7 @@ impl ExtensionManager {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut sidecars) = self.metrics_sidecars.lock() {
             for sidecar in sidecars.iter_mut() {
-                crate::plugin_metrics::drain(sidecar);
+                crate::plugin_metrics::drain_final(sidecar);
             }
         }
     }
@@ -2416,8 +2501,83 @@ fn write_lock(agent_dir: &Path, lock: &ExtensionsLock) -> anyhow::Result<()> {
     std::fs::create_dir_all(agent_dir)?;
     let path = lock_path(agent_dir);
     let content = serde_json::to_string_pretty(lock)?;
-    std::fs::write(&path, content)
+    // Atomic (tmp + rename): a plain fs::write can tear the JSON when
+    // two processes write concurrently — and a torn lockfile made the
+    // marketplace default-installs re-clone EVERY default plugin on
+    // every startup without ever healing (read fell back to empty).
+    crate::atomic_write::atomic_write(&path, &content)
         .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", path.display()))
+}
+
+/// Cross-process guard for lockfile read-modify-write. Atomic writes
+/// prevent TORN files; they cannot stop two processes' read-modify-write
+/// sequences from losing each other's entries (background marketplace
+/// default-installs vs a concurrent `tack ext install`). Best-effort:
+/// a guard abandoned by a crashed holder is reclaimed after
+/// LOCK_GUARD_STALE_SECS, and a process that cannot acquire within the
+/// wait budget proceeds without it rather than blocking startup.
+const LOCK_GUARD_STALE_SECS: u64 = 120;
+struct LockGuard {
+    path: PathBuf,
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        if !self.path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn lock_guard(agent_dir: &Path) -> LockGuard {
+    let path = lock_path(agent_dir).with_extension("guard");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2_000);
+    loop {
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(_) => return LockGuard { path },
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|mtime| mtime.elapsed().ok())
+                    .is_some_and(|age| age.as_secs() > LOCK_GUARD_STALE_SECS);
+                if stale {
+                    // Rename-claim the stale guard aside (never delete
+                    // in place — two concurrent reclaims could then
+                    // both create_new successfully). Ownership is
+                    // decided ONLY by the create_new below.
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    let claimed =
+                        path.with_extension(format!("stale-{}-{nanos}", std::process::id()));
+                    if std::fs::rename(&path, &claimed).is_ok() {
+                        let _ = std::fs::remove_file(&claimed);
+                        continue;
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        "extensions lockfile guard held by another process; proceeding without it"
+                    );
+                    return LockGuard {
+                        path: PathBuf::new(),
+                    };
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => {
+                return LockGuard {
+                    path: PathBuf::new(),
+                };
+            }
+        }
+    }
 }
 
 /// Upsert the lock entry for a freshly installed extension.
@@ -2430,6 +2590,7 @@ fn lock_record_install(
     version: &str,
     marketplace: Option<&str>,
 ) -> anyhow::Result<()> {
+    let _guard = lock_guard(agent_dir);
     let mut lock = read_lock(agent_dir)?;
     let installed_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2452,6 +2613,7 @@ fn lock_record_install(
 
 /// Drop a removed extension's lock entry (no-op when absent).
 fn lock_remove(agent_dir: &Path, id: &str) -> anyhow::Result<()> {
+    let _guard = lock_guard(agent_dir);
     let mut lock = read_lock(agent_dir)?;
     if lock.plugins.remove(id).is_some() {
         write_lock(agent_dir, &lock)?;
@@ -2461,10 +2623,11 @@ fn lock_remove(agent_dir: &Path, id: &str) -> anyhow::Result<()> {
 
 /// `git rev-parse HEAD` of a checkout, or None when not a git repo / no HEAD.
 fn git_head_commit(dir: &Path) -> Option<String> {
+    let mut rev_parse = std::process::Command::new("git");
+    rev_parse.args(["rev-parse", "HEAD"]).current_dir(dir);
+    scrub_git_env(&mut rev_parse);
     let output = crate::sync_process::output_with_timeout(
-        std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(dir),
+        &mut rev_parse,
         std::time::Duration::from_secs(10),
     )
     .ok()?;
@@ -2482,13 +2645,12 @@ fn git_head_commit(dir: &Path) -> Option<String> {
 /// `git status --porcelain` of a checkout: Some(true) when the working
 /// tree is clean, Some(false) when dirty, None when git itself fails.
 fn git_worktree_clean(dir: &Path) -> Option<bool> {
-    let output = crate::sync_process::output_with_timeout(
-        std::process::Command::new("git")
-            .args(["status", "--porcelain"])
-            .current_dir(dir),
-        std::time::Duration::from_secs(10),
-    )
-    .ok()?;
+    let mut status = std::process::Command::new("git");
+    status.args(["status", "--porcelain"]).current_dir(dir);
+    scrub_git_env(&mut status);
+    let output =
+        crate::sync_process::output_with_timeout(&mut status, std::time::Duration::from_secs(10))
+            .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -2663,12 +2825,16 @@ pub fn split_source_ref(source: &str) -> (String, Option<String>) {
     }
 }
 
-/// Clone a git source into `target` (bounded, piped stdio, scrubbed git
-/// environment: no terminal prompt, no inherited GIT_* config).
-pub(crate) fn git_clone(source: &str, rev: Option<&str>, target: &Path) -> anyhow::Result<()> {
-    let mut clone = std::process::Command::new("git");
-    clone
-        .arg("clone")
+/// Scrub the git environment for plugin-store git invocations: no
+/// terminal prompt and no inherited GIT_* config. This must wrap EVERY
+/// git call that touches a checkout (clone, checkout, rev-parse,
+/// status): an inherited `GIT_DIR`/`GIT_WORK_TREE` (tack run from a git
+/// hook, a bare-repo script, some CI setups) otherwise silently
+/// redirects the command to a different repository — installs would
+/// record the wrong commit and the startup lock check would report
+/// drift for every git-installed plugin.
+pub(crate) fn scrub_git_env(command: &mut std::process::Command) -> &mut std::process::Command {
+    command
         .env("GIT_TERMINAL_PROMPT", "0")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
@@ -2676,7 +2842,15 @@ pub(crate) fn git_clone(source: &str, rev: Option<&str>, target: &Path) -> anyho
         .env_remove("GIT_CONFIG")
         .env_remove("GIT_CONFIG_GLOBAL")
         .env_remove("GIT_CONFIG_SYSTEM")
-        .env_remove("GIT_CONFIG_COUNT");
+        .env_remove("GIT_CONFIG_COUNT")
+}
+
+/// Clone a git source into `target` (bounded, piped stdio, scrubbed git
+/// environment: no terminal prompt, no inherited GIT_* config).
+pub(crate) fn git_clone(source: &str, rev: Option<&str>, target: &Path) -> anyhow::Result<()> {
+    let mut clone = std::process::Command::new("git");
+    clone.arg("clone");
+    scrub_git_env(&mut clone);
     if rev.is_none() {
         clone.args(["--depth", "1"]);
     }
@@ -2694,11 +2868,11 @@ pub(crate) fn git_clone(source: &str, rev: Option<&str>, target: &Path) -> anyho
         );
     }
     if let Some(rev) = rev {
+        let mut checkout = std::process::Command::new("git");
+        checkout.args(["checkout", rev]).current_dir(target);
+        scrub_git_env(&mut checkout);
         let output = crate::sync_process::output_with_timeout(
-            std::process::Command::new("git")
-                .args(["checkout", rev])
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .current_dir(target),
+            &mut checkout,
             std::time::Duration::from_secs(60),
         )
         .map_err(|e| anyhow::anyhow!("failed to run git: {e}"))?;
@@ -2995,6 +3169,14 @@ pub fn upgrade_extensions(
     // A managed policy change since install also constrains upgrades:
     // re-check the recorded source before any network access.
     let policy = crate::plugin_policy::PluginPolicy::load();
+    // Resolve the selector ONCE: an unresolvable name must error even
+    // when the lockfile is empty (silently succeeding on a typo is how
+    // "upgrade everything" mistakes go unnoticed), and per-entry
+    // resolution would bail mid-loop after partial upgrades.
+    let want = match name {
+        Some(name) => Some(resolve_installed_id(name, agent_dir)?),
+        None => None,
+    };
     let mut out = Vec::new();
     for (id_string, entry) in lock.plugins.clone() {
         if !entry.store {
@@ -3003,11 +3185,10 @@ pub fn upgrade_extensions(
         let Ok(id) = id_string.parse::<PluginId>() else {
             continue;
         };
-        if let Some(name) = name {
-            let want = resolve_installed_id(name, agent_dir)?;
-            if id != want {
-                continue;
-            }
+        if let Some(want) = &want
+            && &id != want
+        {
+            continue;
         }
         let source = entry.source.clone();
         let is_git = source.starts_with("http://")
@@ -3048,6 +3229,17 @@ pub fn upgrade_extensions(
                 continue;
             }
         };
+        // The per-plugin policy gate from the install channel applies
+        // here too: a managed policy change since install (e.g.
+        // managedPluginsOnly newly enabled) must stop the new version
+        // from being fetched and activated, not just from loading.
+        if let Some(policy) = &policy
+            && let Err(denial) = policy.check_install_allowed(&id)
+        {
+            let _ = std::fs::remove_dir_all(&staging);
+            out.push((id_string.clone(), format!("blocked: {denial}")));
+            continue;
+        }
         let version = install_version(&manifest, entry.rev.as_deref());
         let plugin_root = store_root(agent_dir).join(id.source()).join(id.name());
         std::fs::create_dir_all(&plugin_root)?;
@@ -3417,6 +3609,20 @@ pub(crate) fn activate_synced_catalog(
     let root = marketplaces_root(agent_dir);
     std::fs::create_dir_all(&root)?;
     let target = root.join(format!("{name}.json"));
+    // Crash-window self-heal: a previous activation that died between
+    // target→bak and staged→target left NO live catalog (nothing else
+    // ever reads the .bak). Restore the last good one before deciding
+    // anything — the source may be unreachable right now.
+    if !target.exists() {
+        let backup = root.join(format!("{name}.json.bak"));
+        if backup.exists() {
+            tracing::warn!(
+                "marketplace {name}: live catalog missing after an interrupted sync; \
+                 restoring the last backup"
+            );
+            let _ = std::fs::rename(&backup, &target);
+        }
+    }
     // Fingerprint-idempotent: byte-identical content is a no-op (the
     // caller's cheap fingerprint already short-circuits; this is the
     // exact backstop).
@@ -3453,9 +3659,16 @@ pub(crate) fn activate_synced_catalog(
             }
             None => {
                 if read_pinned_key(agent_dir, name).is_some() {
-                    tracing::warn!(
-                        "marketplace {name}: previously signed catalog replaced by an UNSIGNED \
-                         one — the pinned key no longer protects installs"
+                    // Signature-stripping downgrade: a pinned TOFU key
+                    // means this marketplace MUST stay signed forever.
+                    // Accepting an unsigned replacement would let
+                    // anyone controlling the transport (not the key)
+                    // void the pin and push code via
+                    // installed-by-default.
+                    anyhow::bail!(
+                        "marketplace {name}: catalog lost its signature but a pinned TOFU key \
+                         exists ({}) — refusing to activate an unsigned catalog",
+                        marketplace_key_path(agent_dir, name).display()
                     );
                 }
                 Ok(None)
@@ -3489,6 +3702,9 @@ pub(crate) fn activate_synced_catalog(
         if backup.exists() {
             let _ = std::fs::rename(&backup, &target);
         }
+        // A leaked .staged-*.json would show up in list_marketplaces
+        // as a phantom marketplace the CLI cannot remove.
+        let _ = std::fs::remove_file(&staged);
         return Err(e.into());
     }
     Ok(true)
@@ -3506,16 +3722,21 @@ pub async fn add_marketplace(
     std::fs::create_dir_all(&root)?;
     let target = root.join(format!("{name}.json"));
     if source.starts_with("http://") || source.starts_with("https://") {
-        let response = reqwest::get(source)
+        let mut response = reqwest::get(source)
             .await
             .map_err(|e| anyhow::anyhow!("failed to fetch {source}: {e}"))?;
         if !response.status().is_success() {
             anyhow::bail!("fetching {source} failed: {}", response.status());
         }
-        let body = response
-            .text()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read {source}: {e}"))?;
+        // Catalogs are small JSON documents; read with a hard cap
+        // instead of buffering an unbounded body.
+        const MAX_CATALOG_BYTES: u64 = 8 * 1024 * 1024;
+        let body = crate::catalog_refresh::read_body_capped(
+            &mut response,
+            MAX_CATALOG_BYTES,
+            &format!("marketplace catalog {source}"),
+        )
+        .await?;
         std::fs::write(&target, body)?;
     } else {
         let path = PathBuf::from(source);
@@ -3542,15 +3763,15 @@ pub async fn add_marketplace(
             }
             None => {
                 if read_pinned_key(agent_dir, name).is_some() {
-                    tracing::warn!(
-                        "marketplace {name}: previously signed catalog replaced by an UNSIGNED \
-                         one — the pinned key no longer protects installs"
-                    );
-                } else {
-                    tracing::warn!(
-                        "marketplace {name}: catalog is unsigned; installs are not integrity-protected"
+                    anyhow::bail!(
+                        "marketplace {name}: catalog lost its signature but a pinned TOFU key \
+                         exists ({}) — refusing to register an unsigned catalog",
+                        marketplace_key_path(agent_dir, name).display()
                     );
                 }
+                tracing::warn!(
+                    "marketplace {name}: catalog is unsigned; installs are not integrity-protected"
+                );
                 Ok(None)
             }
         }
@@ -3577,9 +3798,17 @@ pub fn list_marketplaces(agent_dir: &Path) -> Vec<(String, PathBuf)> {
     if let Ok(read) = std::fs::read_dir(marketplaces_root(agent_dir)) {
         for entry in read.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("json")
-                && let Some(name) = path.file_stem().map(|n| n.to_string_lossy().to_string())
-            {
+            let Some(name) = path.file_stem().map(|n| n.to_string_lossy().to_string()) else {
+                continue;
+            };
+            // Dotfiles (staged temps, editor backups) are never
+            // marketplaces; without this filter a leaked
+            // `.staged-acme-<pid>.json` listed as a phantom marketplace
+            // that `ext marketplace remove` cannot delete.
+            if name.starts_with('.') {
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
                 out.push((name, path));
             }
         }
@@ -3868,6 +4097,72 @@ mod tests {
         );
     }
 
+    /// Every plugin-store git invocation must scrub the inherited git
+    /// environment: with GIT_DIR set (tack run from a git hook),
+    /// rev-parse/status would otherwise silently resolve the WRONG
+    /// repository — recording bogus lockfile commits and falsely
+    /// reporting checkout drift for every git-installed plugin.
+    #[test]
+    fn scrub_git_env_removes_inherited_git_vars() {
+        let mut command = std::process::Command::new("git");
+        scrub_git_env(&mut command);
+        let envs: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_EXEC_PATH",
+            "GIT_CONFIG",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_COUNT",
+        ] {
+            assert!(
+                envs.iter().any(|(k, v)| k == var && v.is_none()),
+                "{var} must be env_remove'd: {envs:?}"
+            );
+        }
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "GIT_TERMINAL_PROMPT" && v.as_deref() == Some("0"))
+        );
+    }
+
+    /// Lockfile mutations are atomic (intact JSON under concurrent
+    /// writers) and the cross-process guard is released on drop.
+    #[test]
+    fn lock_record_install_is_atomic_and_releases_the_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let id = PluginId::new("demo", "user").unwrap();
+        lock_record_install(
+            &agent_dir,
+            &id,
+            "https://example.com/x.git",
+            None,
+            Some("abc".to_string()),
+            "1.0.0",
+            None,
+        )
+        .unwrap();
+        let lock = read_lock(&agent_dir).unwrap();
+        assert!(lock.plugins.contains_key("demo@user"));
+        assert!(
+            !lock_path(&agent_dir).with_extension("guard").exists(),
+            "the guard file is released when the mutation returns"
+        );
+        lock_remove(&agent_dir, "demo@user").unwrap();
+        assert!(read_lock(&agent_dir).unwrap().plugins.is_empty());
+        assert!(!lock_path(&agent_dir).with_extension("guard").exists());
+    }
+
     /// Moving HEAD in the installed checkout makes verify report changed.
     #[test]
     fn verify_detects_head_drift() {
@@ -4074,6 +4369,65 @@ mod tests {
         assert!(err.to_string().contains("signature"), "{err}");
     }
 
+    /// Signature-stripping downgrade: once a marketplace pinned a TOFU
+    /// key, an UNSIGNED replacement catalog must be REFUSED (previously
+    /// it was activated with only a warning, voiding the pin on a
+    /// code-delivery channel).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pinned_marketplace_refuses_an_unsigned_replacement() {
+        use ed25519_dalek::Signer as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let key_hex = hex_encode(signing.verifying_key().as_bytes());
+
+        let catalog = serde_json::json!({
+            "name": "acme",
+            "plugins": { "demo": { "source": "/srv/demo" } }
+        });
+        let canonical = serde_json::to_string(&catalog).unwrap();
+        let signature = signing.sign(canonical.as_bytes());
+        let mut signed_catalog = catalog.clone();
+        signed_catalog["signature"] = serde_json::json!({
+            "algorithm": "ed25519",
+            "value": hex_encode(&signature.to_bytes()),
+        });
+        let catalog_path = tmp.path().join("acme.json");
+        std::fs::write(
+            &catalog_path,
+            serde_json::to_string(&signed_catalog).unwrap(),
+        )
+        .unwrap();
+        add_marketplace(
+            "acme",
+            catalog_path.to_str().unwrap(),
+            &agent_dir,
+            Some(&key_hex),
+        )
+        .await
+        .unwrap();
+
+        // A sync delivering the SAME plugins but no signature must fail
+        // and leave the signed catalog untouched.
+        let unsigned = serde_json::to_string(&serde_json::json!({
+            "name": "acme",
+            "plugins": { "demo": { "source": "/srv/evil" } }
+        }))
+        .unwrap();
+        let err =
+            activate_synced_catalog(&agent_dir, "acme", unsigned.as_bytes(), None).unwrap_err();
+        assert!(err.to_string().contains("unsigned"), "{err}");
+        let live =
+            std::fs::read_to_string(marketplaces_root(&agent_dir).join("acme.json")).unwrap();
+        assert!(live.contains("signature"), "signed catalog preserved");
+        assert!(live.contains("/srv/demo"), "original content preserved");
+        // No staged temp leaked into the marketplaces dir.
+        for entry in std::fs::read_dir(marketplaces_root(&agent_dir)).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            assert!(!name.starts_with(".staged-"), "staged temp leaked: {name}");
+        }
+    }
+
     /// Catalog v2: installation states gate resolution and drive
     /// default installs; the inline manifest enriches listing; unknown
     /// keys are skipped (forward compatibility).
@@ -4256,10 +4610,18 @@ mod tests {
             manager.plugins[0].error
         );
         // The validated declaration registered a sidecar with a
-        // pre-created scratch file in the plugin's data root.
+        // pre-created scratch file under the plugin's data root (unique
+        // per manager instance: <data>/metrics/<instance>/metrics.ndjson).
         assert_eq!(manager.metrics_sidecars.lock().unwrap().len(), 1);
-        let scratch = agent_dir.join("extensions/data/user/demo/metrics/metrics.ndjson");
+        let scratch = manager.metrics_sidecars.lock().unwrap()[0]
+            .path()
+            .to_path_buf();
         assert!(scratch.is_file(), "scratch file pre-created");
+        assert!(
+            scratch.starts_with(agent_dir.join("extensions/data/user/demo/metrics")),
+            "scratch lives under the plugin data dir: {}",
+            scratch.display()
+        );
 
         // The tool writes through the host-provided scratchFile path — a
         // wiring failure makes it error out.
@@ -5321,6 +5683,7 @@ mod policy_tests {
             wasm_carrier: None,
             metrics_sidecars: Default::default(),
             metrics_stop: Default::default(),
+            metrics_instance: "test-approval".to_string(),
         };
         assert!(manager.approval_chain().is_empty());
     }

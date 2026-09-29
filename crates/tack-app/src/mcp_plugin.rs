@@ -31,6 +31,44 @@ use tack_tools::mcp::{McpClientCallbacks, McpConnection, McpPluginTool, McpServe
 /// exposes no closed-future; widget cleanup is not latency-critical).
 const DEATH_POLL: Duration = Duration::from_millis(250);
 
+/// Bound on one host→plugin call: the process/WASI carriers' v3 peer
+/// fails a wedged plugin at 30s (`tack_ext::v3::peer::REQUEST_TIMEOUT`),
+/// but the shared MCP client machinery sets no request timeout on its
+/// rmcp calls, so the MCP carrier applies the same bound here (shorter
+/// under test).
+#[cfg(not(test))]
+const CALL_TIMEOUT: Duration = tack_ext::v3::peer::REQUEST_TIMEOUT;
+#[cfg(test)]
+const CALL_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Bound on connect + initialize + the capability probe at load time:
+/// the extension load loop is SEQUENTIAL, so one server that spawns but
+/// never answers initialize must not hang session startup for every
+/// other plugin. The process carrier allows 10s for initialize alone;
+/// the MCP connect also covers the server spawn, hence 15s (shorter
+/// under test).
+#[cfg(not(test))]
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Apply [`CONNECT_TIMEOUT`] to a connect future, mapping expiry to the
+/// same kind of error a failed handshake produces. Dropping the connect
+/// future drops the rmcp serve future and its transport; for stdio that
+/// kills the server child (rmcp's `TokioChildProcess` Drop kills the
+/// process), so no wedged child outlives a timed-out connect.
+async fn with_connect_timeout(
+    server_name: &str,
+    connect: impl Future<Output = Result<McpConnection, String>>,
+) -> Result<McpConnection, String> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "MCP server {server_name} did not finish connect+initialize within {CONNECT_TIMEOUT:?}"
+        )),
+    }
+}
+
 /// The host's view of one Level-2 MCP server plugin.
 pub struct McpPluginConnection {
     plugin_name: String,
@@ -62,8 +100,13 @@ impl McpPluginConnection {
         plugin_name: String,
         plugin_version: String,
     ) -> Result<Self, String> {
-        let conn = Arc::new(tack_tools::mcp::connect_with(spec, callbacks).await?);
-        Ok(Self::from_connection(conn, plugin_name, plugin_version))
+        let conn = with_connect_timeout(&spec.name, tack_tools::mcp::connect_with(spec, callbacks))
+            .await?;
+        Ok(Self::from_connection(
+            Arc::new(conn),
+            plugin_name,
+            plugin_version,
+        ))
     }
 
     /// Adapt an established connection (capability synthesis shared by the
@@ -130,6 +173,12 @@ impl PluginConnection for McpPluginConnection {
     async fn initialize(&self, _params: &InitializeParams) -> Result<InitializeResult, PeerError> {
         // No wire handshake: the MCP initialize already happened at
         // connect; synthesize the v3 result from the probed capabilities.
+        // A server that died between connect and here must not register
+        // as loaded — the process carrier fails its handshake in that
+        // case, so report Dead the same way.
+        if self.conn.is_closed() {
+            return Err(PeerError::Dead);
+        }
         // The server speaks no tack-RPC version — report the host's own so
         // the version check is a no-op by construction.
         Ok(InitializeResult {
@@ -156,10 +205,20 @@ impl PluginConnection for McpPluginConnection {
                 params.name
             )));
         };
-        match engine
-            .execute(&params.tool_call_id, params.arguments.clone())
-            .await
-        {
+        // The shared MCP machinery sets no request timeout on the rmcp
+        // call; bound it to the process carrier's per-call timeout so a
+        // wedged-but-connected server fails the turn at 30s instead of
+        // hanging it forever. Dropping the execute future on expiry
+        // aborts the await (McpPluginTool::execute documents structural
+        // cancellation — the same drop McpTool's cancel path performs),
+        // so no explicit cancellation token needs firing.
+        let result = tokio::time::timeout(
+            CALL_TIMEOUT,
+            engine.execute(&params.tool_call_id, params.arguments.clone()),
+        )
+        .await
+        .map_err(|_| PeerError::Timeout)?;
+        match result {
             Ok(result) => Ok(to_tool_output(result)),
             // MCP isError / transport failures both surface as tool errors
             // (the model sees the message; the run continues).
@@ -590,5 +649,98 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PeerError::Dead));
+    }
+
+    /// A fixture server that answers initialize and tools/list but whose
+    /// call_tool never responds — a wedged-but-connected server.
+    #[derive(Clone, Debug)]
+    struct HangingServer;
+
+    impl ServerHandler for HangingServer {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            Ok(ListToolsResult::with_all_items(vec![Tool::new(
+                "hang".to_string(),
+                "Never answers".to_string(),
+                object_schema(),
+            )]))
+        }
+
+        async fn call_tool(
+            &self,
+            _request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+            std::future::pending::<()>().await;
+            unreachable!("pending never resolves")
+        }
+    }
+
+    async fn hanging_plugin() -> McpPluginConnection {
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            let running = HangingServer.serve(server_io).await.unwrap();
+            running.waiting().await.unwrap();
+        });
+        let conn = tack_tools::mcp::connect_transport("hanging", client_io, Default::default())
+            .await
+            .unwrap();
+        McpPluginConnection::from_connection(
+            Arc::new(conn),
+            "hanging".to_string(),
+            "local".to_string(),
+        )
+    }
+
+    /// A wedged MCP server must fail the call with the same error the
+    /// process carrier produces (PeerError::Timeout) instead of hanging
+    /// the agent turn forever (CALL_TIMEOUT is 250ms under test).
+    #[tokio::test]
+    async fn wedged_tool_call_times_out_like_the_process_carrier() {
+        let plugin = hanging_plugin().await;
+        let err = plugin
+            .tool_execute(&ToolExecuteParams {
+                name: "hang".to_string(),
+                tool_call_id: "call-1".to_string(),
+                arguments: Value::Null,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PeerError::Timeout), "{err:?}");
+    }
+
+    /// A server that died between connect and the handshake must not
+    /// register as loaded (the process carrier fails the handshake).
+    #[tokio::test]
+    async fn initialize_reports_dead_after_the_server_dies() {
+        let plugin = fixture_plugin().await;
+        PluginConnection::shutdown(&plugin).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), plugin.wait_dead())
+            .await
+            .expect("wait_dead hangs after shutdown");
+        let err = plugin.initialize(&init_params()).await.unwrap_err();
+        assert!(matches!(err, PeerError::Dead), "{err:?}");
+    }
+
+    /// A connect that never completes (server spawned but never answers
+    /// initialize) must fail within CONNECT_TIMEOUT instead of hanging
+    /// the sequential extension load loop (250ms under test).
+    #[tokio::test]
+    async fn connect_timeout_fails_instead_of_hanging() {
+        let err = with_connect_timeout(
+            "wedged",
+            std::future::pending::<Result<McpConnection, String>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("wedged"), "{err}");
+        assert!(err.contains("connect+initialize"), "{err}");
     }
 }

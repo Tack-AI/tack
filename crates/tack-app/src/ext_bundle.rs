@@ -15,6 +15,20 @@ pub fn is_bundle_path(source: &str) -> bool {
 /// decompressed caps live in `archive_extract::ExtractCaps::PLUGIN_BUNDLE`).
 const MAX_BUNDLE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Per-process scratch-dir uniqueness: concurrent in-process installs
+/// (RPC/headless may expose parallel installs) must not share one
+/// `.bundle-extract-<pid>` directory.
+static BUNDLE_SCRATCH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Best-effort removal of the extraction scratch dir on every exit path.
+struct ScratchCleanup(PathBuf);
+
+impl Drop for ScratchCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Stage a bundle archive into `staging`: extract defensively, then
 /// unwrap the single top-level directory when the archive has one (both
 /// `pack`-produced `<name>-<version>/...` and hand-rolled flat archives
@@ -35,7 +49,12 @@ pub(crate) fn stage_bundle_archive(source: &Path, staging: &Path) -> anyhow::Res
     if bytes.len() as u64 > MAX_BUNDLE_BYTES {
         anyhow::bail!("bundle {} exceeds the size cap", source.display());
     }
-    let scratch = staging.with_file_name(format!(".bundle-extract-{}", std::process::id()));
+    let scratch = staging.with_file_name(format!(
+        ".bundle-extract-{}-{}",
+        std::process::id(),
+        BUNDLE_SCRATCH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _cleanup = ScratchCleanup(scratch.clone());
     let _ = std::fs::remove_dir_all(&scratch);
     crate::archive_extract::extract_tgz(
         &bytes,
@@ -44,11 +63,7 @@ pub(crate) fn stage_bundle_archive(source: &Path, staging: &Path) -> anyhow::Res
     )?;
     let inner =
         crate::archive_extract::single_top_level_dir(&scratch).unwrap_or_else(|| scratch.clone());
-    if let Err(e) = std::fs::rename(&inner, staging) {
-        let _ = std::fs::remove_dir_all(&scratch);
-        return Err(e.into());
-    }
-    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::rename(&inner, staging)?;
     Ok(())
 }
 
@@ -163,6 +178,26 @@ fn is_exec(_meta: &std::fs::Metadata) -> bool {
     false
 }
 
+/// The manifest version feeds the default output filename and the
+/// archive prefix, so it must be a single safe path component:
+/// semver-shaped versions pass, anything path-like (`../../x`) bails.
+/// (`extension_host::parse_semver` is private; this strict charset +
+/// `..` check accepts its whole output range.)
+fn validate_bundle_version(version: &str) -> anyhow::Result<()> {
+    let valid = !version.is_empty()
+        && version.bytes().enumerate().all(|(i, b)| {
+            b.is_ascii_alphanumeric() || (i > 0 && matches!(b, b'.' | b'+' | b'_' | b'-'))
+        })
+        && !version.contains("..");
+    if !valid {
+        anyhow::bail!(
+            "invalid version {version:?}: expected a semver-like version \
+             (ASCII letters/digits plus `.`, `+`, `_`, `-`; no `..`)"
+        );
+    }
+    Ok(())
+}
+
 /// Pack an extension directory into a deterministic
 /// `<name>-<version>.tgz` (sorted entries, zeroed mtimes/owners,
 /// normalized modes — the same input bytes always produce the same
@@ -176,6 +211,8 @@ pub fn pack_bundle(dir: &Path, output: Option<&Path>) -> anyhow::Result<PathBuf>
     // The name feeds the archive prefix and later the store path.
     tack_ext::plugin_id::PluginId::new(&manifest.name, "user")?;
     let version = manifest.version.as_deref().unwrap_or("0.0.0");
+    // The version feeds the output path too — validate it as strictly.
+    validate_bundle_version(version)?;
     let prefix = format!("{}-{version}", manifest.name);
     let out = output
         .map(PathBuf::from)
@@ -303,5 +340,88 @@ mod tests {
         stage_bundle_archive(&out, &staging).unwrap();
         assert!(!staging.join(".git").exists());
         assert!(!staging.join("demo-1.2.3.tgz").exists());
+    }
+
+    /// The manifest version feeds the output path: path-like versions
+    /// are rejected before any archive byte is written.
+    #[test]
+    fn pack_rejects_a_traversal_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("evil");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("extension.json"),
+            r#"{"name": "evil", "version": "../../x"}"#,
+        )
+        .unwrap();
+        let err = pack_bundle(&dir, None).unwrap_err();
+        assert!(format!("{err:#}").contains("invalid version"), "{err:#}");
+        // Nothing escaped: no `x.tgz` outside the plugin dir, no
+        // `evil-...tgz` anywhere unexpected.
+        assert!(!tmp.path().join("x.tgz").exists());
+        assert!(!tmp.path().join("evil-../../x.tgz").exists());
+    }
+
+    #[test]
+    fn bundle_versions_accept_semver_and_reject_paths() {
+        for ok in [
+            "1.2.3",
+            "0.0.0",
+            "1.0.0-rc.1",
+            "1.0.0+build.5",
+            "v2",
+            "2024_01",
+        ] {
+            validate_bundle_version(ok).unwrap_or_else(|e| panic!("{ok:?} should pass: {e}"));
+        }
+        for bad in [
+            "", "../x", "../../x", "1.0.0/x", "1.0.0\\x", "1..0", ".5", "-1", "x y",
+        ] {
+            assert!(
+                validate_bundle_version(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    /// Concurrent same-pid staging into sibling dirs must not collide
+    /// on the extraction scratch dir, and every path cleans it up.
+    #[test]
+    fn staging_scratch_dirs_are_unique_and_cleaned_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = plugin_dir(tmp.path());
+        let out = pack_bundle(&dir, Some(&tmp.path().join("demo.tgz"))).unwrap();
+
+        let leftover_scratch = |dir: &Path| -> Vec<String> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.starts_with(".bundle-extract-"))
+                .collect()
+        };
+
+        // Parallel: same parent, same process — the per-process counter
+        // keeps the scratch dirs distinct.
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let out = out.clone();
+                let staging = tmp.path().join(format!("par{i}"));
+                std::thread::spawn(move || stage_bundle_archive(&out, &staging))
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        for i in 0..4 {
+            assert!(tmp.path().join(format!("par{i}/extension.json")).is_file());
+        }
+        assert_eq!(leftover_scratch(tmp.path()), Vec::<String>::new());
+
+        // Error path: a corrupt archive fails AND cleans its scratch.
+        let bad = tmp.path().join("bad.tgz");
+        std::fs::write(&bad, b"not a gzip stream").unwrap();
+        assert!(stage_bundle_archive(&bad, &tmp.path().join("staging")).is_err());
+        assert_eq!(leftover_scratch(tmp.path()), Vec::<String>::new());
     }
 }

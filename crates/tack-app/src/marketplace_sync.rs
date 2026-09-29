@@ -155,7 +155,11 @@ enum SourceKind {
 
 fn classify(source: &str) -> SourceKind {
     if source.starts_with("http://") || source.starts_with("https://") {
-        if source.ends_with(".json") {
+        // Classify on the URL path alone: a signed-catalog URL carries
+        // a query (`?token=…`) or fragment that must not break the
+        // `.json` check, and the suffix match is case-insensitive.
+        let path = source.split(['?', '#']).next().unwrap_or(source);
+        if path.to_ascii_lowercase().ends_with(".json") {
             SourceKind::JsonUrl
         } else {
             SourceKind::Git
@@ -236,13 +240,44 @@ impl SyncLock {
                 if !stale {
                     return None;
                 }
-                let _ = std::fs::remove_file(&path);
-                std::fs::OpenOptions::new()
+                // Rename-claim the stale lock before recreating it: the
+                // rename of one source path succeeds for exactly one
+                // racer, so two processes reclaiming the same stale lock
+                // can't both end up believing they hold it (plain
+                // remove+create_new can).
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let claimed = dir.join(format!("{name}.lock.stale-{}-{nanos}", std::process::id()));
+                if std::fs::rename(&path, &claimed).is_err() {
+                    // Already reclaimed (or removed) by someone else.
+                    return None;
+                }
+                match std::fs::OpenOptions::new()
                     .create_new(true)
                     .write(true)
                     .open(&path)
-                    .ok()
-                    .map(|_| SyncLock(path))
+                {
+                    Ok(mut file) => {
+                        use std::io::Write as _;
+                        let _ = writeln!(file, "pid {}", std::process::id());
+                        // Best-effort cleanup of the claimed stale file.
+                        let _ = std::fs::remove_file(&claimed);
+                        Some(SyncLock(path))
+                    }
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::AlreadyExists {
+                            // Someone else won the reclaim race; back off.
+                            // The claimed stale file is garbage either way.
+                            let _ = std::fs::remove_file(&claimed);
+                        } else if std::fs::rename(&claimed, &path).is_err() {
+                            // Put the lock back for the next reclaimer.
+                            let _ = std::fs::remove_file(&claimed);
+                        }
+                        None
+                    }
+                }
             }
             Err(_) => None,
         }
@@ -280,21 +315,66 @@ fn scrub_git(command: &mut std::process::Command) -> &mut std::process::Command 
         .env_remove("GIT_CONFIG_COUNT")
 }
 
+/// Is `reference` a full 40-char hex commit sha? A sha pin IS its own
+/// fingerprint — no network round-trip needed.
+fn is_commit_sha(reference: &str) -> bool {
+    reference.len() == 40 && reference.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// `git ls-remote` patterns for a ref, in preference order: the exact
+/// branch, then the tag (the peeled `^{}` line for annotated tags plus
+/// the plain tag line for lightweight ones). A bare pattern tailglobs
+/// and can return several lines, so every pattern is exact.
+fn ls_remote_patterns(git_ref: Option<&str>) -> Vec<String> {
+    match git_ref {
+        Some(reference) => vec![
+            format!("refs/heads/{reference}"),
+            format!("refs/tags/{reference}^{{}}"),
+            format!("refs/tags/{reference}"),
+        ],
+        None => vec!["HEAD".to_string()],
+    }
+}
+
+/// Pick the fingerprint sha out of `git ls-remote` output: prefer the
+/// branch line, then the peeled annotated-tag line (`^{}`), then the
+/// first sha present (a lightweight tag, or `HEAD`).
+fn ls_remote_fingerprint(stdout: &str) -> Option<String> {
+    let mut branch: Option<&str> = None;
+    let mut peeled: Option<&str> = None;
+    let mut first: Option<&str> = None;
+    for line in stdout.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(sha) = parts.next().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let reference = parts.next().unwrap_or("");
+        if first.is_none() {
+            first = Some(sha);
+        }
+        if reference.ends_with("^{}") {
+            peeled = Some(sha);
+        } else if reference.starts_with("refs/heads/") {
+            branch = Some(sha);
+        }
+    }
+    branch.or(peeled).or(first).map(str::to_string)
+}
+
 /// `git ls-remote` fingerprint of the remote ref (None when git is
 /// unavailable or the probe fails — the archive fallback then
 /// fingerprints by content).
 fn git_ls_remote(source: &str, git_ref: Option<&str>) -> Option<String> {
+    // A sha pin is its own fingerprint: skip the network entirely.
+    if let Some(reference) = git_ref
+        && is_commit_sha(reference)
+    {
+        return Some(reference.to_string());
+    }
     let mut command = std::process::Command::new("git");
-    command.args(["ls-remote", source]);
-    // Prefer the exact branch ref; a bare pattern tailglobs and can
-    // return several lines.
-    match git_ref {
-        Some(reference) => {
-            command.arg(format!("refs/heads/{reference}"));
-        }
-        None => {
-            command.arg("HEAD");
-        }
+    command.arg("ls-remote").arg(source);
+    for pattern in ls_remote_patterns(git_ref) {
+        command.arg(pattern);
     }
     let output = crate::sync_process::output_with_timeout(
         scrub_git(&mut command),
@@ -305,11 +385,7 @@ fn git_ls_remote(source: &str, git_ref: Option<&str>) -> Option<String> {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut lines = stdout.lines();
-    // Exact branch miss (e.g. a tag/sha ref): retry unfiltered below.
-    let first = lines.next()?;
-    let sha = first.split_whitespace().next()?;
-    (!sha.is_empty()).then(|| sha.to_string())
+    ls_remote_fingerprint(&stdout)
 }
 
 /// A git source's forge base for archive degradation
@@ -510,6 +586,26 @@ async fn sync_one_inner(
     };
     let target =
         crate::extension_host::marketplaces_root_path(agent_dir).join(format!("{name}.json"));
+    // Crash-window self-heal: a crash between the backup rename and the
+    // staged rename leaves only `<name>.json.bak`. Put it back BEFORE
+    // the fingerprint decision, so an unreachable source doesn't strand
+    // a marketplace that has a perfectly good backup.
+    let backup =
+        crate::extension_host::marketplaces_root_path(agent_dir).join(format!("{name}.json.bak"));
+    if !target.is_file() && backup.is_file() {
+        match std::fs::rename(&backup, &target) {
+            Ok(()) => tracing::warn!(
+                target: "marketplace_sync",
+                marketplace = %name,
+                "restored {name}.json from its .bak (crash-window recovery)"
+            ),
+            Err(e) => tracing::warn!(
+                target: "marketplace_sync",
+                marketplace = %name,
+                "cannot restore {name}.json.bak: {e}"
+            ),
+        }
+    }
     let unchanged = |fingerprint: &str| {
         read_state(agent_dir, name)
             .map(|s| s.fingerprint == fingerprint)
@@ -650,6 +746,36 @@ async fn install_default_plugins(agent_dir: &Path, marketplace: &str) {
     }
 }
 
+/// Does the lock entry's installed directory still exist? A lock row
+/// alone is not proof of an install — the store copy can be deleted or
+/// corrupted out from under it, and then the default top-up must
+/// re-materialize the plugin instead of skipping it.
+///
+/// Local mirror of `extension_host::lock_entry_dir` (private there; the
+/// layout is `store/<source>/<name>/<version>` vs the legacy flat
+/// `extensions/<name>`). Keep in sync with that function.
+fn lock_entry_dir_exists(
+    agent_dir: &Path,
+    id: &str,
+    entry: &crate::extension_host::LockEntry,
+) -> bool {
+    let (name, source) = match id.split_once('@') {
+        Some((name, source)) => (name, source),
+        None => (id, "user"),
+    };
+    let dir = if entry.store {
+        agent_dir
+            .join("extensions")
+            .join("store")
+            .join(source)
+            .join(name)
+            .join(entry.version.as_deref().unwrap_or("local"))
+    } else {
+        agent_dir.join("extensions").join(name)
+    };
+    dir.is_dir()
+}
+
 fn install_default_plugins_blocking(agent_dir: &Path, marketplace: &str) {
     let defaults = match crate::extension_host::marketplace_default_installs(agent_dir, marketplace)
     {
@@ -670,7 +796,10 @@ fn install_default_plugins_blocking(agent_dir: &Path, marketplace: &str) {
     let cwd = std::env::current_dir().unwrap_or_else(|_| agent_dir.to_path_buf());
     for spec in defaults {
         let id = format!("{}@{}", spec.plugin, spec.marketplace);
-        if lock.plugins.contains_key(&id) {
+        // Skip only a COMPLETE install: lock row AND on-disk store dir.
+        if let Some(entry) = lock.plugins.get(&id)
+            && lock_entry_dir_exists(agent_dir, &id, entry)
+        {
             continue;
         }
         tracing::info!(
@@ -766,6 +895,132 @@ mod tests {
         assert_eq!(classify("ssh://git@h/o/r.git"), SourceKind::Git);
         assert_eq!(classify("/opt/c.json"), SourceKind::LocalPath);
         assert_eq!(classify("./repo"), SourceKind::LocalPath);
+    }
+
+    #[test]
+    fn classify_ignores_query_and_fragment_for_json_urls() {
+        // A signed-catalog URL carries a token query — classify on the
+        // path alone, case-insensitively.
+        assert_eq!(classify("https://h/c.json?token=abc"), SourceKind::JsonUrl);
+        assert_eq!(classify("https://h/c.json#frag"), SourceKind::JsonUrl);
+        assert_eq!(classify("https://h/C.JSON?token=abc"), SourceKind::JsonUrl);
+        assert_eq!(classify("https://h/dir/catalog.Json"), SourceKind::JsonUrl);
+        // `.json` only in the query is NOT a JSON catalog.
+        assert_eq!(classify("https://h/o/r?f=c.json"), SourceKind::Git);
+        assert_eq!(classify("https://h/o/r.git?token=abc"), SourceKind::Git);
+    }
+
+    #[test]
+    fn commit_sha_detection() {
+        assert!(is_commit_sha("0123456789abcdef0123456789abcdef01234567"));
+        assert!(is_commit_sha("0123456789ABCDEF0123456789ABCDEF01234567"));
+        assert!(!is_commit_sha("0123456789abcdef0123456789abcdef0123456")); // 39
+        assert!(!is_commit_sha("0123456789abcdef0123456789abcdef012345678")); // 41
+        assert!(!is_commit_sha("g123456789abcdef0123456789abcdef01234567"));
+        assert!(!is_commit_sha("main"));
+    }
+
+    #[test]
+    fn ls_remote_patterns_cover_branch_then_tag() {
+        assert_eq!(
+            ls_remote_patterns(Some("v1.0")),
+            vec![
+                "refs/heads/v1.0".to_string(),
+                "refs/tags/v1.0^{}".to_string(),
+                "refs/tags/v1.0".to_string(),
+            ]
+        );
+        assert_eq!(ls_remote_patterns(None), vec!["HEAD".to_string()]);
+    }
+
+    #[test]
+    fn fingerprint_prefers_branch_then_peeled_tag() {
+        // Annotated tag only: the peeled commit sha wins over the tag
+        // object sha.
+        let out = "aaaa refs/tags/v1.0\nbbbb refs/tags/v1.0^{}\n";
+        assert_eq!(ls_remote_fingerprint(out).as_deref(), Some("bbbb"));
+        // A branch of the same name beats the tag.
+        let out = "cccc refs/heads/main\ndddd refs/tags/main\neeee refs/tags/main^{}\n";
+        assert_eq!(ls_remote_fingerprint(out).as_deref(), Some("cccc"));
+        // Lightweight tag / HEAD fall back to the first line.
+        assert_eq!(
+            ls_remote_fingerprint("dddd refs/tags/v2\n").as_deref(),
+            Some("dddd")
+        );
+        assert_eq!(
+            ls_remote_fingerprint("ffff HEAD\n").as_deref(),
+            Some("ffff")
+        );
+        assert_eq!(ls_remote_fingerprint(""), None);
+        assert_eq!(ls_remote_fingerprint("\n\n"), None);
+    }
+
+    #[test]
+    fn sha_pin_needs_no_network() {
+        // A sha pin is its own fingerprint: even an unreachable source
+        // resolves instantly without a git invocation.
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            git_ls_remote("https://192.0.2.1.invalid/nope.git", Some(sha)).as_deref(),
+            Some(sha)
+        );
+    }
+
+    #[test]
+    fn lock_blocks_reclaims_stale_and_releases_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path();
+        // A held lock blocks a second acquisition.
+        let held = SyncLock::acquire(agent_dir, "corp").unwrap();
+        assert!(SyncLock::acquire(agent_dir, "corp").is_none());
+        drop(held);
+        // RAII: dropping releases the lock file.
+        assert!(SyncLock::acquire(agent_dir, "corp").is_some());
+
+        // A stale lock (a crashed process) is reclaimed via
+        // rename-claim, and the claimed stale file is cleaned up.
+        let stale_path = sync_scratch_dir(agent_dir).join("stale.lock");
+        std::fs::write(&stale_path, "pid 1\n").unwrap();
+        let file = std::fs::File::open(&stale_path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(1200))
+            .unwrap();
+        drop(file);
+        let lock = SyncLock::acquire(agent_dir, "stale").expect("stale lock is reclaimed");
+        assert!(stale_path.is_file(), "a fresh lock replaces the stale one");
+        let leftovers: Vec<_> = std::fs::read_dir(sync_scratch_dir(agent_dir))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".stale-"))
+            .collect();
+        assert!(leftovers.is_empty(), "rename-claimed file cleaned up");
+        drop(lock);
+    }
+
+    #[test]
+    fn lock_entry_dir_matches_the_store_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entry = crate::extension_host::LockEntry {
+            source: "https://x/plugins.git".to_string(),
+            rev: None,
+            resolved_commit: None,
+            installed_at: 0,
+            version: Some("1.2.3".to_string()),
+            store: true,
+            marketplace: Some("corp".to_string()),
+        };
+        assert!(!lock_entry_dir_exists(tmp.path(), "review@corp", &entry));
+        let dir = tmp.path().join("extensions/store/corp/review/1.2.3");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(lock_entry_dir_exists(tmp.path(), "review@corp", &entry));
+        // Legacy flat layout (`store: false`): `extensions/<name>`.
+        let legacy = crate::extension_host::LockEntry {
+            store: false,
+            version: None,
+            ..entry
+        };
+        assert!(!lock_entry_dir_exists(tmp.path(), "demo@user", &legacy));
+        std::fs::create_dir_all(tmp.path().join("extensions/demo")).unwrap();
+        assert!(lock_entry_dir_exists(tmp.path(), "demo@user", &legacy));
     }
 
     #[test]
@@ -901,5 +1156,102 @@ mod tests {
         assert!(!lock.plugins.contains_key("ondemand@corp"));
         // A second pass leaves the install alone (fingerprint-idempotent).
         assert_eq!(sync_one(&agent_dir, &decl).await, SyncOutcome::Unchanged);
+    }
+
+    /// Crash-window self-heal: when the live `<name>.json` is missing
+    /// but its `.bak` survives, the sync restores it BEFORE touching
+    /// the source — even an unreachable source leaves the marketplace
+    /// registered again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_live_catalog_is_restored_from_the_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let catalog = tmp.path().join("catalog.json");
+        std::fs::write(&catalog, r#"{"name": "corp", "plugins": {}}"#).unwrap();
+        let decl = MarketplaceSyncDecl {
+            name: "corp".to_string(),
+            source: catalog.display().to_string(),
+            git_ref: None,
+            catalog_path: None,
+            public_key: None,
+        };
+        assert_eq!(sync_one(&agent_dir, &decl).await, SyncOutcome::Synced);
+        // A changed second sync leaves the previous catalog as `.bak`.
+        std::fs::write(
+            &catalog,
+            r#"{"name": "corp", "plugins": {"demo": {"source": "/x/d"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(sync_one(&agent_dir, &decl).await, SyncOutcome::Synced);
+        let root = crate::extension_host::marketplaces_root_path(&agent_dir);
+        assert!(root.join("corp.json.bak").is_file());
+        // Simulate the crash window: the live catalog is gone, only the
+        // backup survived — and the source is now unreachable.
+        std::fs::remove_file(root.join("corp.json")).unwrap();
+        std::fs::remove_file(&catalog).unwrap();
+        let outcome = sync_one(&agent_dir, &decl).await;
+        assert!(matches!(outcome, SyncOutcome::Failed(_)), "{outcome:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("corp.json")).unwrap(),
+            r#"{"name": "corp", "plugins": {}}"#,
+            "the previous catalog went back live from the backup"
+        );
+        assert!(!root.join("corp.json.bak").exists());
+    }
+
+    /// The default-install top-up must not trust the lockfile alone: a
+    /// deleted store copy is re-materialized on the next pass.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn default_installs_rematerialize_a_deleted_store_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let plugin = tmp.path().join("review");
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(
+            plugin.join("extension.json"),
+            r#"{"name": "review", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        let catalog = tmp.path().join("catalog.json");
+        std::fs::write(
+            &catalog,
+            serde_json::to_string(&serde_json::json!({
+                "name": "corp",
+                "plugins": {
+                    "review": {
+                        "source": plugin.display().to_string(),
+                        "installation": "installed-by-default"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let decl = MarketplaceSyncDecl {
+            name: "corp".to_string(),
+            source: catalog.display().to_string(),
+            git_ref: None,
+            catalog_path: None,
+            public_key: None,
+        };
+        assert_eq!(sync_one(&agent_dir, &decl).await, SyncOutcome::Synced);
+        let store_dir = agent_dir
+            .join("extensions")
+            .join("store")
+            .join("corp")
+            .join("review")
+            .join("1.0.0");
+        assert!(store_dir.is_dir(), "store layout: {}", store_dir.display());
+        // The store copy vanishes; the lock row remains.
+        std::fs::remove_dir_all(&store_dir).unwrap();
+        let lock = crate::extension_host::read_lock(&agent_dir).unwrap();
+        assert!(lock.plugins.contains_key("review@corp"));
+        // The unchanged-fingerprint pass still runs the top-up, which
+        // now detects the missing store dir and re-installs.
+        assert_eq!(sync_one(&agent_dir, &decl).await, SyncOutcome::Unchanged);
+        assert!(
+            store_dir.is_dir(),
+            "the deleted store copy is re-materialized"
+        );
     }
 }

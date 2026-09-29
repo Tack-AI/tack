@@ -59,6 +59,10 @@ pub fn is_component(wasm: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(wasm) else {
         return false;
     };
+    // WAT tooling treats a leading BOM as whitespace but `trim_start`
+    // does not; strip U+FEFF explicitly or a BOM-saved `.wat` misroutes
+    // to the core-module path.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut rest = text;
     loop {
         rest = rest.trim_start();
@@ -431,6 +435,12 @@ impl WasmComponentPlugin {
 impl PluginConnection for WasmComponentPlugin {
     async fn initialize(&self, _params: &InitializeParams) -> Result<InitializeResult, PeerError> {
         // No handshake on the guest: capabilities were probed at spawn.
+        // A plugin that died between spawn and here must not register as
+        // loaded — the process carrier fails its handshake in that case,
+        // so report Dead the same way.
+        if !self.alive.load(Ordering::SeqCst) {
+            return Err(PeerError::Dead);
+        }
         Ok(self.register.clone())
     }
 
@@ -669,6 +679,12 @@ mod tests {
         assert!(!is_component(b"\0asm\x01\x00\x00\x00rest"));
         assert!(!is_component(b"(; unterminated"));
         assert!(!is_component(b"garbage"));
+        // A leading BOM is whitespace for WAT tooling: a BOM-saved
+        // `(component ...)` .wat must not misroute to the core-module
+        // path.
+        assert!(is_component("\u{feff}(component)".as_bytes()));
+        assert!(is_component("\u{feff}  ;; c\n(component)".as_bytes()));
+        assert!(!is_component("\u{feff}(module)".as_bytes()));
     }
 
     async fn spawn_hello() -> WasmComponentPlugin {
@@ -759,6 +775,17 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), ERR_CAPABILITY_NOT_GRANTED);
         plugin.shutdown().await;
+    }
+
+    /// A plugin that died between spawn and the handshake must not
+    /// register as loaded (the process carrier fails the handshake).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initialize_reports_dead_after_the_plugin_dies() {
+        let plugin = spawn_hello().await;
+        plugin.shutdown().await;
+        assert!(!plugin.is_alive());
+        let err = plugin.initialize(&init_params()).await.unwrap_err();
+        assert!(matches!(err, PeerError::Dead), "{err:?}");
     }
 
     /// A guest that never returns must be stopped by its per-call budget:

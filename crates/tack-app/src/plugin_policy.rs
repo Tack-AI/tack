@@ -79,17 +79,23 @@ impl AllowedSource {
     }
 }
 
-/// Extract the host from an https/http or scp-style git source.
+/// Extract the host from an https/http/ssh or scp-style git source.
+/// Userinfo (`https://oauth2:token@host/…`, `ssh://git@host/…`) and a
+/// port suffix are stripped first; the host is the authority component
+/// after the LAST `@` (WHATWG URL rule — `https://a.com@evil.com/x`
+/// yields `evil.com`, never `a.com`).
 fn url_host(source: &str) -> Option<String> {
     if let Some(rest) = source.strip_prefix("git@") {
         let (host, _) = rest.split_once(':')?;
         return (!host.is_empty()).then(|| host.to_string());
     }
     let after_scheme = source.split_once("://").map(|(_, rest)| rest)?;
-    let host = after_scheme
-        .split(['/', ':'])
-        .next()
-        .filter(|h| !h.is_empty())?;
+    let authority = after_scheme.split('/').next().filter(|h| !h.is_empty())?;
+    let after_userinfo = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    let host = after_userinfo.split(':').next().filter(|h| !h.is_empty())?;
     Some(host.to_string())
 }
 
@@ -173,9 +179,22 @@ impl PluginPolicy {
     /// authority layer; user/project layers cannot set policy).
     pub fn load() -> Option<PluginPolicy> {
         let path = crate::settings::managed_settings_path();
-        let raw = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<Value>(&content).ok())?;
+        let content = std::fs::read_to_string(&path).ok()?;
+        let raw = match serde_json::from_str::<Value>(&content) {
+            Ok(raw) => raw,
+            Err(e) => {
+                // A managed control plane that cannot be parsed must
+                // never fail SILENTLY: with no warning, a truncated or
+                // corrupt deploy looks identical to "no policy" while
+                // every restriction is in fact inactive.
+                tracing::warn!(
+                    "managed settings {} is not valid JSON ({e}); managed plugin policy is \
+                     INACTIVE (all plugins permitted) until the file is fixed",
+                    path.display()
+                );
+                return None;
+            }
+        };
         PluginPolicy::from_raw(&raw, path.display().to_string())
     }
 
@@ -226,8 +245,8 @@ impl PluginPolicy {
         self.allowed_sources.is_empty()
     }
 
-    fn deny(&self, rule: &str, detail: String) -> PolicyDenial {
-        audit("deny", rule, &self.origin, "", &detail);
+    fn deny(&self, rule: &str, subject: &str, detail: String) -> PolicyDenial {
+        audit("deny", rule, &self.origin, subject, &detail);
         PolicyDenial {
             rule: rule.to_string(),
             message: format!(
@@ -277,6 +296,7 @@ impl PluginPolicy {
             .join(", ");
         Err(self.deny(
             "allowedSources",
+            source,
             format!("source {source:?} matches no allowedSources rule: {rules}"),
         ))
     }
@@ -290,12 +310,14 @@ impl PluginPolicy {
         if self.managed_plugins_only && !self.plugins.contains_key(&id_string) {
             return Err(self.deny(
                 "managedPluginsOnly",
+                &id_string,
                 format!("plugin {id_string} is not in the managed plugin allow-list"),
             ));
         }
         if self.plugins.get(&id_string).and_then(|e| e.enabled) == Some(false) {
             return Err(self.deny(
                 "plugins.enabled",
+                &id_string,
                 format!("plugin {id_string} is disabled by managed policy"),
             ));
         }
@@ -546,18 +568,43 @@ mod tests {
             "https://git.acme.com/tack/plugins.git",
             "https://acme.com/x.git",
             "git@git.acme.com:tack/plugins.git",
+            // Credential-embedded URL (common for private hosting tokens):
+            // the userinfo must not hide the real host.
+            "https://oauth2:token@git.acme.com/tack/plugins.git",
+            "ssh://git@git.acme.com/tack/plugins.git",
+            "https://git.acme.com:8443/tack/plugins.git",
         ] {
             assert!(policy.check_install_source(ok, None).is_ok(), "{ok}");
         }
         for denied in [
             "https://acme.com.evil.net/x.git",
             "https://github.com/acme/plugins.git",
+            // Userinfo must never smuggle a fake host past the pattern:
+            // the authority host is after the LAST '@'.
+            "https://git.acme.com@evil.net/x.git",
+            "https://oauth2:git.acme.com@evil.net/x.git",
         ] {
             assert!(
                 policy.check_install_source(denied, None).is_err(),
                 "{denied}"
             );
         }
+    }
+
+    #[test]
+    fn url_host_strips_userinfo_and_port() {
+        assert_eq!(
+            url_host("https://oauth2:token@git.acme.com/repo.git").as_deref(),
+            Some("git.acme.com")
+        );
+        assert_eq!(
+            url_host("ssh://git@git.acme.com:2222/repo.git").as_deref(),
+            Some("git.acme.com")
+        );
+        assert_eq!(
+            url_host("https://git.acme.com@evil.net/x").as_deref(),
+            Some("evil.net")
+        );
     }
 
     #[test]

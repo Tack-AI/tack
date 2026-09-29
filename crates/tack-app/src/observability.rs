@@ -477,6 +477,32 @@ impl<S: tracing::Subscriber> Layer<S> for JsonlLayer {
     fn on_close(&self, _id: tracing::span::Id, _ctx: Context<'_, S>) {}
 }
 
+/// Tracing targets that carry org-mandated audit records (policy
+/// decisions, approval claims, plugin metrics, load telemetry).
+const AUDIT_TARGETS: &[&str] = &[
+    "plugin_policy",
+    "plugin_approval",
+    "plugin_metrics",
+    "plugin_load",
+];
+
+/// The audit sink's filter: the configured level, but with every audit
+/// target pinned at INFO. The managed audit sink is the org's record of
+/// those decisions — a user-level `observability.level = "warn"` (or
+/// TACK_TRACE_LEVEL) must not silently drop them while enforcement
+/// continues.
+fn audit_filter(level: &str) -> tracing_subscriber::EnvFilter {
+    let mut filter = tracing_subscriber::EnvFilter::new(level);
+    for target in AUDIT_TARGETS {
+        filter = filter.add_directive(
+            format!("{target}=info")
+                .parse()
+                .expect("audit directive parses"),
+        );
+    }
+    filter
+}
+
 /// Install the JSONL layer when enabled. Call INSTEAD of the plain fmt init
 /// (composes stderr fmt + optional file export + managed audit sink).
 pub fn init_tracing(
@@ -500,7 +526,7 @@ pub fn init_tracing(
             let subscriber = subscriber.with(layer.with_filter(file_filter));
             match audit {
                 Some(sink) => {
-                    let audit_filter = tracing_subscriber::EnvFilter::new(config.level.clone());
+                    let audit_filter = audit_filter(&config.level);
                     subscriber
                         .with(AuditLayer::new(sink).with_filter(audit_filter))
                         .init();
@@ -518,7 +544,7 @@ pub fn init_tracing(
             // even when the local JSONL file cannot be opened.
             match audit {
                 Some(sink) => {
-                    let audit_filter = tracing_subscriber::EnvFilter::new(config.level.clone());
+                    let audit_filter = audit_filter(&config.level);
                     subscriber
                         .with(AuditLayer::new(sink).with_filter(audit_filter))
                         .init();
@@ -534,6 +560,17 @@ pub fn init_tracing(
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn audit_filter_pins_audit_targets_at_info() {
+        let rendered = audit_filter("warn").to_string();
+        for target in AUDIT_TARGETS {
+            assert!(
+                rendered.contains(&format!("{target}=info")),
+                "{target} must stay pinned at info: {rendered}"
+            );
+        }
+    }
 
     #[test]
     fn config_env_overrides_settings() {

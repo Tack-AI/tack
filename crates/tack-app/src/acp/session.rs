@@ -100,9 +100,15 @@ pub struct AcpSessionState {
     /// Thinking level for the next prompt turn (config option).
     pub thinking: Arc<std::sync::Mutex<Option<tack_ai::ThinkingLevel>>>,
     /// tack-ext plugins loaded for this session's cwd (headless services:
-    /// UI dialogs degrade, exec is trust-gated). Plugins stop with the
-    /// process — ACP has no explicit session-close handshake.
+    /// UI dialogs degrade, exec is trust-gated). The ACP crate has no
+    /// session/close handshake, so plugins are shut down when the client
+    /// connection ends (`shutdown_all_sessions` in `acp::serve`).
     pub extensions: Arc<Mutex<crate::extension_host::ExtensionManager>>,
+    /// Set when untrusted external content (web fetch, MCP/plugin tool
+    /// output) entered this session's context. The permission gate reads
+    /// it to re-prompt for mutating tools instead of honoring cached
+    /// "always allow" decisions (prompt-injection defense, TUI parity).
+    pub untrusted_seen: Arc<std::sync::atomic::AtomicBool>,
     /// In-flight prompt turn (F35): ACP clients (Zed et al.) send prompts
     /// serially, but the protocol does not enforce it — a concurrent
     /// session/prompt must be REJECTED, not queued: two agent loops on
@@ -177,7 +183,12 @@ pub fn create_session_state(
         }
     });
 
-    let mcp_tools = tack_tools::mcp::mcp_tools(&mcp_connections);
+    // Prompt-injection defense: config-file/client MCP tool results are
+    // untrusted server data — wrap them and mark the session's shared flag
+    // (same treatment as TUI/print/rpc; plugin tools are wrapped per turn
+    // in agent.rs via `tools_with_untrusted`).
+    let untrusted_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mcp_tools = tack_tools::mcp::mcp_tools_with(&mcp_connections, Some(untrusted_seen.clone()));
     Rc::new(AcpSessionState {
         session: Arc::new(Mutex::new(session)),
         cancel: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
@@ -189,8 +200,27 @@ pub fn create_session_state(
         model: Arc::new(std::sync::Mutex::new(model)),
         thinking: Arc::new(std::sync::Mutex::new(thinking)),
         extensions: Arc::new(Mutex::new(extensions)),
+        untrusted_seen,
         in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
+}
+
+/// Connection-end teardown: drain the sessions map and gracefully shut
+/// down every session's plugin manager (plugin stop + final metrics
+/// drain). ACP (crate 0.10) has no session/close method and `new_session`
+/// keys are unique per connection, so the end of the client connection is
+/// the only teardown point; `acp::serve` calls this after the io task
+/// finishes. Async, and run inside the connection's `LocalSet` because
+/// plugin shutdown may spawn local tasks.
+pub async fn shutdown_all_sessions(sessions: &Sessions) {
+    let states: Vec<Rc<AcpSessionState>> = sessions
+        .borrow_mut()
+        .drain()
+        .map(|(_, state)| state)
+        .collect();
+    for state in states {
+        state.extensions.lock().await.shutdown().await;
+    }
 }
 
 /// Default permission mode.

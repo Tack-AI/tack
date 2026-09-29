@@ -770,6 +770,12 @@ impl TuiApp {
         // Lifecycle hooks: PreToolUse/PostToolUse via the hook engine. Runs
         // BEFORE the permission hooks so permissionDecision allow/ask and
         // updatedInput rewrites are honored there (shared hook_decisions).
+        // Plugin hook bridges (tack-ext) also run BEFORE the permission
+        // layer: `hooks/beforeToolCall` rewrites land before approval, so
+        // declarative deny, the mode gate, the approval chain and the user
+        // dialog all see (and the dialog displays) the FINAL arguments. A
+        // plugin Allow is not terminal (HooksChain: Allow continues), so
+        // this cannot bypass deny rules or the mode gate.
         let mut hook_list: Vec<Arc<dyn tack_agent_core::AgentHooks>> = vec![
             Arc::new(crate::hooks::SessionHooks {
                 session: state_session.clone(),
@@ -813,34 +819,35 @@ impl TuiApp {
                         .take_groups(crate::shell_hooks::HookEvent::PostToolUseFailure),
                 ),
             ),
-            Arc::new(TuiPermissionHooks {
-                mode,
-                allow_always: self.allow_always.clone(),
-                queries: self.permission_tx.clone(),
-                rules: crate::permissions::PermissionRules::load(&self.settings, &self.agent_dir),
-                agent_dir: self.agent_dir.clone(),
-                disable_bypass: self.settings.disable_bypass,
-                untrusted_seen: services.untrusted_seen.clone(),
-                hook_decisions: self.hook_decisions.clone(),
-                permission_request: if self.settings.features.shell_hooks {
-                    Some((
-                        self.hook_engine.clone(),
-                        self.hook_config
-                            .take_groups(crate::shell_hooks::HookEvent::PermissionRequest),
-                        session_id.clone(),
-                    ))
-                } else {
-                    None
-                },
-                approval_chain: self.extensions.approval_chain(),
-            }),
-            Arc::new(QueueHooks {
-                steering: self.steering.clone(),
-                follow_up: self.follow_up.clone(),
-                steering_mode: self.settings.steering_mode.clone(),
-                follow_up_mode: self.settings.follow_up_mode.clone(),
-            }),
         ];
+        hook_list.extend(self.extensions.hooks());
+        hook_list.push(Arc::new(TuiPermissionHooks {
+            mode,
+            allow_always: self.allow_always.clone(),
+            queries: self.permission_tx.clone(),
+            rules: crate::permissions::PermissionRules::load(&self.settings, &self.agent_dir),
+            agent_dir: self.agent_dir.clone(),
+            disable_bypass: self.settings.disable_bypass,
+            untrusted_seen: services.untrusted_seen.clone(),
+            hook_decisions: self.hook_decisions.clone(),
+            permission_request: if self.settings.features.shell_hooks {
+                Some((
+                    self.hook_engine.clone(),
+                    self.hook_config
+                        .take_groups(crate::shell_hooks::HookEvent::PermissionRequest),
+                    session_id.clone(),
+                ))
+            } else {
+                None
+            },
+            approval_chain: self.extensions.approval_chain(),
+        }));
+        hook_list.push(Arc::new(QueueHooks {
+            steering: self.steering.clone(),
+            follow_up: self.follow_up.clone(),
+            steering_mode: self.settings.steering_mode.clone(),
+            follow_up_mode: self.settings.follow_up_mode.clone(),
+        }));
         // Token budget enforcement: pause stops the run at the next turn
         // boundary, downgrade switches to the budget model.
         if let Some(budget) = self.settings.token_budget {
@@ -872,8 +879,6 @@ impl TuiApp {
                 }));
             }
         }
-        // tack-ext: per-plugin hook bridges (tool_call interception).
-        hook_list.extend(self.extensions.hooks());
         let hooks: Arc<dyn tack_agent_core::AgentHooks> = Arc::new(HooksChain::new(hook_list));
 
         // Values the run task owns from here on. MCP connection setup

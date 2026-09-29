@@ -32,7 +32,15 @@ pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// handler task for the given id; the aborted side sends no response.
 pub const CANCEL_METHOD: &str = "$/cancelRequest";
 
-type PendingMap = Arc<Mutex<HashMap<Id, oneshot::Sender<Result<Value, ErrorObject>>>>>;
+type PendingMap = Arc<Mutex<HashMap<Id, oneshot::Sender<PendingOutcome>>>>;
+
+/// What resolves a pending outgoing call: the remote's response, or a
+/// local cancellation (distinct so callers can tell "cancelled here"
+/// apart from "the remote answered with an error").
+enum PendingOutcome {
+    Response(Result<Value, ErrorObject>),
+    Cancelled,
+}
 
 /// Removes the pending entry on drop: cancel-safe cleanup for callers
 /// that drop a `call` future mid-flight.
@@ -199,8 +207,9 @@ impl JsonRpcPeer {
             serde_json::to_string(&request).map_err(|e| PeerError::Transport(e.to_string()))?;
         self.write_line(&line).await?;
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(Ok(result))) => Ok(result),
-            Ok(Ok(Err(error))) => Err(PeerError::Remote(error)),
+            Ok(Ok(PendingOutcome::Response(Ok(result)))) => Ok(result),
+            Ok(Ok(PendingOutcome::Response(Err(error)))) => Err(PeerError::Remote(error)),
+            Ok(Ok(PendingOutcome::Cancelled)) => Err(PeerError::Cancelled),
             // Sender dropped without answering: the pump died.
             Ok(Err(_)) => Err(PeerError::Dead),
             Err(_) => {
@@ -226,11 +235,7 @@ impl JsonRpcPeer {
     /// abort the corresponding handler.
     pub async fn cancel(&self, id: &Id) {
         if let Some(tx) = self.pending.lock().expect("pending mutex").remove(id) {
-            let _ = tx.send(Err(ErrorObject {
-                code: ERR_REQUEST_TIMEOUT,
-                message: "cancelled locally".to_string(),
-                data: None,
-            }));
+            let _ = tx.send(PendingOutcome::Cancelled);
         }
         let _ = self
             .notify(CANCEL_METHOD, serde_json::json!({ "id": id }))
@@ -337,6 +342,16 @@ impl JsonRpcPeer {
                     .lock()
                     .expect("inflight mutex")
                     .insert(task_id, task);
+                // The spawned task removes itself from `inflight` on
+                // completion — but on a multi-threaded runtime a fast
+                // handler can finish (and run that removal) BEFORE the
+                // insert above lands, leaving a completed handle parked
+                // in the map forever. Reap finished handles on every
+                // insert so the map stays bounded by live work.
+                self.inflight
+                    .lock()
+                    .expect("inflight mutex")
+                    .retain(|_, handle| !handle.is_finished());
             }
             // Incoming notification.
             (Some(method), None) => {
@@ -377,7 +392,7 @@ impl JsonRpcPeer {
                     Ok(message.get("result").cloned().unwrap_or(Value::Null))
                 };
                 if let Some(tx) = self.pending.lock().expect("pending mutex").remove(&id) {
-                    let _ = tx.send(outcome);
+                    let _ = tx.send(PendingOutcome::Response(outcome));
                 }
             }
             // Neither request, notification, nor response: ignore.
@@ -534,8 +549,8 @@ mod tests {
         a.cancel(&Id::Num(1)).await;
         let err = call.await.unwrap().unwrap_err();
         assert!(
-            matches!(err, PeerError::Remote(_)),
-            "cancel surfaces the local error: {err:?}"
+            matches!(err, PeerError::Cancelled),
+            "cancel surfaces the local cancellation: {err:?}"
         );
         for _ in 0..50 {
             if cancelled.load(Ordering::SeqCst) {

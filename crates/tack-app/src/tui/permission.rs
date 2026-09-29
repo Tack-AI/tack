@@ -140,7 +140,10 @@ impl tack_agent_core::AgentHooks for TuiPermissionHooks {
                 };
             }
             Some((crate::shell_hooks::HookPermission::Ask, _)) => {
-                return self.prompt_user(ctx).await;
+                // A hook "ask" forces the HUMAN dialog: skip the plugin
+                // approval chain too, or a chain claim would approve the
+                // call the hook explicitly escalated.
+                return self.prompt_user(ctx, true).await;
             }
             None => {}
         }
@@ -190,16 +193,23 @@ impl tack_agent_core::AgentHooks for TuiPermissionHooks {
                 return BeforeToolCallOutcome::Allow;
             }
         }
-        self.prompt_user(ctx).await
+        self.prompt_user(ctx, untrusted).await
     }
 }
 
 impl TuiPermissionHooks {
-    /// The dialog path: the plugin approval chain gets first crack at the
-    /// decision; then PermissionRequest hooks may answer in place of the
-    /// user (allow/deny); otherwise the overlay prompt decides.
-    async fn prompt_user(&self, ctx: &BeforeToolCallContext<'_>) -> BeforeToolCallOutcome {
-        if !self.approval_chain.is_empty() {
+    /// The dialog path: unless `force_human` (PreToolUse "ask" verdict, or
+    /// an untrusted run with a mutating call — the prompt-injection defense
+    /// where a chain claim must not silently approve), the plugin approval
+    /// chain gets first crack at the decision; then PermissionRequest hooks
+    /// may answer in place of the user (allow/deny); otherwise the overlay
+    /// prompt decides.
+    async fn prompt_user(
+        &self,
+        ctx: &BeforeToolCallContext<'_>,
+        force_human: bool,
+    ) -> BeforeToolCallOutcome {
+        if !force_human && !self.approval_chain.is_empty() {
             let request = crate::approval::ApprovalRequest {
                 approval_id: ctx.tool_call_id.to_string(),
                 tool_call_id: ctx.tool_call_id.to_string(),
@@ -494,8 +504,8 @@ mod tests {
         assert_eq!(lock_recover(&hooks.allow_always).len(), 1);
     }
 
-    /// askUser defers to the built-in dialog (the chain claims, but the
-    /// human still decides).
+    /// askUser defers to the built-in dialog (the chain claims nothing, so
+    /// the human still decides).
     #[tokio::test]
     async fn approval_chain_ask_user_falls_through_to_dialog() {
         let message = tack_ai::AssistantMessage::pending(&test_model());
@@ -504,6 +514,62 @@ mod tests {
         hooks.approval_chain.push(
             "fake@user".into(),
             Arc::new(ClaimReviewer(crate::approval::ChainAction::AskUser)),
+        );
+        let args = serde_json::json!({ "command": "rm -rf build" });
+        let c = ctx(&message, &args);
+        let (outcome, answered) = tokio::join!(hooks.before_tool_call(&c), async {
+            let query = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("prompt expected")
+                .expect("query");
+            query.respond.send(PermissionChoice::Deny).unwrap();
+            true
+        });
+        assert!(answered);
+        assert!(matches!(outcome, BeforeToolCallOutcome::Block { .. }));
+    }
+
+    /// Prompt-injection defense: in an untrusted run (web/MCP content in
+    /// context), a mutating call must reach the HUMAN even when a plugin
+    /// approval-chain reviewer claims allow — the chain is skipped.
+    #[tokio::test]
+    async fn untrusted_run_skips_approval_chain() {
+        let message = tack_ai::AssistantMessage::pending(&test_model());
+        let untrusted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (mut hooks, mut rx) = hooks(PermissionMode::Ask, untrusted);
+        hooks.approval_chain.push(
+            "fake@user".into(),
+            Arc::new(ClaimReviewer(crate::approval::ChainAction::Allow)),
+        );
+        let args = serde_json::json!({ "command": "rm -rf build" });
+        let c = ctx(&message, &args);
+        let (outcome, answered) = tokio::join!(hooks.before_tool_call(&c), async {
+            let query = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("prompt expected")
+                .expect("query");
+            query.respond.send(PermissionChoice::AllowOnce).unwrap();
+            true
+        });
+        assert!(answered);
+        assert!(matches!(outcome, BeforeToolCallOutcome::Allow));
+    }
+
+    /// A PreToolUse "ask" verdict forces the HUMAN dialog past every fast
+    /// path — including the plugin approval chain (a chain claim must not
+    /// approve a call the hook explicitly escalated).
+    #[tokio::test]
+    async fn hook_ask_verdict_forces_dialog_past_approval_chain() {
+        let message = tack_ai::AssistantMessage::pending(&test_model());
+        let untrusted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (mut hooks, mut rx) = hooks(PermissionMode::Ask, untrusted);
+        hooks.approval_chain.push(
+            "fake@user".into(),
+            Arc::new(ClaimReviewer(crate::approval::ChainAction::Allow)),
+        );
+        lock_recover(&hooks.hook_decisions).insert(
+            "1".to_string(),
+            (crate::shell_hooks::HookPermission::Ask, None),
         );
         let args = serde_json::json!({ "command": "rm -rf build" });
         let c = ctx(&message, &args);

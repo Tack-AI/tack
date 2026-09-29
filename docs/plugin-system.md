@@ -156,8 +156,12 @@ and `capabilities`.
 
 When the built-in permission flow is about to prompt a human, plugins
 that declared `capabilities.hooks.approvalReview` get first crack at the
-decision — in load order, first-claim-wins; a null result passes to the
-next reviewer. Composition with the built-in modes:
+decision — every reviewer is consulted in load order, the first
+`allow`/`reviewed` claim wins, and a pass (null) or `askUser` moves to
+the next reviewer. Plugin `hooks/beforeToolCall` bridges run BEFORE the
+permission layer in every surface's hook chain, so reviewers (and the
+dialog) see the FINAL, post-rewrite arguments. Composition with the
+built-in modes:
 
 ```text
 deny rules → PreToolUse hook decisions → mode gate (plan/acceptEdits/bypass)
@@ -169,11 +173,19 @@ deny rules → PreToolUse hook decisions → mode gate (plan/acceptEdits/bypass)
   persists into allow-always state); `reviewed` exists so a reviewer
   that vetted the call itself (an LLM pass, its own UI) is
   distinguishable from a blanket auto-allow in the audit event.
-  `askUser` defers to the built-in prompt.
+  `askUser` claims nothing: it is logged for audit and iteration
+  continues — an early cautious reviewer cannot wedge a later
+  auto-approver.
 - The chain sees only calls that WOULD prompt: allow-rule/mode-approved
   calls never reach it (plugins observe those via
   `hooks/beforeToolCall`), and bypass mode / headless print runs never
-  prompt at all.
+  prompt at all. Two more guards sit in front of it: a PreToolUse
+  `permissionDecision: "ask"` verdict forces the human dialog past the
+  chain, and once untrusted web/MCP content entered the context,
+  mutating (non-read-only) calls skip the chain — the human must be
+  asked; a chain claim must not silently approve (the same distrust the
+  prompt-injection defense applies to allow rules and the allow-always
+  cache).
 - Fail-open: a reviewer error — including `unsupported_capability` from
   carriers that do not implement `approval/review` (Level-2 MCP and WIT
   component carriers today) — degrades to "pass", and every call carries
@@ -303,9 +315,12 @@ gated**).
   plugin hook bridges by default (`subagents.inheritPlugins: "hooks"`),
   so delegation cannot bypass a guardrail plugin's `beforeToolCall`
   verdicts; `"full"` additionally inherits plugin tools.
-- Verdict chain order: SessionHooks → **lifecycle hooks** → permission
-  hooks → queue/budget → tack-ext plugins (what the last one sees is the
-  final set of arguments).
+- Verdict chain order: SessionHooks → **lifecycle hooks** → tack-ext
+  plugins → permission hooks → queue/budget. The permission layer
+  (declarative deny, the mode gate, the approval chain, and the dialog)
+  runs AFTER plugin `beforeToolCall` bridges, so it sees — and the
+  dialog displays — the FINAL, post-rewrite arguments; a rewrite can
+  no longer smuggle content past a deny rule or an approval.
 
 ## 6. Run-mode support matrix
 

@@ -840,19 +840,21 @@ impl SubagentTool {
         // Child hooks: non-interactive, so no permission prompts — but the
         // session's `permissions.deny` rules MUST still apply, or a spawned
         // sub-agent would bypass the deny list entirely (headless CI safety
-        // net). Plugin hook bridges follow the deny rules when inheritance
-        // allows (default "hooks"): hard blocks first, then plugin verdicts
-        // — the same order as the parent surfaces' chains. NoopHooks when
-        // neither is configured.
+        // net). Plugin hook bridges run BEFORE the deny rules when
+        // inheritance allows (default "hooks") — the same order as the
+        // parent surfaces' chains: `hooks/beforeToolCall` rewrites land
+        // first, so deny rules match against the FINAL arguments (a plugin
+        // Allow is not terminal and cannot bypass the deny rules).
+        // NoopHooks when neither is configured.
         let hooks: Arc<dyn AgentHooks> = {
             let mut chain: Vec<Arc<dyn AgentHooks>> = Vec::new();
+            if self.inherit_plugins.inherits_hooks() {
+                chain.extend(self.extension_hooks.iter().cloned());
+            }
             if !self.deny_rules.deny.is_empty() {
                 chain.push(Arc::new(crate::permissions::DenyRulesHooks {
                     rules: self.deny_rules.clone(),
                 }));
-            }
-            if self.inherit_plugins.inherits_hooks() {
-                chain.extend(self.extension_hooks.iter().cloned());
             }
             match chain.len() {
                 0 => Arc::new(NoopHooks),

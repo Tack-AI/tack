@@ -125,6 +125,12 @@ impl TackAcpAgent {
         Self::with_dependencies(shared_conn, model, provider, auth, settings, thinking)
     }
 
+    /// Handle to the live sessions map, for connection-end teardown in
+    /// `serve()` (the agent itself is moved into the connection).
+    pub fn sessions(&self) -> Sessions {
+        self.sessions.clone()
+    }
+
     /// MCP client callbacks for server-initiated requests: sampling (opt-in)
     /// runs against the current model; elicitation auto-declines (headless).
     fn mcp_client_callbacks(&self, _cwd: &Path) -> tack_tools::mcp::McpClientCallbacks {
@@ -438,6 +444,9 @@ struct AcpHooks {
     bridge: tokio::sync::mpsc::UnboundedSender<BridgeRequest>,
     allow_always: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     mode: Arc<std::sync::Mutex<String>>,
+    /// Session-shared prompt-injection flag: set when untrusted external
+    /// content (web/MCP/plugin tool output) entered the context.
+    untrusted_seen: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -491,12 +500,24 @@ impl AgentHooks for AcpHooks {
             .to_string();
         let always_key = format!("{}:{key_arg}", ctx.tool_name);
 
-        let res = {
-            let cache = self.allow_always.lock().unwrap_or_else(|e| e.into_inner());
-            cache.contains(ctx.tool_name) || cache.contains(&always_key)
-        };
-        if res {
-            return BeforeToolCallOutcome::Allow;
+        // Prompt-injection defense (TUI parity, tui/permission.rs): once
+        // untrusted external content entered this session's context, cached
+        // "always allow" decisions no longer auto-approve mutating tools —
+        // the chain "untrusted page → allow-always bash" is the attack.
+        // The client is asked instead. (Bypass mode short-circuits above,
+        // as in the TUI: it is an explicit user override.)
+        let untrusted = self
+            .untrusted_seen
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && !TackAcpAgent::is_read_only_tool(ctx.tool_name, ctx.args);
+        if !untrusted {
+            let res = {
+                let cache = self.allow_always.lock().unwrap_or_else(|e| e.into_inner());
+                cache.contains(ctx.tool_name) || cache.contains(&always_key)
+            };
+            if res {
+                return BeforeToolCallOutcome::Allow;
+            }
         }
 
         let (respond, response) = tokio::sync::oneshot::channel::<PermissionChoice>();
@@ -879,6 +900,10 @@ impl Agent for TackAcpAgent {
                 .with_web_search(self.settings.web_search_config())
                 .with_background_tasks_enabled(self.settings.features.background_tasks)
                 .with_memory_dir(self.settings.memory_directory.clone());
+            // Share the session's untrusted-content flag with this turn's
+            // tool services so web tools mark the SAME flag the permission
+            // gate and the MCP/plugin tool wrappers read.
+            services.untrusted_seen = state.untrusted_seen.clone();
             // Use client-owned terminals for bash when the client supports them.
             if self.client_capabilities.borrow().terminal {
                 services = services.with_bash_executor(std::sync::Arc::new(
@@ -894,8 +919,15 @@ impl Agent for TackAcpAgent {
                 ),
             ));
             tools.extend(state.mcp_tools.iter().cloned());
-            // tack-ext plugin tools (ext__<plugin>__<tool>).
-            tools.extend(state.extensions.lock().await.tools());
+            // tack-ext plugin tools (ext__<plugin>__<tool>); MCP-carrier
+            // plugin output is untrusted and gets wrapped + flagged.
+            tools.extend(
+                state
+                    .extensions
+                    .lock()
+                    .await
+                    .tools_with_untrusted(Some(state.untrusted_seen.clone())),
+            );
             let tools = crate::cli_flags::filter_feature_tools(tools, &self.settings.features);
             (tools, session.build_session_context().messages)
         };
@@ -943,6 +975,7 @@ impl Agent for TackAcpAgent {
             bridge: state.bridge.clone(),
             allow_always: state.allow_always.clone(),
             mode: state.mode.clone(),
+            untrusted_seen: state.untrusted_seen.clone(),
         });
         // permissions.deny applies in ACP sessions too (rpc/print parity):
         // deny rules run BEFORE the mode gate / user prompt, so a denied
@@ -1332,6 +1365,7 @@ mod tests {
             bridge: tx,
             allow_always: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             mode: Arc::new(std::sync::Mutex::new(mode.to_string())),
+            untrusted_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

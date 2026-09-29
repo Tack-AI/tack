@@ -92,6 +92,11 @@ pub(crate) struct RpcPermissionHooks {
     /// first crack at a decision that would otherwise be emitted as a
     /// `permission_request` event (see `crate::approval`).
     approval_chain: crate::approval::ApprovalChain,
+    /// Prompt-injection defense: when untrusted external content (web/MCP)
+    /// entered the context this run, mutating tools always prompt the
+    /// client — allow rules, the allow-always cache AND the plugin approval
+    /// chain are bypassed (parity with the TUI surface). Reset per run.
+    untrusted_seen: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for RpcPermissionHooks {
@@ -131,18 +136,31 @@ impl AgentHooks for RpcPermissionHooks {
                 }
             }
         }
-        // Declarative allow rules skip the prompt.
-        if self.rules.allow_match(ctx.tool_name, ctx.args).is_some() {
-            return Outcome::Allow;
+        // Declarative allow rules + allow-always cache skip the prompt —
+        // but not in an untrusted run: after web/MCP content entered the
+        // context, mutating tools always ask (the injection chain
+        // "webpage → allow-always bash" is the attack this defends
+        // against).
+        let untrusted = self
+            .untrusted_seen
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && !read_only;
+        if !untrusted {
+            if self.rules.allow_match(ctx.tool_name, ctx.args).is_some() {
+                return Outcome::Allow;
+            }
+            let key = allow_always_key(ctx.tool_name, ctx.args);
+            if self.state.lock().await.allow_always.contains(&key) {
+                return Outcome::Allow;
+            }
         }
         let key = allow_always_key(ctx.tool_name, ctx.args);
-        if self.state.lock().await.allow_always.contains(&key) {
-            return Outcome::Allow;
-        }
 
         // Plugin approval chain: reviewers get first crack at the decision
-        // that would otherwise be parked on a client answer.
-        if !self.approval_chain.is_empty() {
+        // that would otherwise be parked on a client answer — EXCEPT in an
+        // untrusted run, where a chain claim must not silently approve a
+        // mutating call the human has to see.
+        if !untrusted && !self.approval_chain.is_empty() {
             let policy = match mode {
                 SessionMode::Ask => "ask",
                 SessionMode::AcceptEdits => "acceptEdits",
@@ -157,6 +175,9 @@ impl AgentHooks for RpcPermissionHooks {
                 approval_policy: policy.to_string(),
                 evidence: json!({
                     "surface": "rpc",
+                    "untrustedSeen": self
+                        .untrusted_seen
+                        .load(std::sync::atomic::Ordering::Relaxed),
                     "readOnly": read_only,
                 }),
             };
@@ -240,6 +261,7 @@ pub(crate) fn rpc_permission_hooks(
     events: EventSink,
     run_cancel: tokio_util::sync::CancellationToken,
     approval_chain: crate::approval::ApprovalChain,
+    untrusted_seen: Arc<std::sync::atomic::AtomicBool>,
 ) -> Arc<RpcPermissionHooks> {
     Arc::new(RpcPermissionHooks {
         session_id,
@@ -248,5 +270,138 @@ pub(crate) fn rpc_permission_hooks(
         events,
         run_cancel,
         approval_chain,
+        untrusted_seen,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    /// Scripted approval-chain reviewer.
+    #[derive(Debug)]
+    struct ClaimReviewer(crate::approval::ChainAction);
+
+    #[async_trait::async_trait]
+    impl crate::approval::ApprovalReviewer for ClaimReviewer {
+        async fn review(
+            &self,
+            _request: &crate::approval::ApprovalRequest,
+        ) -> Option<crate::approval::ChainDecision> {
+            Some(crate::approval::ChainDecision {
+                action: self.0,
+                reason: None,
+            })
+        }
+    }
+
+    fn hooks(
+        untrusted: bool,
+        chain: crate::approval::ApprovalChain,
+    ) -> (
+        Arc<RpcPermissionHooks>,
+        Arc<Mutex<RpcPermissionState>>,
+        mpsc::UnboundedReceiver<Value>,
+    ) {
+        let state = Arc::new(Mutex::new(RpcPermissionState {
+            mode: SessionMode::Ask,
+            ..RpcPermissionState::default()
+        }));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let hooks = rpc_permission_hooks(
+            "s1".to_string(),
+            state.clone(),
+            PermissionRules {
+                allow: vec![crate::permissions::Rule::parse("Bash(rm -rf build)").unwrap()],
+                deny: vec![],
+            },
+            tx,
+            tokio_util::sync::CancellationToken::new(),
+            chain,
+            Arc::new(std::sync::atomic::AtomicBool::new(untrusted)),
+        );
+        (hooks, state, rx)
+    }
+
+    fn ctx<'a>(
+        message: &'a tack_ai::AssistantMessage,
+        args: &'a Value,
+    ) -> BeforeToolCallContext<'a> {
+        BeforeToolCallContext {
+            assistant_message: message,
+            tool_call_id: "1",
+            tool_name: "bash",
+            args,
+            context: &[],
+        }
+    }
+
+    /// Answer the first permission_request event with AllowOnce.
+    async fn answer_first_prompt(
+        state: Arc<Mutex<RpcPermissionState>>,
+        rx: &mut mpsc::UnboundedReceiver<Value>,
+    ) {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("permission_request event expected")
+            .expect("event");
+        assert_eq!(event["type"], "permission_request");
+        let request_id = event["requestId"].as_str().unwrap().to_string();
+        let tx = {
+            let pending = state.lock().await.pending.clone();
+            pending
+                .lock()
+                .await
+                .remove(&request_id)
+                .expect("pending prompt")
+        };
+        tx.send(PermissionAnswer {
+            decision: PermissionDecision::AllowOnce,
+            reason: None,
+        })
+        .unwrap();
+    }
+
+    /// Trusted run: a chain allow claim approves without any client prompt.
+    #[tokio::test]
+    async fn trusted_run_chain_claim_approves() {
+        let message = tack_ai::AssistantMessage::pending(
+            &crate::model::resolve_model("anthropic", Some("k3"), std::path::Path::new("."))
+                .unwrap(),
+        );
+        let mut chain = crate::approval::ApprovalChain::empty();
+        chain.push(
+            "fake@user".into(),
+            Arc::new(ClaimReviewer(crate::approval::ChainAction::Allow)),
+        );
+        let (hooks, _state, mut rx) = hooks(false, chain);
+        let args = json!({ "command": "rm -rf build" });
+        let outcome = hooks.before_tool_call(&ctx(&message, &args)).await;
+        assert!(matches!(outcome, BeforeToolCallOutcome::Allow));
+        assert!(rx.try_recv().is_err(), "no prompt expected");
+    }
+
+    /// Untrusted run: the chain (and the allow rule) must be skipped — the
+    /// client is prompted even though a reviewer claims allow.
+    #[tokio::test]
+    async fn untrusted_run_skips_chain_and_allow_rules() {
+        let message = tack_ai::AssistantMessage::pending(
+            &crate::model::resolve_model("anthropic", Some("k3"), std::path::Path::new("."))
+                .unwrap(),
+        );
+        let mut chain = crate::approval::ApprovalChain::empty();
+        chain.push(
+            "fake@user".into(),
+            Arc::new(ClaimReviewer(crate::approval::ChainAction::Allow)),
+        );
+        let (hooks, state, mut rx) = hooks(true, chain);
+        let args = json!({ "command": "rm -rf build" });
+        let c = ctx(&message, &args);
+        let (outcome, _) = tokio::join!(
+            hooks.before_tool_call(&c),
+            answer_first_prompt(state, &mut rx)
+        );
+        assert!(matches!(outcome, BeforeToolCallOutcome::Allow));
+    }
 }

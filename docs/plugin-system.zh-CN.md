@@ -268,8 +268,10 @@ tack ext marketplace remove acme
 - **子代理继承插件护栏**：子代理循环默认运行会话的插件钩子桥
   （`subagents.inheritPlugins: "hooks"`），委派无法绕过护栏插件的
   `beforeToolCall` 裁决；`"full"` 额外继承插件工具。
-- 裁决链顺序：SessionHooks → **生命周期 hooks** → 权限 hooks →
-  队列/预算 → tack-ext 插件（最后看到的就是最终参数）。
+- 裁决链顺序：SessionHooks → **生命周期 hooks** → tack-ext 插件 →
+  权限 hooks → 队列/预算。权限层（声明式 deny、模式门、审批链、
+  弹窗）运行在插件 `beforeToolCall` 桥接之后，因此它看到——弹窗也
+  展示——改写后的最终参数：改写不再能绕过 deny 规则或审批。
 
 ## 6. 运行模式支持矩阵
 

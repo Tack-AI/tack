@@ -621,15 +621,18 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
             ))
         };
     let mut hook_list: Vec<Arc<dyn tack_agent_core::AgentHooks>> = vec![hooks];
+    hook_list.extend(shell_hooks);
+    // tack-ext plugin hooks (intercept.tool_call / context transform) run
+    // BEFORE the declarative deny layer, so `hooks/beforeToolCall` rewrites
+    // land first and deny rules match against the FINAL arguments (a
+    // rewrite can no longer smuggle content past a deny rule). A plugin
+    // Allow is not terminal, so this cannot bypass the deny rules.
+    hook_list.extend(extensions.hooks());
     if !deny_rules.deny.is_empty() {
         hook_list.push(Arc::new(crate::permissions::DenyRulesHooks {
             rules: deny_rules,
         }));
     }
-    hook_list.extend(shell_hooks);
-    // tack-ext plugin hooks (intercept.tool_call / context transform) see the
-    // final arguments after every other hook in the chain.
-    hook_list.extend(extensions.hooks());
     let hooks: Arc<dyn tack_agent_core::AgentHooks> = match StdinSteering::spawn_if_piped() {
         Some(steering) => {
             hook_list.push(Arc::new(steering));
