@@ -2,6 +2,8 @@
 
 **[English](extensions.md) | 简体中文**
 
+> **刚来？先看实战教程：[plugin-development.md](plugin-development.zh-CN.md)。**
+>
 > 本文档描述 tack-RPC v3 重设计后的扩展系统（背景与阶段见
 > [plugin-roadmap.zh-CN.md](plugin-roadmap.zh-CN.md)）。协议的单一事实
 > 来源是 OpenRPC 文档

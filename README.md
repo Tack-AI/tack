@@ -24,8 +24,9 @@ an embedded browser client. Wire- and storage-compatible with the TypeScript pi.
 - **42 built-in providers** — 40 mirroring TS pi's registry, plus zero-config
   local **ollama** and **llama.cpp** — with the full model catalog embedded
   (1130 models: context windows, costs, reasoning flags, compat quirks).
-- **Extensible** — subprocess plugins in any language (NDJSON/JSON-RPC) or
-  sandboxed WASM, plus Claude-Code-compatible lifecycle hooks.
+- **Extensible** — tack-RPC v3 plugins with Rust/TypeScript/Python SDKs
+  (process, sandboxed WASM, or MCP-server carriers), plus
+  Claude-Code-compatible lifecycle hooks.
 - **Remote-first** — `tack serve` hosts sessions over TCP/WebSocket/TLS with
   token auth; attach from `tack client` or a browser.
 - **Private by default** — no telemetry; local crash.log, opt-in tracing, and
@@ -152,7 +153,8 @@ tack compact      # manually compact the most recent session
 tack doctor       # environment self-check (shell, LSP, sandbox, credentials, MCP)
 tack logs         # structured trace viewer (--follow, --level, --target)
 tack eval <dir>   # run eval tasks headlessly and score pass rates
-tack ext ...      # install/list/remove/verify extensions, marketplaces
+tack ext ...      # install/list/enable/disable/upgrade extensions, marketplaces,
+                  # scaffold + dev/test tack-RPC v3 plugins (ext new/inspect/dev/test)
 ```
 
 The RPC command surface has full TS parity (34 commands, `prompt`/`steer`/
@@ -221,30 +223,47 @@ available with hardened defaults. Details:
 
 ## Extensions
 
-Dynamic extensions run as **subprocess plugins** (`tack-ext`): any executable
-speaking newline-delimited JSON over stdio, one crash-isolated process per
-plugin — or as sandboxed WASI modules (`tack-ext-wasm`).
+Plugins speak **tack-RPC v3** — JSON-RPC 2.0 over NDJSON stdio, defined
+schema-first in [`protocol/tack-rpc.openrpc.json`](protocol/tack-rpc.openrpc.json)
+— running as crash-isolated subprocesses, sandboxed WASM modules (WASI-stdio
+or capability-free WIT components), or MCP servers adapted into full plugin
+identity (`tack-ext` / `tack-ext-wasm`). Write them in Rust
+(`tack-ext-sdk`), TypeScript (`@tack/plugin`), or Python (`tack-plugin`) —
+plugin code never sees a JSON-RPC envelope:
 
 ```bash
-# install from a git URL / local dir / marketplace spec
+tack ext new hello ts      # scaffold a plugin (rust | ts | python)
+tack ext dev hello         # drive it against a mock-host scenario / stream logs
+tack ext test hello        # scenario assertions, non-zero exit on failure
+
+# install from a git URL / local dir / marketplace spec / .tgz bundle
 tack ext install https://github.com/example/plugin.git
-tack ext list
+tack ext list              # id, state (active/disabled/failed/policy-blocked), version
+tack ext enable|disable|upgrade <id>
 ```
 
-…or drop a directory with an `extension.json` manifest into
-`~/.tack/agent/extensions/<name>/`:
+Installs land in a versioned store (identity `name@source`) with atomic
+stage-verify-swap installs; dropping a directory with an `extension.json`
+manifest into `~/.tack/agent/extensions/<name>/` still works:
 
 ```json
 { "name": "hello-js", "command": "node", "args": ["plugin.js"] }
 ```
 
-Plugins can register tools (`ext__<plugin>__<tool>`), slash commands, event
-handlers, UI dialogs/notifications, session control, and runtime providers.
-Ready-made examples under [`examples/extensions/`](examples/extensions/)
-(Node.js hello-world, protected-paths guard, git checkpoints, session
-handoff). **Full guide: [docs/extensions.md](docs/extensions.md)** (protocol,
-API reference, security model) and [docs/extensions-v2.md](docs/extensions-v2.md)
-(WASM carrier).
+Plugins can register tools (`ext__<plugin>__<tool>`), slash commands,
+before/after tool-call hooks (intercept + rewrite), context transforms,
+lifecycle-event handlers, UI dialogs/widgets, autocomplete, an **approval
+chain** that reviews permission prompts before the user sees them, and
+runtime providers — including **provider bridges** that serve inference
+directly, with no HTTP shim. Extension bundles additionally contribute
+Claude-format hooks, MCP servers, and skills. Examples under
+[`examples/extensions/`](examples/extensions/) (WASM carrier reference
+implementations in hand-written WAT). **Full guide:
+[docs/extensions.md](docs/extensions.md)** (manifest, protocol, SDKs, store,
+marketplace, enterprise policy, security model) · architecture panorama:
+[docs/plugin-system.md](docs/plugin-system.md) · provider bridges:
+[docs/plugin-provider-bridge.md](docs/plugin-provider-bridge.md) · design
+rationale: [docs/plugin-roadmap.md](docs/plugin-roadmap.md).
 
 ## Configuration
 
@@ -283,8 +302,12 @@ Chinese (language policy: [CONTRIBUTING.md](CONTRIBUTING.md)).
 | [docs/providers.md](docs/providers.md) | Provider auth deep dives (Bedrock SigV4, Vertex ADC), custom provider schema |
 | [docs/directories.md](docs/directories.md) | Directory & resource loading order |
 | [docs/compatibility.md](docs/compatibility.md) | Compatibility & versioning policy for every interface |
-| [docs/extensions.md](docs/extensions.md) / [docs/extensions-v2.md](docs/extensions-v2.md) | Extension development (process protocol; WASM carrier) |
-| [docs/plugin-system.md](docs/plugin-system.md) | Plugin system overview (hooks / tack-ext / WASM / bundles / marketplace) |
+| **[docs/plugin-development.md](docs/plugin-development.md)** | Plugin development guide — hands-on tutorial (carriers × Rust/TS/Python SDKs) |
+| [docs/extensions.md](docs/extensions.md) | Extension development (tack-RPC v3: manifest, SDKs, store, marketplace, policy) |
+| [docs/extensions-v2.md](docs/extensions-v2.md) | WASM carrier design (historical v2 background) |
+| [docs/plugin-system.md](docs/plugin-system.md) | Plugin system overview (hooks / tack-RPC v3 / carriers / approval / bridges) |
+| [docs/plugin-provider-bridge.md](docs/plugin-provider-bridge.md) | Provider bridge design (plugins serving inference directly) |
+| [docs/plugin-roadmap.md](docs/plugin-roadmap.md) | Plugin redesign roadmap (three-level model, enterprise management plane) |
 | [docs/hooks.md](docs/hooks.md) | Lifecycle hooks (Claude Code compatible) |
 | [docs/codebuddy.md](docs/codebuddy.md) | CodeBuddy guide (install/login, `/model`, troubleshooting) |
 | [docs/intellij-idea-acp.md](docs/intellij-idea-acp.md) | JetBrains IDE setup via ACP |
@@ -311,8 +334,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 | `tack-tools` | Built-in tools: read, bash, git, edit, write, grep, find, ls, web_fetch, web_search, todo |
 | `tack-tui` | Terminal UI library: styled lines, components, diff + alt-screen renderers |
 | `tack-protocol` | CBOR remote-session protocol: schemas, framing, `RemoteClient` |
-| `tack-ext` / `tack-ext-wasm` | Extension hosts: subprocess NDJSON protocol; sandboxed WASM carrier |
+| `tack-ext` | Extension host: tack-RPC v3 (schema-generated `rpc3` types), process/MCP carriers, store, marketplace, policy |
+| `tack-ext-sdk` | Rust SDK for tack-RPC v3 plugins (builder API, typed host client) |
+| `tack-ext-wasm` | Sandboxed WASM carriers: WASI-stdio + WIT component (`tack:plugin@0.3.0`) |
 | `tack-app` | The binary: TUI / print / ACP / RPC / serve / mcp-serve, skills, settings, system prompt |
+
+The TypeScript (`@tack/plugin`) and Python (`tack-plugin`) plugin SDKs live
+in `sdk/` outside the Cargo workspace; their protocol types are generated
+from the OpenRPC schema by `cargo run -p xtask -- codegen`.
 
 Dependency direction is acyclic: `tack-ai ← tack-agent-core ← tack-tools`,
 `tack-ai ← tack-session`, `tack-app → all`.

@@ -2,6 +2,9 @@
 
 **English | [简体中文](extensions.zh-CN.md)**
 
+> **New here? Start with the hands-on tutorial:
+> [plugin-development.md](plugin-development.md).**
+>
 > This document describes the extension system as of the tack-RPC v3
 > redesign (see [plugin-roadmap.md](plugin-roadmap.md) for the why and the
 > phases). The protocol's single source of truth is the OpenRPC document

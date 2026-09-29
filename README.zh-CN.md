@@ -21,8 +21,9 @@ TCP/WebSocket 远程会话。与 TypeScript pi 线上协议和存储格式兼容
 - **内置 42 个 provider** —— 40 个镜像 TS pi 注册表，外加零配置本地
   **ollama** 和 **llama.cpp** —— 内嵌完整模型目录（1130 个模型：上下文
   窗口、成本、推理标志、compat 怪癖）。
-- **可扩展** —— 任意语言的子进程插件（NDJSON/JSON-RPC）或沙箱化 WASM，
-  外加兼容 Claude Code 的生命周期 hooks。
+- **可扩展** —— 讲 tack-RPC v3 协议的插件，提供 Rust/TypeScript/Python SDK
+  （子进程、沙箱化 WASM 或 MCP server 载体），外加兼容 Claude Code 的
+  生命周期 hooks。
 - **远程优先** —— `tack serve` 通过 TCP/WebSocket/TLS + token 鉴权托管
   会话；可从 `tack client` 或浏览器接入。
 - **默认隐私** —— 无遥测；本地 crash.log、opt-in tracing 和
@@ -145,7 +146,8 @@ tack compact      # 手动压缩最近的会话
 tack doctor       # 环境自检（shell、LSP、沙箱、凭据、MCP）
 tack logs         # 结构化 trace 查看器（--follow、--level、--target）
 tack eval <dir>   # 无头运行 eval 任务并统计通过率
-tack ext ...      # 安装/列出/移除/校验扩展，市场管理
+tack ext ...      # 安装/列出/启用/禁用/升级扩展，市场管理，
+                  # 脚手架 + 开发/测试 tack-RPC v3 插件（ext new/inspect/dev/test）
 ```
 
 RPC 命令面与 TS 完全对齐（34 个命令，`prompt`/`steer`/`follow_up`/`abort`/
@@ -208,29 +210,43 @@ sampling（`mcpSampling`，默认关）和 elicitation（`mcpElicitation`）均�
 
 ## 扩展
 
-动态扩展以**子进程插件**运行（`tack-ext`）：任何在 stdio 上讲换行分隔 JSON
-的可执行文件，每个插件一个崩溃隔离进程 —— 或作为沙箱化 WASI 模块
-（`tack-ext-wasm`）。
+插件讲 **tack-RPC v3** 协议 —— NDJSON stdio 上的 JSON-RPC 2.0，以
+[`protocol/tack-rpc.openrpc.json`](protocol/tack-rpc.openrpc.json) 为唯一
+schema 来源 —— 以崩溃隔离的子进程、沙箱化 WASM 模块（WASI-stdio 或无能力
+WIT 组件）、或被接入完整插件身份的 MCP server 形式运行（`tack-ext` /
+`tack-ext-wasm`）。可用 Rust（`tack-ext-sdk`）、TypeScript（`@tack/plugin`）
+或 Python（`tack-plugin`）编写 —— 插件代码完全看不到 JSON-RPC 信封：
 
 ```bash
-# 从 git URL / 本地目录 / 市场规格安装
+tack ext new hello ts      # 脚手架生成插件（rust | ts | python）
+tack ext dev hello         # 用 mock-host 场景驱动 / 跟随日志
+tack ext test hello        # 场景断言，失败退出码非零
+
+# 从 git URL / 本地目录 / 市场规格 / .tgz bundle 安装
 tack ext install https://github.com/example/plugin.git
-tack ext list
+tack ext list              # id、状态（active/disabled/failed/policy-blocked）、版本
+tack ext enable|disable|upgrade <id>
 ```
 
-……或把带 `extension.json` 清单的目录放进
-`~/.tack/agent/extensions/<name>/`：
+安装落入版本化 store（身份为 `name@source`），stage-verify-swap 原子安装；
+把带 `extension.json` 清单的目录放进 `~/.tack/agent/extensions/<name>/`
+依然可以：
 
 ```json
 { "name": "hello-js", "command": "node", "args": ["plugin.js"] }
 ```
 
-插件可注册工具（`ext__<plugin>__<tool>`）、斜杠命令、事件处理器、UI
-对话框/通知、会话控制和运行时 provider。[`examples/extensions/`](examples/extensions/)
-下有现成示例（Node.js hello-world、protected-paths 防护、git checkpoint、
-会话 handoff）。**完整指南：[docs/extensions.zh-CN.md](docs/extensions.zh-CN.md)**
-（协议、API 参考、安全模型）与 [docs/extensions-v2.zh-CN.md](docs/extensions-v2.zh-CN.md)
-（WASM 载体）。
+插件可注册工具（`ext__<plugin>__<tool>`）、斜杠命令、before/after 工具调用
+hooks（拦截 + 改写）、上下文变换、生命周期事件处理器、UI 对话框/widget、
+自动补全、先于用户审查权限提示的**审批链**，以及运行时 provider —— 包括
+不经 HTTP 中转直接提供推理的 **provider bridge**。扩展 bundle 还能额外贡献
+Claude 格式 hooks、MCP server 和技能。示例见
+[`examples/extensions/`](examples/extensions/)（手写 WAT 的 WASM 载体参考
+实现）。**完整指南：[docs/extensions.zh-CN.md](docs/extensions.zh-CN.md)**
+（清单、协议、SDK、store、市场、企业策略、安全模型）· 架构全景：
+[docs/plugin-system.zh-CN.md](docs/plugin-system.zh-CN.md) · provider bridge：
+[docs/plugin-provider-bridge.zh-CN.md](docs/plugin-provider-bridge.zh-CN.md) ·
+设计缘由：[docs/plugin-roadmap.zh-CN.md](docs/plugin-roadmap.zh-CN.md)。
 
 ## 配置
 
@@ -268,8 +284,12 @@ project（`<project>/.pi/settings.json`，受信任门控）—— 深度合并�
 | [docs/providers.zh-CN.md](docs/providers.zh-CN.md) | Provider 认证深入（Bedrock SigV4、Vertex ADC）、自定义 provider schema |
 | [docs/directories.zh-CN.md](docs/directories.zh-CN.md) | 目录与资源加载顺序 |
 | [docs/compatibility.zh-CN.md](docs/compatibility.zh-CN.md) | 各类接口的兼容与版本政策 |
-| [docs/extensions.zh-CN.md](docs/extensions.zh-CN.md) / [docs/extensions-v2.zh-CN.md](docs/extensions-v2.zh-CN.md) | 扩展开发（进程协议；WASM 载体） |
-| [docs/plugin-system.zh-CN.md](docs/plugin-system.zh-CN.md) | 插件系统总览（hooks / tack-ext / WASM / bundle / 市场） |
+| **[docs/plugin-development.zh-CN.md](docs/plugin-development.zh-CN.md)** | 插件开发指南——实战教程（载体 × Rust/TS/Python SDK） |
+| [docs/extensions.zh-CN.md](docs/extensions.zh-CN.md) | 扩展开发（tack-RPC v3：清单、SDK、store、市场、策略） |
+| [docs/extensions-v2.zh-CN.md](docs/extensions-v2.zh-CN.md) | WASM 载体设计（v2 历史背景） |
+| [docs/plugin-system.zh-CN.md](docs/plugin-system.zh-CN.md) | 插件系统总览（hooks / tack-RPC v3 / 载体 / 审批 / bridge） |
+| [docs/plugin-provider-bridge.zh-CN.md](docs/plugin-provider-bridge.zh-CN.md) | Provider bridge 设计（插件直接提供推理） |
+| [docs/plugin-roadmap.zh-CN.md](docs/plugin-roadmap.zh-CN.md) | 插件重构路线图（三级模型、企业管理面） |
 | [docs/hooks.zh-CN.md](docs/hooks.zh-CN.md) | 生命周期 hooks（兼容 Claude Code） |
 | [docs/codebuddy.zh-CN.md](docs/codebuddy.zh-CN.md) | CodeBuddy 指南（安装/登录、`/model`、排障） |
 | [docs/intellij-idea-acp.zh-CN.md](docs/intellij-idea-acp.zh-CN.md) | JetBrains IDE 的 ACP 配置 |
@@ -296,8 +316,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 | `tack-tools` | 内置工具：read、bash、git、edit、write、grep、find、ls、web_fetch、web_search、todo |
 | `tack-tui` | 终端 UI 库：样式行、组件、diff + alt-screen 渲染器 |
 | `tack-protocol` | CBOR 远程会话协议：schema、分帧、`RemoteClient` |
-| `tack-ext` / `tack-ext-wasm` | 扩展宿主：子进程 NDJSON 协议；沙箱化 WASM 载体 |
+| `tack-ext` | 扩展宿主：tack-RPC v3（schema 生成的 `rpc3` 类型）、process/MCP 载体、store、市场、策略 |
+| `tack-ext-sdk` | tack-RPC v3 插件的 Rust SDK（builder API、类型化 host client） |
+| `tack-ext-wasm` | 沙箱化 WASM 载体：WASI-stdio + WIT 组件（`tack:plugin@0.3.0`） |
 | `tack-app` | 二进制：TUI / print / ACP / RPC / serve / mcp-serve，skills、settings、系统提示 |
+
+TypeScript（`@tack/plugin`）和 Python（`tack-plugin`）插件 SDK 位于 Cargo
+工作区之外的 `sdk/` 目录；它们的协议类型由 `cargo run -p xtask -- codegen`
+从 OpenRPC schema 生成。
 
 依赖方向无环：`tack-ai ← tack-agent-core ← tack-tools`、`tack-ai ← tack-session`、
 `tack-app → all`。

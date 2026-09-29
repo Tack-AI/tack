@@ -564,7 +564,9 @@ wire-compatible with TS `@earendil-works/pi-protocol` v1.
 
 The organization-level policy file (path in configuration.md) can: force
 sandbox on, force features on/off, disable bypass mode, lock providers/
-models, and append non-removable deny rules. Combined with the project-trust
+models, append non-removable deny rules, and govern plugins (`pluginPolicy`:
+managed-only loading, source allow-lists, per-plugin capability narrowing —
+see "Extension system" below). Combined with the project-trust
 mechanism, neither the user side nor the repo side can bypass organizational
 policy in an enterprise deployment.
 
@@ -602,26 +604,86 @@ task. Zero extension-process cost — shell commands directly in settings.json;
 enterprises can use `managed-hooks.json` + `managedHooksOnly` to lock down to
 managed hooks only. See [hooks.md](hooks.md) for details.
 
-### Extension system (bundle / marketplace / WASM carrier)
+### Extension system (tack-RPC v3)
 
-- **Extension bundle**: besides a plugin process, `extension.json` can declare
-  `hooks` (Claude format, merged into session hooks), `mcpServers` (merged
-  into MCP connections), `skills` (merged into skill discovery); bundle-only
-  manifests (no command/module) are also valid.
-- **Marketplace**: `tack ext marketplace add/list/remove` registers JSON
-  catalogs (local file or URL, cached in `~/.tack/agent/marketplaces/`),
-  `tack ext install <plugin>@<marketplace>` resolves and installs via the
-  catalog.
-- **WASM carrier** (tack-ext v2): `carrier: "wasm"` + `module` + `limits`
-  runs the plugin as a WASI p1 module in a wasmtime sandbox — no fs/network/
-  env vars by default; fuel / epoch wall-clock / memory hard caps clamped by
-  the host. The wire protocol is byte-identical to the subprocess carrier
-  (same `PluginPeer` reused), handshake `protocol: 2`; example
-  `examples/extensions/hello-wasm/` (protocol reference implementation in
-  hand-written WAT).
+- **tack-RPC v3 protocol**: plugins speak JSON-RPC 2.0 over NDJSON stdio
+  (both-directions requests, `$/cancelRequest`, 30s call timeout, crash
+  isolation), defined schema-first in `protocol/tack-rpc.openrpc.json` —
+  host types (`tack_ext::rpc3`) and the TypeScript/Python SDK types are
+  generated from it (`cargo run -p xtask -- codegen`, freshness-checked in
+  CI). The pre-v3 NDJSON protocol was removed in the same release.
+- **SDKs + dev tooling**: Rust (`tack-ext-sdk`), TypeScript (`@tack/plugin`,
+  `sdk/typescript`), Python (`tack-plugin`, `sdk/python`) — builder APIs;
+  plugin code never sees a JSON-RPC envelope. `tack ext new <dir>
+  <rust|ts|python>` scaffolds, `tack ext inspect` dumps the handshake
+  capabilities, `tack ext dev`/`ext test` drive a plugin against mock-host
+  scenario files (scripted plugin→host answers, recursive subset-match
+  assertions, non-zero exit on failure).
+- **Three carriers**: `process` (default crash-isolated subprocess), `wasm`
+  (wasmtime sandbox; auto-detects WASI-stdio core modules and WIT components
+  `tack:plugin@0.3.0` — components are capability-free by construction; fuel
+  / wall-clock / memory hard caps; examples `examples/extensions/hello-wasm*/`,
+  `hello-component/` in hand-written WAT), and `mcp` (an MCP server *is* the
+  plugin — its tools/resources/prompts are adapted with full plugin identity:
+  `ext__` naming, attribution, policy, hook interception, and the
+  untrusted-content defense).
+- **Plugin identity + versioned store**: plugins are `name@source`; installs
+  land in `extensions/store/<source>/<name>/<version>/` with atomic
+  stage-verify-swap-rollback and fingerprint-idempotent upgrades; lockfile v2
+  (v1 auto-upgraded); legacy flat `extensions/<name>/` installs keep loading.
+  Load failures are first-class state — broken/disabled/policy-blocked
+  plugins stay visible in `tack ext list`. `tack ext enable|disable|upgrade`.
+- **Capability surface** (declared at `initialize`, undeclared = never
+  called): tools (`ext__<plugin>__<tool>`, may return image blocks), slash
+  commands, `beforeToolCall` (allow/deny/**rewrite**), `transformContext`,
+  `afterToolCall` result patching, lifecycle events, UI dialogs/widgets,
+  autocomplete, `session/get` + `session/sendUserMessage`, trust-gated
+  `exec/run`, runtime provider registration, and **provider bridges**
+  (`capabilities.provider.stream`: the plugin serves inference directly — no
+  HTTP shim — in all four run modes; models get the reserved api kind
+  `ext-provider-bridge`, appear in `/model`, credentials stay plugin-side;
+  see [plugin-provider-bridge.md](plugin-provider-bridge.md)).
+- **Approval chain** (`capabilities.hooks.approvalReview`): when the
+  permission flow is about to prompt a human, reviewer plugins get first
+  crack in load order — first claim wins, pass/`askUser` defers, errors
+  fail open. Claims approve one-shot (nothing persists into allow-always),
+  audited under `plugin_approval`; wired in the TUI and rpc surfaces
+  (acp/remote-host prompts are a follow-up). Plugin `beforeToolCall` bridges
+  run BEFORE the permission layer on every surface, so reviewers (and the
+  dialog) see the final post-rewrite arguments. Calls that entered untrusted
+  web/MCP content skip the chain — the human must be asked.
+- **Extension bundle (Level 1)**: `extension.json` can declare `hooks`
+  (Claude format, merged into session hooks), `mcpServers` (merged into MCP
+  connections), `skills` (merged into skill discovery); bundle-only manifests
+  (no command/module) are valid.
+- **Marketplace + distribution**: `tack ext marketplace add/list/remove/sync`
+  registers JSON catalogs (signed catalogs pin an ed25519 key, TOFU); settings
+  `pluginMarketplaces` keeps catalogs fresh in a background startup sync that
+  never blocks; catalog v2 entries add `installation` (incl.
+  `installed-by-default`) and inline `manifest`. `tack ext bundle pack`
+  writes a deterministic `<name>-<version>.tgz` — the air-gapped unit,
+  extracted under hostile-input rules (no links, no traversal, size caps).
+- **Observability**: load telemetry counts by outcome (`active | disabled |
+  failed | policy-filtered`, target `plugin_load`) and persists
+  `extensions/last-load.json`, which `tack doctor` reads to report failures
+  with causes; Level-3 plugins can emit metrics untrusted through the
+  declare-at-initialize metrics sidecar (strict drain validation, target
+  `plugin_metrics`; Rust SDK `MetricsRecorder`).
+- **Enterprise plugin policy** (managed `pluginPolicy` key):
+  `managedPluginsOnly`, `allowedSources` (git URL with optional `ref` pin,
+  host regex, local roots), per-plugin `enabled` (wins over user/project in
+  both directions), narrow-only per-plugin `tools`/`mcpServers`/`hooks`/
+  `provider` intersections. Enforced twice — at install time (before any
+  clone/network) and at load time (discovery filter + registration-time
+  narrowing); blocked plugins stay visible as `policy-blocked (<reason>)`
+  rows; every decision is audit-logged with rule and origin layer (shipped
+  via the managed `auditSink`).
+- **Subagent inheritance**: `subagents.inheritPlugins` (none | hooks | full,
+  default hooks) shares the parent's plugins with child loops — see
+  "Plugin inheritance" under Agent Execution.
 
 See [plugin-system.md](plugin-system.md), [extensions.md](extensions.md),
-[extensions-v2.md](extensions-v2.md) for details.
+[plugin-provider-bridge.md](plugin-provider-bridge.md) for details.
 
 ### MCP server mode
 

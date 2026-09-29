@@ -362,7 +362,7 @@ Web 客户端支持：权限弹窗（allow once/always/deny，并行工具调用
 
 ### Managed settings（组织强制）
 
-组织级策略文件（路径见 configuration.md）可以：强制 sandbox 开、强制开关 features、禁用 bypass 模式、锁定 provider/模型、追加不可移除的 deny 规则。配合项目信任机制，企业内部署时用户侧和仓库侧都无法绕过组织策略。
+组织级策略文件（路径见 configuration.md）可以：强制 sandbox 开、强制开关 features、禁用 bypass 模式、锁定 provider/模型、追加不可移除的 deny 规则，以及管控插件（`pluginPolicy`：仅托管加载、来源白名单、按插件收窄能力——见下文"扩展系统"）。配合项目信任机制，企业内部署时用户侧和仓库侧都无法绕过组织策略。
 
 ### 凭据 keyring
 
@@ -390,22 +390,74 @@ verdict 拒绝启动（工具返回错误、零 token 消耗，后台子代理�
 `managed-hooks.json` + `managedHooksOnly` 锁定只跑托管 hooks。详见
 [hooks.md](hooks.zh-CN.md)。
 
-### 扩展系统（bundle / marketplace / WASM 载体）
+### 扩展系统（tack-RPC v3）
 
-- **Extension bundle**：`extension.json` 除插件进程外可声明 `hooks`
-  （Claude 格式，并入会话 hooks）、`mcpServers`（并入 MCP 连接）、
-  `skills`（并入技能发现）；bundle-only 清单（无 command/module）也合法。
-- **Marketplace**：`tack ext marketplace add/list/remove` 注册 JSON catalog
-  （本地文件或 URL，缓存于 `~/.tack/agent/marketplaces/`），
-  `tack ext install <plugin>@<marketplace>` 经目录解析安装。
-- **WASM 载体**（tack-ext v2）：`carrier: "wasm"` + `module` + `limits` 把插件跑成
-  wasmtime 沙箱里的 WASI p1 模块——默认无 fs/网络/环境变量，fuel / epoch
-  墙钟 / 内存硬上限由 host 钳制。线协议与子进程载体逐字节相同（复用同一个
-  `PluginPeer`），握手 `protocol: 2`；示例 `examples/extensions/hello-wasm/`
-  （手写 WAT 的协议参考实现）。
+- **tack-RPC v3 协议**：插件在 NDJSON stdio 上讲 JSON-RPC 2.0（双向请求、
+  `$/cancelRequest`、30 秒调用超时、崩溃隔离），以
+  `protocol/tack-rpc.openrpc.json` 为唯一 schema 来源——host 类型
+  （`tack_ext::rpc3`）与 TypeScript/Python SDK 类型都由它生成
+  （`cargo run -p xtask -- codegen`，CI 新鲜度检查）。v3 之前的 NDJSON
+  协议已在同一版本移除。
+- **SDK + 开发工具链**：Rust（`tack-ext-sdk`）、TypeScript（`@tack/plugin`，
+  `sdk/typescript`）、Python（`tack-plugin`，`sdk/python`）——builder API，
+  插件代码完全看不到 JSON-RPC 信封。`tack ext new <dir> <rust|ts|python>`
+  脚手架生成，`tack ext inspect` 转储握手能力，`tack ext dev`/`ext test`
+  用 mock-host 场景文件驱动插件（可编排 plugin→host 应答、递归子集匹配
+  断言、失败退出码非零）。
+- **三种载体**：`process`（默认，崩溃隔离的子进程）、`wasm`（wasmtime
+  沙箱；自动识别 WASI-stdio 核心模块与 WIT 组件 `tack:plugin@0.3.0`——
+  组件构造上无能力；fuel / 墙钟 / 内存硬上限；示例
+  `examples/extensions/hello-wasm*/`、`hello-component/`，手写 WAT），以及
+  `mcp`（一个 MCP server *就是*插件——其工具/资源/提示被接入完整插件身份：
+  `ext__` 命名、归属、策略、hook 拦截与不可信内容防御）。
+- **插件身份 + 版本化 store**：插件身份为 `name@source`；安装落入
+  `extensions/store/<source>/<name>/<version>/`，stage-verify-swap-rollback
+  原子安装 + 指纹幂等升级；lockfile v2（v1 自动升级）；旧的扁平
+  `extensions/<name>/` 安装继续加载。加载失败是一等状态——损坏/禁用/被策略
+  拦截的插件在 `tack ext list` 中保持可见。`tack ext enable|disable|upgrade`。
+- **能力面**（`initialize` 时声明，未声明 = 永不被调用）：工具
+  （`ext__<plugin>__<tool>`，可返回图片块）、斜杠命令、`beforeToolCall`
+  （allow/deny/**改写**）、`transformContext`、`afterToolCall` 结果修补、
+  生命周期事件、UI 对话框/widget、自动补全、`session/get` +
+  `session/sendUserMessage`、信任门控的 `exec/run`、运行时 provider 注册，
+  以及 **provider bridge**（`capabilities.provider.stream`：插件不经 HTTP
+  中转直接提供推理，四种运行模式全部生效；模型获得保留 api 类型
+  `ext-provider-bridge`、出现在 `/model`，凭据不出插件进程；见
+  [plugin-provider-bridge.md](plugin-provider-bridge.zh-CN.md)）。
+- **审批链**（`capabilities.hooks.approvalReview`）：当权限流程即将弹出人工
+  提示时，声明了审批能力的插件按加载顺序先审——首个认领生效，pass/`askUser`
+  顺延，出错失败开放（fail-open）。认领仅单次批准（不写入 allow-always），
+  审计在 `plugin_approval` target 下；已接入 TUI 与 rpc 表面（acp/remote-host
+  提示为后续跟进）。插件的 `beforeToolCall` 桥在每个表面都先于权限层运行，
+  因此审批者（和弹窗）看到的是改写后的最终参数。进入过不可信 web/MCP 内容
+  的上下文跳过审批链——必须问人。
+- **Extension bundle（Level 1）**：`extension.json` 可声明 `hooks`（Claude
+  格式，并入会话 hooks）、`mcpServers`（并入 MCP 连接）、`skills`（并入技能
+  发现）；bundle-only 清单（无 command/module）也合法。
+- **市场 + 分发**：`tack ext marketplace add/list/remove/sync` 注册 JSON
+  catalog（签名 catalog 固定 ed25519 公钥，TOFU）；settings
+  `pluginMarketplaces` 在启动后台同步中保持 catalog 新鲜，永不阻塞启动；
+  catalog v2 条目新增 `installation`（含 `installed-by-default`）与内联
+  `manifest`。`tack ext bundle pack` 产出确定性 `<name>-<version>.tgz`——
+  离线（air-gapped）分发单元，按敌意输入规则解包（禁链接、禁穿越、大小
+  上限）。
+- **可观测性**：加载遥测按结果计数（`active | disabled | failed |
+  policy-filtered`，target `plugin_load`）并持久化
+  `extensions/last-load.json`，`tack doctor` 读取它报告带原因的失败；
+  Level-3 插件可经 initialize 时声明的 metrics sidecar 以不可信方式上报指标
+  （严格 drain 校验，target `plugin_metrics`；Rust SDK `MetricsRecorder`）。
+- **企业插件策略**（managed `pluginPolicy` 键）：`managedPluginsOnly`、
+  `allowedSources`（git URL 可带 `ref` 锁、host 正则、本地根目录）、按插件
+  `enabled`（双向都压过 user/project 层）、只窄不宽的按插件
+  `tools`/`mcpServers`/`hooks`/`provider` 交集。双重执行——安装时（任何
+  clone/网络访问之前）与加载时（发现过滤 + 注册时收窄）；被拦截的插件以
+  `policy-blocked (<reason>)` 行保持可见；每个决定都带规则与来源层审计落日志
+  （经托管 `auditSink` 外发）。
+- **子代理继承**：`subagents.inheritPlugins`（none | hooks | full，默认
+  hooks）把父级已加载插件共享给子循环——见 Agent Execution 下的"插件继承"。
 
 详见 [plugin-system.md](plugin-system.zh-CN.md)、[extensions.md](extensions.zh-CN.md)、
-[extensions-v2.md](extensions-v2.zh-CN.md)。
+[plugin-provider-bridge.md](plugin-provider-bridge.zh-CN.md)。
 
 ### MCP server 模式
 
