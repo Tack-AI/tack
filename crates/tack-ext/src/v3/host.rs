@@ -157,7 +157,7 @@ impl HostClient {
 
     /// `shutdown` (graceful stop request; the caller still enforces the
     /// carrier teardown after a grace period). Bounded by a short
-    /// [`SHUTDOWN_TIMEOUT`] — a hung plugin must not stall teardown on
+    /// `SHUTDOWN_TIMEOUT` — a hung plugin must not stall teardown on
     /// the default 30s call timeout before the grace-then-kill starts.
     pub async fn shutdown(&self) -> Result<(), PeerError> {
         self.peer
