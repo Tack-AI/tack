@@ -25,9 +25,12 @@
 //! - A PreToolUse `permissionDecision: "ask"` verdict forces the human
 //!   dialog past every fast path, the chain included.
 //!
-//! Plugin `hooks/beforeToolCall` bridges run BEFORE the permission layer in
-//! every surface's hook chain, so the reviewers (and the dialog) see the
-//! FINAL, post-rewrite arguments.
+//! Plugin `hooks/beforeToolCall` bridges run BEFORE the permission layer
+//! in every surface's hook chain (TUI `tui/run.rs`, headless
+//! `print_mode.rs`, RPC `rpc/prompt.rs`, ACP `acp/agent.rs`), so a plugin
+//! argument rewrite lands before approval and the reviewers (and the
+//! dialog) see the FINAL, post-rewrite arguments — a rewrite cannot
+//! smuggle a command past `permissions.deny` or a granted approval.
 //!
 //! Claimed decisions map to the wire actions: `allow`/`reviewed` both approve
 //! the call (one-shot; nothing is persisted into allow-always state) —

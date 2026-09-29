@@ -27,6 +27,10 @@
 > - **Death watching** polls connection liveness (200ms cadence, the
 >   MCP carrier's precedent) instead of `wait_dead`, whose pump-handle
 >   take is single-waiter.
+> - **Hardening (post-landing)**: plain (non-bridge) registrations are
+>   capability-gated too — `capabilities.provider.register` — through
+>   the same policy/audit path; built-in id collisions are rejected and
+>   `apiKeyEnv` is no longer resolved from the host environment (§7).
 
 ## 1. The gap
 
@@ -139,15 +143,24 @@ the registration path P7b's bridge providers use, so it lands first.
 
 ### 4.1 Protocol additions (OpenRPC is the single source)
 
-New plugin-declared capability (in `InitializeResult.capabilities`):
+Plugin-declared capability (in `InitializeResult.capabilities`):
 
 ```json
-"provider": { "stream": true }
+"provider": { "register": true, "stream": true }
 ```
 
-Undeclared ⇒ the host never calls `provider/stream` and rejects bridge
-registrations with `ERR_CAPABILITY_NOT_GRANTED` — same rule as every
-other capability.
+- `register` — the plugin calls `host/registerProvider` with **plain**
+  (non-bridge) specs (HTTP-shim runtime providers).
+- `stream` — the plugin implements `provider/stream` (bridge
+  registrations, `bridge: true`).
+
+Undeclared ⇒ the host never calls `provider/stream` and rejects the
+matching registrations with `ERR_CAPABILITY_NOT_GRANTED` — same rule as
+every other capability. Both gates wait (fail-closed, bounded) for the
+handshake answer, so a registration racing the plugin's own initialize
+is decided by the published capability, never by the race. A managed
+`pluginPolicy` deny of `provider` publishes `false` for both flags and
+turns the declaring plugin policy-blocked at load (§4.6).
 
 New host→plugin methods:
 
@@ -431,8 +444,26 @@ and documented in the landing note.
 ## 7. Security and trust
 
 - Registration is trust- and mode-gated (existing `registerProvider`
-  gates) and capability-gated (`capabilities.provider.stream`), with
-  managed-policy narrowing on top (§4.6).
+  gates) and capability-gated on **both** paths
+  (`capabilities.provider.register` for plain specs,
+  `capabilities.provider.stream` for bridge specs), with managed-policy
+  narrowing on top (§4.6).
+- **Built-in id collisions are rejected.** A runtime provider (plain or
+  bridge) whose id matches a built-in provider id fails registration:
+  the shadow would override the built-in's `baseUrl` while the host
+  keeps handing it the user's stored credentials — plugin-steered
+  exfiltration, the same attack catalog-supplied `baseUrl`s are guarded
+  against.
+- **`apiKeyEnv` is not resolved from the host environment** for runtime
+  providers: a plugin-chosen variable name paired with a plugin-chosen
+  `baseUrl` would harvest the host's credentials. Runtime providers
+  carry their key explicitly in `apiKey` (or none).
+- **`provider/event` ownership**: a plugin may only emit events for a
+  provider id it actually registered; anything else is dropped with an
+  audit warning (no spoofed rate-limit warnings for `anthropic`).
+- Plain registrations ride the same death watch as bridged ones: a
+  crashed or shut-down plugin registers nothing (load-outcome
+  semantics).
 - The bridge grants the plugin **no new host privileges**: the process
   carrier is already fully privileged; `exec/run` stays separately
   trust-gated; no new host→plugin or plugin→host surface exists beyond

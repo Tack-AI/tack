@@ -22,6 +22,9 @@
 >   没有机会注册。
 > - **死亡监听**改为轮询连接存活（200ms 节奏，沿用 MCP 载体的
 >   先例），而不是 `wait_dead`——其 pump-handle 获取是单等待者的。
+> - **加固（落地后）**：plain（非桥）注册同样做能力门控——
+>   `capabilities.provider.register`——走同一策略/审计路径；内建 id
+>   冲突被拒绝，`apiKeyEnv` 不再从宿主环境解析（§7）。
 
 ## 1. 缺口
 
@@ -123,14 +126,22 @@ provider 的注册通路，所以先落地。
 
 ### 4.1 协议新增（OpenRPC 为单一来源）
 
-新的插件声明能力（在 `InitializeResult.capabilities` 里）：
+插件声明的能力（在 `InitializeResult.capabilities` 里）：
 
 ```json
-"provider": { "stream": true }
+"provider": { "register": true, "stream": true }
 ```
 
-未声明 ⇒ host 永不调用 `provider/stream`，且桥注册被拒以
-`ERR_CAPABILITY_NOT_GRANTED`——与其他能力同规则。
+- `register`——插件以 **plain**（非桥）spec 调用
+  `host/registerProvider`（HTTP-shim 运行时 provider）。
+- `stream`——插件实现 `provider/stream`（桥注册，`bridge: true`）。
+
+未声明 ⇒ host 永不调用 `provider/stream`，且对应注册被拒以
+`ERR_CAPABILITY_NOT_GRANTED`——与其他能力同规则。两道门都会（有界、
+fail-closed）等待握手答案，因此与插件自身 initialize 赛跑的注册由
+已发布的能力决定，而不是由竞态决定。managed `pluginPolicy` 对
+`provider` 的拒绝会为两个标志发布 `false`，并令声明该能力的插件在
+加载时进入 policy-blocked（§4.6）。
 
 新的 host→plugin 方法：
 
@@ -382,8 +393,22 @@ token 数正常——与原生 codebuddy 语义完全一致。倾向：透传（
 
 ## 7. 安全与信任
 
-- 注册是信任与模式门控（现有 `registerProvider` 门）加能力门控
-  （`capabilities.provider.stream`），上有 managed 策略收窄（§4.6）。
+- 注册是信任与模式门控（现有 `registerProvider` 门）加**两条路径**
+  的能力门控（plain spec 要求 `capabilities.provider.register`，桥
+  spec 要求 `capabilities.provider.stream`），上有 managed 策略收窄
+  （§4.6）。
+- **内建 id 冲突被拒绝。** id 与内建 provider 相同的运行时
+  provider（plain 或桥）注册失败：影子会覆盖内建的 `baseUrl`，而
+  宿主仍会把用户存储的凭据交给它——插件操纵的凭据外泄，与目录供给
+  的 `baseUrl` 被防范的是同一类攻击。
+- **`apiKeyEnv` 不从宿主环境解析**（对运行时 provider 而言）：插件
+  选择的变量名配上插件选择的 `baseUrl` 会收割宿主凭据。运行时
+  provider 必须在 `apiKey` 中显式携带密钥（或不带）。
+- **`provider/event` 所有权**：插件只能为它实际注册过的 provider id
+  发事件；其余一律丢弃并记审计警告（不能伪造 `anthropic` 的限速
+  警告）。
+- plain 注册与桥注册共用同一死亡监听：崩溃或被关闭的插件等同于
+  没有注册任何东西（load-outcome 语义）。
 - 桥不授予插件**任何新的 host 特权**：process 载体本就完全特权；
   `exec/run` 保持独立的信任门控；除 §4.1/§5 外没有新的双向表面。
 - 不可信内容防御与模型来源无关：桥模型的工具调用是普通

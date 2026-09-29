@@ -163,6 +163,12 @@ deny 规则 → PreToolUse hook 裁决 → 模式门（plan/acceptEdits/bypass�
   看到它们。
 - 已接线 surface：**TUI 与 rpc**（本仓库拥有的两个可提示 surface）；
   acp 与 remote-host 的提示是文档化的后续项。
+- managed 策略可以用 `pluginPolicy.plugins."<id>".hooks: false`
+  整体剥离一个插件的 hook 桥：插件的工具/命令照常加载，但它不再
+  贡献任何 `beforeToolCall`/`transformContext`/`afterToolCall`/
+  `approvalReview` 桥（以 `audit_narrow` 记审计）。组织为了一个
+  无害工具而放行某插件，绝不应默认同时授予它对会话中每一次工具
+  调用的改写/拦截权。
 
 ### 3.1d Provider 桥（`provider/stream`）
 
@@ -200,7 +206,14 @@ deny 规则 → PreToolUse hook 裁决 → 模式门（plan/acceptEdits/bypass�
 无头模式下走日志行，全部与其他插件审计 target 一起记入
 `plugin_provider` tracing target。managed 策略可以用
 `pluginPolicy.plugins."<id>".provider: false` 拒绝供流（插件在
-加载时变为策略阻止，以 `audit_narrow` 记审计）。
+加载时变为策略阻止，以 `audit_narrow` 记审计）。同一闸门也覆盖
+普通（非桥接）路径：不带 `bridge: true` 的 `host/registerProvider`
+需要声明 `capabilities.provider.register` 能力外加 managed 策略。
+与内置 provider id 冲突的注册会被拒绝——插件不得遮蔽内置
+provider 的 `baseUrl` 而宿主仍把用户存储的凭据交给它——且对插件
+注册的 provider，`apiKeyEnv` 不再从宿主环境解析（插件自选的环境
+变量名配上插件自选的 `baseUrl` 会收割宿主凭据）。完整威胁模型见
+[plugin-provider-bridge.zh-CN.md](plugin-provider-bridge.zh-CN.md) §7。
 
 ### 3.2 身份、加载结果与 store
 

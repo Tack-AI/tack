@@ -11,7 +11,7 @@ Tack 从四级读取配置，**后加载的层级覆盖先加载的**（部分�
 
 | 层级 | 位置 | 说明 |
 |---|---|---|
-| **Managed**（组织强制） | Linux `/etc/tack/managed-settings.json` · macOS `/Library/Application Support/tack/managed-settings.json` · Windows `%ProgramData%\tack\managed-settings.json`（`TACK_MANAGED_SETTINGS` 可覆盖路径） | 最高优先级。深度合并时最后应用。 |
+| **Managed**（组织强制） | Linux `/etc/tack/managed-settings.json` · macOS `/Library/Application Support/tack/managed-settings.json` · Windows `%ProgramData%\tack\managed-settings.json`（`TACK_MANAGED_SETTINGS` 可覆盖路径，仅限开发/测试构建——release 构建会忽略该变量） | 最高优先级。深度合并时最后应用。 |
 | **Global**（用户） | `~/.tack/agent/settings.json` | 用户默认配置。 |
 | **Project**（项目） | `<project>/.pi/settings.json` | 仅当项目被信任时加载（`/trust`）。 |
 
@@ -91,7 +91,7 @@ Tack 从四级读取配置，**后加载的层级覆盖先加载的**（部分�
 - 语法：`Tool(pattern)` 或裸 `Tool`（该工具全部调用）。
 - bash 命令：`*` 通配（首尾锚定）；文件路径：glob（`**` 跨目录）。
 - **deny 永远优先**，且在 headless 模式（print/rpc/serve/CI）同样生效。
-- TUI 里选 "always" 的答复持久化到 `~/.tack/agent/permissions.json` 的 `allowAlways` 数组，重启后仍生效。
+- TUI 里选 "always" 的答复持久化到 `~/.tack/agent/permissions.json` 的 `allowAlways` 数组，重启后仍生效。插件工具（`ext__*`）会同时记录加载时的插件版本（`extToolVersions` 映射），只有该版本仍在加载时条目才生效——`tack ext upgrade` 会使过期批准失效。
 - 不可信内容防线（见 features 文档）会临时绕过 allow 规则强制弹窗。
 
 ### 沙箱
@@ -226,7 +226,7 @@ Tack 从四级读取配置，**后加载的层级覆盖先加载的**（部分�
 | `lockedProvider` | 锁定 provider（启动和 /model 都拦截） |
 | `lockedModel` | 锁定模型 id |
 | `auditSink` | 审计上报：`{"url": "…", "token": "…", "intervalMs": 5000}`——trace 事件批量 POST（换行分隔 JSON，Bearer 鉴权）。设置后强制开启 observability |
-| `pluginPolicy` | 企业插件策略：`managedPluginsOnly`、`allowedSources`（git/hostPattern/local 来源白名单）、按插件的 `enabled`（压过用户/项目层）、只收窄的 `tools`/`mcpServers` 交集，以及 `provider` 桥服务闸门（置 `false` 时 provider-stream 插件在加载时被策略阻止）。安装时与加载时双重执行；决策记入审计日志。见 docs/extensions.zh-CN.md §9 |
+| `pluginPolicy` | 企业插件策略：`managedPluginsOnly`、`allowedSources`（git/hostPattern/local 来源白名单）、按插件的 `enabled`（压过用户/项目层）、只收窄的 `tools`/`mcpServers` 交集、`provider` 桥服务闸门（置 `false` 时 provider-stream 插件在加载时被策略阻止），以及 `hooks` 能力闸门（置 `false` 时在注册时剥离插件的 hook 桥——无工具调用拦截——其工具/命令仍照常加载）。安装时与加载时双重执行；决策记入审计日志。见 docs/extensions.zh-CN.md §9 |
 
 ### MCP（mcp.json）
 
@@ -250,7 +250,7 @@ settings.json 的另外两个 MCP 开关：
 | 变量 | 说明 |
 |---|---|
 | `TACK_AGENT_DIR` | agent 目录覆盖（默认 `~/.tack/agent`） |
-| `TACK_MANAGED_SETTINGS` | managed settings 文件路径覆盖 |
+| `TACK_MANAGED_SETTINGS` | managed settings 文件路径覆盖（仅限开发/测试构建；release 构建忽略） |
 | `TACK_TRACE_FILE` | =1 开启 JSONL trace 导出 |
 | `TACK_TRACE_LEVEL` | trace 文件级别（默认 info） |
 | `TACK_BROWSER` | headless 渲染的浏览器可执行文件路径 |
@@ -322,7 +322,7 @@ settings.json 的另外两个 MCP 开关：
   keybindings.json       # 键位覆盖
   mcp.json               # 全局 MCP servers
   mcp-tokens.json        # MCP OAuth 令牌缓存（0600，含 refresh_token/client_id）
-  permissions.json       # allow-always 持久化（{"allowAlways": [...]}）
+  permissions.json       # allow-always 持久化（{"allowAlways": [...], "extToolVersions": {...}}）
   cron.json              # 定时任务
   catalog.json           # 刷新拉取的模型目录缓存（/models reset 删除）
   catalog.meta.json      # 目录来源与抓取时间（version/providers/models/fetchedAt）

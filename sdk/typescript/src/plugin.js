@@ -39,6 +39,7 @@ export function plugin({ name, version, description } = {}) {
     configSchema: null,
     metrics: null,
     providerStream: null,
+    providerRegister: false,
     onReady: null,
   };
 
@@ -100,6 +101,16 @@ export function plugin({ name, version, description } = {}) {
       state.providerStream = handler;
       return builder;
     },
+    /** Declare the `provider.register` capability: the plugin calls
+     * `host/registerProvider` with plain (non-bridge) provider specs
+     * (typically from `onReady`). The host rejects plain registrations
+     * from plugins that did not declare it; bridge providers
+     * (`bridge: true`) serve inference and need `providerStream`
+     * instead. */
+    providerRegister(enabled = true) {
+      state.providerRegister = enabled;
+      return builder;
+    },
     /** Fired once after the initialize handshake is answered (spawned;
      * must not delay the answer). The registration entry point for
      * provider plugins: call `cx.host.registerProvider(...)` here. */
@@ -152,7 +163,11 @@ export function plugin({ name, version, description } = {}) {
           capabilities.autocompleteProviders = [...state.autocomplete.values()].map((a) => a.spec);
         if (state.configSchema) capabilities.config = { schema: state.configSchema };
         if (state.metrics) capabilities.metrics = state.metrics;
-        if (state.providerStream) capabilities.provider = { stream: true };
+        if (state.providerStream || state.providerRegister)
+          capabilities.provider = {
+            stream: state.providerStream ? true : undefined,
+            register: state.providerRegister ? true : undefined,
+          };
         // The startup hook (provider plugins register their providers
         // here). Spawned: onReady must not delay the handshake answer.
         if (state.onReady) {

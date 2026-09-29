@@ -289,16 +289,121 @@ fn persisted_path(agent_dir: &Path) -> std::path::PathBuf {
     agent_dir.join("permissions.json")
 }
 
+// ---------------------------------------------------------------------------
+// Plugin-version binding for ext__* approvals
+// ---------------------------------------------------------------------------
+//
+// `tack ext upgrade` swaps the code behind an `ext__<plugin>__<tool>` tool
+// name, so an "always allow" granted against one version must not apply to
+// the next (unreviewed) version. Allow-always cache keys and persisted
+// permissions.json entries for ext__* tools therefore carry the LOADED
+// plugin version: the in-memory key embeds it, and the persisted file
+// records it in an additive `extToolVersions` map. Legacy persisted
+// entries (no recorded version) and entries whose recorded version no
+// longer matches the loaded one are ignored — fail-closed, never a crash.
+
+/// The sanitized plugin-id part of an `ext__<plugin>__<tool>` name.
+fn ext_tool_plugin_part(tool_name: &str) -> Option<&str> {
+    tool_name
+        .strip_prefix("ext__")?
+        .split_once("__")
+        .map(|(p, _)| p)
+}
+
+/// The charset sanitizer ExtTool (tack-ext) applies to plugin ids and
+/// tool names ([A-Za-z0-9_-]; everything else becomes `_`). Only the
+/// load-report lookup (ext feature) needs it.
+#[cfg(feature = "ext")]
+fn sanitize_ext_part(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// The version of the plugin behind an ext__* tool as loaded this
+/// session, from the extension load report (the extension host owns the
+/// live version map; the report is the observable snapshot reachable
+/// from here). None when the report is missing/unreadable or the plugin
+/// is not in it — callers treat None as fail-closed.
+#[cfg(feature = "ext")]
+fn loaded_plugin_version(agent_dir: &Path, tool_name: &str) -> Option<String> {
+    let part = ext_tool_plugin_part(tool_name)?;
+    let report = crate::extension_host::read_load_report(agent_dir)?;
+    report
+        .plugins
+        .iter()
+        .filter(|row| row.outcome == "active")
+        .find(|row| sanitize_ext_part(&row.id) == part)
+        .map(|row| row.version.clone())
+}
+
+/// Without the ext feature no plugin can ever be loaded.
+#[cfg(not(feature = "ext"))]
+fn loaded_plugin_version(_agent_dir: &Path, _tool_name: &str) -> Option<String> {
+    None
+}
+
+/// Key for allow-always caching: `tool:first_arg` — with the loaded
+/// plugin version embedded for ext__* tools (`tool@version:first_arg`) so
+/// a plugin upgrade invalidates stale approvals. When the version cannot
+/// be determined the key binds to a version nothing persisted can match
+/// (fail-closed: the user re-approves rather than a stale entry silently
+/// applying to unknown code).
+pub fn allow_always_key(agent_dir: &Path, tool_name: &str, args: &Value) -> String {
+    let first = args
+        .get("path")
+        .or_else(|| args.get("command"))
+        .or_else(|| args.get("pattern"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if ext_tool_plugin_part(tool_name).is_some() {
+        let version =
+            loaded_plugin_version(agent_dir, tool_name).unwrap_or_else(|| "unknown".to_string());
+        format!("{tool_name}@{version}:{first}")
+    } else {
+        format!("{tool_name}:{first}")
+    }
+}
+
+/// Fail-closed gate for one persisted allow-always entry (raw rule
+/// string). ext__* entries survive only when a version was recorded at
+/// approval time AND it matches the version loaded now; every other tool
+/// passes through unchanged.
+fn persisted_entry_current(
+    entry: &str,
+    agent_dir: &Path,
+    recorded: Option<&serde_json::Map<String, Value>>,
+) -> bool {
+    let tool = entry.split('(').next().unwrap_or(entry).trim();
+    if ext_tool_plugin_part(tool).is_none() {
+        return true;
+    }
+    let Some(recorded) = recorded.and_then(|m| m.get(tool)).and_then(Value::as_str) else {
+        // Legacy entry (pre-version-binding) or missing record: ignore.
+        return false;
+    };
+    loaded_plugin_version(agent_dir, tool).as_deref() == Some(recorded)
+}
+
 fn load_persisted(agent_dir: &Path) -> Vec<Rule> {
-    std::fs::read_to_string(persisted_path(agent_dir))
+    let content = std::fs::read_to_string(persisted_path(agent_dir))
         .ok()
-        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+        .and_then(|c| serde_json::from_str::<Value>(&c).ok());
+    content
         .map(|v| {
+            let recorded = v["extToolVersions"].as_object();
             v["allowAlways"]
                 .as_array()
                 .map(|a| {
                     a.iter()
                         .filter_map(|x| x.as_str())
+                        .filter(|s| persisted_entry_current(s, agent_dir, recorded))
                         .filter_map(Rule::parse)
                         .collect()
                 })
@@ -307,7 +412,10 @@ fn load_persisted(agent_dir: &Path) -> Vec<Rule> {
         .unwrap_or_default()
 }
 
-/// Persist an allow-always answer as an exact-match rule.
+/// Persist an allow-always answer as an exact-match rule. For ext__*
+/// tools the loaded plugin version is recorded alongside (additive
+/// `extToolVersions` map) so a later `tack ext upgrade` invalidates the
+/// entry at load time — see the module section on version binding above.
 pub fn persist_allow_always(agent_dir: &Path, tool_name: &str, args: &Value) {
     let target = args
         .get("path")
@@ -319,6 +427,22 @@ pub fn persist_allow_always(agent_dir: &Path, tool_name: &str, args: &Value) {
         return;
     }
     let rule = format!("{tool_name}({target})");
+    // Bound the version check to the load report BEFORE writing: when the
+    // version is unknown the entry would be dropped at the next load
+    // anyway (fail-closed gate), so persist nothing in that case.
+    let ext_version = if ext_tool_plugin_part(tool_name).is_some() {
+        match loaded_plugin_version(agent_dir, tool_name) {
+            Some(version) => Some(version),
+            None => {
+                tracing::warn!(
+                    "not persisting allow-always for {tool_name}: loaded plugin version unknown"
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let path = persisted_path(agent_dir);
     let mut content: Value = std::fs::read_to_string(&path)
         .ok()
@@ -332,17 +456,29 @@ pub fn persist_allow_always(agent_dir: &Path, tool_name: &str, args: &Value) {
     if !content["allowAlways"].is_array() {
         content["allowAlways"] = json!([]);
     }
+    if let Some(version) = &ext_version {
+        if !content["extToolVersions"].is_object() {
+            content["extToolVersions"] = json!({});
+        }
+        content["extToolVersions"][tool_name] = Value::String(version.clone());
+    }
     let list = content["allowAlways"]
         .as_array_mut()
         .expect("allowAlways array");
-    if !list.iter().any(|v| v.as_str() == Some(rule.as_str())) {
+    let rule_new = !list.iter().any(|v| v.as_str() == Some(rule.as_str()));
+    if rule_new {
         list.push(Value::String(rule));
-        if let Err(e) = crate::atomic_write::atomic_write(
-            &path,
-            &serde_json::to_string_pretty(&content).unwrap_or_default(),
-        ) {
-            tracing::warn!("cannot persist allow-always to {}: {e}", path.display());
-        }
+    }
+    // Skip the disk write only when nothing changed (existing rule, no
+    // version record to add/update).
+    if !rule_new && ext_version.is_none() {
+        return;
+    }
+    if let Err(e) = crate::atomic_write::atomic_write(
+        &path,
+        &serde_json::to_string_pretty(&content).unwrap_or_default(),
+    ) {
+        tracing::warn!("cannot persist allow-always to {}: {e}", path.display());
     }
 }
 
@@ -747,6 +883,129 @@ mod tests {
             rules
                 .allow_match("edit", &serde_json::json!({ "path": "src/main.rs" }))
                 .is_some()
+        );
+    }
+
+    /// Write a fake extension load report with one active plugin.
+    #[cfg(feature = "ext")]
+    fn write_load_report(agent_dir: &Path, plugin_id: &str, version: &str) {
+        let dir = agent_dir.join("extensions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("last-load.json"),
+            serde_json::json!({
+                "version": 1,
+                "ts": 0,
+                "mode": "tui",
+                "plugins": [{
+                    "id": plugin_id,
+                    "outcome": "active",
+                    "version": version,
+                    "dir": "/x",
+                }],
+                "warnings": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// ext__* allow-always keys embed the loaded plugin version; built-in
+    /// tools keep the legacy `tool:first_arg` format.
+    #[cfg(feature = "ext")]
+    #[test]
+    fn allow_always_key_binds_plugin_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_load_report(tmp.path(), "guard@acme", "1.2.3");
+        let args = serde_json::json!({ "command": "scan ." });
+        assert_eq!(
+            allow_always_key(tmp.path(), "ext__guard_acme__scan", &args),
+            "ext__guard_acme__scan@1.2.3:scan ."
+        );
+        assert_eq!(allow_always_key(tmp.path(), "bash", &args), "bash:scan .");
+        // Unknown version (plugin not in the report): binds to a key no
+        // persisted entry can satisfy (fail-closed).
+        assert_eq!(
+            allow_always_key(tmp.path(), "ext__other__tool", &args),
+            "ext__other__tool@unknown:scan ."
+        );
+    }
+
+    /// Version-keyed persistence: an ext__* approval is recorded with the
+    /// loaded version and survives reload ONLY while the version matches;
+    /// an upgrade (or a legacy entry with no recorded version) drops it.
+    #[cfg(feature = "ext")]
+    #[test]
+    fn ext_allow_always_entries_are_version_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_load_report(tmp.path(), "guard@acme", "1.2.3");
+        let args = serde_json::json!({ "command": "scan ." });
+
+        persist_allow_always(tmp.path(), "ext__guard_acme__scan", &args);
+        persist_allow_always(tmp.path(), "bash", &args);
+        let loaded: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join("permissions.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            loaded["extToolVersions"]["ext__guard_acme__scan"],
+            serde_json::json!("1.2.3")
+        );
+
+        // Same version: the entry applies.
+        let rules = PermissionRules::load(&crate::settings::Settings::default(), tmp.path());
+        assert!(
+            rules.allow_match("ext__guard_acme__scan", &args).is_some(),
+            "matching version keeps the approval"
+        );
+        assert!(rules.allow_match("bash", &args).is_some());
+
+        // Upgrade: version changes, the stale approval must NOT apply to
+        // the unreviewed new code (the bash entry is unaffected).
+        write_load_report(tmp.path(), "guard@acme", "2.0.0");
+        let rules = PermissionRules::load(&crate::settings::Settings::default(), tmp.path());
+        assert!(
+            rules.allow_match("ext__guard_acme__scan", &args).is_none(),
+            "upgraded plugin invalidates the approval"
+        );
+        assert!(rules.allow_match("bash", &args).is_some());
+    }
+
+    /// Legacy ext__* entries (persisted before version binding, no
+    /// extToolVersions record) are ignored safely — fail-closed, no crash.
+    #[cfg(feature = "ext")]
+    #[test]
+    fn legacy_ext_entries_are_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_load_report(tmp.path(), "guard@acme", "1.2.3");
+        std::fs::write(
+            tmp.path().join("permissions.json"),
+            r#"{ "allowAlways": ["ext__guard_acme__scan(scan .)", "Bash(cargo test)"] }"#,
+        )
+        .unwrap();
+        let rules = PermissionRules::load(&crate::settings::Settings::default(), tmp.path());
+        let args = serde_json::json!({ "command": "scan ." });
+        assert!(rules.allow_match("ext__guard_acme__scan", &args).is_none());
+        assert!(
+            rules
+                .allow_match("bash", &serde_json::json!({ "command": "cargo test" }))
+                .is_some()
+        );
+    }
+
+    /// With no load report at all, an ext__* approval is not persisted
+    /// (it would be dropped at the next load anyway).
+    #[test]
+    fn ext_persist_without_load_report_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        persist_allow_always(
+            tmp.path(),
+            "ext__guard_acme__scan",
+            &serde_json::json!({ "command": "scan ." }),
+        );
+        assert!(
+            !tmp.path().join("permissions.json").exists(),
+            "unknown-version ext approvals are not persisted"
         );
     }
 }

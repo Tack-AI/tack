@@ -49,7 +49,7 @@
     },
     {
       "name": "hooks/transformContext",
-      "description": "COW context pipeline (opt-in via capabilities.hooks.transformContext): a null result means unchanged; a returned list replaces the messages every later hook sees.",
+      "description": "COW context pipeline (opt-in via capabilities.hooks.transformContext): a null result means unchanged; a returned {messages: [...]} object replaces the messages every later hook sees.",
       "paramStructure": "by-name",
       "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/TransformContextParams" } }],
       "result": { "name": "result", "required": true, "schema": { "oneOf": [{ "$ref": "#/components/schemas/TransformContextResult" }, { "type": "null" }] } },
@@ -537,7 +537,7 @@
         "required": ["messages"]
       },
       "TransformContextResult": {
-        "description": "null = unchanged; a list replaces the context every later hook (and the loop) sees.",
+        "description": "null = unchanged; a returned {messages: [...]} object replaces the context every later hook (and the loop) sees.",
         "type": "object",
         "properties": {
           "messages": { "type": "array", "items": {} }
@@ -781,10 +781,11 @@
         "required": ["message"]
       },
       "ProviderCapability": {
-        "description": "Provider bridge surface: the plugin serves inference for the providers it registers (host/registerProvider with bridge: true) through provider/stream.",
+        "description": "Provider surface: `register` — the plugin calls host/registerProvider with plain (non-bridge) specs; `stream` — the plugin additionally serves inference for the providers it registers (host/registerProvider with bridge: true) through provider/stream.",
         "type": "object",
         "properties": {
-          "stream": { "type": "boolean", "description": "The plugin implements provider/stream." }
+          "stream": { "type": "boolean", "description": "The plugin implements provider/stream." },
+          "register": { "type": "boolean", "description": "The plugin calls host/registerProvider with plain (non-bridge) specs." }
         }
       },
       "ProviderStreamParams": {

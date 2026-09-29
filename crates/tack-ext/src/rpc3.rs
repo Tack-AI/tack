@@ -150,7 +150,7 @@ pub mod method {
     /// \[host-to-plugin\] A tool call is about to run; the plugin may allow, deny (reason becomes the error tool result), or rewrite the arguments. Chained plugins observe the previous plugin's rewrite; the first deny short-circuits.
     pub const HOOKS_BEFORE_TOOL_CALL: &str = "hooks/beforeToolCall";
 
-    /// \[host-to-plugin\] COW context pipeline (opt-in via capabilities.hooks.transformContext): a null result means unchanged; a returned list replaces the messages every later hook sees.
+    /// \[host-to-plugin\] COW context pipeline (opt-in via capabilities.hooks.transformContext): a null result means unchanged; a returned {messages: \[...\]} object replaces the messages every later hook sees.
     pub const HOOKS_TRANSFORM_CONTEXT: &str = "hooks/transformContext";
 
     /// \[host-to-plugin\] Observe and patch a tool result (opt-in via capabilities.hooks.afterToolCall). Patches merge in chain order; later plugins win per field.
@@ -659,9 +659,13 @@ pub struct PluginInfo {
     pub version: Option<String>,
 }
 
-/// Provider bridge surface: the plugin serves inference for the providers it registers (host/registerProvider with bridge: true) through provider/stream.
+/// Provider surface: `register` — the plugin calls host/registerProvider with plain (non-bridge) specs; `stream` — the plugin additionally serves inference for the providers it registers (host/registerProvider with bridge: true) through provider/stream.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProviderCapability {
+    /// The plugin calls host/registerProvider with plain (non-bridge) specs.
+    #[serde(rename = "register")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub register: Option<bool>,
     /// The plugin implements provider/stream.
     #[serde(rename = "stream")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -903,7 +907,7 @@ pub struct TransformContextParams {
     pub messages: Vec<Value>,
 }
 
-/// null = unchanged; a list replaces the context every later hook (and the loop) sees.
+/// null = unchanged; a returned {messages: \[...\]} object replaces the context every later hook (and the loop) sees.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TransformContextResult {
     #[serde(rename = "messages")]

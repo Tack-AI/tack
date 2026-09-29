@@ -143,6 +143,38 @@ class ProviderE2ETest(unittest.IsolatedAsyncioTestCase):
         await host.call("shutdown", None)
         await serve
 
+    async def test_provider_register_capability_is_advertised(self):
+        host, serve, _, init = await self.spawn(Plugin("register-plugin").provider_register())
+        self.assertEqual(init["capabilities"]["provider"], {"register": True})
+        await host.call("shutdown", None)
+        await serve
+
+    async def test_provider_register_combines_with_stream(self):
+        async def noop_stream(_params, _events, _cx):
+            return None
+
+        plugin = Plugin("register-plugin").provider_stream(noop_stream).provider_register()
+        host, serve, _, init = await self.spawn(plugin)
+        self.assertEqual(
+            init["capabilities"]["provider"], {"stream": True, "register": True}
+        )
+        await host.call("shutdown", None)
+        await serve
+
+    async def test_provider_register_false_declares_nothing(self):
+        host, serve, _, init = await self.spawn(
+            Plugin("plain-plugin").provider_register(False)
+        )
+        self.assertNotIn("provider", init["capabilities"])
+        await host.call("shutdown", None)
+        await serve
+
+    async def test_provider_capability_absent_without_knobs(self):
+        host, serve, _, init = await self.spawn(Plugin("plain-plugin"))
+        self.assertNotIn("provider", init["capabilities"])
+        await host.call("shutdown", None)
+        await serve
+
     async def test_on_ready_registers_the_provider(self):
         async def noop_stream(_params, _events, _cx):
             return None

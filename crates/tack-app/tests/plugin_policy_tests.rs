@@ -12,7 +12,43 @@
 use std::sync::Arc;
 
 use tack_app::extension_host::ExtensionManager;
+use tack_app::settings::Settings;
 use tack_ext::v3::PeerHandler;
+
+/// The project layer of `plugins."<id>".enabled` is honored only for
+/// TRUSTED projects (same gate as `Settings::load`): a cloned untrusted
+/// repo must not ship `"plugins": {"guardrail@acme": {"enabled": false}}`
+/// and silently disable the user's guardrail plugins.
+#[test]
+fn plugin_enabled_map_ignores_untrusted_project_layer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agent_dir = tmp.path().join("agent");
+    let cwd = tmp.path().join("work");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::create_dir_all(cwd.join(".pi")).unwrap();
+    // Global layer enables the guardrail; the project layer disables it.
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        r#"{ "plugins": { "guardrail@acme": { "enabled": true } } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        cwd.join(".pi").join("settings.json"),
+        r#"{ "plugins": { "guardrail@acme": { "enabled": false } } }"#,
+    )
+    .unwrap();
+
+    // Untrusted (no trust decision recorded, default "ask"): the project
+    // layer is ignored — the global enable stands.
+    assert!(!tack_app::project_trust::is_trusted(&cwd, &agent_dir));
+    let map = Settings::plugin_enabled_map(&cwd, &agent_dir);
+    assert_eq!(map.get("guardrail@acme"), Some(&true));
+
+    // Trusted (session-only decision): the project layer wins again.
+    tack_app::project_trust::set_decision(&agent_dir, &cwd, true, true);
+    let map = Settings::plugin_enabled_map(&cwd, &agent_dir);
+    assert_eq!(map.get("guardrail@acme"), Some(&false));
+}
 
 struct NoopServices;
 

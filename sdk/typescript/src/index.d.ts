@@ -150,6 +150,13 @@ export interface PluginBuilder {
   providerStream(
     handler: (params: ProviderStreamParams, events: ProviderEvents, cx: ProviderStreamCx) => Async<void>,
   ): this;
+  /** Declare the `provider.register` capability: the plugin calls
+   * `cx.host.registerProvider(...)` with plain (non-bridge) provider
+   * specs (typically from `onReady`). The host rejects plain
+   * registrations from plugins that did not declare it; bridge
+   * providers (`bridge: true`) serve inference and need
+   * `providerStream` instead. */
+  providerRegister(enabled?: boolean): this;
   /** Fired once after the initialize handshake is answered. The
    * registration entry point for provider plugins (call
    * `cx.host.registerProvider(...)` here). */

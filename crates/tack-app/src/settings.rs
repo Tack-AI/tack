@@ -559,10 +559,11 @@ fn load_json_file(path: &Path) -> Option<serde_json::Value> {
 ///   Windows: %ProgramData%\tack\managed-settings.json
 ///   macOS:   /Library/Application Support/tack/managed-settings.json
 ///   Linux:   /etc/tack/managed-settings.json
-/// `TACK_MANAGED_SETTINGS` overrides the path (and tests).
+/// `TACK_MANAGED_SETTINGS` overrides the path in development/test builds
+/// ONLY (see below).
 pub fn managed_settings_path() -> PathBuf {
-    if let Some(custom) = std::env::var_os("TACK_MANAGED_SETTINGS") {
-        return PathBuf::from(custom);
+    if let Some(custom) = managed_settings_env_override() {
+        return custom;
     }
     #[cfg(windows)]
     {
@@ -578,6 +579,21 @@ pub fn managed_settings_path() -> PathBuf {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         PathBuf::from("/etc/tack/managed-settings.json")
+    }
+}
+
+/// The `TACK_MANAGED_SETTINGS` path override — development/test builds
+/// ONLY. The managed file is the sole source of `pluginPolicy`,
+/// `disableBypass` and `lockedProvider`; honoring an env override in a
+/// release build would let any process (e.g. a malicious build script
+/// spawning `tack`) fully disengage the managed control plane with
+/// `TACK_MANAGED_SETTINGS=/dev/null`. Tests and dev builds run with
+/// debug assertions; release builds ignore the variable entirely.
+fn managed_settings_env_override() -> Option<PathBuf> {
+    if cfg!(debug_assertions) {
+        std::env::var_os("TACK_MANAGED_SETTINGS").map(PathBuf::from)
+    } else {
+        None
     }
 }
 
@@ -1100,15 +1116,21 @@ impl Settings {
     /// settings + project .pi/settings.json, project winning). Missing
     /// entries default to enabled. Used by the extension host to skip
     /// disabled plugins without uninstalling them.
+    ///
+    /// The project layer is only honored when the project is trusted
+    /// (same gate as `Settings::load`): a cloned untrusted repo must not
+    /// ship `"plugins": {"guardrail@acme": {"enabled": false}}` and
+    /// silently disable the user's guardrail plugins.
     pub fn plugin_enabled_map(
         cwd: &Path,
         agent_dir: &Path,
     ) -> std::collections::HashMap<String, bool> {
         let mut out = std::collections::HashMap::new();
-        for path in [
-            agent_dir.join("settings.json"),
-            cwd.join(".pi").join("settings.json"),
-        ] {
+        let mut paths = vec![agent_dir.join("settings.json")];
+        if crate::project_trust::is_trusted(cwd, agent_dir) {
+            paths.push(cwd.join(".pi").join("settings.json"));
+        }
+        for path in paths {
             let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
             };

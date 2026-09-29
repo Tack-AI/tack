@@ -83,7 +83,9 @@ impl V3Process {
             loop {
                 match read_line_bounded(&mut reader, &mut buf, OverCap::Discard).await {
                     Ok(Some(line)) => {
-                        tracing::info!(target: "tack_ext::plugin_stderr", "{line}")
+                        // Line content is debug-only: a chatty plugin
+                        // must not flood the host's info-level logs.
+                        tracing::debug!(target: "tack_ext::plugin_stderr", "{line}")
                     }
                     Ok(None) => break,
                     Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
@@ -104,7 +106,9 @@ impl V3Process {
         })
     }
 
-    /// Graceful shutdown: `shutdown` request, 2s grace, then force kill.
+    /// Graceful shutdown: `shutdown` request (short-bounded — see
+    /// `HostClient::shutdown`, so a hung plugin cannot stall teardown
+    /// for the default 30s call timeout), 2s grace, then force kill.
     pub async fn shutdown(&mut self) {
         let _ = self.client.shutdown().await;
         let wait = tokio::time::timeout(Duration::from_secs(2), self.child.wait());

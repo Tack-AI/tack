@@ -481,6 +481,53 @@ async fn plugin_calls_host_services_from_a_tool() {
 }
 
 // ---------------------------------------------------------------------------
+// Misbehaving host: requests before initialize
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn request_before_initialize_is_an_error_not_a_panic() {
+    let (s1, s2) = tokio::io::duplex(64 * 1024);
+    let (r1, w1) = tokio::io::split(s1);
+    let (r2, w2) = tokio::io::split(s2);
+    let host_peer = JsonRpcPeer::new(r1, w1, Arc::new(HostStub::default()));
+    let plugin_task = tokio::spawn(echo_tool().run_on(r2, w2));
+    let client = HostClient::new(host_peer);
+
+    // No handshake: tools/execute must come back as an internal error
+    // (a panic in the spawned handler task would instead drop the
+    // request silently and surface as a timeout).
+    let err = client
+        .tool_execute(&ToolExecuteParams {
+            name: "test.echo".to_string(),
+            tool_call_id: "c-1".to_string(),
+            arguments: json!({}),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tack_ext::rpc3::ERR_INTERNAL);
+    assert!(
+        err.to_string().contains("request before initialize"),
+        "{err}"
+    );
+
+    // A pre-initialize notification is dropped without killing the
+    // plugin: the serve loop still answers a proper handshake.
+    client
+        .lifecycle_event("turnStart", json!({}))
+        .await
+        .unwrap();
+    let result = client.initialize(&init_params()).await.expect("handshake");
+    assert_eq!(result.plugin.name, "test-plugin");
+
+    client.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), plugin_task)
+        .await
+        .expect("plugin should exit after shutdown")
+        .unwrap()
+        .unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // shutdown
 // ---------------------------------------------------------------------------
 

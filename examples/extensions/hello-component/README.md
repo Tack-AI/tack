@@ -4,8 +4,12 @@ A tack plugin as a **WIT component** (`tack:plugin@0.3.0`, hand-written
 component WAT) — the sandboxed distribution carrier added in the plugin
 redesign P4. Same `carrier: "wasm"` manifest as the WASI-stdio carrier;
 the host detects the component format and drives it via the
-`tack:plugin/tools` + `tack:plugin/hooks` exports instead of a JSON-RPC
-stdio protocol. See `protocol/wit/tack-plugin.wit` for the contract.
+`tack:plugin/tools@0.3.0` + `tack:plugin/hooks@0.3.0` exports
+(version-qualified interface names, exactly what a wit-bindgen-built
+guest emits; the host also accepts the bare names from hand-written
+guests) instead of a JSON-RPC stdio protocol. It also imports
+`tack:plugin/host@0.3.0` and emits one `log` line per tool call.
+See `protocol/wit/tack-plugin.wit` for the contract.
 
 Point tack at it via the `extensionPaths` setting (or drop it into a
 project's `.pi/extensions/`):

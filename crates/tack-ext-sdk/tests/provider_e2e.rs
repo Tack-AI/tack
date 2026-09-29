@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tack_ext::rpc3::{
-    ErrorObject, HostCapabilities, HostInfo, InitializeParams, ProviderStreamParams, RunMode,
-    method,
+    ErrorObject, HostCapabilities, HostInfo, InitializeParams, InitializeResult,
+    ProviderStreamParams, RunMode, method,
 };
 use tack_ext::v3::{HostClient, JsonRpcPeer, PeerHandler, PluginConnection};
 use tack_ext_sdk::{Plugin, ProviderEvents, ProviderStreamCx};
@@ -61,6 +61,7 @@ struct Fixture {
     client: HostClient,
     stub: Arc<HostStub>,
     plugin_task: tokio::task::JoinHandle<std::io::Result<()>>,
+    init: InitializeResult,
 }
 
 fn init_params() -> InitializeParams {
@@ -89,17 +90,13 @@ async fn spawn(plugin: Plugin) -> Fixture {
     let host_peer = JsonRpcPeer::new(r1, w1, stub.clone());
     let plugin_task = tokio::spawn(plugin.run_on(r2, w2));
     let client = HostClient::new(host_peer);
-    let fixture = Fixture {
+    let init = client.initialize(&init_params()).await.expect("handshake");
+    Fixture {
         client,
         stub,
         plugin_task,
-    };
-    fixture
-        .client
-        .initialize(&init_params())
-        .await
-        .expect("handshake");
-    fixture
+        init,
+    }
 }
 
 fn stream_params(text: &str) -> ProviderStreamParams {
@@ -159,9 +156,15 @@ fn echo_plugin() -> Plugin {
 #[tokio::test]
 async fn capability_advertised_and_stream_events_flow() {
     let fixture = spawn(echo_plugin()).await;
-    // The handshake advertised provider.stream.
-    // (initialize already ran in spawn; re-initialize is not legal, so the
-    // capability is exercised implicitly: the stream call must succeed.)
+    // The handshake advertised provider.stream (and only that).
+    let provider = fixture
+        .init
+        .capabilities
+        .provider
+        .as_ref()
+        .expect("provider capability");
+    assert_eq!(provider.stream, Some(true));
+    assert_eq!(provider.register, None);
     PluginConnection::provider_stream(&fixture.client, &stream_params("hi"))
         .await
         .expect("fast ack");
@@ -172,6 +175,59 @@ async fn capability_advertised_and_stream_events_flow() {
     assert_eq!(captured[1].1["delta"], "hello");
     assert_eq!(captured[2].1["type"], "done");
     assert_eq!(captured[2].1["message"]["stopReason"], "stop");
+    fixture.plugin_task.abort();
+}
+
+#[tokio::test]
+async fn provider_register_capability_is_advertised() {
+    let plugin = Plugin::builder("register-plugin")
+        .provider_register(true)
+        .build();
+    let fixture = spawn(plugin).await;
+    let provider = fixture
+        .init
+        .capabilities
+        .provider
+        .as_ref()
+        .expect("provider capability");
+    assert_eq!(provider.register, Some(true));
+    assert_eq!(provider.stream, None);
+    fixture.plugin_task.abort();
+}
+
+#[tokio::test]
+async fn provider_register_combines_with_stream() {
+    let plugin = Plugin::builder("register-plugin")
+        .provider_register(true)
+        .provider_stream(|_params, _events, _cx| async move { Ok(()) })
+        .build();
+    let fixture = spawn(plugin).await;
+    let provider = fixture
+        .init
+        .capabilities
+        .provider
+        .as_ref()
+        .expect("provider capability");
+    assert_eq!(provider.register, Some(true));
+    assert_eq!(provider.stream, Some(true));
+    fixture.plugin_task.abort();
+}
+
+#[tokio::test]
+async fn provider_capability_is_absent_without_knobs() {
+    let plugin = Plugin::builder("plain-plugin").build();
+    let fixture = spawn(plugin).await;
+    assert!(fixture.init.capabilities.provider.is_none());
+    fixture.plugin_task.abort();
+}
+
+#[tokio::test]
+async fn provider_register_false_declares_nothing() {
+    let plugin = Plugin::builder("plain-plugin")
+        .provider_register(false)
+        .build();
+    let fixture = spawn(plugin).await;
+    assert!(fixture.init.capabilities.provider.is_none());
     fixture.plugin_task.abort();
 }
 

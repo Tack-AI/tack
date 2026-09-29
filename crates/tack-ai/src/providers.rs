@@ -786,7 +786,12 @@ pub struct RuntimeProviderSpec {
     pub api: String,
     #[serde(default)]
     pub api_key: Option<String>,
-    /// Env var to read the API key from (when apiKey is not inline).
+    /// Env var naming the API key. **Ignored** for runtime (plugin-
+    /// registered) providers: resolving a plugin-chosen variable from the
+    /// host environment would let a plugin harvest the host's credentials
+    /// and — paired with a plugin-chosen `baseUrl` — exfiltrate them.
+    /// Runtime providers must carry their key explicitly in `apiKey` (or
+    /// none). The field stays in the schema for wire tolerance.
     #[serde(default)]
     pub api_key_env: Option<String>,
     #[serde(default)]
@@ -815,6 +820,17 @@ pub fn register_runtime_provider(spec: RuntimeProviderSpec) -> Result<(), String
     if spec.models.is_empty() {
         return Err(format!("provider {} registers no models", spec.id));
     }
+    // Built-in ids are owned by the host: a runtime provider shadowing one
+    // would override the built-in's baseUrl while `resolve_api_key` keeps
+    // handing it the user's stored credentials — plugin-steered
+    // exfiltration (the same attack catalog-supplied baseUrls are guarded
+    // against). Applies to plain and bridge specs alike.
+    if let Some(def) = builtin_provider(&spec.id) {
+        return Err(format!(
+            "provider.register id {:?} collides with built-in provider {:?} ({}): runtime providers must not shadow built-ins",
+            spec.id, def.id, def.name
+        ));
+    }
     let bridge = spec.bridge == Some(true);
     let (api, base_url) = if bridge {
         if !spec.api.is_empty() && spec.api != crate::provider_bridge::EXT_PROVIDER_BRIDGE_API {
@@ -835,14 +851,19 @@ pub fn register_runtime_provider(spec: RuntimeProviderSpec) -> Result<(), String
         }
         (spec.api.clone(), spec.base_url.clone())
     };
-    let api_key = spec
-        .api_key
-        .or_else(|| spec.api_key_env.and_then(|var| std::env::var(var).ok()));
+    if spec.api_key.is_none()
+        && let Some(var) = &spec.api_key_env
+    {
+        tracing::warn!(
+            "runtime provider {}: apiKeyEnv ({var}) is ignored — plugin-registered providers must carry their key in apiKey",
+            spec.id
+        );
+    }
     let provider = build_custom_provider(
         spec.id.clone(),
         api,
         base_url,
-        api_key,
+        spec.api_key,
         spec.headers,
         spec.compat,
         spec.models,
@@ -876,7 +897,75 @@ pub fn runtime_providers() -> Vec<CustomProviderModels> {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    #![allow(unsafe_code)] // env-var fixtures (std::env::set_var is unsafe in edition 2024)
     use super::*;
+
+    fn runtime_spec(id: &str) -> RuntimeProviderSpec {
+        RuntimeProviderSpec {
+            id: id.to_string(),
+            base_url: "http://localhost:9999".to_string(),
+            api: "openai-completions".to_string(),
+            api_key: None,
+            api_key_env: None,
+            headers: None,
+            compat: None,
+            bridge: None,
+            models: vec![CustomModel {
+                id: "m1".to_string(),
+                name: None,
+                reasoning: None,
+                input: None,
+                cost: None,
+                context_window: Some(128_000),
+                max_tokens: Some(4096),
+                thinking_level_map: None,
+                headers: None,
+                compat: None,
+                sampling_params: None,
+            }],
+        }
+    }
+
+    /// A runtime provider id colliding with a built-in is rejected — for
+    /// plain and bridge specs alike (a shadow would inherit the user's
+    /// stored credentials for the built-in while steering requests to a
+    /// plugin-chosen endpoint).
+    #[test]
+    fn runtime_provider_cannot_shadow_a_builtin() {
+        for bridge in [false, true] {
+            let mut spec = runtime_spec("anthropic");
+            if bridge {
+                spec.bridge = Some(true);
+                spec.api = String::new();
+                spec.base_url = String::new();
+            }
+            let err = register_runtime_provider(spec).unwrap_err();
+            assert!(err.contains("anthropic"), "{err}");
+            assert!(err.contains("built-in"), "{err}");
+        }
+        assert!(
+            !runtime_providers().iter().any(|p| p.id == "anthropic"),
+            "the built-in id never enters the runtime registry"
+        );
+    }
+
+    /// `apiKeyEnv` is not resolved from the host environment: runtime
+    /// providers carry their key explicitly in `apiKey` or not at all.
+    #[test]
+    fn runtime_provider_api_key_env_is_not_resolved_from_the_host_env() {
+        let id = "test-unit-rt-env-ignored";
+        unsafe { std::env::set_var("TACK_UNIT_RT_KEY_IGNORED", "sk-should-not-leak") };
+        let mut spec = runtime_spec(id);
+        spec.api_key_env = Some("TACK_UNIT_RT_KEY_IGNORED".to_string());
+        register_runtime_provider(spec).unwrap();
+        let registered = runtime_providers()
+            .into_iter()
+            .find(|p| p.id == id)
+            .expect("registered");
+        assert_eq!(registered.api_key, None, "host env must not be read");
+        unregister_runtime_provider(id);
+        unsafe { std::env::remove_var("TACK_UNIT_RT_KEY_IGNORED") };
+    }
 
     /// models.json with the legacy `pi-messages` alias loads with the
     /// canonical `tack-messages` api kind (TS pi config parity).

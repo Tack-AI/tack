@@ -18,10 +18,16 @@ use crate::rpc3::{
     ToolExecuteParams, ToolOutput, TransformContextParams, TransformContextResult, Verdict,
     WidgetActionParams, method,
 };
+use tokio_util::sync::CancellationToken;
 
 /// Handshake bound (a plugin that cannot answer initialize quickly is
 /// not worth waiting for).
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on the graceful `shutdown` request itself: a hung plugin must
+/// not stall carrier teardown for the default 30s call timeout before
+/// the caller's grace-then-kill even starts.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The host's view of one v3 plugin: typed calls host → plugin.
 #[derive(Clone)]
@@ -80,9 +86,28 @@ impl HostClient {
         Ok(result)
     }
 
-    /// `tools/execute`.
+    /// `tools/execute` (default 30s call timeout).
     pub async fn tool_execute(&self, params: &ToolExecuteParams) -> Result<ToolOutput, PeerError> {
         self.call(method::TOOLS_EXECUTE, params).await
+    }
+
+    /// `tools/execute` with NO wall-clock timeout, bound to a
+    /// [`CancellationToken`]: tool runs (builds, test suites)
+    /// legitimately outlive `REQUEST_TIMEOUT`, and on cancel the plugin
+    /// is told to abort via `$/cancelRequest` instead of silently
+    /// executing on after the host dropped the call.
+    pub async fn tool_execute_cancellable(
+        &self,
+        params: &ToolExecuteParams,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, PeerError> {
+        let params =
+            serde_json::to_value(params).map_err(|e| PeerError::Transport(e.to_string()))?;
+        let result = self
+            .peer
+            .call_cancellable(method::TOOLS_EXECUTE, params, cancel)
+            .await?;
+        serde_json::from_value(result).map_err(|e| PeerError::Transport(e.to_string()))
     }
 
     /// `commands/invoke` (free-form result).
@@ -131,9 +156,13 @@ impl HostClient {
     }
 
     /// `shutdown` (graceful stop request; the caller still enforces the
-    /// carrier teardown after a grace period).
+    /// carrier teardown after a grace period). Bounded by a short
+    /// [`SHUTDOWN_TIMEOUT`] — a hung plugin must not stall teardown on
+    /// the default 30s call timeout before the grace-then-kill starts.
     pub async fn shutdown(&self) -> Result<(), PeerError> {
-        self.peer.call(method::SHUTDOWN, Value::Null).await?;
+        self.peer
+            .call_with_timeout(method::SHUTDOWN, Value::Null, SHUTDOWN_TIMEOUT)
+            .await?;
         Ok(())
     }
 
@@ -207,6 +236,22 @@ pub trait PluginConnection: Send + Sync + std::fmt::Debug {
     async fn initialize(&self, params: &InitializeParams) -> Result<InitializeResult, PeerError>;
     /// `tools/execute`.
     async fn tool_execute(&self, params: &ToolExecuteParams) -> Result<ToolOutput, PeerError>;
+    /// `tools/execute` wired to host-side cancellation AND freed from the
+    /// default 30s call timeout: cancelling must also tell the plugin to
+    /// abort (`$/cancelRequest`) so a cancelled build/test does not keep
+    /// running plugin-side. Default: local cancellation only (carriers
+    /// without wire-level cancel simply drop the call future); the
+    /// JSON-RPC carriers override this through [`HostClient`].
+    async fn tool_execute_cancellable(
+        &self,
+        params: &ToolExecuteParams,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, PeerError> {
+        tokio::select! {
+            _ = cancel.cancelled() => Err(PeerError::Cancelled),
+            result = self.tool_execute(params) => result,
+        }
+    }
     /// `commands/invoke`.
     async fn command_invoke(&self, params: &CommandInvokeParams) -> Result<Value, PeerError>;
     /// `hooks/beforeToolCall`.
@@ -270,6 +315,14 @@ impl PluginConnection for HostClient {
 
     async fn tool_execute(&self, params: &ToolExecuteParams) -> Result<ToolOutput, PeerError> {
         HostClient::tool_execute(self, params).await
+    }
+
+    async fn tool_execute_cancellable(
+        &self,
+        params: &ToolExecuteParams,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, PeerError> {
+        HostClient::tool_execute_cancellable(self, params, cancel).await
     }
 
     async fn command_invoke(&self, params: &CommandInvokeParams) -> Result<Value, PeerError> {
@@ -481,6 +534,87 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(plugin.cancelled.lock().unwrap().as_slice(), ["ps-1"]);
+    }
+
+    /// Cancelling `tool_execute_cancellable` must abort the plugin-side
+    /// handler (via `$/cancelRequest` with the allocated request id) —
+    /// not just drop the host-side future while the plugin executes on.
+    #[tokio::test]
+    async fn tool_execute_cancellation_aborts_plugin_handler() {
+        /// Plugin whose tools/execute blocks until aborted (the abort is
+        /// observed through the guard's Drop).
+        struct ToolPlugin {
+            aborted: Arc<std::sync::atomic::AtomicBool>,
+        }
+        struct AbortedGuard(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for AbortedGuard {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        #[async_trait::async_trait]
+        impl PeerHandler for ToolPlugin {
+            async fn handle_request(
+                &self,
+                rpc_method: &str,
+                _params: Value,
+            ) -> Result<Value, ErrorObject> {
+                match rpc_method {
+                    method::TOOLS_EXECUTE => {
+                        let _guard = AbortedGuard(self.aborted.clone());
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        Ok(Value::Null)
+                    }
+                    _ => Err(ErrorObject {
+                        code: ERR_METHOD_NOT_FOUND,
+                        message: format!("unknown method {rpc_method}"),
+                        data: None,
+                    }),
+                }
+            }
+        }
+        let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let plugin = Arc::new(ToolPlugin {
+            aborted: aborted.clone(),
+        });
+        let (s1, s2) = tokio::io::duplex(64 * 1024);
+        let (r1, w1) = tokio::io::split(s1);
+        let (r2, w2) = tokio::io::split(s2);
+        let host_peer = crate::v3::peer::JsonRpcPeer::new(
+            r1,
+            w1,
+            Arc::new(HostSide {
+                received: Mutex::new(vec![]),
+            }),
+        );
+        let _plugin_peer = crate::v3::peer::JsonRpcPeer::new(r2, w2, plugin);
+        let client = HostClient::new(host_peer);
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let params = ToolExecuteParams {
+            name: "build".to_string(),
+            tool_call_id: "call-1".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let call = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { client.tool_execute_cancellable(&params, cancel).await }
+        });
+        // Let the request land, then cancel.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancel.cancel();
+        let err = call.await.unwrap().unwrap_err();
+        assert!(
+            matches!(err, PeerError::Cancelled),
+            "local cancellation surfaces as Cancelled: {err:?}"
+        );
+        for _ in 0..50 {
+            if aborted.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("plugin-side handler was not aborted by $/cancelRequest");
     }
 
     #[tokio::test]

@@ -34,6 +34,10 @@ pub struct Cx {
 
 impl Cx {
     fn init(&self) -> &InitializeParams {
+        // Unreachable in practice: the dispatcher answers every request
+        // (and drops every notification) that arrives before initialize
+        // with an internal error, so handlers only ever run against a
+        // completed handshake.
         self.state.init.get().expect("initialize completed")
     }
 
@@ -81,8 +85,15 @@ pub struct Host {
 }
 
 impl Host {
-    fn peer(&self) -> &Arc<JsonRpcPeer> {
-        self.state.peer.get().expect("plugin is serving")
+    /// The serving peer. Fallible (no expect): on a multi-threaded
+    /// runtime a request can in principle be dispatched in the tiny
+    /// window before `run_on` publishes the peer, and a panic in the
+    /// spawned handler task would drop the request silently.
+    fn peer(&self) -> Result<&Arc<JsonRpcPeer>, PeerError> {
+        self.state
+            .peer
+            .get()
+            .ok_or_else(|| PeerError::Transport("plugin is not serving yet".to_string()))
     }
 
     async fn call<P, R>(&self, rpc_method: &str, params: &P) -> Result<R, PeerError>
@@ -92,14 +103,14 @@ impl Host {
     {
         let params =
             serde_json::to_value(params).map_err(|e| PeerError::Transport(e.to_string()))?;
-        let result = self.peer().call(rpc_method, params).await?;
+        let result = self.peer()?.call(rpc_method, params).await?;
         serde_json::from_value(result).map_err(|e| PeerError::Transport(e.to_string()))
     }
 
     async fn call_unit<P: Serialize>(&self, rpc_method: &str, params: &P) -> Result<(), PeerError> {
         let params =
             serde_json::to_value(params).map_err(|e| PeerError::Transport(e.to_string()))?;
-        self.peer().call(rpc_method, params).await?;
+        self.peer()?.call(rpc_method, params).await?;
         Ok(())
     }
 
@@ -191,7 +202,7 @@ impl Host {
             message: message.into(),
         })
         .map_err(|e| PeerError::Transport(e.to_string()))?;
-        self.peer().notify(method::LOGS_EMIT, params).await
+        self.peer()?.notify(method::LOGS_EMIT, params).await
     }
 
     /// `warnings/emit` notification (structured user-facing warning).
@@ -201,7 +212,7 @@ impl Host {
             context: None,
         })
         .map_err(|e| PeerError::Transport(e.to_string()))?;
-        self.peer().notify(method::WARNINGS_EMIT, params).await
+        self.peer()?.notify(method::WARNINGS_EMIT, params).await
     }
 
     /// `session/get`.
@@ -260,14 +271,14 @@ impl Host {
             detail,
         })
         .map_err(|e| PeerError::Transport(e.to_string()))?;
-        self.peer().notify(method::PROVIDER_EVENT, params).await
+        self.peer()?.notify(method::PROVIDER_EVENT, params).await
     }
 
     /// `widgets/update` notification: idempotent full-state replacement.
     pub async fn widget_update(&self, update: WidgetUpdateParams) -> Result<(), PeerError> {
         let params =
             serde_json::to_value(update).map_err(|e| PeerError::Transport(e.to_string()))?;
-        self.peer().notify(method::WIDGETS_UPDATE, params).await
+        self.peer()?.notify(method::WIDGETS_UPDATE, params).await
     }
 }
 

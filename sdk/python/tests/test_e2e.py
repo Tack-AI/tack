@@ -213,5 +213,41 @@ class E2ETest(unittest.IsolatedAsyncioTestCase):
         await serve
 
 
+class LargeLineTest(unittest.IsolatedAsyncioTestCase):
+    """NDJSON lines routinely exceed the asyncio StreamReader default
+    64 KiB limit; the stdio carrier raises it to MAX_LINE_BYTES + 1
+    (mirroring the TS/Rust peers' 16 MiB cap)."""
+
+    async def test_stdio_streams_reader_limit(self):
+        from tack_plugin.peer import MAX_LINE_BYTES
+        from tack_plugin.plugin import _stdio_streams
+
+        reader, _writer = _stdio_streams()
+        # Private, but the regression this guards (ValueError from
+        # readline() killing the connection) lives exactly here.
+        self.assertGreater(reader._limit, 64 * 1024)
+        self.assertGreaterEqual(reader._limit, MAX_LINE_BYTES)
+
+    async def test_oversized_ndjson_line_roundtrips(self):
+        from tack_plugin.peer import MAX_LINE_BYTES
+
+        # Readers with the stdio carrier's raised limit: a > 64 KiB
+        # request line must cross the peer without killing it.
+        r1: asyncio.StreamReader = asyncio.StreamReader(limit=MAX_LINE_BYTES + 1)
+        r2: asyncio.StreamReader = asyncio.StreamReader(limit=MAX_LINE_BYTES + 1)
+        host = JsonRpcPeer(r1, MemoryWriter(r2))
+        serve = asyncio.ensure_future(echo_plugin().serve(r2, MemoryWriter(r1)))
+        await host.call("initialize", init_params())
+        big = "x" * (256 * 1024)
+        output = await host.call(
+            "tools/execute",
+            {"name": "test.echo", "toolCallId": "c-1", "arguments": {"big": big}},
+        )
+        self.assertIn(big, output["content"][0]["text"])
+        self.assertTrue(host.alive)
+        await host.call("shutdown", None)
+        await serve
+
+
 if __name__ == "__main__":
     unittest.main()

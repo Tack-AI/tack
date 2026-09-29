@@ -69,6 +69,15 @@ async fn with_connect_timeout(
     }
 }
 
+/// The carrier spec for a Level-2 plugin: identical to the declared
+/// server, but with credential stripping on the stdio spawn — a plugin
+/// is third-party code, so the v3 process carrier's env rule applies
+/// (see `tack_ext::process::env_vars_to_strip`). Only user-configured
+/// MCP servers inherit the host's full environment.
+fn plugin_carrier_spec(spec: &McpServerSpec) -> McpServerSpec {
+    spec.clone().with_credential_stripping()
+}
+
 /// The host's view of one Level-2 MCP server plugin.
 pub struct McpPluginConnection {
     plugin_name: String,
@@ -100,8 +109,10 @@ impl McpPluginConnection {
         plugin_name: String,
         plugin_version: String,
     ) -> Result<Self, String> {
-        let conn = with_connect_timeout(&spec.name, tack_tools::mcp::connect_with(spec, callbacks))
-            .await?;
+        let spec = plugin_carrier_spec(spec);
+        let conn =
+            with_connect_timeout(&spec.name, tack_tools::mcp::connect_with(&spec, callbacks))
+                .await?;
         Ok(Self::from_connection(
             Arc::new(conn),
             plugin_name,
@@ -494,6 +505,19 @@ mod tests {
             "capabilities": {}
         }))
         .unwrap()
+    }
+
+    /// Plugin carriers opt in to credential stripping on stdio spawns
+    /// (third-party code must not inherit the host's API keys); the
+    /// declared spec — which user-configured servers also use — is not
+    /// mutated.
+    #[test]
+    fn plugin_carrier_opts_into_credential_stripping() {
+        let spec = McpServerSpec::stdio("srv".to_string(), "cmd".to_string(), vec![], vec![], None);
+        assert!(!spec.strip_credentials);
+        let carrier = super::plugin_carrier_spec(&spec);
+        assert!(carrier.strip_credentials);
+        assert!(!spec.strip_credentials, "the declared spec is untouched");
     }
 
     #[tokio::test]

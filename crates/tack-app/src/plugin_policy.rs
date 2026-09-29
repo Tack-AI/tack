@@ -8,7 +8,10 @@
 //!    loader starts carriers (the backstop that keeps every downstream
 //!    consumer compliant by construction), and per-plugin
 //!    `tools`/`mcpServers` narrow (intersect-only) what a plugin may
-//!    register. A managed `enabled` wins over the user/project layers.
+//!    register. `provider` and `hooks` are capability gates: a managed
+//!    `false` blocks a provider-declaring plugin at load, respectively
+//!    strips its hook bridges while the rest loads. A managed `enabled`
+//!    wins over the user/project layers.
 //!
 //! Every decision is audit-logged as a structured tracing event (target
 //! `plugin_policy`) naming the rule and its origin layer; with a managed
@@ -112,13 +115,19 @@ fn looks_like_git_source(source: &str) -> bool {
 /// `mcpServers` are narrow-only: they intersect with what the plugin
 /// registers and can never expand it. `provider` is an indivisible
 /// capability gate: a managed `false` turns a plugin that declares
-/// `provider.stream` policy-blocked at load.
+/// `provider.stream` policy-blocked at load. `hooks` is the same kind
+/// of gate for `capabilities.hooks`: a managed `false` strips the
+/// plugin's hook bridges (beforeToolCall interception and friends) at
+/// registration while its tools/commands load normally — allowing a
+/// plugin for one benign tool must not silently grant it
+/// rewrite/block power over every tool call in the session.
 #[derive(Clone, Debug, Default)]
 pub struct PluginPolicyEntry {
     pub enabled: Option<bool>,
     pub tools: Option<Vec<String>>,
     pub mcp_servers: Option<Vec<String>>,
     pub provider: Option<bool>,
+    pub hooks: Option<bool>,
 }
 
 /// The parsed managed `pluginPolicy`. Absent managed file or absent key
@@ -402,6 +411,18 @@ impl PluginPolicy {
             .unwrap_or(true)
     }
 
+    /// The managed hook-capability gate for one plugin: `false` strips
+    /// the plugin's `capabilities.hooks` at registration (no hook
+    /// bridges — the plugin's tools/commands still load); absent or
+    /// `true` allows. Absent = allowed mirrors `provider_allowed`:
+    /// policy is opt-in restriction, never opt-in permission.
+    pub fn hooks_allowed(&self, id: &str) -> bool {
+        self.plugins
+            .get(id)
+            .and_then(|entry| entry.hooks)
+            .unwrap_or(true)
+    }
+
     /// Audit a narrow decision (called by the loader after intersecting).
     pub fn audit_narrow(&self, id: &str, kind: &str, dropped: &[String]) {
         if dropped.is_empty() {
@@ -480,6 +501,7 @@ fn parse_policy_entry(raw: &Value) -> PluginPolicyEntry {
         tools: string_list(raw, "tools"),
         mcp_servers: string_list(raw, "mcpServers"),
         provider: raw.get("provider").and_then(Value::as_bool),
+        hooks: raw.get("hooks").and_then(Value::as_bool),
     }
 }
 
@@ -748,5 +770,28 @@ mod tests {
             &["jira"]
         );
         assert!(policy.narrowed_tools("other@user").is_none());
+    }
+
+    #[test]
+    fn hooks_gate_parses_and_defaults_to_allowed() {
+        let policy = policy(
+            r#"{"pluginPolicy": {"plugins": {
+                "guard@acme": {"hooks": false},
+                "full@acme": {"hooks": true},
+                "benign@acme": {"tools": ["create_ticket"]}
+            }}}"#,
+        );
+        assert!(!policy.hooks_allowed("guard@acme"), "managed false denies");
+        assert!(policy.hooks_allowed("full@acme"), "explicit true allows");
+        assert!(
+            policy.hooks_allowed("benign@acme"),
+            "absent key allows (policy is opt-in restriction)"
+        );
+        assert!(
+            policy.hooks_allowed("unlisted@user"),
+            "no entry at all allows"
+        );
+        // The provider gate is untouched by the hooks key.
+        assert!(policy.provider_allowed("guard@acme"));
     }
 }

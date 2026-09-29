@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::rpc3::{ContentBlockKind, ToolExecuteParams, ToolSpec};
 use crate::v3::PluginConnection;
+use crate::v3::peer::PeerError;
 
 /// Intern a fully-qualified tool name. `AgentTool::name` must return
 /// `&'static str`, and the naive `Box::leak` on every `ExtTool::new`
@@ -135,13 +136,19 @@ impl AgentTool for ExtTool {
             tool_call_id: tool_call_id.to_string(),
             arguments: params,
         };
-        let call = self.client.tool_execute(&execute_params);
-        let output = tokio::select! {
-            _ = cancel.cancelled() => return Err("Operation aborted".to_string()),
-            r = call => r,
+        // No wall-clock timeout here: legitimate tool runs (builds, test
+        // suites) outlive the default 30s call timeout, and cancellation
+        // must reach the plugin (`$/cancelRequest`) rather than just
+        // dropping the host-side future while the plugin executes on.
+        let output = self
+            .client
+            .tool_execute_cancellable(&execute_params, cancel)
+            .await;
+        let output = match output {
+            Ok(output) => output,
+            Err(PeerError::Cancelled) => return Err("Operation aborted".to_string()),
+            Err(e) => return Err(format!("extension tool {} failed: {e}", self.spec.name)),
         };
-        let output =
-            output.map_err(|e| format!("extension tool {} failed: {e}", self.spec.name))?;
         let text = output
             .content
             .iter()
@@ -175,16 +182,21 @@ impl AgentTool for ExtTool {
                 ContentBlockKind::Text => None,
             })
             .collect();
+        // The plugin's structured details ride along on BOTH success
+        // shapes; AgentToolResult::text would silently reset them to {}.
+        let details = output
+            .details
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
         if images.is_empty() {
-            return Ok(AgentToolResult::text(self.wrap_text(text)));
+            let mut result = AgentToolResult::text(self.wrap_text(text));
+            result.details = details;
+            return Ok(result);
         }
         let mut content = vec![tack_ai::InputContentBlock::text(self.wrap_text(text))];
         content.extend(images);
         Ok(AgentToolResult {
             content,
-            details: output
-                .details
-                .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+            details,
             usage: None,
             terminate: false,
             added_tool_names: None,
@@ -276,6 +288,25 @@ mod tests {
         .await;
         let err = result.expect_err("isError must become a tool error");
         assert!(err.contains("boom"), "{err}");
+    }
+
+    /// Plugin-provided details survive the text-only success path (they
+    /// already survived the image path).
+    #[tokio::test]
+    async fn details_preserved_on_text_only_success() {
+        let result = execute_with_output(ToolOutput {
+            content: vec![crate::rpc3::ContentBlock {
+                r#type: ContentBlockKind::Text,
+                text: Some("ok".to_string()),
+                mime_type: None,
+                data: None,
+            }],
+            details: Some(serde_json::json!({"exitCode": 0})),
+            is_error: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.details, serde_json::json!({"exitCode": 0}));
     }
 
     #[tokio::test]

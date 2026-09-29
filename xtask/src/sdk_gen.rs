@@ -13,6 +13,11 @@ use crate::codegen::{
 
 const HEADER: &str = "GENERATED from protocol/tack-rpc.openrpc.json by `cargo run -p xtask -- codegen`. Do not edit by hand.";
 
+/// JS numbers are IEEE-754 doubles: integer-valued schema fields
+/// (uint64 in Rust) lose precision above 2^53. Noted on the generated
+/// TypeScript header so SDK consumers are not surprised.
+const TS_UINT64_NOTE: &str = "Note: uint64 schema fields (cursorOffset, messageCount, token usage, timeoutMs) are plain JS `number` here — values above 2^53 lose precision.";
+
 /// Error codes + method constants shared by both emitters.
 fn error_codes() -> &'static [(&'static str, i64)] {
     &[
@@ -34,7 +39,8 @@ fn error_codes() -> &'static [(&'static str, i64)] {
 
 pub fn generate_ts(doc: &Value) -> Result<String> {
     let mut out = String::new();
-    let _ = writeln!(out, "// {HEADER}\n");
+    let _ = writeln!(out, "// {HEADER}");
+    let _ = writeln!(out, "// {TS_UINT64_NOTE}\n");
     for (name, code) in error_codes() {
         let _ = writeln!(out, "export const {name} = {code};");
     }
@@ -166,32 +172,66 @@ fn ts_type(schema: &Value) -> Result<String> {
 // Python
 // ---------------------------------------------------------------------------
 
+/// Which typing/enum imports the emitted Python body actually uses —
+/// the header is rendered from this so unused imports (and duplicate
+/// import lines) never appear.
+#[derive(Default)]
+struct PyUsage {
+    any: bool,
+    optional: bool,
+    not_required: bool,
+    typed_dict: bool,
+    enumeration: bool,
+}
+
 pub fn generate_py(doc: &Value) -> Result<String> {
-    let mut out = String::new();
-    let _ = writeln!(out, "# {HEADER}");
-    out.push_str(
-        "\nfrom enum import Enum\nfrom typing import Any, Optional, TypedDict\n\nfrom typing import NotRequired\n\n",
-    );
+    let mut body = String::new();
+    let mut usage = PyUsage::default();
     for (name, code) in error_codes() {
-        let _ = writeln!(out, "{name} = {code}");
+        let _ = writeln!(body, "{name} = {code}");
     }
-    out.push('\n');
+    body.push('\n');
     for method in methods(doc)? {
         let name = method
             .get("name")
             .and_then(Value::as_str)
             .context("method without name")?;
-        let _ = writeln!(out, "{} = \"{name}\"", method_const_name(name));
+        let _ = writeln!(body, "{} = \"{name}\"", method_const_name(name));
     }
     for (name, schema) in component_schemas(doc)? {
-        out.push('\n');
-        py_named_type(&mut out, name, schema)?;
+        body.push('\n');
+        py_named_type(&mut body, name, schema, &mut usage)?;
     }
+
+    let mut out = String::new();
+    let _ = writeln!(out, "# {HEADER}\n");
+    if usage.enumeration {
+        out.push_str("from enum import Enum\n");
+    }
+    let mut typing: Vec<&str> = Vec::new();
+    if usage.any {
+        typing.push("Any");
+    }
+    if usage.not_required {
+        typing.push("NotRequired");
+    }
+    if usage.optional {
+        typing.push("Optional");
+    }
+    if usage.typed_dict {
+        typing.push("TypedDict");
+    }
+    if !typing.is_empty() {
+        let _ = writeln!(out, "from typing import {}", typing.join(", "));
+    }
+    out.push('\n');
+    out.push_str(&body);
     Ok(out)
 }
 
-fn py_named_type(out: &mut String, name: &str, schema: &Value) -> Result<()> {
+fn py_named_type(out: &mut String, name: &str, schema: &Value, usage: &mut PyUsage) -> Result<()> {
     if let Some(variants) = string_enum_variants(schema) {
+        usage.enumeration = true;
         let _ = writeln!(out, "class {name}(str, Enum):");
         let description = description_of(schema);
         if !description.is_empty() {
@@ -209,6 +249,7 @@ fn py_named_type(out: &mut String, name: &str, schema: &Value) -> Result<()> {
         return Ok(());
     }
     if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        usage.typed_dict = true;
         let required: Vec<&str> = schema
             .get("required")
             .and_then(Value::as_array)
@@ -227,21 +268,22 @@ fn py_named_type(out: &mut String, name: &str, schema: &Value) -> Result<()> {
             out.push_str("    pass\n");
         }
         for (wire_name, property) in properties {
-            let ty = py_type(property)?;
+            let ty = py_type(property, usage)?;
             if required.contains(&wire_name.as_str()) {
                 let _ = writeln!(out, "    {wire_name}: {ty}");
             } else {
+                usage.not_required = true;
                 let _ = writeln!(out, "    {wire_name}: NotRequired[{ty}]");
             }
         }
         out.push('\n');
         return Ok(());
     }
-    let _ = writeln!(out, "{name} = {}\n", py_type(schema)?);
+    let _ = writeln!(out, "{name} = {}\n", py_type(schema, usage)?);
     Ok(())
 }
 
-fn py_type(schema: &Value) -> Result<String> {
+fn py_type(schema: &Value, usage: &mut PyUsage) -> Result<String> {
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
         return Ok(format!("\"{}\"", ref_name(reference)?));
     }
@@ -251,7 +293,8 @@ fn py_type(schema: &Value) -> Result<String> {
             .filter(|v| v.get("type").and_then(Value::as_str) != Some("null"))
             .collect();
         if non_null.len() == 1 && non_null.len() < one_of.len() {
-            return Ok(format!("Optional[{}]", py_type(non_null.remove(0))?));
+            usage.optional = true;
+            return Ok(format!("Optional[{}]", py_type(non_null.remove(0), usage)?));
         }
         bail!("unsupported oneOf shape: {one_of:?}");
     }
@@ -266,7 +309,8 @@ fn py_type(schema: &Value) -> Result<String> {
             if let Some(object) = clone.as_object_mut() {
                 object.insert("type".to_string(), non_null.remove(0).clone());
             }
-            return Ok(format!("Optional[{}]", py_type(&clone)?));
+            usage.optional = true;
+            return Ok(format!("Optional[{}]", py_type(&clone, usage)?));
         }
         bail!("unsupported type union: {types:?}");
     }
@@ -277,15 +321,21 @@ fn py_type(schema: &Value) -> Result<String> {
         Some("boolean") => "bool".to_string(),
         Some("array") => format!(
             "list[{}]",
-            py_type(schema.get("items").context("array without items")?)?
+            py_type(schema.get("items").context("array without items")?, usage)?
         ),
         Some("object") => match schema.get("additionalProperties") {
             Some(additional) if additional.is_object() => {
-                format!("dict[str, {}]", py_type(additional)?)
+                format!("dict[str, {}]", py_type(additional, usage)?)
             }
-            _ => "Any".to_string(),
+            _ => {
+                usage.any = true;
+                "Any".to_string()
+            }
         },
-        _ => "Any".to_string(),
+        _ => {
+            usage.any = true;
+            "Any".to_string()
+        }
     })
 }
 
@@ -314,5 +364,10 @@ mod tests {
         assert!(py.contains("class InitializeParams(TypedDict):"));
         assert!(py.contains("class RunMode(str, Enum):"));
         assert!(py.contains("TUI = \"tui\""));
+        // Imports are emitted once and only when the schema uses them.
+        assert_eq!(py.matches("from typing import").count(), 1);
+        assert!(py.contains("from typing import Any, NotRequired, TypedDict"));
+        assert!(!py.contains("Optional"), "unused Optional import: {py}");
+        assert!(ts.contains("values above 2^53 lose precision"));
     }
 }

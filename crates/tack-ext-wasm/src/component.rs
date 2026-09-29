@@ -6,7 +6,11 @@
 //! `tack:plugin/hooks` interfaces with JSON-string payloads (the rpc3 data
 //! types — the OpenRPC schema stays the single source of truth; see the WIT
 //! file for the rationale) and imports at most `tack:plugin/host` (`log`).
-//! The world declares no WASI interfaces, so the sandbox is structural:
+//! Interface names resolve version-qualified first (`tack:plugin/tools@0.3.0`
+//! — the component-model name mangling for a versioned package, which real
+//! wit-bindgen/cargo-component guests emit) with the bare form as a
+//! fallback for hand-written guests. The world declares no WASI interfaces,
+//! so the sandbox is structural:
 //! no fs, no env, no argv, no network — WASI preopen/env/args capability
 //! grants are WASI-only and are ignored (with a warning) here.
 //!
@@ -41,12 +45,40 @@ use crate::{EpochDemand, WasmCapabilities, WasmCarrier, WasmLimits, WasmSandboxC
 /// The WIT package version this carrier implements.
 pub const WIT_PACKAGE: &str = "tack:plugin@0.3.0";
 
-/// Export name of the tools interface instance.
-const IFACE_TOOLS: &str = "tack:plugin/tools";
-/// Export name of the hooks interface instance.
-const IFACE_HOOKS: &str = "tack:plugin/hooks";
-/// Import name of the host interface instance.
-const IFACE_HOST: &str = "tack:plugin/host";
+/// (`name`, `version`) halves of [`WIT_PACKAGE`] — every interface name
+/// below is built from these so the resolved names can never drift from
+/// the declared package version.
+fn wit_package_parts() -> (&'static str, &'static str) {
+    WIT_PACKAGE
+        .split_once('@')
+        .expect("WIT_PACKAGE is `<name>@<version>`")
+}
+
+/// Candidate export/import names for one interface of the WIT package,
+/// most-likely first: the version-qualified form (what real wit-bindgen
+/// / cargo-component guests use — component-model name mangling appends
+/// `@<version>` for a versioned package such as `tack:plugin@0.3.0`),
+/// then the bare form for hand-written guests.
+fn iface_names(short: &str) -> [String; 2] {
+    let (package, version) = wit_package_parts();
+    [
+        format!("{package}/{short}@{version}"),
+        format!("{package}/{short}"),
+    ]
+}
+
+/// `set_epoch_deadline` value meaning "practically never" (used when
+/// `max_execution` is `None`): a deadline must still be set explicitly
+/// because with epoch interruption enabled the default deadline is 0.
+const NO_DEADLINE_TICKS: u64 = u64::MAX / 2;
+
+/// Upper bound on one guest `host.log` event's level/message before it
+/// is forwarded to tracing: without it a guest could push a
+/// near-memory-cap-sized (256 MiB) string into the host log in a single
+/// call. (The line COUNT needs no separate cap: each `log` host call
+/// burns call-boundary fuel, so a flooding guest exhausts its per-call
+/// fuel budget.)
+const MAX_GUEST_LOG_BYTES: usize = 4 * 1024;
 
 /// Detect a WIT component (binary or text) vs a core module: the binary
 /// header's version/layer word differs (`0x0001_000d` for components,
@@ -137,7 +169,13 @@ struct Resolved {
 }
 
 impl Resolved {
-    fn resolve(instance: &Instance, store: &mut Store<ComponentState>) -> Result<Self, String> {
+    fn resolve(
+        instance: &Instance,
+        store: &mut Store<ComponentState>,
+        component: &Component,
+    ) -> Result<Self, String> {
+        // Try the version-qualified interface name first (SDK-built
+        // guests), then the bare form (hand-written guests).
         let lookup = |instance: &Instance,
                       store: &mut Store<ComponentState>,
                       iface: &str,
@@ -147,31 +185,47 @@ impl Resolved {
             let func_index = instance.get_export_index(&mut *store, Some(&iface_index), func)?;
             instance.get_func(&mut *store, func_index)
         };
-        let tools_list = lookup(instance, store, IFACE_TOOLS, "list")
+        let tools_names = iface_names("tools");
+        let hooks_names = iface_names("hooks");
+        let tools_list = tools_names
+            .iter()
+            .find_map(|name| lookup(instance, store, name, "list"))
             .map(|f| f.typed(&*store))
             .transpose()
-            .map_err(|e| format!("tack:plugin/tools#list has an unexpected type: {e}"))?;
-        let tools_execute = lookup(instance, store, IFACE_TOOLS, "execute")
+            .map_err(|e| format!("{}#list has an unexpected type: {e}", tools_names[0]))?;
+        let tools_execute = tools_names
+            .iter()
+            .find_map(|name| lookup(instance, store, name, "execute"))
             .map(|f| f.typed(&*store))
             .transpose()
-            .map_err(|e| format!("tack:plugin/tools#execute has an unexpected type: {e}"))?;
-        let hooks_before_tool_call = lookup(instance, store, IFACE_HOOKS, "before-tool-call")
+            .map_err(|e| format!("{}#execute has an unexpected type: {e}", tools_names[0]))?;
+        let hooks_before_tool_call = hooks_names
+            .iter()
+            .find_map(|name| lookup(instance, store, name, "before-tool-call"))
             .map(|f| f.typed(&*store))
             .transpose()
             .map_err(|e| {
-                format!("tack:plugin/hooks#before-tool-call has an unexpected type: {e}")
+                format!(
+                    "{}#before-tool-call has an unexpected type: {e}",
+                    hooks_names[0]
+                )
             })?;
         // WIT interfaces are atomic: exporting an interface means
         // exporting all of its functions.
         if tools_list.is_some() != tools_execute.is_some() {
-            return Err(
-                "component exports a partial tack:plugin/tools interface (need list + execute)"
-                    .to_string(),
-            );
+            return Err(format!(
+                "component exports a partial {} interface (need list + execute)",
+                tools_names.join("` / `")
+            ));
         }
         if tools_list.is_none() && hooks_before_tool_call.is_none() {
+            if let Some(mismatch) = version_mismatch_error(component, store.engine()) {
+                return Err(mismatch);
+            }
             return Err(format!(
-                "component exports neither {IFACE_TOOLS} nor {IFACE_HOOKS} (WIT {WIT_PACKAGE})"
+                "component exports neither the tools nor the hooks interface \
+                 (tried `{}`, `{}`, `{}`, `{}`; WIT {WIT_PACKAGE})",
+                tools_names[0], tools_names[1], hooks_names[0], hooks_names[1]
             ));
         }
         Ok(Resolved {
@@ -182,8 +236,48 @@ impl Resolved {
     }
 }
 
+/// If the component exports `tack:plugin/<iface>@<other-version>` — a
+/// guest built for a different WIT package version than this host
+/// supports — name both versions in the error instead of the generic
+/// "exports nothing" one (the raw export names come straight from the
+/// component type; a versioned guest's exports never match our names).
+fn version_mismatch_error(component: &Component, engine: &wasmtime::Engine) -> Option<String> {
+    let (package, supported) = wit_package_parts();
+    let prefix = format!("{package}/");
+    let ty = component.component_type();
+    for (name, _) in ty.exports(engine) {
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if let Some((_, version)) = rest.rsplit_once('@')
+            && version != supported
+        {
+            return Some(format!(
+                "component was built for WIT {package}@{version} (exports `{name}`); \
+                 this host supports {WIT_PACKAGE}"
+            ));
+        }
+    }
+    None
+}
+
+/// Truncate a guest log field at a char boundary before it reaches the
+/// host log (see [`MAX_GUEST_LOG_BYTES`]).
+fn truncate_guest_log(s: &str) -> &str {
+    if s.len() <= MAX_GUEST_LOG_BYTES {
+        return s;
+    }
+    let mut end = MAX_GUEST_LOG_BYTES;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Emit one guest `host.log` line at the matching tracing level.
 fn emit_guest_log(plugin: &str, level: &str, message: &str) {
+    let level = truncate_guest_log(level);
+    let message = truncate_guest_log(message);
     match level {
         "error" => tracing::error!(target: "tack_ext_wasm::guest", plugin, "{message}"),
         "warn" => tracing::warn!(target: "tack_ext_wasm::guest", plugin, "{message}"),
@@ -200,9 +294,8 @@ fn deadline_ticks(max_execution: Option<std::time::Duration>) -> u64 {
             let ticks = duration.as_millis().max(1) / crate::EPOCH_TICK.as_millis().max(1);
             u64::try_from(ticks).unwrap_or(u64::MAX).saturating_add(1)
         }
-        // Practically "never" — but a deadline must be set explicitly:
-        // with epoch interruption enabled the default deadline is 0.
-        None => u64::MAX / 2,
+        // Practically "never" — see [`NO_DEADLINE_TICKS`].
+        None => NO_DEADLINE_TICKS,
     }
 }
 
@@ -240,6 +333,13 @@ fn run_guest_thread(
 
     let ticks = deadline_ticks(limits.max_execution);
     let max_fuel = limits.max_fuel;
+    // With `max_execution: None` the deadline is the practically-never
+    // NO_DEADLINE_TICKS sentinel; the epoch ticker only needs waking
+    // while a deadline'd call is in flight, so skip the demand
+    // acquire/guard entirely in that case (same gate as the core-module
+    // carrier's spawn_with_capabilities — otherwise the ticker wakes
+    // every 10ms purely as churn).
+    let has_deadline = limits.max_execution.is_some();
     let setup = (|| -> Result<(Store<ComponentState>, Instance, Resolved), String> {
         let state = ComponentState {
             limits: StoreLimitsBuilder::new()
@@ -258,24 +358,31 @@ fn run_guest_thread(
             .map_err(|e| format!("failed to set fuel: {e}"))?;
         store.set_epoch_deadline(ticks);
         let mut linker = Linker::new(&engine);
-        linker
-            .instance(IFACE_HOST)
-            .and_then(|mut host| {
-                host.func_wrap(
-                    "log",
-                    |store: StoreContextMut<ComponentState>,
-                     (level, message): (String, String)|
-                     -> wasmtime::Result<()> {
-                        emit_guest_log(&store.data().plugin, &level, &message);
-                        Ok(())
-                    },
-                )
-            })
-            .map_err(|e| format!("failed to link {IFACE_HOST}: {e}"))?;
+        // Link the host interface under both its candidate names: the
+        // version-qualified form an SDK-built guest imports
+        // (`tack:plugin/host@0.3.0`) and the bare form a hand-written
+        // guest imports. Unused linker definitions are ignored at
+        // instantiation, so offering both is free.
+        for host_name in iface_names("host") {
+            linker
+                .instance(&host_name)
+                .and_then(|mut host| {
+                    host.func_wrap(
+                        "log",
+                        |store: StoreContextMut<ComponentState>,
+                         (level, message): (String, String)|
+                         -> wasmtime::Result<()> {
+                            emit_guest_log(&store.data().plugin, &level, &message);
+                            Ok(())
+                        },
+                    )
+                })
+                .map_err(|e| format!("failed to link {host_name}: {e}"))?;
+        }
         let instance = linker
             .instantiate(&mut store, &component)
             .map_err(|e| format!("failed to instantiate plugin component: {e:#}"))?;
-        let resolved = Resolved::resolve(&instance, &mut store)?;
+        let resolved = Resolved::resolve(&instance, &mut store, &component)?;
         Ok((store, instance, resolved))
     })();
     let (mut store, _instance, resolved) = match setup {
@@ -291,8 +398,10 @@ fn run_guest_thread(
     // handshake's declaration. None = the component exports no tools
     // interface at all.
     let tools_json: Option<String> = if let Some(list) = &resolved.tools_list {
-        epoch_demand.acquire();
-        let _guard = crate::EpochDemandGuard(epoch_demand.clone());
+        let _guard = has_deadline.then(|| {
+            epoch_demand.acquire();
+            crate::EpochDemandGuard(epoch_demand.clone())
+        });
         let _ = store.set_fuel(max_fuel);
         store.set_epoch_deadline(ticks);
         match list.call(&mut store, ()) {
@@ -316,8 +425,10 @@ fn run_guest_thread(
         match command {
             Command::Shutdown => break,
             Command::Call { func, arg, respond } => {
-                epoch_demand.acquire();
-                let _guard = crate::EpochDemandGuard(epoch_demand.clone());
+                let _guard = has_deadline.then(|| {
+                    epoch_demand.acquire();
+                    crate::EpochDemandGuard(epoch_demand.clone())
+                });
                 let _ = store.set_fuel(max_fuel);
                 store.set_epoch_deadline(ticks);
                 let outcome = run_call(&mut store, &resolved, func, arg);
@@ -342,7 +453,8 @@ fn run_call(
         ExportFn::ToolsExecute => {
             let Some(execute) = &resolved.tools_execute else {
                 return CallOutcome::PluginError(format!(
-                    "component exports no {IFACE_TOOLS} interface"
+                    "component exports no {} interface",
+                    iface_names("tools")[0]
                 ));
             };
             let arg = arg.unwrap_or_else(|| "null".to_string());
@@ -355,7 +467,8 @@ fn run_call(
         ExportFn::HooksBeforeToolCall => {
             let Some(hook) = &resolved.hooks_before_tool_call else {
                 return CallOutcome::PluginError(format!(
-                    "component exports no {IFACE_HOOKS} interface"
+                    "component exports no {} interface",
+                    iface_names("hooks")[0]
                 ));
             };
             let arg = arg.unwrap_or_else(|| "null".to_string());
@@ -376,8 +489,14 @@ pub struct WasmComponentPlugin {
     dead: watch::Receiver<bool>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     register: InitializeResult,
+    /// Spawn-time capability probe (the component exports a tools/hooks
+    /// interface). Gates tool_execute / before_tool_call locally — a
+    /// certain capability miss must not round-trip to the guest thread.
     has_tools: bool,
     has_hooks: bool,
+    /// Shutdown join bound, derived from the call's own fuel/epoch
+    /// budget (see [`WasmComponentPlugin::shutdown`]).
+    join_timeout: std::time::Duration,
 }
 
 impl std::fmt::Debug for WasmComponentPlugin {
@@ -414,19 +533,31 @@ impl WasmComponentPlugin {
     }
 
     /// Graceful stop: the thread exits its command loop and drops the
-    /// store. Idempotent; a wedged thread is leaked with a warning (the
-    /// epoch deadline bounds every call, so wedging means a host bug).
+    /// store. Idempotent. The join wait is bounded by `join_timeout` —
+    /// derived from the per-call fuel/epoch budget, because Shutdown is
+    /// queued behind any in-flight call on the single guest thread and
+    /// a healthy-but-slow call can legitimately run up to that budget
+    /// (far longer than any fixed grace period). On timeout the thread
+    /// is leaked with a warning and exits once the call's budget is
+    /// spent; wedging past the budget would still mean a host bug.
     pub async fn shutdown(&self) {
         let _ = self.tx.send(Command::Shutdown);
-        let Some(thread) = self.thread.lock().expect("thread handle poisoned").take() else {
+        let Some(thread) = self
+            .thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        else {
             return;
         };
         let join = tokio::task::spawn_blocking(move || thread.join());
-        if tokio::time::timeout(std::time::Duration::from_secs(2), join)
-            .await
-            .is_err()
-        {
-            tracing::warn!("component plugin thread did not exit within 2s of shutdown");
+        if tokio::time::timeout(self.join_timeout, join).await.is_err() {
+            tracing::warn!(
+                timeout = ?self.join_timeout,
+                "component plugin thread still running after shutdown — typically a \
+                 healthy-but-slow in-flight call; the thread is leaked and exits when \
+                 the call's fuel/epoch budget expires"
+            );
         }
     }
 }
@@ -445,6 +576,13 @@ impl PluginConnection for WasmComponentPlugin {
     }
 
     async fn tool_execute(&self, params: &ToolExecuteParams) -> Result<ToolOutput, PeerError> {
+        // Fast path: the spawn-time probe already proved there is no
+        // tools interface — fail locally with the same capability error
+        // as the other unsupported methods instead of round-tripping to
+        // the guest thread for a certain plugin-error.
+        if !self.has_tools {
+            return Err(unsupported_capability("tools/execute"));
+        }
         let payload =
             serde_json::to_string(params).map_err(|e| PeerError::Transport(e.to_string()))?;
         let json = self
@@ -459,6 +597,10 @@ impl PluginConnection for WasmComponentPlugin {
     }
 
     async fn before_tool_call(&self, params: &BeforeToolCallParams) -> Result<Verdict, PeerError> {
+        // Fast path: no hooks interface (see tool_execute).
+        if !self.has_hooks {
+            return Err(unsupported_capability("hooks/beforeToolCall"));
+        }
         let payload =
             serde_json::to_string(params).map_err(|e| PeerError::Transport(e.to_string()))?;
         let json = self
@@ -569,6 +711,17 @@ impl WasmCarrier {
                 "plugin declared limits above the host ceilings; clamped"
             );
         }
+        // Shutdown join bound derived from the call's actual budget:
+        // Shutdown is queued behind any in-flight call on the guest
+        // thread, and a healthy-but-slow call can legitimately run up
+        // to its epoch deadline (clamped to the 1h host ceiling), so a
+        // flat short grace would misclassify it as wedged. With no
+        // wall-clock cap the fuel budget is the only bound; give that a
+        // generous margin too.
+        let join_timeout = match clamped.max_execution {
+            Some(deadline) => deadline + std::time::Duration::from_secs(5),
+            None => std::time::Duration::from_secs(300),
+        };
         if *capabilities != WasmCapabilities::default() {
             tracing::warn!(
                 plugin = %plugin_name,
@@ -656,6 +809,7 @@ impl WasmCarrier {
             register,
             has_tools,
             has_hooks,
+            join_timeout,
         })
     }
 }
@@ -669,6 +823,53 @@ mod tests {
     /// The checked-in example doubles as the carrier's fixture.
     const HELLO_COMPONENT: &str =
         include_str!("../../../examples/extensions/hello-component/plugin.wat");
+
+    /// The interface names resolved against guests must be derived from
+    /// WIT_PACKAGE so the two can never drift apart (the review finding
+    /// that motivated them: unversioned hardcoded names could not load
+    /// any real SDK-built component).
+    #[test]
+    fn interface_names_are_derived_from_wit_package() {
+        assert_eq!(
+            iface_names("tools"),
+            [
+                "tack:plugin/tools@0.3.0".to_string(),
+                "tack:plugin/tools".to_string()
+            ]
+        );
+        assert_eq!(
+            iface_names("hooks"),
+            [
+                "tack:plugin/hooks@0.3.0".to_string(),
+                "tack:plugin/hooks".to_string()
+            ]
+        );
+        assert_eq!(
+            iface_names("host"),
+            [
+                "tack:plugin/host@0.3.0".to_string(),
+                "tack:plugin/host".to_string()
+            ]
+        );
+        assert_eq!(wit_package_parts(), ("tack:plugin", "0.3.0"));
+    }
+
+    /// Guest log fields are bounded before they reach tracing (a guest
+    /// may pass a near-memory-cap-sized string in one `host.log` call);
+    /// truncation must stay on char boundaries.
+    #[test]
+    fn guest_log_fields_are_truncated_safely() {
+        assert_eq!(truncate_guest_log("short"), "short");
+        let long_ascii = "a".repeat(MAX_GUEST_LOG_BYTES * 2);
+        assert_eq!(truncate_guest_log(&long_ascii).len(), MAX_GUEST_LOG_BYTES);
+        // Multi-byte chars straddling the cap must not panic or split a
+        // codepoint: each `€` is 3 bytes.
+        let long_utf8 = "€".repeat(MAX_GUEST_LOG_BYTES);
+        let truncated = truncate_guest_log(&long_utf8);
+        assert!(truncated.len() <= MAX_GUEST_LOG_BYTES);
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert_eq!(truncated.len() % 3, 0);
+    }
 
     #[test]
     fn detects_components_vs_core_modules() {
@@ -688,6 +889,11 @@ mod tests {
     }
 
     async fn spawn_hello() -> WasmComponentPlugin {
+        // The checked-in example doubles as the carrier's fixture: it
+        // uses the VERSION-QUALIFIED interface names and imports
+        // `tack:plugin/host@0.3.0`, so these tests prove a real
+        // SDK-style component (plus the host.log dispatch path —
+        // execute emits one log line) loads and runs.
         let carrier = WasmCarrier::new().unwrap();
         carrier
             .spawn_component(
@@ -789,7 +995,10 @@ mod tests {
     }
 
     /// A guest that never returns must be stopped by its per-call budget:
-    /// fuel exhaustion traps the call and kills the plugin.
+    /// fuel exhaustion traps the call and kills the plugin. (Both spinner
+    /// fixtures deliberately keep the BARE `tack:plugin/tools` export
+    /// name — they are the unversioned-fallback coverage; the versioned
+    /// path is covered by the hello-component fixture.)
     #[tokio::test(flavor = "multi_thread")]
     async fn fuel_exhaustion_traps_and_kills() {
         let spinner = r#"
@@ -893,5 +1102,127 @@ mod tests {
             .await
             .expect("wait_dead hangs after a trap");
         assert!(!plugin.is_alive());
+    }
+
+    /// A component built for a DIFFERENT WIT package version must get a
+    /// dedicated error naming the detected and the host-supported
+    /// versions — not the generic "exports nothing" one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn version_mismatch_names_both_versions() {
+        let future_guest = r#"
+(component
+  (core module $m
+    (memory (export "memory") 1)
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) (i32.const 1024))
+    (func (export "list") (result i32)
+      (i32.store (i32.const 1024) (i32.const 2048))
+      (i32.store (i32.const 1028) (i32.const 2))
+      (i32.const 1024))
+    (func (export "execute") (param i32 i32) (result i32) (i32.const 0))
+    (data (i32.const 2048) "[]")
+  )
+  (core instance $i (instantiate $m))
+  (func $list
+    (result string)
+    (canon lift (core func $i "list") (memory $i "memory") (realloc (func $i "realloc"))))
+  (func $execute
+    (param "call" string)
+    (result (result string (error string)))
+    (canon lift (core func $i "execute") (memory $i "memory") (realloc (func $i "realloc"))))
+  (instance $tools
+    (export "list" (func $list))
+    (export "execute" (func $execute)))
+  (export "tack:plugin/tools@0.4.0" (instance $tools))
+)
+"#;
+        let carrier = WasmCarrier::new().unwrap();
+        let err = carrier
+            .spawn_component(
+                future_guest.as_bytes(),
+                &WasmLimits::default(),
+                &WasmCapabilities::default(),
+                "future".to_string(),
+                "local".to_string(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("0.4.0") && err.contains(WIT_PACKAGE),
+            "mismatch error must name the detected and supported versions: {err}"
+        );
+    }
+
+    /// A hooks-only guest under the BARE (unversioned) interface names:
+    /// covers the fallback resolution path and the local capability gate
+    /// for the missing tools interface (fast-path error, no round-trip).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unversioned_hooks_only_guest_loads_and_tools_fail_locally() {
+        let hooks_only = r#"
+(component
+  (core module $m
+    (memory (export "memory") 1)
+    (func (export "realloc") (param $old i32) (param $old_size i32) (param $align i32) (param $new_size i32) (result i32)
+      (i32.const 4096))
+    (func (export "before-tool-call") (param i32 i32) (result i32)
+      (i32.store (i32.const 4096) (i32.const 0))
+      (i32.store (i32.const 4100) (i32.const 8192))
+      (i32.store (i32.const 4104) (i32.const 18))
+      (i32.const 4096))
+    (data (i32.const 8192) "{\"action\":\"allow\"}")
+  )
+  (core instance $i (instantiate $m))
+  (func $before_tool_call
+    (param "call" string)
+    (result (result string (error string)))
+    (canon lift (core func $i "before-tool-call") (memory $i "memory") (realloc (func $i "realloc"))))
+  (instance $hooks
+    (export "before-tool-call" (func $before_tool_call)))
+  (export "tack:plugin/hooks" (instance $hooks))
+)
+"#;
+        let carrier = WasmCarrier::new().unwrap();
+        let plugin = carrier
+            .spawn_component(
+                hooks_only.as_bytes(),
+                &WasmLimits::default(),
+                &WasmCapabilities::default(),
+                "hooks-only".to_string(),
+                "local".to_string(),
+            )
+            .await
+            .unwrap();
+        let register = plugin.initialize(&init_params()).await.unwrap();
+        assert!(register.capabilities.tools.is_none());
+        assert_eq!(
+            register.capabilities.hooks.and_then(|h| h.before_tool_call),
+            Some(true)
+        );
+        // No tools interface: a fast-path capability error without
+        // round-tripping to the guest thread (the plugin stays alive).
+        let err = plugin
+            .tool_execute(&ToolExecuteParams {
+                name: "nope".to_string(),
+                tool_call_id: "call-1".to_string(),
+                arguments: serde_json::Value::Null,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ERR_CAPABILITY_NOT_GRANTED);
+        assert!(plugin.is_alive());
+        // The unversioned hooks export resolved via the fallback name
+        // and answers.
+        let verdict = plugin
+            .before_tool_call(
+                &serde_json::from_value::<BeforeToolCallParams>(serde_json::json!({"toolCall": {
+                    "toolName": "bash",
+                    "toolCallId": "call-1",
+                    "arguments": {}
+                }}))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(verdict.action, VerdictAction::Allow);
+        plugin.shutdown().await;
     }
 }

@@ -81,6 +81,11 @@ pub const DRAIN_MAX_BYTES: u64 = 64 * 1024;
 pub const DRAIN_MAX_LINES: usize = 100;
 /// Strikes before the sidecar is disabled for the session.
 const MAX_VIOLATIONS: u32 = 3;
+/// Cap on declared operations: `declaration.operations` is an
+/// unbounded map, and every operation id inflates telemetry
+/// cardinality (and host memory) — a plugin declaring thousands must
+/// be rejected wholesale like any other declaration violation.
+const MAX_OPERATIONS: usize = 64;
 /// Declared enums: at most 64 values of at most 64 chars.
 const MAX_ENUM_VALUES: usize = 64;
 const MAX_ENUM_VALUE_LEN: usize = 64;
@@ -102,6 +107,12 @@ fn ident_ok(ident: &str) -> bool {
 pub fn validate_declaration(declaration: &MetricsDeclaration) -> Result<(), String> {
     if declaration.operations.is_empty() {
         return Err("declares no operations".to_string());
+    }
+    if declaration.operations.len() > MAX_OPERATIONS {
+        return Err(format!(
+            "declares {} operations (at most {MAX_OPERATIONS})",
+            declaration.operations.len()
+        ));
     }
     for (operation, spec) in &declaration.operations {
         if !ident_ok(operation) {
@@ -461,6 +472,27 @@ mod tests {
             let decl: MetricsDeclaration = serde_json::from_value(bad).unwrap();
             assert!(validate_declaration(&decl).is_err(), "{decl:?}");
         }
+    }
+
+    /// The operations map itself is capped: thousands of declared ids
+    /// would inflate telemetry cardinality and host memory
+    /// unboundedly.
+    #[test]
+    fn declaration_caps_the_operation_count() {
+        let operations: serde_json::Map<String, Value> = (0..=MAX_OPERATIONS)
+            .map(|i| (format!("op.{i:03}"), serde_json::json!({})))
+            .collect();
+        let decl: MetricsDeclaration =
+            serde_json::from_value(serde_json::json!({"operations": operations})).unwrap();
+        let err = validate_declaration(&decl).unwrap_err();
+        assert!(err.contains("operations"), "{err}");
+        // Exactly at the cap passes.
+        let operations: serde_json::Map<String, Value> = (0..MAX_OPERATIONS)
+            .map(|i| (format!("op.{i:03}"), serde_json::json!({})))
+            .collect();
+        let decl: MetricsDeclaration =
+            serde_json::from_value(serde_json::json!({"operations": operations})).unwrap();
+        assert!(validate_declaration(&decl).is_ok());
     }
 
     #[test]

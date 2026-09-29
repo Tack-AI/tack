@@ -407,6 +407,21 @@ fn is_subset(expected: &Value, actual: &Value) -> bool {
     }
 }
 
+/// Inject the host-assigned streamId into the providerStream params.
+/// The params come straight from scenario JSON, and serde_json's
+/// IndexMut<&str> panics on a Value that is neither object nor null —
+/// validate the shape and fail the step cleanly instead of crashing
+/// the CLI.
+fn with_stream_id(mut params: Value, stream_id: &str) -> Result<Value, String> {
+    let Some(object) = params.as_object_mut() else {
+        return Err(format!(
+            "providerStream params must be a JSON object (model/context/options), got {params}"
+        ));
+    };
+    object.insert("streamId".to_string(), Value::String(stream_id.to_string()));
+    Ok(params)
+}
+
 /// The `providerStream` step (P7): assign a streamId, script the optional
 /// cancel race, fast-ack the stream, then wait for the terminal event and
 /// subset-match the captured sequence against `expectEvents`.
@@ -414,14 +429,14 @@ async fn run_provider_stream_step(
     client: &tack_ext::v3::HostClient,
     host: &DevHost,
     step: &Step,
-    mut params: Value,
+    params: Value,
 ) -> Result<(), String> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let stream_id = format!(
         "dev-stream-{}",
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
-    params["streamId"] = Value::String(stream_id.clone());
+    let params = with_stream_id(params, &stream_id)?;
     host.begin_stream_capture(&stream_id);
     if let Some(ms) = step.cancel_after_ms {
         let peer = client.peer().clone();
@@ -904,6 +919,20 @@ pub fn cmd_ext_new(dir: &Path, lang: &str) -> Result<()> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    /// A non-object providerStream step fails the step cleanly instead
+    /// of panicking inside serde_json's IndexMut (regression:
+    /// `"providerStream": "x"` used to crash the CLI).
+    #[test]
+    fn provider_stream_params_must_be_an_object() {
+        let err = with_stream_id(serde_json::json!("x"), "s-1").unwrap_err();
+        assert!(err.contains("must be a JSON object"), "{err}");
+        assert!(with_stream_id(serde_json::json!([1, 2]), "s-1").is_err());
+        assert!(with_stream_id(serde_json::json!(42), "s-1").is_err());
+        let ok = with_stream_id(serde_json::json!({"model": {}}), "s-1").unwrap();
+        assert_eq!(ok["streamId"], "s-1");
+        assert!(ok.get("model").is_some(), "existing keys are kept");
+    }
 
     #[test]
     fn subset_matching() {

@@ -49,18 +49,6 @@ impl std::fmt::Debug for LiveSession {
     }
 }
 
-/// Key for allow-always caching: tool + first identifying arg (same
-/// scheme as the TUI permission dialog).
-fn allow_always_key(tool_name: &str, args: &Value) -> String {
-    let first = args
-        .get("path")
-        .or_else(|| args.get("command"))
-        .or_else(|| args.get("pattern"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    format!("{tool_name}:{first}")
-}
-
 /// Short human-readable summary of a tool call for the permission prompt.
 fn permission_title(tool_name: &str, args: &Value) -> String {
     let first = args
@@ -187,7 +175,10 @@ impl AgentHooks for RemotePermissionHooks {
         if self.rules.allow_match(ctx.tool_name, ctx.args).is_some() {
             return Outcome::Allow;
         }
-        let key = allow_always_key(ctx.tool_name, ctx.args);
+        // Shared keying (permissions::allow_always_key) so ext__* tools
+        // bind the loaded plugin version here too — a plugin upgrade must
+        // invalidate stale allow-always entries on every surface.
+        let key = crate::permissions::allow_always_key(&self.agent_dir, ctx.tool_name, ctx.args);
         {
             let host_guard = self.host.lock().await;
             let cached = host_guard

@@ -344,6 +344,12 @@ pub(crate) async fn spawn_prompt(
     }
 
     let hooks: Arc<dyn AgentHooks> = {
+        // PreToolUse permission verdicts (allow/ask/deny) recorded by the
+        // ShellHooks bridge below are SHARED with RpcPermissionHooks,
+        // which consumes them by tool_call_id (allow skips prompting, ask
+        // forces the client prompt past every fast path and the plugin
+        // approval chain) — the same contract as the TUI surface.
+        let hook_decisions = crate::shell_hooks::HookDecisions::default();
         // Compaction against the live session + steering/follow-up queues.
         let mut hook_list: Vec<Arc<dyn AgentHooks>> = vec![
             Arc::new(RpcCompactionHooks {
@@ -378,7 +384,7 @@ pub(crate) async fn spawn_prompt(
                         model: model.id.clone(),
                         permission_mode: "bypass".to_string(),
                     },
-                    crate::shell_hooks::HookDecisions::default(),
+                    hook_decisions.clone(),
                 )
                 .with_post_failure(post_failure_groups),
             ));
@@ -414,6 +420,8 @@ pub(crate) async fn spawn_prompt(
                 cancel.clone(),
                 approval_chain,
                 untrusted_seen,
+                hook_decisions,
+                agent_dir.clone(),
             ));
         }
         Arc::new(HooksChain::new(hook_list))

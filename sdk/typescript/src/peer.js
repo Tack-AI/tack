@@ -45,8 +45,14 @@ export function createPeer({ input, output, handler = {} }) {
   const handleNotification = handler.handleNotification ?? (() => Promise.resolve());
 
   function writeLine(line) {
-    // Serialize writes (a stream is not concurrent-write safe).
-    writeChain = writeChain.then(
+    if (!alive) {
+      return Promise.reject(new PeerError(ERR_PLUGIN_UNAVAILABLE, "peer is unavailable"));
+    }
+    // Serialize writes (a stream is not concurrent-write safe). A failed
+    // write is terminal (the Rust peer's Dead semantics): markDead below,
+    // and keep writeChain itself usable so it never re-rejects later
+    // writes with the stale first error.
+    const write = writeChain.then(
       () =>
         new Promise((resolve, reject) => {
           try {
@@ -56,7 +62,11 @@ export function createPeer({ input, output, handler = {} }) {
           }
         }),
     );
-    return writeChain.catch((err) => {
+    writeChain = write.catch(() => {});
+    return write.catch((err) => {
+      // The write failure is terminal: pending waiters see the real
+      // cause, later calls fail fast with the dead-peer error.
+      markDead(new PeerError(ERR_PLUGIN_UNAVAILABLE, `write failed: ${err.message ?? err}`));
       throw new PeerError(ERR_PLUGIN_UNAVAILABLE, `write failed: ${err.message ?? err}`);
     });
   }
@@ -69,6 +79,9 @@ export function createPeer({ input, output, handler = {} }) {
   }
 
   function dispatch(message) {
+    // Only JSON-RPC envelopes (non-null objects) are dispatched; bare
+    // values like `null` are ignored, matching the Rust/Python peers.
+    if (message === null || typeof message !== "object") return;
     const { method, id } = message;
     const params = message.params ?? null;
     if (method !== undefined && id !== undefined && id !== null) {
@@ -85,9 +98,13 @@ export function createPeer({ input, output, handler = {} }) {
           (result) => respond(id, result, null),
           (error) => {
             if (controller.signal.aborted) return; // cancelled: no response
-            respond(id, null, error instanceof PeerError ? error : new PeerError(ERR_INTERNAL, String(error?.message ?? error)));
+            return respond(id, null, error instanceof PeerError ? error : new PeerError(ERR_INTERNAL, String(error?.message ?? error)));
           },
         )
+        // A write failure while responding is terminal: writeLine has
+        // already marked the peer dead — just swallow the rejection so
+        // it cannot crash the process as an unhandled rejection.
+        .catch(() => {})
         .finally(() => inflight.delete(JSON.stringify(id)));
     } else if (method !== undefined) {
       // Incoming notification.
@@ -111,12 +128,12 @@ export function createPeer({ input, output, handler = {} }) {
     }
   }
 
-  function markDead() {
+  function markDead(cause) {
     if (!alive) return;
     alive = false;
     for (const { reject, timer } of pending.values()) {
       clearTimeout(timer);
-      reject(new PeerError(ERR_PLUGIN_UNAVAILABLE, "peer is unavailable"));
+      reject(cause ?? new PeerError(ERR_PLUGIN_UNAVAILABLE, "peer is unavailable"));
     }
     pending.clear();
     for (const controller of inflight.values()) controller.abort();
@@ -154,6 +171,13 @@ export function createPeer({ input, output, handler = {} }) {
     markDead();
   })();
 
+  /** Fire-and-forget notification (internal: safe to call without a
+   * receiver, unlike the destructurable method on the returned peer). */
+  function notifyMethod(method, params) {
+    if (!alive) return Promise.reject(new PeerError(ERR_PLUGIN_UNAVAILABLE, "peer is unavailable"));
+    return writeLine(JSON.stringify({ jsonrpc: JSONRPC_VERSION, method, params }));
+  }
+
   return {
     get alive() {
       return alive;
@@ -167,7 +191,7 @@ export function createPeer({ input, output, handler = {} }) {
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
           pending.delete(key);
-          this.notify(CANCEL_METHOD, { id }).catch(() => {});
+          notifyMethod(CANCEL_METHOD, { id }).catch(() => {});
           reject(new PeerError(ERR_REQUEST_TIMEOUT, `request timed out: ${method}`));
         }, timeoutMs);
         pending.set(key, { resolve, reject, timer });
@@ -180,9 +204,6 @@ export function createPeer({ input, output, handler = {} }) {
     },
 
     /** Fire-and-forget notification. */
-    notify(method, params) {
-      if (!alive) return Promise.reject(new PeerError(ERR_PLUGIN_UNAVAILABLE, "peer is unavailable"));
-      return writeLine(JSON.stringify({ jsonrpc: JSONRPC_VERSION, method, params }));
-    },
+    notify: notifyMethod,
   };
 }

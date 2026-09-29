@@ -349,6 +349,39 @@ fn resolve_mcp_stdio_spec(spec: &mut tack_tools::mcp::McpServerSpec, dir: &Path)
     }
 }
 
+/// WASM carrier: resolve the manifest's `module` against the extension
+/// directory, rejecting anything that escapes it. An absolute `module`
+/// (`dir.join(abs)` discards `dir`) or a `../` traversal would load
+/// arbitrary host code under this plugin's identity, so absolute/prefixed
+/// paths and `..` components are rejected lexically, and the
+/// canonicalized module must stay under the canonicalized extension
+/// directory (symlink defense).
+#[cfg(feature = "wasm")]
+fn resolve_module_path(dir: &Path, module: &str) -> anyhow::Result<PathBuf> {
+    let rel = Path::new(module);
+    let escapes = rel.is_absolute()
+        || rel.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        });
+    if escapes {
+        anyhow::bail!("wasm module {module:?} must be a relative path inside the extension");
+    }
+    let joined = dir.join(rel);
+    let resolved = joined
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", joined.display()))?;
+    let root = dir
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("cannot resolve extension dir {}: {e}", dir.display()))?;
+    if !resolved.starts_with(&root) {
+        anyhow::bail!("wasm module {module:?} escapes the extension directory");
+    }
+    Ok(resolved)
+}
+
 /// True for environment variable names that typically carry credentials
 /// (manifest env pass-through must not receive the live host values for
 /// WASM guests — same rule as the process carrier's strip list).
@@ -589,6 +622,12 @@ impl std::fmt::Debug for PluginHandle {
 
 impl PluginHandle {
     /// The host→plugin call surface (carrier-agnostic).
+    ///
+    /// Panics when the WASM/MCP carrier has been shut down (its inner
+    /// connection is consumed by `shutdown`). The upheld invariant is
+    /// that callers gate on `LoadedPlugin::is_active`, which reports
+    /// false once the plugin has been shut down — see
+    /// `LoadedPlugin::stopped`.
     pub fn client(&self) -> Arc<dyn PluginConnection> {
         match self {
             PluginHandle::Process(process) => Arc::new(process.client.clone()),
@@ -679,6 +718,18 @@ pub struct LoadedPlugin {
     pub version: String,
     /// The directory the plugin was loaded from.
     pub dir: PathBuf,
+    /// Set by [`ExtensionManager::shutdown`]: WASM/MCP carrier shutdown
+    /// consumes the inner connection (`Option::take`), so a post-shutdown
+    /// `client()` on a still-"active" row would panic — `is_active` must
+    /// report false once the handle has been shut down. Tracked here
+    /// rather than by dropping `handle` so the row keeps its diagnostics.
+    stopped: bool,
+    /// The manifest's `failMode`, cached at load time. `hooks()` runs
+    /// per agent run and per subagent spawn; re-reading extension.json
+    /// there would let failMode drift from the loaded manifest and
+    /// silently revert to fail-open if the file were corrupted
+    /// mid-session.
+    fail_mode: FailMode,
 }
 
 impl LoadedPlugin {
@@ -694,6 +745,8 @@ impl LoadedPlugin {
             handle: None,
             version: entry.version,
             dir: entry.dir,
+            stopped: false,
+            fail_mode: FailMode::default(),
         }
     }
 
@@ -714,6 +767,8 @@ impl LoadedPlugin {
             handle: None,
             version: entry.version,
             dir: entry.dir,
+            stopped: false,
+            fail_mode: FailMode::default(),
         }
     }
 
@@ -729,6 +784,8 @@ impl LoadedPlugin {
             handle: None,
             version: entry.version,
             dir: entry.dir,
+            stopped: false,
+            fail_mode: FailMode::default(),
         }
     }
 
@@ -738,6 +795,7 @@ impl LoadedPlugin {
         enabled: bool,
         register: InitializeResult,
         handle: PluginHandle,
+        fail_mode: FailMode,
     ) -> Self {
         LoadedPlugin {
             id: entry.id,
@@ -749,11 +807,13 @@ impl LoadedPlugin {
             handle: Some(handle),
             version: entry.version,
             dir: entry.dir,
+            stopped: false,
+            fail_mode,
         }
     }
 
     pub fn is_active(&self) -> bool {
-        self.enabled && self.error.is_none() && self.policy_block.is_none()
+        self.enabled && !self.stopped && self.error.is_none() && self.policy_block.is_none()
     }
 
     /// The load outcome bucket for telemetry and the doctor report:
@@ -1513,10 +1573,7 @@ impl ExtensionManager {
         let trusted = crate::project_trust::is_trusted(cwd, agent_dir);
         let enabled_map = plugin_enabled_map(cwd, agent_dir);
         let discovered = discover(cwd, agent_dir);
-        let lock = read_lock(agent_dir).unwrap_or_else(|e| {
-            tracing::warn!("ignoring unreadable extensions lockfile: {e}");
-            ExtensionsLock::default()
-        });
+        let (lock, lock_corrupt) = read_lock_for_gate(agent_dir);
         for entry in discovered {
             let id_string = entry.id.to_string();
             let mut enabled = enabled_map.get(&id_string).copied().unwrap_or(true);
@@ -1583,7 +1640,7 @@ impl ExtensionManager {
             // Supply-chain gate: store installs with a lock entry pinned
             // to a resolved commit are skipped when the checkout drifted.
             if (entry.id.source() == "user" || !entry.id.is_reserved_source())
-                && !lock_allows(&entry, &lock, lock_required)
+                && !lock_allows(&entry, &lock, lock_required, lock_corrupt)
             {
                 manager.plugins.push(LoadedPlugin::failed(
                     entry,
@@ -1626,9 +1683,18 @@ impl ExtensionManager {
                     // plugin the server IS the plugin, so a policy list
                     // that excludes it blocks the load outright (it was
                     // previously accepted but silently not enforced).
+                    // Two entry forms are accepted in the list: the full
+                    // plugin id (`jira@acme`) and the bare plugin name
+                    // (`jira`). The list matches server names for bundle
+                    // contributions, but an mcp-carrier's server has no
+                    // name distinct from the plugin's, and an admin can
+                    // naturally write either form — requiring one would
+                    // silently block plugins listed in the other form.
                     if let Some(policy) = &policy
                         && let Some(allow) = policy.narrowed_mcp_servers(&id_string)
-                        && !allow.iter().any(|name| name == &id_string)
+                        && !allow
+                            .iter()
+                            .any(|name| name == &id_string || name == entry.id.name())
                     {
                         policy.audit_narrow(
                             &id_string,
@@ -1697,7 +1763,18 @@ impl ExtensionManager {
                             ));
                             continue;
                         };
-                        let module_path = entry.dir.join(module);
+                        let module_path = match resolve_module_path(&entry.dir, module) {
+                            Ok(path) => path,
+                            Err(e) => {
+                                manager.plugins.push(LoadedPlugin::failed(
+                                    entry,
+                                    enabled,
+                                    LoadErrorClass::Manifest,
+                                    e.to_string(),
+                                ));
+                                continue;
+                            }
+                        };
                         let wasm = match std::fs::read(&module_path) {
                             Ok(bytes) => bytes,
                             Err(e) => {
@@ -1978,39 +2055,92 @@ impl ExtensionManager {
                             ));
                         }
                     }
+                    // Managed policy hook-capability gate (P5): a
+                    // managed `hooks: false` strips the plugin's
+                    // `capabilities.hooks` at registration, so it
+                    // contributes NO hook bridges (beforeToolCall
+                    // rewrite/block over every tool call, context
+                    // transform, result patch, approval review) while
+                    // its tools/commands still load — the same
+                    // intersect-at-initialize rule as tools, except the
+                    // capability is dropped whole rather than
+                    // intersected. An org allowing a plugin for one
+                    // benign tool must not silently grant it
+                    // interception over the whole session.
+                    if let Some(policy) = &policy
+                        && !policy.hooks_allowed(&id_string)
+                        && let Some(hooks) = register.capabilities.hooks.take()
+                    {
+                        let declared: Vec<String> = [
+                            (hooks.before_tool_call == Some(true), "beforeToolCall"),
+                            (hooks.transform_context == Some(true), "transformContext"),
+                            (hooks.after_tool_call == Some(true), "afterToolCall"),
+                            (hooks.approval_review == Some(true), "approvalReview"),
+                        ]
+                        .into_iter()
+                        .filter(|(declared, _)| *declared)
+                        .map(|(_, name)| name.to_string())
+                        .collect();
+                        policy.audit_narrow(&id_string, "plugins.hooks", &declared);
+                        if !declared.is_empty() {
+                            manager.load_warnings.push(format!(
+                                "extension {id_string}: managed policy dropped hook capability(ies): {}",
+                                declared.join(", ")
+                            ));
+                        }
+                    }
                     // Managed policy provider-capability narrowing (P5):
                     // a managed deny of `provider` turns a plugin that
-                    // declares provider.stream policy-blocked — the same
-                    // intersect-at-initialize rule as tools, except the
-                    // capability is indivisible so denial blocks the load.
+                    // declares provider.stream or provider.register
+                    // policy-blocked — the same intersect-at-initialize
+                    // rule as tools, except the capability is indivisible
+                    // so denial blocks the load.
                     let declares_provider_stream = register
                         .capabilities
                         .provider
                         .as_ref()
                         .and_then(|p| p.stream)
                         == Some(true);
-                    if declares_provider_stream
+                    let declares_provider_register = register
+                        .capabilities
+                        .provider
+                        .as_ref()
+                        .and_then(|p| p.register)
+                        == Some(true);
+                    if (declares_provider_stream || declares_provider_register)
                         && let Some(policy) = &policy
                         && !policy.provider_allowed(&id_string)
                     {
-                        policy.audit_narrow(
-                            &id_string,
-                            "plugins.provider",
-                            &["stream".to_string()],
-                        );
+                        let declared: Vec<String> = [
+                            (declares_provider_stream, "stream"),
+                            (declares_provider_register, "register"),
+                        ]
+                        .into_iter()
+                        .filter(|(declared, _)| *declared)
+                        .map(|(_, name)| name.to_string())
+                        .collect();
+                        policy.audit_narrow(&id_string, "plugins.provider", &declared);
                         bridge_state.set_provider_stream_granted(&id_string, false);
+                        bridge_state.set_provider_register_granted(&id_string, false);
+                        // The connection was published before the
+                        // handshake; withdraw it like the
+                        // handshake-failure path does, or the bridge
+                        // keeps routing to a shut-down plugin.
+                        bridge_state.remove_connection(&id_string);
                         handle.shutdown().await;
                         manager.plugins.push(LoadedPlugin::policy_blocked(
                             entry,
                             enabled,
                             format!(
-                                "provider bridge serving is denied by managed policy ({})",
+                                "provider capability is denied by managed policy ({})",
                                 policy.origin
                             ),
                         ));
                         continue;
                     }
                     bridge_state.set_provider_stream_granted(&id_string, declares_provider_stream);
+                    bridge_state
+                        .set_provider_register_granted(&id_string, declares_provider_register);
                     // Metrics sidecar (roadmap §9): the declared schema
                     // validates all-or-nothing; a valid declaration on a
                     // supported carrier gets a drained sidecar.
@@ -2056,9 +2186,13 @@ impl ExtensionManager {
                     if let Some(widgets) = &register.capabilities.widgets {
                         manager.widgets.register_plugin(&id_string, widgets);
                     }
-                    manager
-                        .plugins
-                        .push(LoadedPlugin::loaded(entry, enabled, register, handle));
+                    manager.plugins.push(LoadedPlugin::loaded(
+                        entry,
+                        enabled,
+                        register,
+                        handle,
+                        FailMode::from_setting(manifest.fail_mode.as_deref()),
+                    ));
                 }
                 Err(e) => {
                     bridge_state.remove_connection(&id_string);
@@ -2264,15 +2398,12 @@ impl ExtensionManager {
             .filter_map(|p| {
                 let capabilities = p.capabilities()?.hooks.clone()?;
                 let handle = p.handle.as_ref()?;
-                let fail_mode = std::fs::read_to_string(p.dir.join("extension.json"))
-                    .ok()
-                    .and_then(|c| serde_json::from_str::<ExtensionManifest>(&c).ok())
-                    .and_then(|m| m.fail_mode);
-                let fail_mode = FailMode::from_setting(fail_mode.as_deref());
+                // failMode comes from the load-time cache on the row, not
+                // a fresh extension.json read (see `LoadedPlugin::fail_mode`).
                 Some(Arc::new(ExtHooks::with_fail_mode(
                     handle.client(),
                     capabilities,
-                    fail_mode,
+                    p.fail_mode,
                 )) as Arc<dyn AgentHooks>)
             })
             .collect()
@@ -2447,13 +2578,24 @@ impl ExtensionManager {
 
     /// Gracefully stop all running plugins.
     pub async fn shutdown(&mut self) {
-        // Metrics sidecars: plugins flush final measurements during their
-        // own shutdown, so the final drain runs AFTER it.
-        for plugin in &mut self.plugins {
+        // Plugins shut down CONCURRENTLY: their shutdowns are
+        // independent (each only touches its own carrier handle — the
+        // per-plugin bridge connection, child process, and wasm/mcp
+        // connection are not shared), so sequential awaiting would just
+        // multiply app-exit latency by the count of unresponsive
+        // plugins. The only ordering dependency is the metrics sidecar
+        // final drain below: plugins flush final measurements during
+        // their own shutdown, so it runs AFTER the join.
+        futures_util::future::join_all(self.plugins.iter_mut().map(|plugin| async move {
             if let Some(handle) = &mut plugin.handle {
                 handle.shutdown().await;
             }
-        }
+            // The carrier is stopped; `is_active` must report false now
+            // (WASM/MCP shutdown consumed the inner connection, so a
+            // post-shutdown `client()` would panic otherwise).
+            plugin.stopped = true;
+        }))
+        .await;
         self.metrics_stop
             .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut sidecars) = self.metrics_sidecars.lock() {
@@ -2622,6 +2764,74 @@ pub(crate) fn read_lock(agent_dir: &Path) -> anyhow::Result<ExtensionsLock> {
     Ok(lock)
 }
 
+/// Read the lockfile for the startup gate. The second tuple element is
+/// true when a lockfile EXISTS but could not be read or parsed: with
+/// `extensionLockRequired` the gate must fail CLOSED in that state —
+/// falling back to an empty lock would silently disengage the
+/// supply-chain check for every plugin (no entry ⇒ `lock_allows` says
+/// yes), and the next lock write would destroy every resolved_commit
+/// pin with no record they ever existed.
+fn read_lock_for_gate(agent_dir: &Path) -> (ExtensionsLock, bool) {
+    let path = lock_path(agent_dir);
+    match std::fs::read_to_string(&path) {
+        Ok(_) => match read_lock(agent_dir) {
+            Ok(lock) => (lock, false),
+            Err(e) => {
+                tracing::warn!("ignoring unparseable extensions lockfile: {e}");
+                (ExtensionsLock::default(), true)
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (ExtensionsLock::default(), false),
+        Err(e) => {
+            tracing::warn!("extensions lockfile {} is unreadable: {e}", path.display());
+            (ExtensionsLock::default(), true)
+        }
+    }
+}
+
+/// Rename a corrupt lockfile aside before it is rewritten, so the
+/// resolved_commit pins it carried survive for forensics/recovery
+/// instead of being silently destroyed by the next write.
+fn backup_corrupt_lock(path: &Path, reason: &str) -> anyhow::Result<()> {
+    let backup = path.with_extension("json.corrupt");
+    tracing::warn!(
+        "extensions lockfile is corrupt ({reason}); moving it to {} before rewriting",
+        backup.display()
+    );
+    // Best-effort replace of a previous backup: losing the OLD backup
+    // is acceptable, losing the CURRENT corrupt file is not.
+    let _ = std::fs::remove_file(&backup);
+    std::fs::rename(path, &backup).map_err(|e| {
+        anyhow::anyhow!(
+            "extensions lockfile is corrupt and could not be backed up to {}: {e}",
+            backup.display()
+        )
+    })
+}
+
+/// Read the lockfile for a read-modify-write cycle. A file that exists
+/// but cannot be read or parsed is renamed aside (`…lock.json.corrupt`)
+/// before the caller rewrites from an empty lock; when the rename fails
+/// the update is refused outright (overwriting without a backup would
+/// lose every pin irrecoverably).
+fn read_lock_for_update(agent_dir: &Path) -> anyhow::Result<ExtensionsLock> {
+    let path = lock_path(agent_dir);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            if let Err(e) = serde_json::from_str::<ExtensionsLock>(&content) {
+                backup_corrupt_lock(&path, &e.to_string())?;
+                return Ok(ExtensionsLock::default());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            backup_corrupt_lock(&path, &format!("unreadable: {e}"))?;
+            return Ok(ExtensionsLock::default());
+        }
+    }
+    read_lock(agent_dir)
+}
+
 fn write_lock(agent_dir: &Path, lock: &ExtensionsLock) -> anyhow::Result<()> {
     std::fs::create_dir_all(agent_dir)?;
     let path = lock_path(agent_dir);
@@ -2716,7 +2926,7 @@ fn lock_record_install(
     marketplace: Option<&str>,
 ) -> anyhow::Result<()> {
     let _guard = lock_guard(agent_dir);
-    let mut lock = read_lock(agent_dir)?;
+    let mut lock = read_lock_for_update(agent_dir)?;
     let installed_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -2739,7 +2949,7 @@ fn lock_record_install(
 /// Drop a removed extension's lock entry (no-op when absent).
 fn lock_remove(agent_dir: &Path, id: &str) -> anyhow::Result<()> {
     let _guard = lock_guard(agent_dir);
-    let mut lock = read_lock(agent_dir)?;
+    let mut lock = read_lock_for_update(agent_dir)?;
     if lock.plugins.remove(id).is_some() {
         write_lock(agent_dir, &lock)?;
     }
@@ -2848,8 +3058,27 @@ pub fn verify_extensions(agent_dir: &Path) -> anyhow::Result<Vec<(String, Verify
 
 /// Startup gate: may this discovered plugin load, given the lockfile?
 /// Only installs with a lock entry carrying a resolved commit are gated.
-fn lock_allows(discovered: &Discovered, lock: &ExtensionsLock, required: bool) -> bool {
+/// `lock_corrupt` marks a lockfile that existed but could not be read or
+/// parsed: with `required` the gate fails CLOSED (no plugin has a
+/// verifiable pin then); without it the warn-and-continue behavior is
+/// kept.
+fn lock_allows(
+    discovered: &Discovered,
+    lock: &ExtensionsLock,
+    required: bool,
+    lock_corrupt: bool,
+) -> bool {
     let id_string = discovered.id.to_string();
+    if lock_corrupt {
+        if required {
+            tracing::warn!(
+                "extension {id_string}: the extensions lockfile is corrupt/unreadable and \
+                 extensionLockRequired is set — skipping (fail-closed)"
+            );
+            return false;
+        }
+        return true;
+    }
     let Some(entry) = lock.plugins.get(&id_string) else {
         return true;
     };
@@ -3013,6 +3242,22 @@ pub(crate) fn git_clone(source: &str, rev: Option<&str>, target: &Path) -> anyho
     Ok(())
 }
 
+/// Per-process scratch-dir uniqueness (the pattern
+/// `ext_bundle::BUNDLE_SCRATCH_COUNTER` established for bundle
+/// extraction): concurrent same-process installs share one PID, so a
+/// bare `.staging-<pid>` / `backup-<pid>` name would let one install
+/// `remove_dir_all` another's staging mid-clone.
+static STAGING_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A unique-per-process suffix for staging/backup directory names.
+fn scratch_suffix() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 /// The store version for an install: the manifest's `version` when it is
 /// a semver, else the install rev stripped of a leading `v` when that is
 /// a semver, else `local`.
@@ -3080,7 +3325,7 @@ pub fn install_extension_named(
         // Project installs stay flat (trust-gated, no lockfile).
         let root = cwd.join(".pi").join("extensions");
         std::fs::create_dir_all(&root)?;
-        let staging = root.join(format!(".staging-{}", std::process::id()));
+        let staging = root.join(format!(".staging-{}", scratch_suffix()));
         let _ = std::fs::remove_dir_all(&staging);
         if is_git {
             git_clone(source, rev, &staging)?;
@@ -3114,7 +3359,7 @@ pub fn install_extension_named(
     std::fs::create_dir_all(&staging_parent)?;
 
     // Stage under a scratch name; the manifest decides the plugin name.
-    let staging = staging_parent.join(format!(".staging-{}", std::process::id()));
+    let staging = staging_parent.join(format!(".staging-{}", scratch_suffix()));
     let _ = std::fs::remove_dir_all(&staging);
     if is_git {
         git_clone(source, rev, &staging)?;
@@ -3178,7 +3423,7 @@ fn read_and_check_manifest(staging: &Path) -> anyhow::Result<ExtensionManifest> 
 /// failure rolls the backup back.
 fn activate_staging(staging: &Path, target: &Path) -> anyhow::Result<()> {
     if target.exists() {
-        let backup = target.with_extension(format!("backup-{}", std::process::id()));
+        let backup = target.with_extension(format!("backup-{}", scratch_suffix()));
         let _ = std::fs::remove_dir_all(&backup);
         std::fs::rename(target, &backup)?;
         if let Err(e) = std::fs::rename(staging, target) {
@@ -3228,7 +3473,12 @@ pub fn remove_extension(
     local: bool,
 ) -> anyhow::Result<()> {
     if local {
-        let target = cwd.join(".pi").join("extensions").join(name);
+        // `name` becomes a path component under .pi/extensions —
+        // validate it against the PluginId name grammar like the store
+        // branch does, otherwise `tack ext remove --local ../../somedir`
+        // deletes an arbitrary directory.
+        let id = PluginId::new(name, "project")?;
+        let target = cwd.join(".pi").join("extensions").join(id.name());
         if !target.is_dir() {
             anyhow::bail!("no extension named {name:?} installed");
         }
@@ -4286,6 +4536,201 @@ mod tests {
         lock_remove(&agent_dir, "demo@user").unwrap();
         assert!(read_lock(&agent_dir).unwrap().plugins.is_empty());
         assert!(!lock_path(&agent_dir).with_extension("guard").exists());
+    }
+
+    /// Concurrent same-process installs share one PID; the staging and
+    /// backup dirs must still be unique per install (the
+    /// `.staging-<pid>-<n>` counter suffix), or one install's
+    /// `remove_dir_all` deletes another's staging mid-clone.
+    #[test]
+    fn parallel_installs_do_not_clobber_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut sources = Vec::new();
+        for name in ["aaa", "bbb", "ccc", "ddd"] {
+            let src = tmp.path().join(name);
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(
+                src.join("extension.json"),
+                format!(r#"{{"name":"{name}"}}"#),
+            )
+            .unwrap();
+            sources.push(src);
+        }
+        std::thread::scope(|scope| {
+            for src in &sources {
+                scope.spawn(|| {
+                    install_extension(src.to_str().unwrap(), &cwd, &agent_dir, false).unwrap();
+                });
+            }
+        });
+        for name in ["aaa", "bbb", "ccc", "ddd"] {
+            assert!(
+                store_root(&agent_dir)
+                    .join("user")
+                    .join(name)
+                    .join("local")
+                    .join("extension.json")
+                    .is_file(),
+                "{name} installed"
+            );
+        }
+        let lock = read_lock(&agent_dir).unwrap();
+        assert_eq!(lock.plugins.len(), 4, "no lock entry lost");
+        let leftovers: Vec<_> = std::fs::read_dir(store_root(&agent_dir).join("user"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".staging"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staging dirs cleaned up: {leftovers:?}"
+        );
+    }
+
+    /// A corrupt lockfile must not silently destroy the pins it carried:
+    /// the next lock write renames it aside first.
+    #[test]
+    fn corrupt_lockfile_is_backed_up_before_rewrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(lock_path(&agent_dir), "{ not json").unwrap();
+
+        let id = PluginId::new("demo", "user").unwrap();
+        lock_record_install(
+            &agent_dir,
+            &id,
+            "https://example.com/x.git",
+            None,
+            Some("abc".to_string()),
+            "1.0.0",
+            None,
+        )
+        .unwrap();
+        let backup = lock_path(&agent_dir).with_extension("json.corrupt");
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            "{ not json",
+            "the corrupt original survives as a backup"
+        );
+        let lock = read_lock(&agent_dir).unwrap();
+        assert!(lock.plugins.contains_key("demo@user"));
+
+        // lock_remove on a corrupt lockfile backs up too (and the
+        // corrupt file does not come back).
+        std::fs::remove_file(&backup).unwrap();
+        std::fs::write(lock_path(&agent_dir), "{ still not json").unwrap();
+        lock_remove(&agent_dir, "demo@user").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            "{ still not json"
+        );
+    }
+
+    /// Fail-closed gate: with `extensionLockRequired`, a corrupt
+    /// lockfile rejects gated plugins; without it, the warn-and-continue
+    /// behavior is kept.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn corrupt_lockfile_fails_closed_only_when_required() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        // Bundle-only legacy flat install (no `command`): passes the
+        // gate ⇒ no row at all; rejected ⇒ a Store-class failure row.
+        let ext_dir = agent_dir.join("extensions").join("demo");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(ext_dir.join("extension.json"), r#"{"name":"demo"}"#).unwrap();
+        std::fs::write(lock_path(&agent_dir), "{ not json").unwrap();
+
+        let manager = ExtensionManager::load(
+            &cwd,
+            &agent_dir,
+            "print",
+            Arc::new(NoopServices),
+            true,
+            Default::default(),
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
+        )
+        .await;
+        let plugin = manager
+            .plugins
+            .iter()
+            .find(|p| p.id.name() == "demo")
+            .expect("a fail-closed row");
+        assert_eq!(plugin.error_class, Some(LoadErrorClass::Store));
+        assert!(!plugin.is_active());
+
+        let manager = ExtensionManager::load(
+            &cwd,
+            &agent_dir,
+            "print",
+            Arc::new(NoopServices),
+            false,
+            Default::default(),
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
+        )
+        .await;
+        assert!(
+            manager
+                .plugins
+                .iter()
+                .all(|p| p.error_class != Some(LoadErrorClass::Store)),
+            "not required ⇒ the gate warns and continues: {:?}",
+            manager.plugins
+        );
+    }
+
+    /// The wasm `module` path must stay inside the extension directory —
+    /// absolute paths, `..` traversal, and escaping symlinks would load
+    /// arbitrary code under the plugin's identity.
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn wasm_module_path_must_stay_inside_the_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ext");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/mod.wasm"), b"\0asm").unwrap();
+        assert!(resolve_module_path(&dir, "sub/mod.wasm").is_ok());
+        assert!(resolve_module_path(&dir, "../escape.wasm").is_err());
+        assert!(resolve_module_path(&dir, "/etc/hostname").is_err());
+        assert!(resolve_module_path(&dir, "missing.wasm").is_err());
+        #[cfg(unix)]
+        {
+            let outside = tmp.path().join("outside.wasm");
+            std::fs::write(&outside, b"\0asm").unwrap();
+            std::os::unix::fs::symlink(&outside, dir.join("link.wasm")).unwrap();
+            assert!(
+                resolve_module_path(&dir, "link.wasm").is_err(),
+                "a symlink pointing outside the extension dir is an escape"
+            );
+        }
+    }
+
+    /// `remove --local` validates the name before joining it under
+    /// .pi/extensions — a traversal name must not delete arbitrary dirs.
+    #[test]
+    fn remove_local_rejects_traversal_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let cwd = tmp.path().join("cwd");
+        // `.pi/extensions/../../victim` resolves to `<cwd>/victim`.
+        let victim = cwd.join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("keep.txt"), "x").unwrap();
+        for name in ["../../victim", "..", "a/b", "/abs", "name@project"] {
+            assert!(
+                remove_extension(name, &cwd, &agent_dir, true).is_err(),
+                "{name} rejected"
+            );
+        }
+        assert!(
+            victim.join("keep.txt").is_file(),
+            "the traversal target is untouched"
+        );
     }
 
     /// Moving HEAD in the installed checkout makes verify report changed.
@@ -5552,6 +5997,61 @@ mod policy_tests {
         assert!(warnings.contains("nonexistent"), "{warnings}");
     }
 
+    /// For an mcp-carrier plugin (the server IS the plugin) the managed
+    /// `mcpServers` list accepts BOTH the full plugin id and the bare
+    /// plugin name — admins can naturally write either, and requiring
+    /// one form would silently block plugins listed in the other form.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn policy_mcp_servers_matches_mcp_carrier_by_id_or_bare_name() {
+        let manifest = r#"{
+  "name": "jira",
+  "carrier": "mcp",
+  "mcpServer": { "command": "definitely-not-a-real-command-xyz" }
+}"#;
+        // (allow-list, expect a policy block?)
+        for (allow, blocked) in [
+            ("jira", false),      // bare plugin name
+            ("jira@user", false), // full plugin id
+            ("other", true),      // neither form ⇒ blocked
+        ] {
+            let (_tmp, agent_dir, cwd) = dirs();
+            write_flat_plugin(&agent_dir, "jira", manifest);
+            let policy = test_policy(
+                &serde_json::json!({
+                    "pluginPolicy": {"plugins": {"jira@user": {"mcpServers": [allow]}}}
+                })
+                .to_string(),
+            );
+            let manager = ExtensionManager::load_with_policy(
+                &cwd,
+                &agent_dir,
+                "tui",
+                Arc::new(NoopServices),
+                true,
+                Default::default(),
+                Some(policy),
+                crate::ext_provider_bridge::ProviderBridgeState::shared(),
+            )
+            .await;
+            assert_eq!(manager.plugins.len(), 1);
+            let plugin = &manager.plugins[0];
+            if blocked {
+                let reason = plugin.policy_block.as_deref().unwrap_or("");
+                assert!(reason.contains("mcpServers"), "{reason}");
+            } else {
+                assert!(
+                    plugin.policy_block.is_none(),
+                    "allow-list entry {allow:?} must not block: {:?}",
+                    plugin.policy_block
+                );
+                // The plugin proceeded to the carrier connect, which
+                // fails on the bogus command — a handshake failure row,
+                // NOT a policy block.
+                assert!(plugin.error.is_some());
+            }
+        }
+    }
+
     /// A managed `tools` list narrows the registered tool set at
     /// registration time (intersect-only).
     #[tokio::test(flavor = "multi_thread")]
@@ -5622,6 +6122,87 @@ mod policy_tests {
         .await;
         assert_eq!(manager.tools().len(), 1);
         manager.shutdown().await;
+    }
+
+    /// Managed `hooks: false` strips a plugin's hook bridges at
+    /// registration (no beforeToolCall interception over the session)
+    /// while its tools still load; an absent entry allows hooks, and an
+    /// explicit `hooks: true` allows too (managed wins by construction
+    /// — there is no user-layer hooks grant to override).
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "wasm")]
+    async fn plugin_policy_hooks_gate_drops_bridges_keeps_tools() {
+        async fn load(entry: &str) -> (tempfile::TempDir, ExtensionManager) {
+            let (_tmp, agent_dir, cwd) = dirs();
+            let ext_dir = agent_dir.join("extensions").join("hello-component");
+            std::fs::create_dir_all(&ext_dir).unwrap();
+            std::fs::write(
+                ext_dir.join("extension.json"),
+                r#"{
+  "name": "hello-component",
+  "carrier": "wasm",
+  "module": "plugin.wat",
+  "limits": { "maxFuel": 100000000, "maxMemoryBytes": 16777216 }
+}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                ext_dir.join("plugin.wat"),
+                include_str!("../../../examples/extensions/hello-component/plugin.wat"),
+            )
+            .unwrap();
+            let policy = test_policy(&format!(
+                r#"{{"pluginPolicy": {{"plugins": {{"hello-component@user": {entry}}}}}}}"#
+            ));
+            (
+                _tmp,
+                ExtensionManager::load_with_policy(
+                    &cwd,
+                    &agent_dir,
+                    "tui",
+                    Arc::new(NoopServices),
+                    true,
+                    Default::default(),
+                    Some(policy),
+                    crate::ext_provider_bridge::ProviderBridgeState::shared(),
+                )
+                .await,
+            )
+        }
+
+        // hooks: false — the declared beforeToolCall bridge is gone, the
+        // tool survives, the drop is surfaced as a load warning.
+        let (_tmp, mut manager) = load(r#"{"hooks": false}"#).await;
+        assert!(
+            manager.hooks().is_empty(),
+            "managed hooks:false strips the hook bridges"
+        );
+        assert_eq!(
+            manager.tools().len(),
+            1,
+            "tools are unaffected by the hooks gate"
+        );
+        let plugin = &manager.plugins[0];
+        assert!(plugin.is_active(), "the plugin itself still loads");
+        assert!(plugin.policy_block.is_none(), "not a load-time block");
+        let warnings = manager.load_warnings.join("\n");
+        assert!(
+            warnings.contains("dropped hook capability(ies): beforeToolCall"),
+            "{warnings}"
+        );
+        manager.shutdown().await;
+
+        // Absent key and explicit true both allow the bridges.
+        for entry in [r#"{"tools": ["hello"]}"#, r#"{"hooks": true}"#] {
+            let (_tmp, mut manager) = load(entry).await;
+            assert_eq!(
+                manager.hooks().len(),
+                1,
+                "entry {entry} must allow the hook bridge"
+            );
+            assert_eq!(manager.tools().len(), 1);
+            manager.shutdown().await;
+        }
     }
 
     /// Load-time source backstop: a store install whose locked source
@@ -5814,6 +6395,8 @@ mod policy_tests {
                 handle: None,
                 version: "1.0.0".into(),
                 dir: PathBuf::new(),
+                stopped: false,
+                fail_mode: FailMode::default(),
             }],
             load_warnings: Vec::new(),
             commands: HashMap::new(),

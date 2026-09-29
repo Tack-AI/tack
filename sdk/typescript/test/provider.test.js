@@ -120,6 +120,7 @@ test("capability advertised and stream events flow", async () => {
   const run = echoPlugin().run({ input: b, output: a });
   const init = await host.call("initialize", initParams());
   assert.equal(init.capabilities.provider.stream, true);
+  assert.equal(init.capabilities.provider.register, undefined);
   const ack = await host.call("provider/stream", streamParams("hi"));
   assert.equal(ack, null, "fast null ack");
   const captured = await waitForEvents(stub, 3);
@@ -129,6 +130,40 @@ test("capability advertised and stream events flow", async () => {
   assert.equal(captured[1][1].delta, "hello");
   assert.equal(captured[2][1].type, "done");
   assert.equal(captured[2][1].message.stopReason, "stop");
+  await finish(host, run, a, b);
+});
+
+test("providerRegister declares the provider.register capability", async () => {
+  const { a, b } = connect();
+  const { peer: host } = makeHost(a, b);
+  const run = plugin({ name: "register-plugin" })
+    .providerRegister()
+    .run({ input: b, output: a });
+  const init = await host.call("initialize", initParams());
+  assert.deepEqual(init.capabilities.provider, { register: true });
+  await finish(host, run, a, b);
+});
+
+test("providerRegister combines with providerStream", async () => {
+  const { a, b } = connect();
+  const { peer: host } = makeHost(a, b);
+  const run = plugin({ name: "register-plugin" })
+    .providerStream(async () => {})
+    .providerRegister(true)
+    .run({ input: b, output: a });
+  const init = await host.call("initialize", initParams());
+  assert.deepEqual(init.capabilities.provider, { stream: true, register: true });
+  await finish(host, run, a, b);
+});
+
+test("providerRegister(false) declares nothing", async () => {
+  const { a, b } = connect();
+  const { peer: host } = makeHost(a, b);
+  const run = plugin({ name: "plain-plugin" })
+    .providerRegister(false)
+    .run({ input: b, output: a });
+  const init = await host.call("initialize", initParams());
+  assert.equal(init.capabilities.provider, undefined);
   await finish(host, run, a, b);
 });
 

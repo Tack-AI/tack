@@ -62,8 +62,9 @@ fn validate_entry_path(path: &Path) -> anyhow::Result<PathBuf> {
 /// Extract `tgz_bytes` into `dest` (created). Every entry must be a
 /// regular file or a directory: symbolic/hard links, fifos, and device
 /// nodes are rejected outright — a plugin that needs one can create it
-/// at runtime, an archive never can. Unix modes are applied masked to
-/// 0o777 (no setuid/sgid/sticky). Returns the number of files written.
+/// at runtime, an archive never can. Unix file modes are applied masked
+/// to 0o755 (no group/other write, no setuid/sgid/sticky — see the
+/// permission restore below). Returns the number of files written.
 ///
 /// The cumulative cap is enforced on ENTRY DATA as it streams out (a zip
 /// bomb dies at the ceiling, not the disk); tar container overhead is
@@ -137,7 +138,12 @@ pub fn extract_tgz(tgz_bytes: &[u8], dest: &Path, caps: &ExtractCaps) -> anyhow:
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = mode_bits & 0o777;
+            // Mask to 0o755, not 0o777: a hostile archive shipping
+            // group/other write bits would plant world-writable code
+            // into the plugin store for other local users to tamper
+            // with before the victim executes it. pack_bundle only ever
+            // emits 0o755/0o644, so this loses nothing legitimate.
+            let mode = mode_bits & 0o755;
             let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode));
         }
         files_written += 1;
@@ -239,6 +245,37 @@ mod tests {
             single_top_level_dir(tmp.path()),
             Some(tmp.path().join("pkg"))
         );
+    }
+
+    /// A hostile archive must not plant group/other-writable code into
+    /// the plugin store: file modes are masked to 0o755 (directories
+    /// keep the fs defaults, which stay traversable).
+    #[cfg(unix)]
+    #[test]
+    fn file_modes_are_masked_to_755() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tgz = make_tgz(&[
+            ("pkg/", &[], 0o755, tar::EntryType::Directory),
+            (
+                "pkg/writable.sh",
+                b"#!/bin/sh\n",
+                0o777,
+                tar::EntryType::Regular,
+            ),
+            ("pkg/data.json", b"{}", 0o666, tar::EntryType::Regular),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        extract_tgz(&tgz, tmp.path(), &caps()).unwrap();
+        let mode = |relative: &str| {
+            std::fs::metadata(tmp.path().join(relative))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode("pkg/writable.sh"), 0o755, "group/other write stripped");
+        assert_eq!(mode("pkg/data.json"), 0o644);
+        assert!(mode("pkg") & 0o111 == 0o111, "directories stay traversable");
     }
 
     #[test]

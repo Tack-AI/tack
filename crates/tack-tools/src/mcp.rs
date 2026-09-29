@@ -43,6 +43,10 @@ pub struct McpServerSpec {
     pub transport: McpTransport,
     /// OAuth config (HTTP/SSE only). `Some(…)` = authorize on 401.
     pub oauth: Option<McpOAuthConfig>,
+    /// Strip sensitive inherited env vars from the stdio child (see
+    /// [`Self::with_credential_stripping`]). Off by default:
+    /// user-configured servers keep the host's full environment.
+    pub strip_credentials: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +86,7 @@ impl McpServerSpec {
                 cwd,
             },
             oauth: None,
+            strip_credentials: false,
         }
     }
 
@@ -90,6 +95,7 @@ impl McpServerSpec {
             name,
             transport: McpTransport::Http { url, headers },
             oauth: None,
+            strip_credentials: false,
         }
     }
 
@@ -98,12 +104,25 @@ impl McpServerSpec {
             name,
             transport: McpTransport::Sse { url, headers },
             oauth: None,
+            strip_credentials: false,
         }
     }
 
     /// Attach an OAuth config (HTTP/SSE only).
     pub fn with_oauth(mut self, oauth: McpOAuthConfig) -> Self {
         self.oauth = Some(oauth);
+        self
+    }
+
+    /// Opt in to credential stripping for stdio spawns: sensitive
+    /// inherited env vars (API keys, tokens — see
+    /// [`is_sensitive_env_key`]) the spec does not explicitly declare
+    /// are removed from the child process. For PLUGIN carriers only —
+    /// a plugin is third-party code and the host's API keys are not
+    /// its business. User-configured MCP servers deliberately keep the
+    /// host's full environment (the existing public behavior).
+    pub fn with_credential_stripping(mut self) -> Self {
+        self.strip_credentials = true;
         self
     }
 
@@ -306,6 +325,49 @@ pub async fn connect(spec: &McpServerSpec) -> Result<McpConnection, String> {
     connect_with(spec, McpClientCallbacks::default()).await
 }
 
+/// True for environment variable names that typically carry credentials
+/// (`OPENAI_API_KEY`, `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`, ...).
+/// Local copy of `tack_ext::process::is_sensitive_env_key` — duplicated
+/// because tack-tools deliberately does not depend on tack-ext (the
+/// dependency direction is tack-app → all), and the strip rule must
+/// match the v3 process carrier's exactly: a plugin is third-party code
+/// and the host's API keys are not its business.
+fn is_sensitive_env_key(key: &str) -> bool {
+    const SUFFIXES: &[&str] = &[
+        "_API_KEY",
+        "_ACCESS_KEY",
+        "_TOKEN",
+        "_SECRET",
+        "_PASSWORD",
+        "_CREDENTIALS",
+        "_PRIVATE_KEY",
+    ];
+    let upper = key.to_ascii_uppercase();
+    SUFFIXES.iter().any(|suffix| upper.ends_with(suffix))
+        || matches!(
+            upper.as_str(),
+            "API_KEY" | "TOKEN" | "SECRET" | "PASSWORD" | "CREDENTIALS"
+        )
+}
+
+/// Strip sensitive inherited env vars from a plugin-carrier child
+/// command, mirroring the v3 process carrier's
+/// `tack_ext::process::env_vars_to_strip`: sensitive-looking vars the
+/// server spec did NOT explicitly declare are `env_remove`d
+/// individually (never `env_clear` — clearing breaks process startup
+/// on Windows, where e.g. `SystemRoot` is required).
+fn strip_credential_env(
+    command: &mut tokio::process::Command,
+    parent_keys: &[String],
+    declared: &[(String, String)],
+) {
+    for key in parent_keys {
+        if is_sensitive_env_key(key) && !declared.iter().any(|(dk, _)| dk == key) {
+            command.env_remove(key);
+        }
+    }
+}
+
 /// `connect` with client-side callbacks for server-initiated requests
 /// (sampling / elicitation).
 pub async fn connect_with(
@@ -325,6 +387,16 @@ pub async fn connect_with(
             command.args(args);
             for (k, v) in env {
                 command.env(k, v);
+            }
+            if spec.strip_credentials {
+                // A plugin carrier is third-party code: strip the host's
+                // credentials like the v3 process carrier does. Only
+                // reached when the caller opted in — user-configured
+                // servers inherit the full environment.
+                let parent_keys: Vec<String> = std::env::vars_os()
+                    .filter_map(|(k, _)| k.into_string().ok())
+                    .collect();
+                strip_credential_env(&mut command, &parent_keys, env);
             }
             if let Some(cwd) = cwd {
                 command.current_dir(cwd);
@@ -1232,6 +1304,49 @@ pub fn plugin_capabilities(conn: &Arc<McpConnection>) -> Vec<McpPluginTool> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::sanitize_tool_name;
+
+    /// Credential stripping mirrors the v3 process carrier's rule:
+    /// sensitive inherited vars are `env_remove`d unless the server
+    /// spec explicitly re-declares them; lookalikes stay.
+    #[test]
+    fn credential_stripping_matches_the_process_carrier() {
+        assert!(super::is_sensitive_env_key("ANTHROPIC_API_KEY"));
+        assert!(super::is_sensitive_env_key("OPENAI_API_KEY"));
+        assert!(super::is_sensitive_env_key("GITHUB_TOKEN"));
+        assert!(super::is_sensitive_env_key("AWS_SECRET_ACCESS_KEY"));
+        assert!(!super::is_sensitive_env_key("PATH"));
+        assert!(!super::is_sensitive_env_key("TOKENIZER_THREADS")); // no _TOKEN suffix
+        assert!(!super::is_sensitive_env_key("SECRETARY_NAME"));
+
+        let parent: Vec<String> = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "PATH", "HOME"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // The spec explicitly declares one key: it is NOT stripped.
+        let declared = vec![("OPENAI_API_KEY".to_string(), "explicit".to_string())];
+        let mut command = tokio::process::Command::new("true");
+        super::strip_credential_env(&mut command, &parent, &declared);
+        let removed: Vec<String> = command
+            .as_std()
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(removed, vec!["ANTHROPIC_API_KEY".to_string()]);
+    }
+
+    /// User-configured servers opt out of stripping by default; plugin
+    /// carriers opt in via the builder.
+    #[test]
+    fn credential_stripping_is_opt_in() {
+        let spec =
+            super::McpServerSpec::stdio("srv".to_string(), "cmd".to_string(), vec![], vec![], None);
+        assert!(!spec.strip_credentials);
+        assert!(spec.with_credential_stripping().strip_credentials);
+        let http =
+            super::McpServerSpec::http("srv".to_string(), "https://x/mcp".to_string(), vec![]);
+        assert!(!http.strip_credentials);
+    }
 
     #[test]
     fn sanitize_replaces_invalid_chars() {

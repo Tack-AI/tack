@@ -193,10 +193,22 @@ impl AgentHooks for ExtHooks {
         if !self.wants_transform() || messages.is_empty() {
             return None;
         }
-        let payload: Vec<serde_json::Value> = messages
-            .iter()
-            .filter_map(|m| serde_json::to_value(m).ok())
-            .collect();
+        // Serialize ALL messages or none: one unserializable message
+        // silently truncating the payload would let a returned
+        // replacement silently delete history, so refuse the transform
+        // wholesale instead.
+        let mut payload: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
+        for message in messages {
+            match serde_json::to_value(message) {
+                Ok(value) => payload.push(value),
+                Err(e) => {
+                    tracing::warn!(
+                        "hooks/transformContext skipped: a message failed to serialize: {e}"
+                    );
+                    return None;
+                }
+            }
+        }
         let params = TransformContextParams { messages: payload };
         let result = self.client.transform_context(&params).await.ok()??;
         match serde_json::from_value::<Vec<tack_agent_core::AgentMessage>>(

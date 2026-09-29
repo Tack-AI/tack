@@ -124,10 +124,15 @@ pub struct BridgeConnection {
     /// cannot — carrier matrix, design doc §4.4).
     pub serves_provider_stream: bool,
     caps: watch::Sender<Option<bool>>,
-    /// Keeps the channel open: a `watch::Sender::send` with zero live
-    /// receivers fails silently, so the entry pins one.
+    /// Declared `capabilities.provider.register` (plain registrations),
+    /// published alongside `caps` by the load loop.
+    register_caps: watch::Sender<Option<bool>>,
+    /// Keeps the channels open: a `watch::Sender::send` with zero live
+    /// receivers fails silently, so the entry pins one of each.
     #[allow(dead_code)]
     caps_keepalive: Arc<watch::Receiver<Option<bool>>>,
+    #[allow(dead_code)]
+    register_caps_keepalive: Arc<watch::Receiver<Option<bool>>>,
 }
 
 impl BridgeConnection {
@@ -141,12 +146,26 @@ impl BridgeConnection {
             _ => None,
         }
     }
+
+    /// Resolve with the declared `capabilities.provider.register` (the
+    /// plain-registration counterpart of
+    /// [`Self::wait_provider_stream_granted`]).
+    pub async fn wait_provider_register_granted(&self) -> Option<bool> {
+        let mut rx = self.register_caps.subscribe();
+        match tokio::time::timeout(CAPS_WAIT, rx.wait_for(|v| v.is_some())).await {
+            Ok(Ok(granted)) => *granted,
+            _ => None,
+        }
+    }
 }
 
 /// A provider-id registration owned by one bridge instance.
 #[derive(Debug)]
 struct BridgeRegistration {
     instance: u64,
+    /// The plugin that registered the provider (plain or bridged) — the
+    /// ownership check behind `provider/event` routing.
+    plugin: String,
     conn: Arc<dyn PluginConnection>,
 }
 
@@ -198,14 +217,17 @@ impl ProviderBridgeState {
         conn: Arc<dyn PluginConnection>,
         serves_provider_stream: bool,
     ) {
-        let (caps, caps_keepalive) = watch::channel(None);
+        let (caps, caps_rx) = watch::channel(None);
+        let (register_caps, register_caps_rx) = watch::channel(None);
         self.lock().connections.insert(
             plugin.to_string(),
             BridgeConnection {
                 conn,
                 serves_provider_stream,
                 caps,
-                caps_keepalive: Arc::new(caps_keepalive),
+                register_caps,
+                caps_keepalive: Arc::new(caps_rx),
+                register_caps_keepalive: Arc::new(register_caps_rx),
             },
         );
     }
@@ -217,6 +239,16 @@ impl ProviderBridgeState {
     pub fn set_provider_stream_granted(&self, plugin: &str, granted: bool) {
         if let Some(entry) = self.lock().connections.get(plugin) {
             let _ = entry.caps.send(Some(granted));
+        }
+    }
+
+    /// Publish the plugin's declared `capabilities.provider.register` —
+    /// the plain-registration counterpart of
+    /// [`Self::set_provider_stream_granted`], with the same `false`
+    /// semantics for policy-blocked plugins.
+    pub fn set_provider_register_granted(&self, plugin: &str, granted: bool) {
+        if let Some(entry) = self.lock().connections.get(plugin) {
+            let _ = entry.register_caps.send(Some(granted));
         }
     }
 
@@ -387,6 +419,11 @@ impl ProviderBridgeState {
     /// Route a plugin's `provider/event` notification (P7c) onto the
     /// provider-event channel (TUI inline warning + desktop notification;
     /// headless log — identical to the native path).
+    ///
+    /// Forgery guard: `params.provider` is free-form, so it must name a
+    /// provider the emitting plugin actually registered (plain or
+    /// bridged) — otherwise a plugin could spoof rate-limit warnings for
+    /// built-in providers like `anthropic`.
     pub fn route_provider_event(&self, plugin: &str, payload: Value) {
         let params: ProviderEventParams = match serde_json::from_value(payload) {
             Ok(params) => params,
@@ -400,6 +437,20 @@ impl ProviderBridgeState {
                 return;
             }
         };
+        let owned = self
+            .lock()
+            .registrations
+            .get(&params.provider)
+            .is_some_and(|registration| registration.plugin == plugin);
+        if !owned {
+            tracing::warn!(
+                target: AUDIT_TARGET,
+                plugin,
+                provider = params.provider.as_str(),
+                "provider/event for a provider the plugin did not register; dropped"
+            );
+            return;
+        }
         let kind = match params.kind {
             rpc3::ProviderEventKind::RateLimited => tack_ai::ProviderEventKind::RateLimited,
             rpc3::ProviderEventKind::Warning => tack_ai::ProviderEventKind::Warning,
@@ -425,11 +476,16 @@ impl ProviderBridgeState {
         &self,
         provider_id: &str,
         instance: u64,
+        plugin: &str,
         conn: Arc<dyn PluginConnection>,
     ) {
         self.lock().registrations.insert(
             provider_id.to_string(),
-            BridgeRegistration { instance, conn },
+            BridgeRegistration {
+                instance,
+                plugin: plugin.to_string(),
+                conn,
+            },
         );
     }
 
@@ -446,9 +502,9 @@ impl ProviderBridgeState {
     }
 
     /// Watch a serving connection; on carrier death, fail its in-flight
-    /// streams with synthesized in-band errors and unregister the bridge
-    /// providers it serves (load-outcome semantics: a dead plugin registers
-    /// nothing). One watcher per connection.
+    /// streams with synthesized in-band errors and unregister every
+    /// provider it registered — bridged or plain (load-outcome semantics:
+    /// a dead plugin registers nothing). One watcher per connection.
     fn ensure_death_watch(self: &Arc<Self>, plugin: &str, conn: Arc<dyn PluginConnection>) {
         {
             let mut inner = self.lock();
@@ -494,8 +550,9 @@ impl ProviderBridgeState {
                     );
                 }
             }
-            // Bridge providers this connection serves: unregister both the
-            // models and the serving endpoint.
+            // Providers this connection registered (bridged or plain):
+            // unregister the models and, for bridged ones, the serving
+            // endpoint (a no-op for plain ids).
             let owned: Vec<(String, u64)> = inner
                 .registrations
                 .iter()
@@ -618,6 +675,16 @@ impl ProviderStreamBridge for ExtProviderBridge {
         sink: AssistantMessageEventSender,
     ) -> Result<(), String> {
         let stream_id = params.stream_id.clone();
+        // model/context/options cross as provider-shaped JSON (the v3
+        // schema types them free-form; tack-ai's serde types own parsing).
+        // Serialize BEFORE inserting the stream entry: a serialization
+        // error must not leak the entry into the streams map.
+        let wire = ProviderStreamParams {
+            stream_id: stream_id.clone(),
+            model: serde_json::to_value(&params.model).map_err(|e| e.to_string())?,
+            context: serde_json::to_value(&params.context).map_err(|e| e.to_string())?,
+            options: serde_json::to_value(&params.options).map_err(|e| e.to_string())?,
+        };
         let mut closed_rx = self.state.insert_stream(
             &self.plugin,
             &stream_id,
@@ -625,14 +692,6 @@ impl ProviderStreamBridge for ExtProviderBridge {
             self.conn.clone(),
             sink,
         );
-        // model/context/options cross as provider-shaped JSON (the v3
-        // schema types them free-form; tack-ai's serde types own parsing).
-        let wire = ProviderStreamParams {
-            stream_id: stream_id.clone(),
-            model: serde_json::to_value(&params.model).map_err(|e| e.to_string())?,
-            context: serde_json::to_value(&params.context).map_err(|e| e.to_string())?,
-            options: serde_json::to_value(&params.options).map_err(|e| e.to_string())?,
-        };
         tracing::info!(
             target: AUDIT_TARGET,
             plugin = self.plugin.as_str(),
@@ -704,8 +763,16 @@ impl ExtProviderBridge {
 /// The shared `host/registerProvider` handler (TUI and headless services
 /// alike). Plain specs register an HTTP-shim runtime provider (P7a: now
 /// available in every run mode); `bridge: true` specs additionally register
-/// the plugin connection as the serving endpoint (P7b), gated on the
-/// declared `provider.stream` capability and a serving carrier.
+/// the plugin connection as the serving endpoint (P7b).
+///
+/// Both paths are gated the same way: spoof-proof plugin attribution, a
+/// live connection, and the matching declared capability
+/// (`capabilities.provider.register` for plain specs,
+/// `capabilities.provider.stream` + a serving carrier for bridge specs).
+/// The capability answer also carries the managed-policy decision: a
+/// policy-blocked plugin is published `false` (and its connection
+/// withdrawn) before it is blocked at load, so the wait below never
+/// grants it.
 pub async fn handle_register_provider(
     state: &Arc<ProviderBridgeState>,
     params: Value,
@@ -725,19 +792,19 @@ pub async fn handle_register_provider(
     })?;
     let provider_id = spec.id.clone();
     let bridged = spec.bridge == Some(true);
-    let serving = if bridged {
-        if plugin.is_empty() {
-            return Err(service_error(
-                rpc3::ERR_INTERNAL,
-                "bridge registration without plugin attribution",
-            ));
-        }
-        let entry = state.connection(&plugin).ok_or_else(|| {
-            service_error(
-                rpc3::ERR_PLUGIN_UNAVAILABLE,
-                format!("plugin {plugin} has no live connection"),
-            )
-        })?;
+    if plugin.is_empty() {
+        return Err(service_error(
+            rpc3::ERR_INTERNAL,
+            "provider registration without plugin attribution",
+        ));
+    }
+    let entry = state.connection(&plugin).ok_or_else(|| {
+        service_error(
+            rpc3::ERR_PLUGIN_UNAVAILABLE,
+            format!("plugin {plugin} has no live connection"),
+        )
+    })?;
+    if bridged {
         // Capability gate: same rule as every other capability — undeclared
         // means never granted.
         let Some(granted) = entry.wait_provider_stream_granted().await else {
@@ -758,15 +825,30 @@ pub async fn handle_register_provider(
                 "the plugin's carrier does not serve provider/stream",
             ));
         }
-        Some(entry)
     } else {
-        None
-    };
+        // Plain HTTP-shim registration: the declared
+        // `capabilities.provider.register` gates it (a plugin registering
+        // during its own initialize handshake waits here, fail-closed,
+        // until the load loop publishes the handshake answer).
+        let Some(granted) = entry.wait_provider_register_granted().await else {
+            return Err(service_error(
+                rpc3::ERR_CAPABILITY_NOT_GRANTED,
+                "the plugin handshake did not complete in time",
+            ));
+        };
+        if !granted {
+            return Err(service_error(
+                rpc3::ERR_CAPABILITY_NOT_GRANTED,
+                "plugin did not declare capabilities.provider.register",
+            ));
+        }
+    }
     // Validation lives in tack-ai (bridge specs get the reserved api kind;
-    // a conflicting explicit api is a registration error).
+    // a conflicting explicit api is a registration error; built-in id
+    // collisions are rejected for both paths).
     tack_ai::providers::register_runtime_provider(spec)
         .map_err(|e| service_error(rpc3::ERR_INVALID_PARAMS, e))?;
-    if let Some(entry) = serving {
+    let instance = if bridged {
         let bridge = Arc::new(ExtProviderBridge::new(
             plugin.clone(),
             provider_id.clone(),
@@ -775,9 +857,15 @@ pub async fn handle_register_provider(
         ));
         let instance = bridge.instance();
         tack_ai::register_provider_bridge(&provider_id, bridge);
-        state.track_registration(&provider_id, instance, entry.conn.clone());
-        state.ensure_death_watch(&plugin, entry.conn);
-    }
+        instance
+    } else {
+        NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed)
+    };
+    // Plain and bridged registrations alike ride the death watch: a
+    // crashed or shut-down plugin registers nothing (load-outcome
+    // semantics).
+    state.track_registration(&provider_id, instance, &plugin, entry.conn.clone());
+    state.ensure_death_watch(&plugin, entry.conn);
     tracing::info!(
         target: AUDIT_TARGET,
         plugin = plugin.as_str(),

@@ -51,8 +51,12 @@ fn runtime_provider_resolves_as_model() {
     assert!(tack_app::model::resolve_model(id, Some("nope"), agent_dir.path()).is_err());
 }
 
+/// `apiKeyEnv` is NOT resolved from the host environment for runtime
+/// providers (credential hygiene: a plugin-chosen variable name paired
+/// with a plugin-chosen baseUrl would exfiltrate host credentials).
+/// Runtime providers carry their key explicitly in `apiKey` or none.
 #[test]
-fn runtime_provider_api_key_from_env() {
+fn runtime_provider_api_key_env_is_ignored() {
     let id = "test-rt-key";
     let mut spec = spec(id);
     spec.api_key_env = Some("TACK_TEST_RT_KEY".to_string());
@@ -61,7 +65,9 @@ fn runtime_provider_api_key_from_env() {
 
     let agent_dir = tempfile::tempdir().unwrap();
     let key = tack_app::model::resolve_api_key(id, None, agent_dir.path());
-    assert_eq!(key.as_deref(), Some("sk-runtime"));
+    assert_eq!(key, None, "the host environment must not be read");
+    tack_ai::providers::unregister_runtime_provider(id);
+    unsafe { std::env::remove_var("TACK_TEST_RT_KEY") };
 }
 
 #[test]

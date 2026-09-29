@@ -336,10 +336,13 @@ mod tests {
     }
 
     /// P7a: provider registration is mode-independent — headless modes
-    /// honor `host/registerProvider` and the provider resolves in the
-    /// process-global registry like a native one.
+    /// route `host/registerProvider` to the shared handler. The plain
+    /// (non-bridge) path is capability-gated like the bridge path: real
+    /// plugin traffic is tagged by TaggedServices, so an untagged request
+    /// (no plugin attribution) is rejected; the granted-capability happy
+    /// path is covered end-to-end in `tests/provider_bridge_tests.rs`.
     #[tokio::test]
-    async fn register_provider_is_honored_headless() {
+    async fn register_provider_is_capability_gated_headless() {
         let services = HeadlessExtServices::new(
             "print",
             true,
@@ -353,25 +356,17 @@ mod tests {
                 "models": [{"id": "shim-model"}]
             }
         });
-        services
+        let err = services
             .handle_request("host/registerProvider", spec)
             .await
-            .unwrap();
-        let registered = tack_ai::providers::runtime_providers();
+            .unwrap_err();
+        assert_eq!(err.code, tack_ext::rpc3::ERR_INTERNAL, "{err:?}");
         assert!(
-            registered.iter().any(|p| p.id == "headless-shim"),
-            "registered providers: {:?}",
-            registered.iter().map(|p| &p.id).collect::<Vec<_>>()
+            !tack_ai::providers::runtime_providers()
+                .iter()
+                .any(|p| p.id == "headless-shim"),
+            "an unattributed plain registration must not land"
         );
-        // Model resolution reads the same registry (P7a's whole point).
-        let model = crate::model::resolve_model(
-            "headless-shim",
-            Some("shim-model"),
-            std::path::Path::new("/nonexistent-agent-dir"),
-        )
-        .unwrap();
-        assert_eq!(model.api, "openai-completions");
-        tack_ai::providers::unregister_runtime_provider("headless-shim");
     }
 
     /// A bridge registration without a live plugin connection and without

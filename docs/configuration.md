@@ -12,7 +12,7 @@ ones** (some keys have special rules, see below):
 
 | Tier | Location | Notes |
 |---|---|---|
-| **Managed** (org-enforced) | Linux `/etc/tack/managed-settings.json` · macOS `/Library/Application Support/tack/managed-settings.json` · Windows `%ProgramData%\tack\managed-settings.json` (path overridable via `TACK_MANAGED_SETTINGS`) | Highest priority. Applied last in the deep merge. |
+| **Managed** (org-enforced) | Linux `/etc/tack/managed-settings.json` · macOS `/Library/Application Support/tack/managed-settings.json` · Windows `%ProgramData%\tack\managed-settings.json` (path overridable via `TACK_MANAGED_SETTINGS` in development/test builds only — release builds ignore the variable) | Highest priority. Applied last in the deep merge. |
 | **Global** (user) | `~/.tack/agent/settings.json` | User defaults. |
 | **Project** | `<project>/.pi/settings.json` | Loaded only when the project is trusted (`/trust`). |
 
@@ -103,7 +103,10 @@ Built-in server probing: `rs`→rust-analyzer, `ts/tsx/js/jsx/mts/cts/mjs/cjs`�
 - **deny always wins**, and applies in headless modes (print/rpc/serve/CI)
   too.
 - "always" answers in the TUI persist to the `allowAlways` array in
-  `~/.tack/agent/permissions.json` and survive restarts.
+  `~/.tack/agent/permissions.json` and survive restarts. For plugin tools
+  (`ext__*`) the loaded plugin version is recorded alongside
+  (`extToolVersions` map) and the entry only applies while that version is
+  still loaded — `tack ext upgrade` invalidates stale approvals.
 - The untrusted-content defense (see the features doc) temporarily bypasses
   allow rules to force a prompt.
 
@@ -283,7 +286,7 @@ Effective only in managed-settings.json:
 | `lockedProvider` | Lock the provider (blocked at startup and in /model) |
 | `lockedModel` | Lock the model id |
 | `auditSink` | Audit reporting: `{"url": "…", "token": "…", "intervalMs": 5000}` — batch POSTs of trace events (newline-delimited JSON, Bearer auth). Setting this force-enables observability |
-| `pluginPolicy` | Enterprise plugin policy: `managedPluginsOnly`, `allowedSources` (git/hostPattern/local source allow-list), per-plugin `enabled` (wins over user/project), narrow-only `tools`/`mcpServers` intersections, and the `provider` bridge-serving gate (`false` policy-blocks a provider-stream plugin at load). Enforced at install time and at load time; decisions are audit-logged. See docs/extensions.md §9 |
+| `pluginPolicy` | Enterprise plugin policy: `managedPluginsOnly`, `allowedSources` (git/hostPattern/local source allow-list), per-plugin `enabled` (wins over user/project), narrow-only `tools`/`mcpServers` intersections, the `provider` bridge-serving gate (`false` policy-blocks a provider-stream plugin at load), and the `hooks` capability gate (`false` strips the plugin's hook bridges at registration — no tool-call interception — while its tools/commands still load). Enforced at install time and at load time; decisions are audit-logged. See docs/extensions.md §9 |
 
 ### MCP (mcp.json)
 
@@ -310,7 +313,7 @@ Two more MCP switches in settings.json:
 | Variable | Notes |
 |---|---|
 | `TACK_AGENT_DIR` | Agent directory override (default `~/.tack/agent`) |
-| `TACK_MANAGED_SETTINGS` | Managed settings file path override |
+| `TACK_MANAGED_SETTINGS` | Managed settings file path override (development/test builds only; ignored in release builds) |
 | `TACK_TRACE_FILE` | =1 enables JSONL trace export |
 | `TACK_TRACE_LEVEL` | Trace file level (default info) |
 | `TACK_BROWSER` | Browser executable path for headless rendering |
@@ -382,7 +385,7 @@ Subcommands:
   keybindings.json       # keybinding overrides
   mcp.json               # global MCP servers
   mcp-tokens.json        # MCP OAuth token cache (0600, contains refresh_token/client_id)
-  permissions.json       # allow-always persistence ({"allowAlways": [...]})
+  permissions.json       # allow-always persistence ({"allowAlways": [...], "extToolVersions": {...}})
   cron.json              # scheduled tasks
   catalog.json           # model catalog cache pulled by refresh (deleted by /models reset)
   catalog.meta.json      # catalog origin and fetch time (version/providers/models/fetchedAt)

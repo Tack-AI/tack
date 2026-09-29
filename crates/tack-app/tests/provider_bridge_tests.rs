@@ -387,3 +387,267 @@ async fn provider_event_surfaces_on_the_event_channel() {
     manager.shutdown().await;
     cleanup(provider_id).await;
 }
+
+// ---------------------------------------------------------------------------
+// Plain (non-bridge) registration gates — in-memory duplex fixtures (the
+// connection exists for attribution, capability, and death-watch liveness;
+// nothing crosses the wire).
+// ---------------------------------------------------------------------------
+
+/// A silent peer side for the in-memory duplex.
+struct SilentPeer;
+
+#[async_trait::async_trait]
+impl tack_ext::v3::PeerHandler for SilentPeer {}
+
+/// A live host-side connection over an in-memory duplex, plus the raw
+/// plugin-side stream: dropping it kills the carrier (host-side EOF).
+fn duplex_connection() -> (
+    Arc<dyn tack_ext::v3::PluginConnection>,
+    tokio::io::DuplexStream,
+) {
+    let (host_side, plugin_side) = tokio::io::duplex(64 * 1024);
+    let (reader, writer) = tokio::io::split(host_side);
+    let host_peer = tack_ext::v3::JsonRpcPeer::new(reader, writer, Arc::new(SilentPeer));
+    (
+        Arc::new(tack_ext::v3::HostClient::new(host_peer)),
+        plugin_side,
+    )
+}
+
+fn plain_spec(id: &str) -> serde_json::Value {
+    json!({
+        "id": id,
+        "baseUrl": "http://localhost:9/v1",
+        "api": "openai-completions",
+        "models": [{"id": "m1"}]
+    })
+}
+
+fn is_registered(provider_id: &str) -> bool {
+    tack_ai::providers::runtime_providers()
+        .iter()
+        .any(|p| p.id == provider_id)
+}
+
+/// A plain registration needs plugin attribution, a live connection, and
+/// the declared `capabilities.provider.register` — the same gate posture
+/// as the bridge path.
+#[tokio::test]
+async fn plain_registration_requires_attribution_connection_and_capability() {
+    let _guard = ENV_LOCK.lock().await;
+    let state = tack_app::ext_provider_bridge::ProviderBridgeState::shared();
+    // No attribution (TaggedServices injects `plugin` for real traffic).
+    let err = tack_app::ext_provider_bridge::handle_register_provider(
+        &state,
+        json!({"provider": plain_spec("plain-noattr")}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, tack_ext::rpc3::ERR_INTERNAL, "{err:?}");
+    // Attribution but no live connection.
+    let err = tack_app::ext_provider_bridge::handle_register_provider(
+        &state,
+        json!({"plugin": "ghost@user", "provider": plain_spec("plain-ghost")}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, tack_ext::rpc3::ERR_PLUGIN_UNAVAILABLE, "{err:?}");
+    // Live connection, capability not granted (undeclared).
+    let (conn, _plugin_side) = duplex_connection();
+    state.register_connection("plug@user", conn, false);
+    state.set_provider_register_granted("plug@user", false);
+    let err = tack_app::ext_provider_bridge::handle_register_provider(
+        &state,
+        json!({"plugin": "plug@user", "provider": plain_spec("plain-denied")}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err.code,
+        tack_ext::rpc3::ERR_CAPABILITY_NOT_GRANTED,
+        "{err:?}"
+    );
+    assert!(err.message.contains("provider.register"), "{err:?}");
+    assert!(!is_registered("plain-denied"));
+}
+
+/// With the capability granted, a plain registration lands in the
+/// process-global runtime registry and resolves like a models.json custom.
+#[tokio::test]
+async fn plain_registration_with_capability_registers_and_resolves() {
+    let _guard = ENV_LOCK.lock().await;
+    let provider_id = "plain-granted";
+    let state = tack_app::ext_provider_bridge::ProviderBridgeState::shared();
+    let (conn, _plugin_side) = duplex_connection();
+    state.register_connection("plug@user", conn, false);
+    state.set_provider_register_granted("plug@user", true);
+    tack_app::ext_provider_bridge::handle_register_provider(
+        &state,
+        json!({"plugin": "plug@user", "provider": plain_spec(provider_id)}),
+    )
+    .await
+    .unwrap();
+    assert!(is_registered(provider_id));
+    let agent_dir = tempfile::tempdir().unwrap();
+    let model = tack_app::model::resolve_model(provider_id, Some("m1"), agent_dir.path())
+        .expect("plain-registered model resolves");
+    assert_eq!(model.api, "openai-completions");
+    assert_eq!(model.base_url, "http://localhost:9/v1");
+    cleanup(provider_id).await;
+}
+
+/// A registration that arrives during the plugin's own initialize
+/// handshake waits (fail-closed) for the capability answer; when the load
+/// loop then policy-blocks the plugin, the pending registration is
+/// rejected and nothing stays registered.
+#[tokio::test]
+async fn plain_registration_during_init_is_rejected_when_policy_blocked() {
+    let _guard = ENV_LOCK.lock().await;
+    let provider_id = "plain-initblock";
+    let state = tack_app::ext_provider_bridge::ProviderBridgeState::shared();
+    let (conn, _plugin_side) = duplex_connection();
+    state.register_connection("plug@user", conn, false);
+    // The registration races the handshake: no capability answer yet.
+    let pending = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            tack_app::ext_provider_bridge::handle_register_provider(
+                &state,
+                json!({"plugin": "plug@user", "provider": plain_spec(provider_id)}),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The load loop's policy-block sequence (declares provider.* while
+    // managed policy denies it): grant nothing, withdraw the connection.
+    state.set_provider_stream_granted("plug@user", false);
+    state.set_provider_register_granted("plug@user", false);
+    state.remove_connection("plug@user");
+    let err = pending.await.unwrap().unwrap_err();
+    assert_eq!(
+        err.code,
+        tack_ext::rpc3::ERR_CAPABILITY_NOT_GRANTED,
+        "{err:?}"
+    );
+    assert!(!is_registered(provider_id));
+}
+
+/// A plugin that registered plain providers and then dies gets them
+/// unregistered — load-outcome semantics, same as bridged providers.
+#[tokio::test]
+async fn plugin_death_unregisters_plain_providers() {
+    let _guard = ENV_LOCK.lock().await;
+    let provider_id = "plain-death";
+    let state = tack_app::ext_provider_bridge::ProviderBridgeState::shared();
+    let (conn, plugin_side) = duplex_connection();
+    state.register_connection("plug@user", conn, false);
+    state.set_provider_register_granted("plug@user", true);
+    tack_app::ext_provider_bridge::handle_register_provider(
+        &state,
+        json!({"plugin": "plug@user", "provider": plain_spec(provider_id)}),
+    )
+    .await
+    .unwrap();
+    assert!(is_registered(provider_id));
+    // Carrier death: the plugin side of the duplex closes.
+    drop(plugin_side);
+    for _ in 0..100 {
+        if !is_registered(provider_id) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("dead plugin's plain provider was not unregistered");
+}
+
+/// Runtime providers must not shadow a built-in id (they would inherit
+/// the user's stored credentials for the built-in while steering requests
+/// to a plugin-chosen endpoint).
+#[tokio::test]
+async fn registration_colliding_with_a_builtin_id_is_rejected() {
+    let _guard = ENV_LOCK.lock().await;
+    let state = tack_app::ext_provider_bridge::ProviderBridgeState::shared();
+    let (conn, _plugin_side) = duplex_connection();
+    state.register_connection("plug@user", conn, true);
+    state.set_provider_register_granted("plug@user", true);
+    state.set_provider_stream_granted("plug@user", true);
+    // Plain spec.
+    let err = tack_app::ext_provider_bridge::handle_register_provider(
+        &state,
+        json!({"plugin": "plug@user", "provider": plain_spec("anthropic")}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, tack_ext::rpc3::ERR_INVALID_PARAMS, "{err:?}");
+    assert!(err.message.contains("anthropic"), "{err:?}");
+    // Bridge spec: equally rejected.
+    let err = tack_app::ext_provider_bridge::handle_register_provider(
+        &state,
+        json!({"plugin": "plug@user", "provider": {"id": "anthropic", "bridge": true, "models": [{"id": "m1"}]}}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, tack_ext::rpc3::ERR_INVALID_PARAMS, "{err:?}");
+    assert!(err.message.contains("anthropic"), "{err:?}");
+    assert!(!is_registered("anthropic"));
+}
+
+/// `provider/event` forgery guard: events for a provider the emitting
+/// plugin did not register are dropped; events for its own provider ride
+/// the channel.
+#[tokio::test]
+async fn provider_event_requires_plugin_ownership() {
+    let _guard = ENV_LOCK.lock().await;
+    let provider_id = "plain-events";
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tack_ai::set_provider_event_notifier(Some(Arc::new(move |event| {
+        let _ = tx.send(event);
+    })));
+    let state = tack_app::ext_provider_bridge::ProviderBridgeState::shared();
+    let (conn, _plugin_side) = duplex_connection();
+    state.register_connection("plug@user", conn, false);
+    state.set_provider_register_granted("plug@user", true);
+    tack_app::ext_provider_bridge::handle_register_provider(
+        &state,
+        json!({"plugin": "plug@user", "provider": plain_spec(provider_id)}),
+    )
+    .await
+    .unwrap();
+    // Spoofing a built-in provider id: dropped.
+    state.route_provider_event(
+        "plug@user",
+        json!({"provider": "anthropic", "kind": "rateLimited", "message": "forged"}),
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err(),
+        "forged provider/event must not reach the channel"
+    );
+    // Another plugin emitting for THIS plugin's provider: dropped.
+    state.route_provider_event(
+        "other@user",
+        json!({"provider": provider_id, "kind": "warning", "message": "forged"}),
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err(),
+        "provider/event from a non-owner must not reach the channel"
+    );
+    // The owning plugin's event: forwarded.
+    state.route_provider_event(
+        "plug@user",
+        json!({"provider": provider_id, "kind": "warning", "message": "heads up"}),
+    );
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("own provider event arrived")
+        .expect("channel open");
+    assert_eq!(event.provider, provider_id);
+    assert_eq!(event.kind, tack_ai::ProviderEventKind::Warning);
+    tack_ai::set_provider_event_notifier(None);
+    cleanup(provider_id).await;
+}

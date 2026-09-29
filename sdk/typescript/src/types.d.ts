@@ -1,4 +1,5 @@
 // GENERATED from protocol/tack-rpc.openrpc.json by `cargo run -p xtask -- codegen`. Do not edit by hand.
+// Note: uint64 schema fields (cursorOffset, messageCount, token usage, timeoutMs) are plain JS `number` here — values above 2^53 lose precision.
 
 export const ERR_PARSE = -32700;
 export const ERR_INVALID_REQUEST = -32600;
@@ -20,7 +21,7 @@ export const TOOLS_EXECUTE = "tools/execute";
 export const COMMANDS_INVOKE = "commands/invoke";
 /** [host-to-plugin] A tool call is about to run; the plugin may allow, deny (reason becomes the error tool result), or rewrite the arguments. Chained plugins observe the previous plugin's rewrite; the first deny short-circuits. */
 export const HOOKS_BEFORE_TOOL_CALL = "hooks/beforeToolCall";
-/** [host-to-plugin] COW context pipeline (opt-in via capabilities.hooks.transformContext): a null result means unchanged; a returned list replaces the messages every later hook sees. */
+/** [host-to-plugin] COW context pipeline (opt-in via capabilities.hooks.transformContext): a null result means unchanged; a returned {messages: [...]} object replaces the messages every later hook sees. */
 export const HOOKS_TRANSFORM_CONTEXT = "hooks/transformContext";
 /** [host-to-plugin] Observe and patch a tool result (opt-in via capabilities.hooks.afterToolCall). Patches merge in chain order; later plugins win per field. */
 export const HOOKS_AFTER_TOOL_CALL = "hooks/afterToolCall";
@@ -311,8 +312,10 @@ export interface PluginInfo {
   "version"?: string;
 }
 
-/** Provider bridge surface: the plugin serves inference for the providers it registers (host/registerProvider with bridge: true) through provider/stream. */
+/** Provider surface: `register` — the plugin calls host/registerProvider with plain (non-bridge) specs; `stream` — the plugin additionally serves inference for the providers it registers (host/registerProvider with bridge: true) through provider/stream. */
 export interface ProviderCapability {
+  /** The plugin calls host/registerProvider with plain (non-bridge) specs. */
+  "register"?: boolean;
   /** The plugin implements provider/stream. */
   "stream"?: boolean;
 }
@@ -449,7 +452,7 @@ export interface TransformContextParams {
   "messages": Array<any>;
 }
 
-/** null = unchanged; a list replaces the context every later hook (and the loop) sees. */
+/** null = unchanged; a returned {messages: [...]} object replaces the context every later hook (and the loop) sees. */
 export interface TransformContextResult {
   "messages": Array<any>;
 }

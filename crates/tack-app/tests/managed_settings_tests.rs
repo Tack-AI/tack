@@ -82,4 +82,19 @@ fn managed_layer_wins_and_denies_union() {
     assert!(!plain.features.cron, "global cron=false restored");
     assert!(plain.features.lsp);
     assert!(plain.locked_provider.is_none());
+
+    // The env override resolves the managed path in this (debug) test
+    // binary. Release builds ignore TACK_MANAGED_SETTINGS entirely
+    // (managed_settings_env_override in settings.rs gates on
+    // cfg!(debug_assertions)) so the managed control plane — sole source
+    // of pluginPolicy / disableBypass / lockedProvider — cannot be
+    // disengaged by a process env var; that path is compile-time gated
+    // and not exercisable from a debug test binary.
+    if !cfg!(debug_assertions) {
+        panic!("tests must run in a debug build for the env override to apply");
+    }
+    assert_eq!(
+        tack_app::settings::managed_settings_path(),
+        tmp.path().join("does-not-exist.json")
+    );
 }

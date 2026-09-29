@@ -212,6 +212,79 @@ notice can parse entries (same convention as TS pi).
 
 ### Fixed
 
+- **Plugin security hardening (second post-redesign review).**
+  - ACP sessions ordered plugin `beforeToolCall` bridges AFTER the
+    permission layer, so a plugin could rewrite a command the human had
+    already approved (and past `permissions.deny`). Plugin bridges now
+    run BEFORE deny rules and the prompt in ACP too — every surface
+    (TUI/rpc/print/acp/subagent) sees the final post-rewrite arguments.
+  - Provider-bridge trust boundary: plain (non-bridge)
+    `host/registerProvider` now requires the new declared
+    `capabilities.provider.register` + managed policy (previously
+    ungated — any plugin, even a sandboxed one, could register HTTP-shim
+    providers); registrations whose id collides with a built-in
+    provider are rejected (a plugin can no longer shadow e.g.
+    `anthropic` and redirect its traffic); `apiKeyEnv` is no longer
+    resolved from the HOST environment for plugin-registered providers;
+    plain registrations are revoked when the plugin dies or is shut
+    down; `provider/event` notifications are accepted only for provider
+    ids the emitting plugin actually registered. SDK parity: all three
+    SDKs gained a `provider_register`/`providerRegister` builder knob.
+  - The WIT component carrier now resolves the version-qualified
+    interface names real toolchains emit (`tack:plugin/tools@0.3.0`,
+    falling back to the bare names for hand-written guests) —
+    wit-bindgen/cargo-component guests actually load now — and a guest
+    built for a different WIT version gets an error naming both
+    versions instead of a misleading "exports neither" failure.
+  - Managed-control-plane escape hatches closed: `TACK_MANAGED_SETTINGS`
+    is honored only in debug/test builds (release binaries ignore it),
+    and the project `.pi/settings.json` `plugins."<id>".enabled` map is
+    only read for trusted projects — an untrusted clone can no longer
+    disable your guardrail plugins. Managed policy can now also strip a
+    plugin's `hooks` capability (`pluginPolicy.plugins."<id>".hooks:
+    false`) while keeping its tools, and the `mcpServers` narrowing
+    list matches an MCP-carrier plugin by id or bare name.
+  - Approval integrity: rpc mode honors PreToolUse
+    `permissionDecision: "ask"`/`"allow"` verdicts (previously recorded
+    into a map nobody read, letting the plugin approval chain approve a
+    call a shell hook had escalated); allow-always approvals for
+    `ext__*` tools now bind the loaded plugin version — a plugin
+    upgrade invalidates stale approvals instead of applying them to
+    unreviewed code (permissions.json gained an additive
+    `extToolVersions` key; legacy ext__* entries are ignored).
+  - v3 protocol robustness: plugin tool calls are no longer killed by
+    the 30s default RPC timeout (they run until the turn cancels them,
+    and cancellation now reaches the plugin via `$/cancelRequest`);
+    graceful shutdown of a hung plugin costs ~5s instead of ~32s and
+    plugins shut down concurrently; a write failure on the wire marks
+    the peer dead instead of desynchronizing NDJSON framing; inbound
+    requests/notifications are concurrency-capped (a flooding plugin is
+    disconnected); requests with unparseable ids get `-32600` instead
+    of being silently downgraded to notifications; duplicate request
+    ids are rejected; plugin-provided result `details` survive on
+    text-only tool results; `transformContext` serialization failure
+    leaves the context unchanged instead of silently truncating it.
+  - SDK robustness: Python plugins no longer die on NDJSON lines over
+    64 KiB (asyncio default limit — now 16 MiB like Rust/TS); the
+    TypeScript peer survives write failures (was an unhandled
+    rejection = process crash) and ignores non-object lines like the
+    other peers; the Rust SDK answers pre-`initialize` requests with a
+    protocol error instead of panicking-and-dropping.
+  - Distribution hardening: concurrent same-process installs no longer
+    share one `.staging-<pid>` directory; a corrupt
+    `extensions-lock.json` fails CLOSED when `extensionLockRequired`
+    is set and is backed up before any rewrite (pins survive);
+    marketplace http client re-validates every redirect hop (no
+    https→http downgrade) and archive-fallback sync tries the
+    remaining URL/ref candidates when one serves an undecodable body;
+    extracted archive file modes are masked to `0o755` (no
+    world-writable plugin code); plugin metrics declarations cap the
+    operation count; MCP-carrier plugin servers no longer inherit the
+    host's credential environment variables (parity with the process
+    carrier); a WASM manifest `module` path can no longer escape the
+    extension directory; `tack ext remove --local` rejects path-like
+    names; `ext dev` rejects a non-object `providerStream` step
+    instead of panicking.
 - **Plugin security hardening (post-redesign review).**
   - Pinned marketplaces now REFUSE an unsigned replacement catalog
     (previously only warned) — a signature-stripping downgrade can no

@@ -15,6 +15,7 @@ from typing import Any, Awaitable, Callable, Optional
 from .peer import (
     ERR_METHOD_NOT_FOUND,
     ERR_PLUGIN_UNAVAILABLE,
+    MAX_LINE_BYTES,
     JsonRpcPeer,
     PeerError,
 )
@@ -157,6 +158,7 @@ class Plugin:
         self._config_schema: Optional[dict] = None
         self._metrics: Optional[dict] = None
         self._provider_stream_handler: Optional[Callable] = None
+        self._provider_register: bool = False
         self._on_ready: Optional[Callable] = None
         # streamId -> cancellation event for in-flight provider/stream
         # handlers (provider/streamCancel sets it; entries drop on
@@ -231,6 +233,16 @@ class Plugin:
         self._provider_stream_handler = handler
         return self
 
+    def provider_register(self, enabled: bool = True) -> "Plugin":
+        """Declare the ``provider.register`` capability: the plugin calls
+        ``host/registerProvider`` with plain (non-bridge) provider specs
+        (typically from :meth:`on_ready`). The host rejects plain
+        registrations from plugins that did not declare it; bridge
+        providers (``bridge: True``) serve inference and need
+        :meth:`provider_stream` instead."""
+        self._provider_register = enabled
+        return self
+
     def on_ready(self, handler: Callable) -> "Plugin":
         """Run once after the initialize handshake is answered — the
         registration entry point for provider plugins (call
@@ -292,8 +304,13 @@ class Plugin:
                 capabilities["config"] = {"schema": self._config_schema}
             if self._metrics is not None:
                 capabilities["metrics"] = self._metrics
-            if self._provider_stream_handler is not None:
-                capabilities["provider"] = {"stream": True}
+            if self._provider_stream_handler is not None or self._provider_register:
+                provider: dict[str, Any] = {}
+                if self._provider_stream_handler is not None:
+                    provider["stream"] = True
+                if self._provider_register:
+                    provider["register"] = True
+                capabilities["provider"] = provider
             plugin_info: dict[str, Any] = {"name": self._name}
             if self._version is not None:
                 plugin_info["version"] = self._version
@@ -455,7 +472,10 @@ def _stdio_streams() -> tuple[asyncio.StreamReader, _StdoutWriter]:
     """A StreamReader fed from stdin on a daemon thread + the stdout
     writer. (Cross-platform: no connect_read_pipe portability traps.)"""
     loop = asyncio.get_running_loop()
-    reader: asyncio.StreamReader = asyncio.StreamReader()
+    # Mirror the TS/Rust peers' 16 MiB line cap: the default 64 KiB
+    # limit makes readline() raise ValueError on routine oversized
+    # NDJSON lines, silently killing the connection via the read pump.
+    reader: asyncio.StreamReader = asyncio.StreamReader(limit=MAX_LINE_BYTES + 1)
 
     def pump() -> None:
         while True:

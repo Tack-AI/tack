@@ -14,12 +14,13 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
+use tokio_util::sync::CancellationToken;
 
 use crate::process::{OverCap, read_line_bounded};
 use crate::rpc3::{
-    ERR_INTERNAL, ERR_METHOD_NOT_FOUND, ERR_PARSE, ERR_PLUGIN_UNAVAILABLE, ERR_REQUEST_TIMEOUT,
-    ErrorObject, Id, Notification, Request, Response,
+    ERR_INTERNAL, ERR_INVALID_REQUEST, ERR_METHOD_NOT_FOUND, ERR_PARSE, ERR_PLUGIN_UNAVAILABLE,
+    ERR_REQUEST_TIMEOUT, ErrorObject, Id, Notification, Request, Response,
 };
 
 /// Default bound on one outgoing request (mirrors the v1 protocol).
@@ -31,6 +32,13 @@ pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// `$/cancelRequest` notification (LSP convention): aborts the in-flight
 /// handler task for the given id; the aborted side sends no response.
 pub const CANCEL_METHOD: &str = "$/cancelRequest";
+
+/// Bound on concurrent INBOUND request/notification handler tasks. A
+/// well-behaved plugin never approaches the low hundreds; beyond that the
+/// remote is flooding us, and spawning/queuing unboundedly would be a
+/// memory and CPU DoS against the host — exhaustion is treated as
+/// protocol abuse and fails closed (the peer is killed, not queued).
+const MAX_INFLIGHT_INBOUND: usize = 256;
 
 type PendingMap = Arc<Mutex<HashMap<Id, oneshot::Sender<PendingOutcome>>>>;
 
@@ -84,7 +92,12 @@ pub enum PeerError {
     /// The call exceeded its timeout; a best-effort `$/cancelRequest`
     /// was sent.
     Timeout,
-    /// The call was cancelled locally via [`JsonRpcPeer::cancel`].
+    /// The call was cancelled locally (via [`JsonRpcPeer::cancel`] or a
+    /// cancellation token). Note [`PeerError::code`] deliberately aliases
+    /// this to `ERR_REQUEST_TIMEOUT`: the rpc3 schema is generated and
+    /// defines no distinct cancellation code, so callers must match the
+    /// VARIANT — not the code — to tell local cancellation apart from a
+    /// real timeout.
     Cancelled,
     /// Transport/serialization failure.
     Transport(String),
@@ -99,6 +112,8 @@ impl PeerError {
         match self {
             PeerError::Dead => ERR_PLUGIN_UNAVAILABLE,
             PeerError::Timeout => ERR_REQUEST_TIMEOUT,
+            // Deliberate alias of Timeout: rpc3.rs is generated (no
+            // hand-edits, no new codes) and has no cancellation code.
             PeerError::Cancelled => ERR_REQUEST_TIMEOUT,
             PeerError::Transport(_) => ERR_INTERNAL,
             PeerError::Remote(error) => error.code,
@@ -130,8 +145,16 @@ pub struct JsonRpcPeer {
     next_id: AtomicU64,
     alive: Arc<AtomicBool>,
     write_timeout_ms: AtomicU64,
-    /// Read pump; awaited by `wait_dead` so liveness is deterministic.
+    /// Read pump; aborted by `mark_dead` so a write-side death (timeout,
+    /// flood kill) tears down a pump parked in a read.
     pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Liveness broadcast behind `wait_dead`: flipped by `mark_dead` so
+    /// EVERY concurrent waiter observes the real death (a taken
+    /// JoinHandle would only ever resolve the first caller).
+    dead: watch::Sender<bool>,
+    /// Permits for inbound request/notification handler tasks; see
+    /// [`MAX_INFLIGHT_INBOUND`].
+    inbound_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for JsonRpcPeer {
@@ -149,6 +172,7 @@ impl JsonRpcPeer {
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
+        let (dead, _) = watch::channel(false);
         let peer = Arc::new(JsonRpcPeer {
             writer: AsyncMutex::new(Box::new(writer)),
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -157,6 +181,8 @@ impl JsonRpcPeer {
             alive: Arc::new(AtomicBool::new(true)),
             write_timeout_ms: AtomicU64::new(WRITE_TIMEOUT.as_millis() as u64),
             pump: Mutex::new(None),
+            dead,
+            inbound_permits: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_INBOUND)),
         });
         let pump_peer = peer.clone();
         let handle = tokio::spawn(async move { pump_peer.read_pump(reader, handler).await });
@@ -168,11 +194,16 @@ impl JsonRpcPeer {
         self.alive.load(Ordering::SeqCst)
     }
 
-    /// Wait until the read pump observes EOF. Idempotent.
+    /// Wait until the peer dies (EOF, IO error, flood kill). Safe for
+    /// any number of concurrent callers: liveness rides a watch channel
+    /// flipped by `mark_dead`, so every waiter observes the real death —
+    /// not just the first caller to take a JoinHandle.
     pub async fn wait_dead(&self) {
-        let handle = self.pump.lock().expect("pump mutex").take();
-        if let Some(handle) = handle {
-            let _ = handle.await;
+        let mut rx = self.dead.subscribe();
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                return;
+            }
         }
     }
 
@@ -189,6 +220,47 @@ impl JsonRpcPeer {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, PeerError> {
+        let (id, rx, _cleanup) = self.begin_call(method, params).await?;
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(outcome) => Self::resolve(outcome),
+            Err(_) => {
+                self.send_cancel(&id).await;
+                Err(PeerError::Timeout)
+            }
+        }
+    }
+
+    /// Call with NO wall-clock timeout, bound to a [`CancellationToken`]
+    /// instead: on cancel the remote is told to abort via
+    /// `$/cancelRequest` carrying the real allocated id, and the waiter
+    /// fails with [`PeerError::Cancelled`]. For long-running work (tool
+    /// execution — builds, test suites) where `REQUEST_TIMEOUT` would
+    /// kill legitimate runs; keep `call`/`call_with_timeout` for
+    /// everything else.
+    pub async fn call_cancellable(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: CancellationToken,
+    ) -> Result<Value, PeerError> {
+        let (id, rx, _cleanup) = self.begin_call(method, params).await?;
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                self.send_cancel(&id).await;
+                Err(PeerError::Cancelled)
+            }
+            outcome = rx => Self::resolve(outcome),
+        }
+    }
+
+    /// Shared prologue of an outgoing call: liveness check, id
+    /// allocation, pending-map registration (the returned guard removes
+    /// the entry if the waiter is dropped mid-flight), request write.
+    async fn begin_call(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<(Id, oneshot::Receiver<PendingOutcome>, PendingCleanup), PeerError> {
         if !self.is_alive() {
             return Err(PeerError::Dead);
         }
@@ -198,7 +270,7 @@ impl JsonRpcPeer {
             .lock()
             .expect("pending mutex")
             .insert(id.clone(), tx);
-        let _cleanup = PendingCleanup {
+        let cleanup = PendingCleanup {
             pending: self.pending.clone(),
             id: id.clone(),
         };
@@ -206,16 +278,20 @@ impl JsonRpcPeer {
         let line =
             serde_json::to_string(&request).map_err(|e| PeerError::Transport(e.to_string()))?;
         self.write_line(&line).await?;
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(PendingOutcome::Response(Ok(result)))) => Ok(result),
-            Ok(Ok(PendingOutcome::Response(Err(error)))) => Err(PeerError::Remote(error)),
-            Ok(Ok(PendingOutcome::Cancelled)) => Err(PeerError::Cancelled),
+        Ok((id, rx, cleanup))
+    }
+
+    /// Interpret a resolved pending receiver uniformly across the
+    /// timeout/cancellation wrappers.
+    fn resolve(
+        outcome: Result<PendingOutcome, oneshot::error::RecvError>,
+    ) -> Result<Value, PeerError> {
+        match outcome {
+            Ok(PendingOutcome::Response(Ok(result))) => Ok(result),
+            Ok(PendingOutcome::Response(Err(error))) => Err(PeerError::Remote(error)),
+            Ok(PendingOutcome::Cancelled) => Err(PeerError::Cancelled),
             // Sender dropped without answering: the pump died.
-            Ok(Err(_)) => Err(PeerError::Dead),
-            Err(_) => {
-                self.send_cancel(&id).await;
-                Err(PeerError::Timeout)
-            }
+            Err(_) => Err(PeerError::Dead),
         }
     }
 
@@ -256,20 +332,30 @@ impl JsonRpcPeer {
             writer.write_all(b"\n").await?;
             writer.flush().await
         };
-        tokio::time::timeout(timeout, write)
-            .await
-            .map_err(|_| PeerError::Timeout)?
-            .map_err(|e| {
-                if self.is_alive() {
-                    PeerError::Transport(e.to_string())
-                } else {
-                    PeerError::Dead
-                }
-            })
+        match tokio::time::timeout(timeout, write).await {
+            Ok(Ok(())) => Ok(()),
+            // A timed-out or failed write can leave a PARTIAL NDJSON
+            // frame in the pipe: framing is permanently desynchronized,
+            // so the peer is dead — every caller must fail fast, not
+            // just this one.
+            Err(_) => {
+                self.mark_dead();
+                Err(PeerError::Timeout)
+            }
+            Ok(Err(e)) => {
+                self.mark_dead();
+                Err(PeerError::Transport(e.to_string()))
+            }
+        }
     }
 
     fn mark_dead(&self) {
         self.alive.store(false, Ordering::SeqCst);
+        // Wake every wait_dead caller FIRST: liveness must land no
+        // matter which path detected the death. send_replace (not send)
+        // because it stores the value even with zero receivers — a
+        // waiter subscribing after death must still observe it.
+        self.dead.send_replace(true);
         if let Ok(mut pending) = self.pending.lock() {
             pending.clear();
         }
@@ -277,6 +363,13 @@ impl JsonRpcPeer {
             for (_, handle) in inflight.drain() {
                 handle.abort();
             }
+        }
+        // Abort the read pump when death was detected write-side or by
+        // the flood guard: a pump parked in a read would otherwise
+        // linger forever. On the EOF path the pump calls this itself and
+        // aborting its own (finishing) handle is a harmless no-op.
+        if let Some(handle) = self.pump.lock().expect("pump mutex").take() {
+            handle.abort();
         }
     }
 
@@ -310,19 +403,60 @@ impl JsonRpcPeer {
 
     fn dispatch(self: &Arc<Self>, message: Value, handler: &Arc<dyn PeerHandler>) {
         let method = message.get("method").and_then(Value::as_str);
+        // Distinguish "id absent" (notification) from "id present but not
+        // a legal JSON-RPC id" (invalid request): `Id` only accepts a
+        // u64 or a string, so negatives/floats/bools/null land in Err.
         let id = message
             .get("id")
-            .and_then(|v| serde_json::from_value::<Id>(v.clone()).ok());
+            .map(|v| serde_json::from_value::<Id>(v.clone()));
         let params = message.get("params").cloned().unwrap_or(Value::Null);
         match (method, id) {
             // Incoming request: answer in a spawned task (tracked for
             // cancellation).
-            (Some(method), Some(id)) => {
+            (Some(method), Some(Ok(id))) => {
+                // Bounded inbound concurrency: a hostile plugin flooding
+                // requests must not spawn unbounded tasks. Exhaustion is
+                // protocol abuse — fail closed (kill the peer) rather
+                // than queue without bound.
+                let Ok(permit) = self.inbound_permits.clone().try_acquire_owned() else {
+                    tracing::warn!(
+                        "inbound request flood exceeded {MAX_INFLIGHT_INBOUND}; killing peer"
+                    );
+                    self.mark_dead();
+                    return;
+                };
+                {
+                    let mut inflight = self.inflight.lock().expect("inflight mutex");
+                    // Reap finished handles BEFORE the duplicate check so
+                    // a completed-but-unreaped task is not mistaken for
+                    // a live collision (see the race note below).
+                    inflight.retain(|_, handle| !handle.is_finished());
+                    // A duplicate id would overwrite the inflight entry
+                    // and corrupt cancellation: reject the newcomer, keep
+                    // the original task.
+                    if inflight.contains_key(&id) {
+                        drop(inflight);
+                        let peer = self.clone();
+                        tokio::spawn(async move {
+                            let response = Response::error(
+                                Some(id),
+                                ERR_INVALID_REQUEST,
+                                "duplicate request id",
+                            );
+                            if let Ok(line) = serde_json::to_string(&response) {
+                                let _ = peer.write_line(&line).await;
+                            }
+                        });
+                        return;
+                    }
+                }
                 let peer = self.clone();
                 let handler = handler.clone();
                 let method = method.to_string();
                 let task_id = id.clone();
                 let task = tokio::spawn(async move {
+                    // The permit is held for the handler's whole life.
+                    let _permit = permit;
                     let outcome = handler.handle_request(&method, params).await;
                     let response = match outcome {
                         Ok(result) => Response::result(Some(id.clone()), result),
@@ -353,6 +487,19 @@ impl JsonRpcPeer {
                     .expect("inflight mutex")
                     .retain(|_, handle| !handle.is_finished());
             }
+            // Method with an id that is present but unparseable
+            // (negative, float, bool, null): Invalid Request per spec,
+            // answered with a null id — the offending id cannot be
+            // echoed back because it is not representable.
+            (Some(_), Some(Err(_))) => {
+                let response = Response::error(None, ERR_INVALID_REQUEST, "invalid request id");
+                if let Ok(line) = serde_json::to_string(&response) {
+                    let peer = self.clone();
+                    tokio::spawn(async move {
+                        let _ = peer.write_line(&line).await;
+                    });
+                }
+            }
             // Incoming notification.
             (Some(method), None) => {
                 if method == CANCEL_METHOD {
@@ -371,14 +518,25 @@ impl JsonRpcPeer {
                     }
                     return;
                 }
+                // Same inbound bound as requests: notifications spawn
+                // handler tasks too, so an unbounded flood here is just
+                // as much a DoS.
+                let Ok(permit) = self.inbound_permits.clone().try_acquire_owned() else {
+                    tracing::warn!(
+                        "inbound notification flood exceeded {MAX_INFLIGHT_INBOUND}; killing peer"
+                    );
+                    self.mark_dead();
+                    return;
+                };
                 let handler = handler.clone();
                 let method = method.to_string();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     handler.handle_notification(&method, params).await;
                 });
             }
             // Incoming response: complete the pending call.
-            (None, Some(id)) => {
+            (None, Some(Ok(id))) => {
                 let outcome = if let Some(error) = message.get("error") {
                     match serde_json::from_value::<ErrorObject>(error.clone()) {
                         Ok(error) => Err(error),
@@ -396,7 +554,7 @@ impl JsonRpcPeer {
                 }
             }
             // Neither request, notification, nor response: ignore.
-            (None, None) => {}
+            (None, _) => {}
         }
     }
 }
@@ -590,5 +748,188 @@ mod tests {
         let response: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(response["error"]["code"], ERR_PARSE);
         assert!(response["id"].is_null());
+    }
+
+    /// A failed write leaves a partial NDJSON frame in the pipe, so the
+    /// peer must die: the failing call errors AND every later call fails
+    /// fast with Dead instead of writing into a desynchronized stream.
+    #[tokio::test]
+    async fn failed_write_marks_peer_dead() {
+        // Reader side: the far writer is held open, so the pump never
+        // observes EOF on its own.
+        let (read_half, _dangling_writer) = tokio::io::duplex(1024);
+        // Writer side: the far reader is dropped, so every write fails.
+        let (dropped_reader, write_half) = tokio::io::duplex(1024);
+        drop(dropped_reader);
+        let peer = JsonRpcPeer::new(read_half, write_half, Arc::new(Echo));
+        let err = peer.call("echo", Value::Null).await.unwrap_err();
+        assert!(
+            matches!(err, PeerError::Transport(_) | PeerError::Timeout),
+            "the failing call surfaces the write failure: {err:?}"
+        );
+        assert!(!peer.is_alive(), "a failed write must kill the peer");
+        let err = peer.call("echo", Value::Null).await.unwrap_err();
+        assert!(
+            matches!(err, PeerError::Dead),
+            "subsequent calls fail fast: {err:?}"
+        );
+        // wait_dead resolves even though the pump never saw EOF.
+        tokio::time::timeout(Duration::from_secs(5), peer.wait_dead())
+            .await
+            .expect("wait_dead must observe the write-side death");
+    }
+
+    /// An id that is present but not a legal JSON-RPC id (negative,
+    /// float) is Invalid Request (-32600) with a null id — not a silent
+    /// downgrade to a notification.
+    #[tokio::test]
+    async fn unparseable_id_gets_invalid_request_response() {
+        let (s1, s2) = tokio::io::duplex(64 * 1024);
+        let (r1, w1) = tokio::io::split(s1);
+        let (mut r2, mut w2) = tokio::io::split(s2);
+        let _peer = JsonRpcPeer::new(r1, w1, Arc::new(Echo));
+        w2.write_all(br#"{"jsonrpc":"2.0","id":-3,"method":"echo"}"#)
+            .await
+            .unwrap();
+        w2.write_all(b"\n").await.unwrap();
+        w2.write_all(br#"{"jsonrpc":"2.0","id":1.5,"method":"echo"}"#)
+            .await
+            .unwrap();
+        w2.write_all(b"\n").await.unwrap();
+        w2.flush().await.unwrap();
+        let mut reader = tokio::io::BufReader::new(&mut r2);
+        let mut buf = Vec::new();
+        for _ in 0..2 {
+            let line = read_line_bounded(&mut reader, &mut buf, OverCap::Fail)
+                .await
+                .unwrap()
+                .unwrap();
+            let response: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                response["error"]["code"],
+                crate::rpc3::ERR_INVALID_REQUEST,
+                "{response}"
+            );
+            // The offending id cannot be echoed back (not representable).
+            assert!(response["id"].is_null(), "{response}");
+        }
+    }
+
+    /// A duplicate request id must be rejected (Invalid Request) without
+    /// disturbing the original in-flight task.
+    #[tokio::test]
+    async fn duplicate_request_id_is_rejected_and_original_survives() {
+        /// "hold" blocks until released; anything else echoes.
+        struct Gate(Arc<tokio::sync::Notify>);
+        #[async_trait::async_trait]
+        impl PeerHandler for Gate {
+            async fn handle_request(
+                &self,
+                method: &str,
+                params: Value,
+            ) -> Result<Value, ErrorObject> {
+                match method {
+                    "hold" => {
+                        self.0.notified().await;
+                        Ok(serde_json::json!("held"))
+                    }
+                    other => Echo.handle_request(other, params).await,
+                }
+            }
+        }
+        let (s1, s2) = tokio::io::duplex(64 * 1024);
+        let (r1, w1) = tokio::io::split(s1);
+        let (mut r2, mut w2) = tokio::io::split(s2);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let _peer = JsonRpcPeer::new(r1, w1, Arc::new(Gate(release.clone())));
+        // The pump dispatches lines in order and registers inflight
+        // synchronously, so no sleep is needed between the two sends.
+        w2.write_all(br#"{"jsonrpc":"2.0","id":1,"method":"hold"}"#)
+            .await
+            .unwrap();
+        w2.write_all(b"\n").await.unwrap();
+        w2.write_all(br#"{"jsonrpc":"2.0","id":1,"method":"echo","params":{"x":1}}"#)
+            .await
+            .unwrap();
+        w2.write_all(b"\n").await.unwrap();
+        w2.flush().await.unwrap();
+        let mut reader = tokio::io::BufReader::new(&mut r2);
+        let mut buf = Vec::new();
+        // The duplicate is rejected immediately; the original still runs.
+        let line = read_line_bounded(&mut reader, &mut buf, OverCap::Fail)
+            .await
+            .unwrap()
+            .unwrap();
+        let rejection: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            rejection["error"]["code"],
+            crate::rpc3::ERR_INVALID_REQUEST,
+            "{rejection}"
+        );
+        assert_eq!(rejection["id"], 1);
+        // Releasing the gate lets the ORIGINAL request complete normally.
+        release.notify_one();
+        let line = read_line_bounded(&mut reader, &mut buf, OverCap::Fail)
+            .await
+            .unwrap()
+            .unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["result"], "held", "{response}");
+        assert_eq!(response["id"], 1);
+    }
+
+    /// An unbounded inbound notification flood is protocol abuse: the
+    /// peer fails closed instead of spawning without bound.
+    #[tokio::test]
+    async fn notification_flood_kills_peer() {
+        struct Sleepy;
+        #[async_trait::async_trait]
+        impl PeerHandler for Sleepy {
+            async fn handle_notification(&self, _method: &str, _params: Value) {
+                // Hold the permit long enough for the flood to exhaust it.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
+        let (s1, s2) = tokio::io::duplex(64 * 1024);
+        let (r1, w1) = tokio::io::split(s1);
+        let (_r2, mut w2) = tokio::io::split(s2);
+        let peer = JsonRpcPeer::new(r1, w1, Arc::new(Sleepy));
+        let mut payload = String::new();
+        for i in 0..(MAX_INFLIGHT_INBOUND + 64) {
+            payload.push_str(&format!("{{\"jsonrpc\":\"2.0\",\"method\":\"n{i}\"}}\n"));
+        }
+        w2.write_all(payload.as_bytes()).await.unwrap();
+        w2.flush().await.unwrap();
+        for _ in 0..100 {
+            if !peer.is_alive() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("inbound flood did not kill the peer");
+    }
+
+    /// Every concurrent wait_dead caller must observe the real death,
+    /// not just the first to take the pump handle.
+    #[tokio::test]
+    async fn concurrent_wait_dead_callers_all_observe_death() {
+        let (s1, s2) = tokio::io::duplex(1024);
+        let (r1, w1) = tokio::io::split(s1);
+        let peer = JsonRpcPeer::new(r1, w1, Arc::new(Echo));
+        let mut waiters = Vec::new();
+        for _ in 0..8 {
+            let peer = peer.clone();
+            waiters.push(tokio::spawn(async move { peer.wait_dead().await }));
+        }
+        // Let all waiters subscribe before the death lands.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(s2);
+        for waiter in waiters {
+            tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("a wait_dead caller hung")
+                .unwrap();
+        }
+        assert!(!peer.is_alive());
     }
 }

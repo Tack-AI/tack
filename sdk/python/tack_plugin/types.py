@@ -1,9 +1,7 @@
 # GENERATED from protocol/tack-rpc.openrpc.json by `cargo run -p xtask -- codegen`. Do not edit by hand.
 
 from enum import Enum
-from typing import Any, Optional, TypedDict
-
-from typing import NotRequired
+from typing import Any, NotRequired, TypedDict
 
 ERR_PARSE = -32700
 ERR_INVALID_REQUEST = -32600
@@ -283,7 +281,8 @@ class PluginInfo(TypedDict):
 
 
 class ProviderCapability(TypedDict):
-    """Provider bridge surface: the plugin serves inference for the providers it registers (host/registerProvider with bridge: true) through provider/stream."""
+    """Provider surface: `register` — the plugin calls host/registerProvider with plain (non-bridge) specs; `stream` — the plugin additionally serves inference for the providers it registers (host/registerProvider with bridge: true) through provider/stream."""
+    register: NotRequired[bool]
     stream: NotRequired[bool]
 
 
@@ -419,7 +418,7 @@ class TransformContextParams(TypedDict):
 
 
 class TransformContextResult(TypedDict):
-    """null = unchanged; a list replaces the context every later hook (and the loop) sees."""
+    """null = unchanged; a returned {messages: [...]} object replaces the context every later hook (and the loop) sees."""
     messages: list[Any]
 
 

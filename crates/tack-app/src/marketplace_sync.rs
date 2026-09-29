@@ -414,11 +414,34 @@ fn archive_urls(source: &str, reference: &str) -> Vec<String> {
 
 const MAX_CATALOG_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 32 * 1024 * 1024;
+/// Redirect hop cap for catalog/archive fetches — a reqwest custom
+/// redirect policy must enforce its own limit (the default of 10 no
+/// longer applies).
+const MAX_REDIRECTS: usize = 10;
+
+/// Whether a redirect hop to `target` (after `hops` prior redirects)
+/// may proceed. Every hop re-runs the same scheme rule as the initial
+/// URL: reqwest's default policy follows up to 10 redirects WITHOUT
+/// re-validating, so an https catalog/archive URL could otherwise
+/// downgrade to http:// or hop to a non-public host. Loopback http
+/// targets stay allowed, matching `validate_url_scheme`'s exception
+/// for local mirrors.
+fn redirect_allowed(target: &str, hops: usize) -> bool {
+    hops < MAX_REDIRECTS
+        && crate::catalog_refresh::validate_url_scheme(target, "redirect target").is_ok()
+}
 
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent(concat!("tack/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if redirect_allowed(attempt.url().as_str(), attempt.previous().len()) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -466,8 +489,18 @@ async fn fetch_catalog_via_archive(
                     .unwrap_or_else(|| tmp.path().to_path_buf());
                 Ok(std::fs::read(root.join(&catalog_path))?)
             })
-            .await??;
-            return Ok((extracted, reference.clone()));
+            .await
+            .map_err(|e| anyhow::anyhow!("archive extraction worker failed: {e}"))?;
+            // A forge can answer 200 with a non-tarball body (a login
+            // page, error HTML): treat extraction/catalog-read failures
+            // like fetch failures — a later URL/ref candidate may work.
+            match extracted {
+                Ok(catalog) => return Ok((catalog, reference.clone())),
+                Err(e) => {
+                    last_error = Some(e.context(format!("extracting {url}")));
+                    continue;
+                }
+            }
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no archive URL candidates for {source}")))
@@ -1034,6 +1067,126 @@ mod tests {
             ]
         );
         assert!(archive_urls("git@git.acme.com:tack/plugins.git", "main").is_empty());
+    }
+
+    /// Redirect decisions re-validate every hop against the same rule
+    /// as the initial URL (policy-level, no network).
+    #[test]
+    fn redirect_hops_are_revalidated() {
+        assert!(redirect_allowed("https://cdn.example.com/x", 0));
+        // The loopback exception matches validate_url_scheme.
+        assert!(redirect_allowed("http://127.0.0.1:8080/x", 0));
+        assert!(redirect_allowed("http://localhost/x", 0));
+        assert!(redirect_allowed("http://[::1]:8080/x", 0));
+        // An https → http downgrade to a public host is rejected.
+        assert!(!redirect_allowed("http://evil.example.com/x", 0));
+        assert!(!redirect_allowed("ftp://example.com/x", 0));
+        assert!(!redirect_allowed("example.com/x", 0));
+        // The hop cap stops redirect loops.
+        assert!(!redirect_allowed("https://example.com/x", MAX_REDIRECTS));
+        assert!(redirect_allowed("https://example.com/x", MAX_REDIRECTS - 1));
+    }
+
+    /// One queued fixture response: (status line, extra headers, body).
+    type FixtureResponse = (String, Vec<(String, String)>, Vec<u8>);
+
+    /// One-shot loopback HTTP responder: serves each queued response to
+    /// one connection, in order, then exits. (Loopback http is the
+    /// sanctioned test exception in validate_url_scheme — no real
+    /// network is involved.)
+    fn serve_http(responses: Vec<FixtureResponse>) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for (status, headers, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                // Drain the request head (bounded — tests only).
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 16 * 1024 {
+                    if stream.read(&mut byte).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    head.push(byte[0]);
+                }
+                let mut response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    body.len()
+                );
+                for (key, value) in &headers {
+                    response.push_str(&format!("{key}: {value}\r\n"));
+                }
+                response.push_str("\r\n");
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(&body).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        port
+    }
+
+    /// A 302 whose target fails the scheme rule is stopped by the
+    /// redirect policy: the fetch fails without ever dialing the
+    /// target (192.0.2.1 is TEST-NET-1 — unroutable by design).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn redirect_to_insecure_target_is_rejected() {
+        let port = serve_http(vec![(
+            "302 Found".to_string(),
+            vec![("Location".to_string(), "http://192.0.2.1/evil".to_string())],
+            Vec::new(),
+        )]);
+        let url = format!("http://127.0.0.1:{port}/catalog.json");
+        let err = http_get(&url, MAX_CATALOG_BYTES, "marketplace catalog")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("fetching"), "{err:#}");
+    }
+
+    /// Build a minimal repo-snapshot tgz: one top-level dir with one file.
+    fn make_snapshot_tgz(top_dir: &str, file: &str, body: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_mode(0o755);
+        header.set_size(0);
+        builder
+            .append_data(&mut header, format!("{top_dir}/"), std::io::empty())
+            .unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_size(body.len() as u64);
+        builder
+            .append_data(&mut header, format!("{top_dir}/{file}"), body)
+            .unwrap();
+        let tar = builder.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar).unwrap();
+        gz.finish().unwrap()
+    }
+
+    /// A 200 with a non-tarball body on the first candidate must not
+    /// kill the sync: extraction failures fall through to the next
+    /// URL/ref candidate exactly like fetch failures.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn archive_fallback_continues_past_a_bad_archive() {
+        let catalog = br#"{"name": "corp", "plugins": {}}"#;
+        let tgz = make_snapshot_tgz("plugins-main", "marketplace.json", catalog);
+        let port = serve_http(vec![
+            // GitHub shape: the forge answers 200 with an HTML page.
+            ("200 OK".to_string(), vec![], b"<html>login</html>".to_vec()),
+            // GitLab shape: the real snapshot.
+            ("200 OK".to_string(), vec![], tgz),
+        ]);
+        let source = format!("http://127.0.0.1:{port}/tack/plugins.git");
+        let (content, used_ref) =
+            fetch_catalog_via_archive(&source, &["main".to_string()], "marketplace.json")
+                .await
+                .unwrap();
+        assert_eq!(content, catalog);
+        assert_eq!(used_ref, "main");
     }
 
     /// A local-path sync activates the catalog and short-circuits the

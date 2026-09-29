@@ -197,6 +197,13 @@ deny rules → PreToolUse hook decisions → mode gate (plan/acceptEdits/bypass)
   managed `auditSink` deployments see them like policy decisions.
 - Wired surfaces: **TUI and rpc** (the prompt-capable surfaces this
   repo owns); acp and remote-host prompts are a documented follow-up.
+- Managed policy can strip a plugin's hook bridges wholesale with
+  `pluginPolicy.plugins."<id>".hooks: false`: the plugin's
+  tools/commands still load, but it contributes no
+  `beforeToolCall`/`transformContext`/`afterToolCall`/`approvalReview`
+  bridge (audited with `audit_narrow`). An org that allows a plugin
+  for one benign tool must not silently grant it rewrite/block power
+  over every tool call in the session.
 
 ### 3.1d Provider bridges (`provider/stream`)
 
@@ -238,7 +245,17 @@ plus a settings-gated desktop notification, log line headless, all
 audited under the `plugin_provider` tracing target alongside the other
 plugin audit targets. Managed policy can deny serving with
 `pluginPolicy.plugins."<id>".provider: false` (the plugin becomes
-policy-blocked at load, audited with `audit_narrow`).
+policy-blocked at load, audited with `audit_narrow`). The same gate
+covers the plain (non-bridge) path: `host/registerProvider` without
+`bridge: true` requires the declared `capabilities.provider.register`
+capability plus managed policy. Built-in provider id collisions are
+rejected — a plugin must not shadow a built-in's `baseUrl` while the
+host keeps handing it the user's stored credentials — and `apiKeyEnv`
+is not resolved from the host environment for plugin-registered
+providers (a plugin-chosen variable name paired with a plugin-chosen
+`baseUrl` would harvest host credentials). See
+[plugin-provider-bridge.md](plugin-provider-bridge.md) §7 for the full
+threat model.
 
 ### 3.2 Identity, load outcome, and the store
 

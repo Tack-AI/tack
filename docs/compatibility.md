@@ -263,6 +263,15 @@ in `docs/upstream-alignment.md` (§5).
     `bridge` flag (`RuntimeProviderSpec.bridge` — additive optional
     field; `models.json` is unchanged). Bridge models carry the
     reserved api kind `ext-provider-bridge`.
+  - `PluginCapabilities.provider.register` (additive) declares plain
+    (non-bridge) registration: `host/registerProvider` with a plain
+    spec is now capability-gated (`ERR_CAPABILITY_NOT_GRANTED` when
+    undeclared) and managed-policy gated exactly like bridge serving —
+    a managed `provider` deny turns a plugin declaring either flag
+    policy-blocked at load. Runtime providers (plain or bridge) whose
+    id collides with a built-in provider id are rejected, and
+    `apiKeyEnv` is no longer resolved from the host environment for
+    runtime providers (they carry their key in `apiKey` or none).
   - `provider/stream` (host→plugin, fast ack) starts one inference
     stream; `provider/streamCancel` (notification) aborts it;
     `provider/streamEvent` (plugin→host notification) carries one
@@ -285,6 +294,13 @@ in `docs/upstream-alignment.md` (§5).
   - The native rate-limit notifier generalized into the provider-event
     channel (`tack_ai::set_provider_event_notifier`); the codebuddy
     provider rides it unchanged in behavior.
+- **Allow-always persistence**: `permissions.json` gained an additive
+  `extToolVersions` map binding each `ext__*` allow-always entry to the
+  plugin version recorded at approval time. Old tack versions ignore
+  the unknown key entirely; new tack ignores legacy `ext__*`
+  allow-always entries without a recorded version (fail-closed — the
+  entry simply stops matching, so a `tack ext upgrade` cannot ride a
+  stale approval).
 
 **Commitment.**
 

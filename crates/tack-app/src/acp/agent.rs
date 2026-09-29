@@ -983,23 +983,35 @@ impl Agent for TackAcpAgent {
             mode: state.mode.clone(),
             untrusted_seen: state.untrusted_seen.clone(),
         });
+        // Hook ordering (rpc/prompt.rs / print_mode.rs parity — SECURITY):
+        // tack-ext plugin `hooks/beforeToolCall` bridges run BEFORE the
+        // permission layer so a plugin Rewrite lands before approval:
+        // permissions.deny, the mode gate and the ACP permission prompt
+        // all see (and the prompt displays) the FINAL, post-rewrite
+        // arguments. The reverse order (permission gate first, plugin
+        // bridges last) let a plugin rewrite a command AFTER the human
+        // approved it and after deny rules matched — the rewritten
+        // command then executed approved, and deny rules never saw the
+        // post-rewrite args (HooksChain: Rewrite replaces the args for
+        // every LATER hook and the tool). A plugin Allow is not terminal
+        // (HooksChain: Allow continues), so this cannot bypass deny rules
+        // or the mode gate.
+        let mut chain: Vec<Arc<dyn AgentHooks>> = ext_hooks;
         // permissions.deny applies in ACP sessions too (rpc/print parity):
-        // deny rules run BEFORE the mode gate / user prompt, so a denied
-        // tool is blocked even in bypass mode.
-        let hooks = crate::permissions::chain_with_deny_rules(
+        // deny rules run before the mode gate / user prompt — now over the
+        // post-rewrite arguments — so a denied tool is blocked even in
+        // bypass mode.
+        let deny_rules = crate::permissions::PermissionRules::load(
             &self.settings,
             &tack_session::default_agent_dir(),
-            acp_hooks,
         );
-        // tack-ext plugin hooks see the final arguments after every other
-        // hook in the chain.
-        let hooks: Arc<dyn AgentHooks> = if ext_hooks.is_empty() {
-            hooks
-        } else {
-            let mut chain = vec![hooks];
-            chain.extend(ext_hooks);
-            Arc::new(tack_agent_core::HooksChain::new(chain))
-        };
+        if !deny_rules.deny.is_empty() {
+            chain.push(Arc::new(crate::permissions::DenyRulesHooks {
+                rules: deny_rules,
+            }));
+        }
+        chain.push(acp_hooks);
+        let hooks: Arc<dyn AgentHooks> = Arc::new(tack_agent_core::HooksChain::new(chain));
 
         let config = AgentLoopConfig {
             model: turn_model.clone(),

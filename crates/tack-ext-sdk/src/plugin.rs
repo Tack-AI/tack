@@ -81,6 +81,7 @@ pub struct PluginBuilder {
     config_schema: Option<Value>,
     metrics: Option<MetricsDeclaration>,
     provider_stream: Option<ProviderStreamHandler>,
+    provider_register: bool,
     on_ready: Option<ReadyHandler>,
 }
 
@@ -268,6 +269,17 @@ impl PluginBuilder {
         self
     }
 
+    /// Declare the `provider.register` capability: the plugin calls
+    /// `host/registerProvider` with plain (non-bridge) provider specs
+    /// (typically from [`on_ready`](Self::on_ready)). The host rejects
+    /// plain registrations from plugins that did not declare it; bridge
+    /// providers (`bridge: true`) serve inference and need
+    /// [`provider_stream`](Self::provider_stream) instead.
+    pub fn provider_register(mut self, enabled: bool) -> Self {
+        self.provider_register = enabled;
+        self
+    }
+
     /// Run once after the initialize handshake is answered — the
     /// registration entry point for provider plugins (call
     /// [`crate::Host::register_provider`] here) and for any plugin that
@@ -325,6 +337,7 @@ impl Plugin {
             config_schema: None,
             metrics: None,
             provider_stream: None,
+            provider_register: false,
             on_ready: None,
         }
     }
@@ -435,10 +448,12 @@ impl Dispatch {
                     .clone()
                     .map(|schema| ConfigDeclaration { schema }),
                 metrics: builder.metrics.clone(),
-                provider: builder
-                    .provider_stream
-                    .as_ref()
-                    .map(|_| ProviderCapability { stream: Some(true) }),
+                provider: (builder.provider_stream.is_some() || builder.provider_register).then(
+                    || ProviderCapability {
+                        stream: builder.provider_stream.as_ref().map(|_| true),
+                        register: builder.provider_register.then_some(true),
+                    },
+                ),
             },
         };
         let _ = self.state.init.set(params);
@@ -459,6 +474,15 @@ impl Dispatch {
 impl PeerHandler for Dispatch {
     async fn handle_request(&self, rpc_method: &str, params: Value) -> Result<Value, ErrorObject> {
         let builder = &self.plugin.builder;
+        // Everything except the handshake requires a completed
+        // initialize; a misbehaving host gets an internal error rather
+        // than a silently dropped request (handler panics on the unset
+        // init state would kill the spawned task without a response).
+        if !matches!(rpc_method, method::INITIALIZE | method::SHUTDOWN)
+            && self.state.init.get().is_none()
+        {
+            return Err(Error::internal(format!("request before initialize: {rpc_method}")).into());
+        }
         match rpc_method {
             method::INITIALIZE => self.on_initialize(params),
             method::SHUTDOWN => {
@@ -539,7 +563,9 @@ impl PeerHandler for Dispatch {
                 };
                 let params: ProviderStreamParams = parse(params)?;
                 let stream_id = params.stream_id.clone();
-                let peer = self.state.peer.get().expect("plugin is serving").clone();
+                let Some(peer) = self.state.peer.get().cloned() else {
+                    return Err(Error::internal("plugin is not serving yet").into());
+                };
                 let cancel = CancellationToken::new();
                 self.provider_streams
                     .lock()
@@ -579,6 +605,12 @@ impl PeerHandler for Dispatch {
     }
 
     async fn handle_notification(&self, rpc_method: &str, params: Value) {
+        // Notifications before initialize are dropped: there is no
+        // channel to report an error on, and running a handler without
+        // the negotiated init state could panic inside user code.
+        if self.state.init.get().is_none() {
+            return;
+        }
         match rpc_method {
             method::EVENTS_LIFECYCLE => {
                 if let Some(handler) = &self.plugin.builder.event_handler

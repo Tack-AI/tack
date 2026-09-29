@@ -235,6 +235,13 @@ ACP 侧的破坏性变更只通过上游 crate 升级进入，会在 CHANGELOG �
     （`RuntimeProviderSpec.bridge`——只增的可选字段；
     `models.json` 不变）。桥接模型携带保留的 api kind
     `ext-provider-bridge`。
+  - `PluginCapabilities.provider.register`（只增）声明 plain（非桥）
+    注册：以 plain spec 调用 `host/registerProvider` 现在与桥供推理
+    一样受能力门控（未声明则以 `ERR_CAPABILITY_NOT_GRANTED` 拒绝）
+    与 managed 策略门控——managed 的 `provider` 拒绝会令声明任一
+    标志的插件在加载时进入 policy-blocked。id 与内建 provider 冲突
+    的运行时 provider（plain 或桥）被拒绝；`apiKeyEnv` 不再为运行时
+    provider 从宿主环境解析（密钥须在 `apiKey` 中显式携带，或不带）。
   - `provider/stream`（宿主→插件，快速 ack）启动一次推理流；
     `provider/streamCancel`（通知）中止它；
     `provider/streamEvent`（插件→宿主通知）按 `streamId` 解复用，
@@ -253,6 +260,12 @@ ACP 侧的破坏性变更只通过上游 crate 升级进入，会在 CHANGELOG �
   - 原生的限速通知器泛化为 provider 事件通道
     （`tack_ai::set_provider_event_notifier`）；codebuddy provider
     搭上它，行为不变。
+- **allow-always 持久化**：`permissions.json` 新增了只增的
+  `extToolVersions` 映射，把每个 `ext__*` allow-always 条目绑定到
+  批准时记录的插件版本。旧版 tack 完全忽略这个未知键；新版 tack
+  会忽略没有记录版本的遗留 `ext__*` allow-always 条目（fail-closed
+  ——条目只是不再匹配，因此 `tack ext upgrade` 无法搭 stale 批准的
+  便车）。
 
 **承诺。**
 

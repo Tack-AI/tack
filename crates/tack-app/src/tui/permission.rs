@@ -67,15 +67,12 @@ pub enum PermissionChoice {
     Deny,
 }
 
-/// Key for allow-always caching: tool + first identifying arg.
-fn allow_always_key(tool_name: &str, args: &Value) -> String {
-    let first = args
-        .get("path")
-        .or_else(|| args.get("command"))
-        .or_else(|| args.get("pattern"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    format!("{tool_name}:{first}")
+/// Key for allow-always caching: tool + first identifying arg — with the
+/// loaded plugin version embedded for ext__* tools so `tack ext upgrade`
+/// (which swaps the code behind the tool name) invalidates stale
+/// approvals (see `crate::permissions::allow_always_key`).
+fn allow_always_key(agent_dir: &std::path::Path, tool_name: &str, args: &Value) -> String {
+    crate::permissions::allow_always_key(agent_dir, tool_name, args)
 }
 
 /// Hooks-side permission gate: decides from mode/rules/cache, else forwards
@@ -188,7 +185,7 @@ impl tack_agent_core::AgentHooks for TuiPermissionHooks {
             if self.rules.allow_match(ctx.tool_name, ctx.args).is_some() {
                 return BeforeToolCallOutcome::Allow;
             }
-            let key = allow_always_key(ctx.tool_name, ctx.args);
+            let key = allow_always_key(&self.agent_dir, ctx.tool_name, ctx.args);
             if lock_recover(&self.allow_always).contains(&key) {
                 return BeforeToolCallOutcome::Allow;
             }
@@ -265,7 +262,7 @@ impl TuiPermissionHooks {
                 _ => {}
             }
         }
-        let key = allow_always_key(ctx.tool_name, ctx.args);
+        let key = allow_always_key(&self.agent_dir, ctx.tool_name, ctx.args);
         let (tx, rx) = oneshot::channel();
         let query = PermissionQuery {
             tool_call_id: ctx.tool_call_id.to_string(),
