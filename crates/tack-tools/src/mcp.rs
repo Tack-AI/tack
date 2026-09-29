@@ -116,7 +116,7 @@ impl McpServerSpec {
 
     /// Opt in to credential stripping for stdio spawns: sensitive
     /// inherited env vars (API keys, tokens — see
-    /// [`is_sensitive_env_key`]) the spec does not explicitly declare
+    /// `is_sensitive_env_key`) the spec does not explicitly declare
     /// are removed from the child process. For PLUGIN carriers only —
     /// a plugin is third-party code and the host's API keys are not
     /// its business. User-configured MCP servers deliberately keep the
