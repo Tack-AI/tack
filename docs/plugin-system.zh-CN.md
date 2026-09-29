@@ -319,3 +319,7 @@ tack ext marketplace remove acme
   收益；用 `ext install` + 重启代替）
 - 企业策略（P5）、指标 sidecar 与分发同步（P6）——Level-2 MCP server
   插件与 WIT/组件 WASM 载体（P4）已落地，见 §3.3/§3.4
+- 一等 provider 桥——插件直接供推理而不是注册一个 HTTP 端点，以及
+  headless 模式的 `host/registerProvider`——设计见
+  [plugin-provider-bridge.zh-CN.md](plugin-provider-bridge.zh-CN.md)
+  （P7，未落地）

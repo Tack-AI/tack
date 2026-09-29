@@ -375,3 +375,7 @@ gated**).
 - Enterprise policy (P5), metrics sidecar + distribution sync (P6) —
   Level-2 MCP server plugins and the WIT/component WASM carrier (P4)
   landed and are documented in §3.3/§3.4
+- First-class provider bridges — a plugin serving inference directly
+  instead of registering an HTTP endpoint, plus `host/registerProvider`
+  in headless modes — designed in
+  [plugin-provider-bridge.md](plugin-provider-bridge.md) (P7, not landed)

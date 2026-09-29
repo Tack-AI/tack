@@ -409,6 +409,7 @@ Given zero installed base:
 | P4 | MCP server plugins (Level 2); WIT/component WASM carrier | P1 | landed |
 | P5 | Enterprise policy (allow-lists, load-time filter, narrow-only) | P3 | landed |
 | P6 | Distribution (curated sync, bundles, catalog v2) + observability (metrics sidecar, telemetry, doctor) | P3, P5 | landed |
+| P7 | Provider bridges: headless `registerProvider`, the `provider/stream` bridge, provider events | P3 | designed — [plugin-provider-bridge.md](plugin-provider-bridge.md) |
 
 P0–P2 are the DX spine and ship first — a plugin system is its
 development loop. P3–P6 make it enterprise-grade; their designs are
