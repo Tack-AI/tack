@@ -496,7 +496,9 @@ fn audit_capability_grants(name: &str, caps: &tack_ext_wasm::WasmCapabilities) {
 
 /// A running plugin's carrier handle (process or WASM module).
 pub enum PluginHandle {
-    Process(V3Process),
+    /// Boxed: `V3Process` embeds `tokio::process::Child`, which dwarfs
+    /// the other variants (especially on Windows).
+    Process(Box<V3Process>),
     /// Option: shutdown consumes the plugin (take()).
     #[cfg(feature = "wasm")]
     Wasm(Option<tack_ext_wasm::WasmPlugin>),
@@ -1772,7 +1774,7 @@ impl ExtensionManager {
                                     "extension {id_string}: metrics scratch file unavailable: {e}"
                                 )),
                             }
-                            PluginHandle::Process(process)
+                            PluginHandle::Process(Box::new(process))
                         }
                         Err(e) => {
                             manager.plugins.push(LoadedPlugin::failed(

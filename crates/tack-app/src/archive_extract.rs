@@ -99,6 +99,8 @@ pub fn extract_tgz(tgz_bytes: &[u8], dest: &Path, caps: &ExtractCaps) -> anyhow:
             );
         }
         let declared_size = header.size().unwrap_or(u64::MAX);
+        // Only consumed by the Unix permission restore below.
+        #[cfg(unix)]
         let mode_bits = header.mode().unwrap_or(0o644);
         if !is_dir && declared_size > caps.max_file_bytes {
             anyhow::bail!("archive entry is {declared_size} bytes, over the per-file cap");
