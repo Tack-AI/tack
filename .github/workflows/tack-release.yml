@@ -71,10 +71,35 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # Release notes = this version's CHANGELOG.md section (its existence
+      # is verified above), not GitHub's --generate-notes: that one only
+      # sees merged PRs, while most release work lands as direct pushes to
+      # main, so auto-notes came out as dependabot-only noise. The compare
+      # base is the next section header — no git-tag dependency.
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          version="${TAG#tack-v}"
+          awk -v v="$version" '
+            index($0, "## [" v "]") == 1 { flag = 1; next }
+            /^## \[/ && flag { exit }
+            flag
+          ' CHANGELOG.md > release-notes.md
+          prev="$(awk -v v="$version" '
+            index($0, "## [" v "]") == 1 { flag = 1; next }
+            /^## \[/ && flag {
+              match($0, /[0-9]+\.[0-9]+\.[0-9]+/)
+              print substr($0, RSTART, RLENGTH)
+              exit
+            }
+          ' CHANGELOG.md)"
+          if [ -n "$prev" ]; then
+            printf '\n---\n**Full Changelog**: https://github.com/%s/compare/tack-v%s...tack-v%s\n' \
+              "${{ github.repository }}" "$prev" "$version" >> release-notes.md
+          fi
       - name: Create draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "$TAG" --draft --title "tack ${TAG#tack-v}" --generate-notes --verify-tag
+        run: gh release create "$TAG" --draft --title "tack ${TAG#tack-v}" --notes-file release-notes.md --verify-tag
 
   build:
     needs: prepare

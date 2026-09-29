@@ -64,7 +64,9 @@ git push origin tack-v0.9.0
 
 1. **prepare** — 校验 tag 版本与 `Cargo.toml` 一致、检查 CHANGELOG 条目、
    跑 fmt + clippy 预检（快速失败，避免浪费 6 平台并行构建），创建 GitHub
-   Release（release notes 由 `--generate-notes` 自动生成，可事后在网页编辑）
+   Release（release notes 提取自本版本在 CHANGELOG.md 中的段落——
+   `--generate-notes` 只识别合并的 PR，曾生成全是 dependabot 的无效
+   notes；body 仍可事后在网页编辑）
 2. **build** — 6 平台并行 `cargo build --release --locked --package tack-app`，
    各自打包为 tar.gz / zip
 3. **publish** — 汇总产物、生成 `SHA256SUMS.txt`，上传到 Release
