@@ -231,13 +231,36 @@ impl Host {
         Ok(result.config)
     }
 
-    /// `host/registerProvider` (trust/mode gated).
+    /// `host/registerProvider` (trust/mode gated). Pass `bridge: true`
+    /// with a declared `provider.stream` capability to serve inference
+    /// for the provider's models yourself (the P7 provider bridge).
     pub async fn register_provider(&self, provider: Value) -> Result<(), PeerError> {
         self.call_unit(
             method::HOST_REGISTER_PROVIDER,
             &tack_ext::rpc3::RegisterProviderParams { provider },
         )
         .await
+    }
+
+    /// `provider/event` notification (P7c): surface a provider-scoped
+    /// out-of-band event (rate limits, warnings, info) exactly like the
+    /// native rate-limit path — TUI inline notice + desktop notification,
+    /// headless log line.
+    pub async fn provider_event(
+        &self,
+        provider: impl Into<String>,
+        kind: tack_ext::rpc3::ProviderEventKind,
+        message: impl Into<String>,
+        detail: Option<Value>,
+    ) -> Result<(), PeerError> {
+        let params = serde_json::to_value(tack_ext::rpc3::ProviderEventParams {
+            provider: provider.into(),
+            kind,
+            message: message.into(),
+            detail,
+        })
+        .map_err(|e| PeerError::Transport(e.to_string()))?;
+        self.peer().notify(method::PROVIDER_EVENT, params).await
     }
 
     /// `widgets/update` notification: idempotent full-state replacement.

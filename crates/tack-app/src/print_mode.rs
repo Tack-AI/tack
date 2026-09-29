@@ -422,6 +422,7 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
     // tack-ext plugins (process + wasm carriers) in headless mode: tools,
     // intercepts, lifecycle events and trust-gated exec stay live; UI
     // dialogs degrade (see ext_headless). Bundle resources merge below.
+    let bridge_state = crate::ext_provider_bridge::ProviderBridgeState::shared();
     let mut extensions = crate::extension_host::ExtensionManager::load(
         &options.cwd,
         &agent_dir,
@@ -429,6 +430,7 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
         crate::ext_headless::HeadlessExtServices::new(
             "print",
             crate::project_trust::is_trusted(&options.cwd, &agent_dir),
+            bridge_state.clone(),
         ),
         settings.extension_lock_required,
         crate::mcp_config::plugin_mcp_callbacks(
@@ -436,6 +438,7 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
             crate::mcp_elicitation::InteractionMode::Headless,
             None,
         ),
+        bridge_state,
     )
     .await;
     hooks_cfg.extend(extensions.bundle_hooks.clone());

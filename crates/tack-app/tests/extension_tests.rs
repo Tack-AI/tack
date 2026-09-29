@@ -97,6 +97,7 @@ async fn load_demo(
         services.clone(),
         true,
         Default::default(),
+        tack_app::ext_provider_bridge::ProviderBridgeState::shared(),
     )
     .await;
     (manager, services)
@@ -222,7 +223,11 @@ async fn demo_plugin_in_headless_mode() {
         .to_string(),
     )
     .unwrap();
-    let services = tack_app::ext_headless::HeadlessExtServices::new("print", true);
+    let services = tack_app::ext_headless::HeadlessExtServices::new(
+        "print",
+        true,
+        tack_app::ext_provider_bridge::ProviderBridgeState::shared(),
+    );
     let mut manager = ExtensionManager::load(
         cwd.path(),
         agent_dir.path(),
@@ -230,6 +235,7 @@ async fn demo_plugin_in_headless_mode() {
         services,
         true,
         Default::default(),
+        tack_app::ext_provider_bridge::ProviderBridgeState::shared(),
     )
     .await;
     assert_eq!(manager.plugins.len(), 1, "demo plugin should load headless");

@@ -11,7 +11,11 @@ pub struct HeadlessExtServices {
 }
 
 impl HeadlessExtServices {
-    pub fn new(_mode: &'static str, _trusted: bool) -> Arc<Self> {
+    pub fn new(
+        _mode: &'static str,
+        _trusted: bool,
+        _bridge_state: Arc<crate::ext_provider_bridge::ProviderBridgeState>,
+    ) -> Arc<Self> {
         Arc::new(HeadlessExtServices { _private: () })
     }
 }

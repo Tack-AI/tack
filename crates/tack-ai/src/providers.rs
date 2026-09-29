@@ -770,13 +770,19 @@ fn build_custom_provider(
 // ---------------------------------------------------------------------------
 
 /// A provider registered at runtime by a plugin (same shape as a models.json
-/// provider entry).
+/// provider entry, plus the optional `bridge` flag).
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeProviderSpec {
     pub id: String,
+    /// Ignored for bridge providers (no HTTP endpoint exists).
+    #[serde(default)]
     pub base_url: String,
     /// Wire protocol id (`openai-completions`, `anthropic-messages`, …).
+    /// Must be absent/empty for bridge providers: every model is assigned
+    /// the reserved [`crate::provider_bridge::EXT_PROVIDER_BRIDGE_API`]
+    /// kind; a conflicting explicit api is a registration error.
+    #[serde(default)]
     pub api: String,
     #[serde(default)]
     pub api_key: Option<String>,
@@ -787,6 +793,10 @@ pub struct RuntimeProviderSpec {
     pub headers: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub compat: Option<serde_json::Value>,
+    /// `true` = the registering plugin serves inference itself via the v3
+    /// `provider/stream` bridge; `baseUrl`/`apiKey`/`headers` are ignored.
+    #[serde(default)]
+    pub bridge: Option<bool>,
     pub models: Vec<CustomModel>,
 }
 
@@ -795,21 +805,43 @@ static RUNTIME_PROVIDERS: std::sync::Mutex<Vec<CustomProviderModels>> =
 
 /// Register (or replace) a runtime provider. Models become selectable via
 /// `/model`, resolvable via resolve_model, and callable through the api kind's
-/// adapter.
+/// adapter. Bridge providers (`bridge: true`) get the reserved
+/// [`crate::provider_bridge::EXT_PROVIDER_BRIDGE_API`] kind on every model and
+/// resolve to the plugin's serving connection instead of an HTTP adapter.
 pub fn register_runtime_provider(spec: RuntimeProviderSpec) -> Result<(), String> {
-    if spec.id.is_empty() || spec.api.is_empty() || spec.base_url.is_empty() {
-        return Err("provider.register needs id, api, and baseUrl".to_string());
+    if spec.id.is_empty() {
+        return Err("provider.register needs an id".to_string());
     }
     if spec.models.is_empty() {
         return Err(format!("provider {} registers no models", spec.id));
     }
+    let bridge = spec.bridge == Some(true);
+    let (api, base_url) = if bridge {
+        if !spec.api.is_empty() && spec.api != crate::provider_bridge::EXT_PROVIDER_BRIDGE_API {
+            return Err(format!(
+                "bridge provider {} must not declare api {:?}: every model is assigned the reserved {} kind",
+                spec.id,
+                spec.api,
+                crate::provider_bridge::EXT_PROVIDER_BRIDGE_API
+            ));
+        }
+        (
+            crate::provider_bridge::EXT_PROVIDER_BRIDGE_API.to_string(),
+            String::new(),
+        )
+    } else {
+        if spec.api.is_empty() || spec.base_url.is_empty() {
+            return Err("provider.register needs id, api, and baseUrl".to_string());
+        }
+        (spec.api.clone(), spec.base_url.clone())
+    };
     let api_key = spec
         .api_key
         .or_else(|| spec.api_key_env.and_then(|var| std::env::var(var).ok()));
     let provider = build_custom_provider(
         spec.id.clone(),
-        spec.api,
-        spec.base_url,
+        api,
+        base_url,
         api_key,
         spec.headers,
         spec.compat,
@@ -821,6 +853,16 @@ pub fn register_runtime_provider(spec: RuntimeProviderSpec) -> Result<(), String
     registry.retain(|p| p.id != spec.id);
     registry.push(provider);
     Ok(())
+}
+
+/// Remove a runtime-registered provider (the serving plugin is gone).
+/// Resolution after removal hits the unknown-provider path — the same
+/// behavior as a native provider whose CLI disappeared.
+pub fn unregister_runtime_provider(id: &str) {
+    RUNTIME_PROVIDERS
+        .lock()
+        .expect("runtime providers poisoned")
+        .retain(|p| p.id != id);
 }
 
 /// All runtime-registered providers (plugin-registered).

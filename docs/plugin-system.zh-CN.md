@@ -116,8 +116,8 @@ LLM 评估经独立的 provider 适配器（不经扩展事件通道，不对插
 
 | 方向 | 方法/通知 |
 |---|---|
-| 宿主 → 插件 | `tools/execute`、`commands/invoke`、`hooks/beforeToolCall`（allow/deny/**rewrite**）、`hooks/transformContext`（整体替换上下文）、`hooks/afterToolCall`（按字段结果补丁）、`approval/review`（审批链）、`autocomplete/provide`、`events/lifecycle`（订阅门控）、`widgets/action` |
-| 插件 → 宿主 | `ui/notify/select/confirm/input`（TUI 对话框）、`session/get`、`session/sendUserMessage`、`snapshot/get`（只读摘要）、`config/get`、`exec/run`（信任门控）、`host/registerProvider`（LLM provider 桥）、`widgets/update`、`logs/emit`、`warnings/emit` |
+| 宿主 → 插件 | `tools/execute`、`commands/invoke`、`hooks/beforeToolCall`（allow/deny/**rewrite**）、`hooks/transformContext`（整体替换上下文）、`hooks/afterToolCall`（按字段结果补丁）、`approval/review`（审批链）、`autocomplete/provide`、`events/lifecycle`（订阅门控）、`widgets/action`、`provider/stream` + `provider/streamCancel`（provider bridge） |
+| 插件 → 宿主 | `ui/notify/select/confirm/input`（TUI 对话框）、`session/get`、`session/sendUserMessage`、`snapshot/get`（只读摘要）、`config/get`、`exec/run`（信任门控）、`host/registerProvider`（LLM provider 注册）、`provider/streamEvent` + `provider/event`（provider bridge）、`widgets/update`、`logs/emit`、`warnings/emit` |
 
 SDK 覆盖 Rust（`tack-ext-sdk`）、TypeScript（`@tack/plugin`）、
 Python（`tack-plugin`）；`tack ext new` 生成任一脚手架，
@@ -128,9 +128,12 @@ Python（`tack-plugin`）；`tack ext new` 生成任一脚手架，
 四种运行模式都加载插件（矩阵见 §6）。非 TUI 模式（print/rpc/acp）
 确定性降级：工具、拦截、生命周期事件、`exec/run`（信任门控）照常；
 `ui/select|confirm|input` 返回 `ERR_CAPABILITY_NOT_GRANTED`；
-`session/*` 与 `host/registerProvider` 返回
-`ERR_METHOD_NOT_FOUND`；`ui/notify` 进日志。插件从 initialize
-payload 的 `mode` 与 `capabilities` 获知当前模式与可用表面。
+`session/*` 返回 `ERR_METHOD_NOT_FOUND`；`ui/notify` 进日志。
+`host/registerProvider` 在每种模式都被受理——provider 注册与
+模式无关（它写入的是每个模式的模型解析都要读取的进程级运行时
+注册表），桥接 provider 像原生 provider 一样在无头模式下供推理。
+插件从 initialize payload 的 `mode` 与 `capabilities` 获知当前
+模式与可用表面。
 
 ### 3.1c 审批链（`approval/review`）
 
@@ -160,6 +163,44 @@ deny 规则 → PreToolUse hook 裁决 → 模式门（plan/acceptEdits/bypass�
   看到它们。
 - 已接线 surface：**TUI 与 rpc**（本仓库拥有的两个可提示 surface）；
   acp 与 remote-host 的提示是文档化的后续项。
+
+### 3.1d Provider 桥（`provider/stream`）
+
+声明了 `capabilities.provider.stream` 的插件可以**直接**供推理
+——没有 HTTP 一跳。它用 `bridge: true` 注册一个 provider
+（通常在 SDK 的 `on_ready` hook 中）：
+
+```jsonc
+// plugin → host: host/registerProvider
+{ "provider": { "id": "acme-agent", "bridge": true, "models": [ … ] } }
+```
+
+每个模型都会被赋予保留的 api kind **`ext-provider-bridge`**
+（与之冲突的显式 `api` 是注册错误；`baseUrl`/`apiKey`/`headers`
+被忽略——bridge 自己管理凭据，CLI-login 风格）。这些模型可以经
+`/model` 选择、像任何运行时 provider 一样被解析，且**四种运行
+模式全部支持**。宿主在流式时把它们解析到插件的供流连接。
+
+流式模型适配 v3 peer 的 30s 请求上限：`provider/stream` 是
+**快速 ack**（仅同步校验）；该轮的事件随后以插件→宿主
+`provider/streamEvent` 通知的形式流动，按 `streamId` 解复用
+——每条通知携带一个 `AssistantMessageEvent`，以恰好一个终止
+事件（`done`/`error`）收尾。`provider/streamCancel` 中止进行中的
+流（用户按下 Esc）；若插件沉默，宿主在 5s 宽限期后合成一个带内
+终止 `Error`；载体死亡或协议违例时同样如此——因此行为不端的
+插件只会拖垮自己的 provider，而 agent loop 对桥接 provider 与
+原生 provider 一视同仁。载体支持：process 与 WASI-stdio WASM
+可以供流；WIT component 与 MCP 载体在结构上不能（来自它们的桥
+注册会被拒绝）。SDK 负责管道细节（streamId 作用域、ack/cancel
+接线、终止强制）；usage/cost 是透传的——插件是自己账单的唯一
+事实来源。
+
+`provider/event`（P7c）以与原生限速路径完全相同的方式呈现带外
+状况——限速、警告：TUI 内联通知加一个 settings 门控的桌面通知，
+无头模式下走日志行，全部与其他插件审计 target 一起记入
+`plugin_provider` tracing target。managed 策略可以用
+`pluginPolicy.plugins."<id>".provider: false` 拒绝供流（插件在
+加载时变为策略阻止，以 `audit_narrow` 记审计）。
 
 ### 3.2 身份、加载结果与 store
 
@@ -319,7 +360,5 @@ tack ext marketplace remove acme
   收益；用 `ext install` + 重启代替）
 - 企业策略（P5）、指标 sidecar 与分发同步（P6）——Level-2 MCP server
   插件与 WIT/组件 WASM 载体（P4）已落地，见 §3.3/§3.4
-- 一等 provider 桥——插件直接供推理而不是注册一个 HTTP 端点，以及
-  headless 模式的 `host/registerProvider`——设计见
+- 一等 provider 桥（P7）已落地：§3.1d 与
   [plugin-provider-bridge.zh-CN.md](plugin-provider-bridge.zh-CN.md)
-  （P7，未落地）

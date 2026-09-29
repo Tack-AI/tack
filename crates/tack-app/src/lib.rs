@@ -16,6 +16,14 @@ pub mod cron;
 pub mod debug_image;
 pub mod doctor;
 pub mod eval;
+/// Provider bridge host machinery (P7).
+#[cfg(feature = "ext")]
+pub mod ext_provider_bridge;
+#[cfg(not(feature = "ext"))]
+#[doc(hidden)]
+pub mod ext_provider_bridge_stub;
+#[cfg(not(feature = "ext"))]
+pub use ext_provider_bridge_stub as ext_provider_bridge;
 #[cfg(feature = "ext")]
 pub mod ext_bundle;
 #[cfg(feature = "ext")]

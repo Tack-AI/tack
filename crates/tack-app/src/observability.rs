@@ -478,12 +478,14 @@ impl<S: tracing::Subscriber> Layer<S> for JsonlLayer {
 }
 
 /// Tracing targets that carry org-mandated audit records (policy
-/// decisions, approval claims, plugin metrics, load telemetry).
+/// decisions, approval claims, plugin metrics, load telemetry, provider
+/// bridge events).
 const AUDIT_TARGETS: &[&str] = &[
     "plugin_policy",
     "plugin_approval",
     "plugin_metrics",
     "plugin_load",
+    "plugin_provider",
 ];
 
 /// The audit sink's filter: the configured level, but with every audit

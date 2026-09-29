@@ -94,6 +94,21 @@
       "x-direction": "host-to-plugin"
     },
     {
+      "name": "provider/stream",
+      "description": "Start one inference stream on a bridge provider (capability provider.stream). The answer is a fast ack: synchronous validation only (capability granted, params shape); the turn's events then flow as plugin->host provider/streamEvent notifications demuxed by streamId, ending with exactly one terminal event (done/error).",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/ProviderStreamParams" } }],
+      "result": { "name": "result", "schema": { "type": "null" } },
+      "x-direction": "host-to-plugin"
+    },
+    {
+      "name": "provider/streamCancel",
+      "description": "Abort an in-flight inference stream (host cancelled / user pressed Esc). The plugin should end the stream promptly with its own terminal event; the host synthesizes a terminal error after a grace period if it does not.",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/ProviderStreamCancelParams" } }],
+      "x-direction": "host-to-plugin"
+    },
+    {
       "name": "widgets/update",
       "description": "Idempotent full-state replacement for a declared widget (not a diff; dropped frames are harmless).",
       "paramStructure": "by-name",
@@ -187,8 +202,22 @@
       "x-direction": "plugin-to-host"
     },
     {
+      "name": "provider/streamEvent",
+      "description": "One AssistantMessageEvent per notification (provider-shaped JSON), demuxed by streamId. Exactly one terminal event (done/error) ends the stream; events after the terminal are a protocol violation.",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/ProviderStreamEventParams" } }],
+      "x-direction": "plugin-to-host"
+    },
+    {
+      "name": "provider/event",
+      "description": "Provider-scoped out-of-band event from a bridge provider: rate limits, warnings, info. Surfaced like the native rate-limit path (inline warning + desktop notification in the TUI, log line in headless modes).",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/ProviderEventParams" } }],
+      "x-direction": "plugin-to-host"
+    },
+    {
       "name": "host/registerProvider",
-      "description": "Dynamically register an LLM provider bridge (trust/mode gated). The registration payload mirrors the provider registry entry format.",
+      "description": "Dynamically register an LLM provider (trust/mode gated). The registration payload mirrors the provider registry entry format; with bridge: true the plugin serves inference itself via provider/stream (capability provider.stream) and every model is assigned the reserved api kind ext-provider-bridge (baseUrl/apiKey/headers are ignored).",
       "paramStructure": "by-name",
       "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/RegisterProviderParams" } }],
       "result": { "name": "result", "schema": { "type": "null" } },
@@ -406,7 +435,8 @@
           "widgets": { "type": "array", "items": { "$ref": "#/components/schemas/WidgetSpec" } },
           "autocompleteProviders": { "type": "array", "items": { "$ref": "#/components/schemas/AutocompleteProviderSpec" } },
           "config": { "$ref": "#/components/schemas/ConfigDeclaration" },
-          "metrics": { "$ref": "#/components/schemas/MetricsDeclaration" }
+          "metrics": { "$ref": "#/components/schemas/MetricsDeclaration" },
+          "provider": { "$ref": "#/components/schemas/ProviderCapability" }
         }
       },
       "InitializeResult": {
@@ -749,6 +779,57 @@
           "context": { "description": "Structured context shown in the warning details." }
         },
         "required": ["message"]
+      },
+      "ProviderCapability": {
+        "description": "Provider bridge surface: the plugin serves inference for the providers it registers (host/registerProvider with bridge: true) through provider/stream.",
+        "type": "object",
+        "properties": {
+          "stream": { "type": "boolean", "description": "The plugin implements provider/stream." }
+        }
+      },
+      "ProviderStreamParams": {
+        "description": "provider/stream params: start one inference stream on a bridge provider.",
+        "type": "object",
+        "properties": {
+          "streamId": { "type": "string", "description": "Host-generated stream id, unique per connection." },
+          "model": { "description": "The resolved registry Model entry (provider-shaped JSON)." },
+          "context": { "description": "The full session Context: system prompt, messages, tools (provider-shaped JSON)." },
+          "options": { "description": "Serializable subset of the host stream options: maxTokens, temperature, reasoning, thinkingBudgets, toolChoice, cacheRetention, sessionId, headers, samplingParams. Bridge providers manage their own credentials (no apiKey is sent); cancellation rides provider/streamCancel and retry policy belongs to the plugin." }
+        },
+        "required": ["streamId", "model", "context", "options"]
+      },
+      "ProviderStreamCancelParams": {
+        "description": "provider/streamCancel params.",
+        "type": "object",
+        "properties": {
+          "streamId": { "type": "string" }
+        },
+        "required": ["streamId"]
+      },
+      "ProviderStreamEventParams": {
+        "description": "provider/streamEvent params.",
+        "type": "object",
+        "properties": {
+          "streamId": { "type": "string" },
+          "event": { "description": "One AssistantMessageEvent (provider-shaped JSON, type-tagged: start, textStart/textDelta/textEnd, thinkingStart/thinkingDelta/thinkingEnd, toolCallStart/toolCallDelta/toolCallEnd, done, error; done/error are terminal)." }
+        },
+        "required": ["streamId", "event"]
+      },
+      "ProviderEventKind": {
+        "description": "Provider event kinds (provider/event).",
+        "type": "string",
+        "enum": ["rateLimited", "warning", "info"]
+      },
+      "ProviderEventParams": {
+        "description": "provider/event params.",
+        "type": "object",
+        "properties": {
+          "provider": { "type": "string", "description": "The registered provider id." },
+          "kind": { "$ref": "#/components/schemas/ProviderEventKind" },
+          "message": { "type": "string" },
+          "detail": { "description": "Optional structured data." }
+        },
+        "required": ["provider", "kind", "message"]
       },
       "RegisterProviderParams": {
         "description": "host/registerProvider params: a provider registry entry (provider-shaped JSON).",

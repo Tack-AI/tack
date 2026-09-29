@@ -1,6 +1,7 @@
 //! Streaming primitives. Mirrors `packages/ai/src/utils/event-stream.ts`:
 //! an awaitable event queue plus a final-result future.
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::types::{AssistantMessage, StopReason};
@@ -110,7 +111,16 @@ impl<T, R> EventStream<T, R> {
 // Assistant message events (port of AssistantMessageEvent from types.ts)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+/// One provider stream event. The serde shape is the wire format of the v3
+/// `provider/streamEvent` notification (type-tagged, camelCase fields); the
+/// `partial` carried by non-terminal events is the accumulated message so
+/// far, terminal events carry the final message.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum AssistantMessageEvent {
     Start {
         partial: AssistantMessage,

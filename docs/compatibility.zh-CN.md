@@ -228,6 +228,31 @@ ACP 侧的破坏性变更只通过上游 crate 升级进入，会在 CHANGELOG �
     `plugin_metrics`（带插件归属的校验通过测量）、
     `marketplace_sync`（同步结果）——与 `plugin_policy` 一样汇入
     观测 JSONL/auditSink 管道。
+- **Provider 桥（P7）**：v3 面新增了 provider 能力与四个方法，
+  直接以最终形态落地（当时没有任何已发布插件或 v3 部署）：
+  - `PluginCapabilities.provider = { stream }` 声明供推理；
+    `host/registerProvider` 载荷新增了可选的 `bridge` 标志
+    （`RuntimeProviderSpec.bridge`——只增的可选字段；
+    `models.json` 不变）。桥接模型携带保留的 api kind
+    `ext-provider-bridge`。
+  - `provider/stream`（宿主→插件，快速 ack）启动一次推理流；
+    `provider/streamCancel`（通知）中止它；
+    `provider/streamEvent`（插件→宿主通知）按 `streamId` 解复用，
+    每条消息携带一个 `AssistantMessageEvent`，每个流恰好一个终止
+    事件（`done`/`error`）；`provider/event`（插件→宿主通知）呈现
+    provider 级限速/警告。`model`/`context`/`event` 是由 tack-ai
+    的 serde 类型解析的 provider 形状 JSON（OpenRPC 文档将其标为
+    自由形态，与 `RegisterProviderParams.provider` 同一先例）。
+  - WIT world 不变（`tack:plugin@0.3.0`）：component 载体不供推理；
+    来自它与 MCP 载体插件的桥注册以 `ERR_CAPABILITY_NOT_GRANTED`
+    拒绝。指定了桥接模型的会话在插件不在时沿用既有的模型未找到
+    路径恢复——与 CLI 消失的原生 provider 行为相同。
+  - 新的结构化事件 target：`plugin_provider`（注册、流生命周期、
+    协议违例、合成的终止事件），在 managed `auditSink` EnvFilter
+    中固定为 INFO。
+  - 原生的限速通知器泛化为 provider 事件通道
+    （`tack_ai::set_provider_event_notifier`）；codebuddy provider
+    搭上它，行为不变。
 
 **承诺。**
 

@@ -242,6 +242,7 @@ pub async fn run_rpc(
 
     // tack-ext plugins in headless mode: tools, intercepts, lifecycle events
     // and trust-gated exec stay live; UI dialogs degrade (ext_headless).
+    let bridge_state = crate::ext_provider_bridge::ProviderBridgeState::shared();
     let extensions = crate::extension_host::ExtensionManager::load(
         &cwd,
         &agent_dir,
@@ -249,6 +250,7 @@ pub async fn run_rpc(
         crate::ext_headless::HeadlessExtServices::new(
             "rpc",
             crate::project_trust::is_trusted(&cwd, &agent_dir),
+            bridge_state.clone(),
         ),
         settings.extension_lock_required,
         crate::mcp_config::plugin_mcp_callbacks(
@@ -256,6 +258,7 @@ pub async fn run_rpc(
             crate::mcp_elicitation::InteractionMode::Headless,
             None,
         ),
+        bridge_state,
     )
     .await;
     // Provider-boundary lifecycle events for subscribed plugins.

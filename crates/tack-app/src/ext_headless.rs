@@ -9,8 +9,12 @@
 //! - `ui/select` / `ui/confirm` / `ui/input`: `ERR_CAPABILITY_NOT_GRANTED`
 //!   — there is no user to ask (the initialize payload's `mode` and
 //!   `capabilities` tell the plugin);
-//! - `session/*`, `snapshot/get`, `host/registerProvider`: not available
-//!   in headless support — session control needs a live session UI/owner;
+//! - `host/registerProvider`: honored — provider registration is
+//!   mode-independent (it writes the process-global runtime registry that
+//!   every mode's model resolution reads); `bridge: true` additionally
+//!   wires the plugin connection as the serving endpoint;
+//! - `session/*`, `snapshot/get`: not available in headless modes —
+//!   session control needs a live session UI/owner;
 //! - `exec/run`: honored when the context is trusted, run inline with the
 //!   same shell + timeout semantics as the TUI path (`run_ext_exec` is
 //!   shared).
@@ -106,6 +110,8 @@ pub struct HeadlessExtServices {
     mode: &'static str,
     /// Project trust: `exec/run` is only honored for trusted contexts.
     trusted: bool,
+    /// Provider bridge state (connections, stream sinks, registrations).
+    bridge_state: Arc<crate::ext_provider_bridge::ProviderBridgeState>,
 }
 
 impl std::fmt::Debug for HeadlessExtServices {
@@ -118,8 +124,16 @@ impl std::fmt::Debug for HeadlessExtServices {
 }
 
 impl HeadlessExtServices {
-    pub fn new(mode: &'static str, trusted: bool) -> Arc<Self> {
-        Arc::new(HeadlessExtServices { mode, trusted })
+    pub fn new(
+        mode: &'static str,
+        trusted: bool,
+        bridge_state: Arc<crate::ext_provider_bridge::ProviderBridgeState>,
+    ) -> Arc<Self> {
+        Arc::new(HeadlessExtServices {
+            mode,
+            trusted,
+            bridge_state,
+        })
     }
 }
 
@@ -159,6 +173,10 @@ impl PeerHandler for HeadlessExtServices {
                     )),
                 }
             }
+            "host/registerProvider" => {
+                crate::ext_provider_bridge::handle_register_provider(&self.bridge_state, params)
+                    .await
+            }
             other => Err(service_error(
                 ERR_METHOD_NOT_FOUND,
                 format!("{other} is not available in {} mode", self.mode),
@@ -187,6 +205,22 @@ impl PeerHandler for HeadlessExtServices {
             }
             // widgets/update: headless modes accept and ignore widget
             // state (widgets are best-effort UI, never load-bearing).
+            "provider/streamEvent" => {
+                let plugin = payload
+                    .get("plugin")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                self.bridge_state.route_stream_event(&plugin, payload);
+            }
+            "provider/event" => {
+                let plugin = payload
+                    .get("plugin")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                self.bridge_state.route_provider_event(&plugin, payload);
+            }
             _ => {}
         }
     }
@@ -200,7 +234,11 @@ mod tests {
 
     #[tokio::test]
     async fn exec_requires_trust() {
-        let services = HeadlessExtServices::new("print", false);
+        let services = HeadlessExtServices::new(
+            "print",
+            false,
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
+        );
         let err = services
             .handle_request("exec/run", serde_json::json!({"command": "echo hi"}))
             .await
@@ -210,7 +248,11 @@ mod tests {
 
     #[tokio::test]
     async fn exec_runs_inline_when_trusted() {
-        let services = HeadlessExtServices::new("print", true);
+        let services = HeadlessExtServices::new(
+            "print",
+            true,
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
+        );
         let value = services
             .handle_request(
                 "exec/run",
@@ -227,7 +269,11 @@ mod tests {
     async fn exec_timeout_kills_the_child() {
         // A timed-out exec must not leave the shell (or its children)
         // running — the timeout branch kills the process tree and reaps it.
-        let services = HeadlessExtServices::new("print", true);
+        let services = HeadlessExtServices::new(
+            "print",
+            true,
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
+        );
         let started = std::time::Instant::now();
         let value = services
             .handle_request(
@@ -249,7 +295,11 @@ mod tests {
 
     #[tokio::test]
     async fn interactive_ui_is_capability_not_granted() {
-        let services = HeadlessExtServices::new("rpc", true);
+        let services = HeadlessExtServices::new(
+            "rpc",
+            true,
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
+        );
         for method in ["ui/select", "ui/confirm", "ui/input"] {
             let err = services
                 .handle_request(method, serde_json::json!({}))
@@ -266,8 +316,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_control_and_provider_register_are_method_not_found() {
-        let services = HeadlessExtServices::new("acp", true);
+    async fn session_control_is_method_not_found() {
+        let services = HeadlessExtServices::new(
+            "acp",
+            true,
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
+        );
         let err = services
             .handle_request("session/sendUserMessage", serde_json::json!({"text": "x"}))
             .await
@@ -275,9 +329,68 @@ mod tests {
         assert_eq!(err.code, ERR_METHOD_NOT_FOUND);
         assert!(err.message.contains("acp mode"), "{err:?}");
         let err = services
-            .handle_request("host/registerProvider", serde_json::json!({}))
+            .handle_request("snapshot/get", serde_json::json!({}))
             .await
             .unwrap_err();
         assert_eq!(err.code, ERR_METHOD_NOT_FOUND);
+    }
+
+    /// P7a: provider registration is mode-independent — headless modes
+    /// honor `host/registerProvider` and the provider resolves in the
+    /// process-global registry like a native one.
+    #[tokio::test]
+    async fn register_provider_is_honored_headless() {
+        let services = HeadlessExtServices::new(
+            "print",
+            true,
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
+        );
+        let spec = serde_json::json!({
+            "provider": {
+                "id": "headless-shim",
+                "baseUrl": "http://localhost:9/v1",
+                "api": "openai-completions",
+                "models": [{"id": "shim-model"}]
+            }
+        });
+        services
+            .handle_request("host/registerProvider", spec)
+            .await
+            .unwrap();
+        let registered = tack_ai::providers::runtime_providers();
+        assert!(
+            registered.iter().any(|p| p.id == "headless-shim"),
+            "registered providers: {:?}",
+            registered.iter().map(|p| &p.id).collect::<Vec<_>>()
+        );
+        // Model resolution reads the same registry (P7a's whole point).
+        let model = crate::model::resolve_model(
+            "headless-shim",
+            Some("shim-model"),
+            std::path::Path::new("/nonexistent-agent-dir"),
+        )
+        .unwrap();
+        assert_eq!(model.api, "openai-completions");
+        tack_ai::providers::unregister_runtime_provider("headless-shim");
+    }
+
+    /// A bridge registration without a live plugin connection and without
+    /// the declared capability is rejected (capability gating).
+    #[tokio::test]
+    async fn register_bridge_provider_requires_a_serving_plugin() {
+        let services = HeadlessExtServices::new(
+            "rpc",
+            true,
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
+        );
+        let spec = serde_json::json!({
+            "plugin": "ghost@user",
+            "provider": {"id": "ghost-bridge", "bridge": true, "models": [{"id": "m"}]}
+        });
+        let err = services
+            .handle_request("host/registerProvider", spec)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, tack_ext::rpc3::ERR_PLUGIN_UNAVAILABLE);
     }
 }

@@ -8,6 +8,44 @@ notice can parse entries (same convention as TS pi).
 
 ### Added
 
+- **First-class provider bridges (plugin redesign P7).** Plugins can
+  serve inference **directly** — no HTTP shim between the user and the
+  model. A plugin declaring `capabilities.provider.stream` registers a
+  provider with `bridge: true`; its models get the reserved api kind
+  `ext-provider-bridge`, appear in `/model`, and resolve like native
+  providers in **all four run modes** (print/rpc/acp previously answered
+  `host/registerProvider` with `ERR_METHOD_NOT_FOUND`). The streaming
+  model fits the v3 peer: `provider/stream` is a fast ack, the turn's
+  events ride plugin→host `provider/streamEvent` notifications demuxed
+  by `streamId` with in-band terminal semantics (the `Provider`
+  contract), and abort (Esc) rides `provider/streamCancel` with a 5s
+  grace period before the host synthesizes a terminal error — carrier
+  death and protocol violations fail-open the same way, so a
+  misbehaving plugin degrades only its own provider. Bridge providers
+  manage their own credentials (no `apiKey` crosses the wire); usage
+  and cost pass through from the plugin's terminal message. Carrier
+  matrix: process and WASI-stdio serve streams; the WIT component and
+  MCP carriers reject bridge registrations (the WIT world is
+  unchanged). Managed policy narrows the capability
+  (`pluginPolicy.plugins."<id>".provider: false` → policy-blocked at
+  load), everything is audited under the new `plugin_provider` tracing
+  target (pinned at INFO in the managed auditSink filter), and load
+  telemetry counts provider-bridging plugins. SDK parity: Rust
+  (`PluginBuilder::provider_stream` / `ProviderEvents` /
+  `ProviderStreamCx`), TypeScript (`.providerStream`), Python
+  (`.provider_stream`), plus a new `on_ready` startup hook in all three
+  (the registration entry point); `ext dev` scenarios gained the
+  `providerStream` step (scripted cancel races included), `ext inspect`
+  prints bridge registrations, and the demo plugin fixture grew a
+  deterministic fake model. See docs/plugin-system.md §3.1d.
+- **Provider events (`provider/event`, P7c).** The codebuddy-only
+  rate-limit notifier generalized into a provider-wide channel:
+  plugins (and native providers) surface rate limits and warnings by
+  provider id — TUI shows the same inline notice plus a settings-gated,
+  throttled desktop notification, headless modes log, and events are
+  audited under `plugin_provider`. The codebuddy provider rides the
+  generalized channel unchanged in behavior.
+
 - **Plugin approval chain (`approval/review`) wired into the host.**
   When the built-in permission flow is about to prompt a human, active
   plugins that declared `capabilities.hooks.approvalReview` get first

@@ -2,12 +2,31 @@
 
 **English | [简体中文](plugin-provider-bridge.zh-CN.md)**
 
-> Status: **design — not landed**. This is the P7 milestone design for the
-> plugin roadmap ([plugin-roadmap.md](plugin-roadmap.md) §11). Context:
-> [plugin-system.md](plugin-system.md) §3.1 (the tack-RPC v3 capability
-> surface), §3.1b (headless degradation), and §3.2 (identity/load outcome).
-> When P7 lands, fold the landed behavior back into plugin-system.md and
-> record the protocol additions in [compatibility.md](compatibility.md).
+> Status: **landed**. This document is the design record of the P7
+> milestone; the normative description of the shipped behavior lives in
+> [plugin-system.md](plugin-system.md) §3.1d and the protocol additions
+> are recorded in [compatibility.md](compatibility.md) §2.5.
+> Implementation decisions taken at landing (§8's open questions and the
+> small deviations from the sketches below):
+>
+> - **Cancel forwarding**: the host's cancellation token is passed to
+>   `ProviderStreamBridge::stream` as a separate in-process argument (it
+>   never crosses the wire — §4.1's exclusion stands), so the bridge owns
+>   cancel watching, `provider/streamCancel`, and the grace-period
+>   synthesis in one place. Grace period: **5s** as leaned.
+> - **Cost (open question 2)**: pass-through — the terminal
+>   `AssistantMessage`'s `usage` is adopted as reported; the host does
+>   not recompute from the model's static `cost` declaration (the native
+>   codebuddy provider's posture).
+> - **Idle watchdog (open question 1)**: no host-side wall-clock cap in
+>   v1 — the plugin owns its backend's policy, like native adapters.
+> - **SDK surface**: the SDKs additionally gained an `on_ready`
+>   startup hook (Rust `PluginBuilder::on_ready`, TS `.onReady`, Python
+>   `.on_ready`) — the registration entry point provider plugins need;
+>   without it a provider plugin has no chance to register before use.
+> - **Death watching** polls connection liveness (200ms cadence, the
+>   MCP carrier's precedent) instead of `wait_dead`, whose pump-handle
+>   take is single-waiter.
 
 ## 1. The gap
 

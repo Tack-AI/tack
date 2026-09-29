@@ -32,6 +32,10 @@ export const AUTOCOMPLETE_PROVIDE = "autocomplete/provide";
 export const EVENTS_LIFECYCLE = "events/lifecycle";
 /** [host-to-plugin] User interaction with a declared widget (never produced in headless modes). Sent only to the owning plugin. */
 export const WIDGETS_ACTION = "widgets/action";
+/** [host-to-plugin] Start one inference stream on a bridge provider (capability provider.stream). The answer is a fast ack: synchronous validation only (capability granted, params shape); the turn's events then flow as plugin->host provider/streamEvent notifications demuxed by streamId, ending with exactly one terminal event (done/error). */
+export const PROVIDER_STREAM = "provider/stream";
+/** [host-to-plugin] Abort an in-flight inference stream (host cancelled / user pressed Esc). The plugin should end the stream promptly with its own terminal event; the host synthesizes a terminal error after a grace period if it does not. */
+export const PROVIDER_STREAM_CANCEL = "provider/streamCancel";
 /** [plugin-to-host] Idempotent full-state replacement for a declared widget (not a diff; dropped frames are harmless). */
 export const WIDGETS_UPDATE = "widgets/update";
 /** [plugin-to-host] Read current session state (trust/mode gated). */
@@ -56,7 +60,11 @@ export const EXEC_RUN = "exec/run";
 export const LOGS_EMIT = "logs/emit";
 /** [plugin-to-host] Structured user-facing warning (dismissible in the TUI, logged with plugin attribution everywhere). */
 export const WARNINGS_EMIT = "warnings/emit";
-/** [plugin-to-host] Dynamically register an LLM provider bridge (trust/mode gated). The registration payload mirrors the provider registry entry format. */
+/** [plugin-to-host] One AssistantMessageEvent per notification (provider-shaped JSON), demuxed by streamId. Exactly one terminal event (done/error) ends the stream; events after the terminal are a protocol violation. */
+export const PROVIDER_STREAM_EVENT = "provider/streamEvent";
+/** [plugin-to-host] Provider-scoped out-of-band event from a bridge provider: rate limits, warnings, info. Surfaced like the native rate-limit path (inline warning + desktop notification in the TUI, log line in headless modes). */
+export const PROVIDER_EVENT = "provider/event";
+/** [plugin-to-host] Dynamically register an LLM provider (trust/mode gated). The registration payload mirrors the provider registry entry format; with bridge: true the plugin serves inference itself via provider/stream (capability provider.stream) and every model is assigned the reserved api kind ext-provider-bridge (baseUrl/apiKey/headers are ignored). */
 export const HOST_REGISTER_PROVIDER = "host/registerProvider";
 
 /** hooks/afterToolCall params. */
@@ -291,6 +299,7 @@ export interface PluginCapabilities {
   "events"?: Array<string>;
   "hooks"?: HookCapabilities;
   "metrics"?: MetricsDeclaration;
+  "provider"?: ProviderCapability;
   "tools"?: Array<ToolSpec>;
   "widgets"?: Array<WidgetSpec>;
 }
@@ -300,6 +309,50 @@ export interface PluginInfo {
   "description"?: string;
   "name": string;
   "version"?: string;
+}
+
+/** Provider bridge surface: the plugin serves inference for the providers it registers (host/registerProvider with bridge: true) through provider/stream. */
+export interface ProviderCapability {
+  /** The plugin implements provider/stream. */
+  "stream"?: boolean;
+}
+
+/** Provider event kinds (provider/event). */
+export type ProviderEventKind = "rateLimited" | "warning" | "info";
+
+
+/** provider/event params. */
+export interface ProviderEventParams {
+  /** Optional structured data. */
+  "detail"?: any;
+  "kind": ProviderEventKind;
+  "message": string;
+  /** The registered provider id. */
+  "provider": string;
+}
+
+/** provider/streamCancel params. */
+export interface ProviderStreamCancelParams {
+  "streamId": string;
+}
+
+/** provider/streamEvent params. */
+export interface ProviderStreamEventParams {
+  /** One AssistantMessageEvent (provider-shaped JSON, type-tagged: start, textStart/textDelta/textEnd, thinkingStart/thinkingDelta/thinkingEnd, toolCallStart/toolCallDelta/toolCallEnd, done, error; done/error are terminal). */
+  "event": any;
+  "streamId": string;
+}
+
+/** provider/stream params: start one inference stream on a bridge provider. */
+export interface ProviderStreamParams {
+  /** The full session Context: system prompt, messages, tools (provider-shaped JSON). */
+  "context": any;
+  /** The resolved registry Model entry (provider-shaped JSON). */
+  "model": any;
+  /** Serializable subset of the host stream options: maxTokens, temperature, reasoning, thinkingBudgets, toolChoice, cacheRetention, sessionId, headers, samplingParams. Bridge providers manage their own credentials (no apiKey is sent); cancellation rides provider/streamCancel and retry policy belongs to the plugin. */
+  "options": any;
+  /** Host-generated stream id, unique per connection. */
+  "streamId": string;
 }
 
 /** host/registerProvider params: a provider registry entry (provider-shaped JSON). */

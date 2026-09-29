@@ -132,6 +132,7 @@ async fn managed_policy_gates_install_and_load() {
         Arc::new(NoopServices),
         false,
         Default::default(),
+        tack_app::ext_provider_bridge::ProviderBridgeState::shared(),
     )
     .await;
     let good = manager
@@ -173,6 +174,7 @@ async fn managed_policy_gates_install_and_load() {
         Arc::new(NoopServices),
         false,
         Default::default(),
+        tack_app::ext_provider_bridge::ProviderBridgeState::shared(),
     )
     .await;
     let good = manager

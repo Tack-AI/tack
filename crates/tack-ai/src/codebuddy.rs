@@ -890,32 +890,16 @@ struct CodeBuddySession {
 }
 
 /// Rate-limit surface (reference: piUI.notify on rate_limit_event). The
-/// provider layer has no UI channel; tack-app installs a handler at startup
-/// (TUI desktop notification / status line); headless modes just log.
-/// Rate-limit notification handler installed by tack-app.
-type RateLimitNotifier = Arc<dyn Fn(&str) + Send + Sync>;
-
-static RATE_LIMIT_NOTIFIER: OnceLock<RwLock<Option<RateLimitNotifier>>> = OnceLock::new();
-
-/// Install (or clear) the rate-limit notification handler.
-pub fn set_rate_limit_notifier(handler: Option<RateLimitNotifier>) {
-    if let Ok(mut slot) = RATE_LIMIT_NOTIFIER
-        .get_or_init(|| RwLock::new(None))
-        .write()
-    {
-        *slot = handler;
-    }
-}
-
+/// provider layer has no UI channel of its own; events ride the
+/// provider-event channel ([`crate::provider::emit_provider_event`]) that
+/// tack-app surfaces (TUI inline warning + desktop notification; headless
+/// modes log).
 fn notify_rate_limit(message: &str) {
-    let handler = RATE_LIMIT_NOTIFIER
-        .get_or_init(|| RwLock::new(None))
-        .read()
-        .ok()
-        .and_then(|slot| slot.clone());
-    if let Some(handler) = handler {
-        handler(message);
-    }
+    crate::provider::emit_provider_event(crate::provider::ProviderEvent {
+        kind: crate::provider::ProviderEventKind::RateLimited,
+        provider: "codebuddy".to_string(),
+        message: message.to_string(),
+    });
 }
 
 /// Process-wide session registry (keyed by tack session id).

@@ -14,13 +14,21 @@
 //!     { "call": "hooks/beforeToolCall", "params": {…}, "expectError": -32001 },
 //!     { "notify": "events/lifecycle", "params": {…} },
 //!     { "expectHostRequest": "ui/select", "respond": "b" },
+//!     { "providerStream": { "model": {…}, "context": {…}, "options": {…} },
+//!       "expectEvents": [ {"type": "start"}, {"type": "done"} ],
+//!       "cancelAfterMs": 100, "timeoutMs": 5000 },
 //!     { "sleepMs": 50 }
 //!   ]
 //! }
 //! ```
 //!
 //! `expect` is a recursive subset match (objects: every expected key is
-//! present and matches; arrays: prefix-wise; scalars: equality).
+//! present and matches; arrays: prefix-wise; scalars: equality). The
+//! `providerStream` step (P7) drives one inference stream on a provider
+//! plugin: the host assigns the streamId, captures the plugin's
+//! `provider/streamEvent` notifications, can script a cancel race
+//! (`cancelAfterMs`), and subset-matches the captured sequence against
+//! `expectEvents`.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -89,13 +97,17 @@ struct Expectation {
 /// The dev-host service surface. Requests matching the scenario's
 /// `expectHostRequest` queue get the scripted answer; everything else
 /// degrades deterministically (dialogs fail with a hint, `exec` is
-/// trust-gated, notifications are printed).
+/// trust-gated, notifications are printed). Provider registrations are
+/// recorded (printed by `ext inspect`); stream events are captured per
+/// streamId for the `providerStream` scenario step.
 struct DevHost {
     cwd: PathBuf,
     trusted: bool,
     config: Value,
     shell: Option<Arc<tack_tools::shell::ShellConfig>>,
     scripted: Mutex<VecDeque<Expectation>>,
+    registrations: Mutex<Vec<Value>>,
+    stream_events: Mutex<HashMap<String, Vec<Value>>>,
 }
 
 impl std::fmt::Debug for DevHost {
@@ -115,6 +127,8 @@ impl DevHost {
             config,
             shell,
             scripted: Mutex::new(VecDeque::new()),
+            registrations: Mutex::new(Vec::new()),
+            stream_events: Mutex::new(HashMap::new()),
         }
     }
 
@@ -126,6 +140,53 @@ impl DevHost {
                 method: method.to_string(),
                 response,
             });
+    }
+
+    /// The provider registrations the plugin made (P7; `ext inspect`
+    /// prints them).
+    fn registrations(&self) -> Vec<Value> {
+        self.registrations.lock().expect("registrations").clone()
+    }
+
+    /// Begin capturing `provider/streamEvent` notifications for a stream.
+    fn begin_stream_capture(&self, stream_id: &str) {
+        self.stream_events
+            .lock()
+            .expect("stream events")
+            .insert(stream_id.to_string(), Vec::new());
+    }
+
+    /// Wait until the stream's terminal event arrives (or the timeout
+    /// elapses) and return the captured event sequence.
+    async fn wait_stream_events(
+        &self,
+        stream_id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<Value>, String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            {
+                let captured = self.stream_events.lock().expect("stream events");
+                if let Some(events) = captured.get(stream_id) {
+                    let terminal = events.iter().any(|event| {
+                        matches!(
+                            event.get("type").and_then(Value::as_str),
+                            Some("done" | "error")
+                        )
+                    });
+                    if terminal {
+                        return Ok(events.clone());
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "stream {stream_id} produced no terminal event within {}s",
+                    timeout.as_secs()
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     fn error(code: i64, message: impl Into<String>) -> ErrorObject {
@@ -220,6 +281,17 @@ impl PeerHandler for DevHost {
                 "messageCount": 0,
             })),
             method::CONFIG_GET => Ok(serde_json::json!({ "config": self.config })),
+            method::HOST_REGISTER_PROVIDER => {
+                let provider = params.get("provider").cloned().unwrap_or(Value::Null);
+                let id = provider.get("id").and_then(Value::as_str).unwrap_or("");
+                let bridge = provider.get("bridge").and_then(Value::as_bool) == Some(true);
+                eprintln!("[plugin provider] {id} registered (bridge: {bridge})");
+                self.registrations
+                    .lock()
+                    .expect("registrations")
+                    .push(provider);
+                Ok(Value::Null)
+            }
             method::SHUTDOWN => Ok(Value::Null),
             other => Err(Self::error(
                 ERR_METHOD_NOT_FOUND,
@@ -245,6 +317,29 @@ impl PeerHandler for DevHost {
             method::WIDGETS_UPDATE => {
                 let id = params.get("id").and_then(Value::as_str).unwrap_or("");
                 eprintln!("[plugin widget] {id} updated");
+            }
+            method::PROVIDER_STREAM_EVENT => {
+                let stream_id = params
+                    .get("streamId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let event = params.get("event").cloned().unwrap_or(Value::Null);
+                // Unknown streams are simply not captured (no scenario
+                // step registered an interest).
+                if let Some(events) = self
+                    .stream_events
+                    .lock()
+                    .expect("stream events")
+                    .get_mut(&stream_id)
+                {
+                    events.push(event);
+                }
+            }
+            method::PROVIDER_EVENT => {
+                let provider = params.get("provider").and_then(Value::as_str).unwrap_or("");
+                let message = params.get("message").and_then(Value::as_str).unwrap_or("");
+                eprintln!("[plugin provider event] {provider}: {message}");
             }
             _ => {}
         }
@@ -282,6 +377,15 @@ struct Step {
     respond: Option<Value>,
     respond_error: Option<i64>,
     sleep_ms: Option<u64>,
+    /// P7: drive one provider stream (`{model, context, options}`; the
+    /// streamId is assigned by the dev host).
+    provider_stream: Option<Value>,
+    /// Subset-matched against the captured stream event sequence.
+    expect_events: Option<Vec<Value>>,
+    /// Script a cancel race: send `provider/streamCancel` after N ms.
+    cancel_after_ms: Option<u64>,
+    /// Bound on waiting for the stream's terminal event (default 30s).
+    timeout_ms: Option<u64>,
 }
 
 /// Recursive subset match (see module docs).
@@ -301,6 +405,57 @@ fn is_subset(expected: &Value, actual: &Value) -> bool {
         }
         (expected, actual) => expected == actual,
     }
+}
+
+/// The `providerStream` step (P7): assign a streamId, script the optional
+/// cancel race, fast-ack the stream, then wait for the terminal event and
+/// subset-match the captured sequence against `expectEvents`.
+async fn run_provider_stream_step(
+    client: &tack_ext::v3::HostClient,
+    host: &DevHost,
+    step: &Step,
+    mut params: Value,
+) -> Result<(), String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let stream_id = format!(
+        "dev-stream-{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    params["streamId"] = Value::String(stream_id.clone());
+    host.begin_stream_capture(&stream_id);
+    if let Some(ms) = step.cancel_after_ms {
+        let peer = client.peer().clone();
+        let stream_id = stream_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            let _ = peer
+                .notify(
+                    method::PROVIDER_STREAM_CANCEL,
+                    serde_json::json!({"streamId": stream_id}),
+                )
+                .await;
+        });
+    }
+    // The fast ack (synchronous validation only).
+    client
+        .peer()
+        .call(method::PROVIDER_STREAM, params)
+        .await
+        .map_err(|e| format!("provider/stream ack failed: {e}"))?;
+    let timeout = std::time::Duration::from_millis(step.timeout_ms.unwrap_or(30_000));
+    let events = host.wait_stream_events(&stream_id, timeout).await?;
+    if let Some(expected) = &step.expect_events {
+        let actual = Value::Array(events);
+        let expected_value = Value::Array(expected.clone());
+        if !is_subset(&expected_value, &actual) {
+            return Err(format!(
+                "stream event expectation mismatch\n  expected (subset): {expected_value}\n  actual: {actual}"
+            ));
+        }
+    } else {
+        eprintln!("  stream events: {}", Value::Array(events));
+    }
+    Ok(())
 }
 
 struct StepOutcome {
@@ -359,6 +514,9 @@ async fn run_step(
     if let Some(ms) = step.sleep_ms {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
         return Ok(());
+    }
+    if let Some(stream) = &step.provider_stream {
+        return run_provider_stream_step(client, host, step, stream.clone()).await;
     }
     if let Some(method_name) = &step.notify {
         return client
@@ -448,7 +606,7 @@ async fn spawn_and_initialize(
             snapshot: Some(false),
             ui_dialogs: Some(true),
             exec: Some(trusted),
-            provider_registration: Some(false),
+            provider_registration: Some(true),
             metrics: None,
         },
         config: Some(config),
@@ -466,9 +624,25 @@ async fn spawn_and_initialize(
 // ---------------------------------------------------------------------------
 
 /// `tack ext inspect <dir>`: handshake and dump the declared capabilities.
+/// For provider plugins (P7) the bridge registrations made at startup are
+/// captured and printed too.
 pub async fn cmd_ext_inspect(dir: &Path) -> Result<()> {
-    let (mut process, _host, result) = spawn_and_initialize(dir, &ScenarioInit::default()).await?;
+    let (mut process, host, result) = spawn_and_initialize(dir, &ScenarioInit::default()).await?;
     println!("{}", serde_json::to_string_pretty(&result)?);
+    let declares_provider =
+        result.capabilities.provider.as_ref().and_then(|p| p.stream) == Some(true);
+    if declares_provider {
+        // on_ready registrations race the handshake answer; give the
+        // plugin a moment, then print what landed.
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let registrations = host.registrations();
+        if !registrations.is_empty() {
+            println!(
+                "registered providers:\n{}",
+                serde_json::to_string_pretty(&registrations)?
+            );
+        }
+    }
     process.shutdown().await;
     Ok(())
 }
@@ -872,6 +1046,90 @@ mod tests {
             .unwrap();
         assert_eq!(output.content[0].text.as_deref(), Some("picked: b"));
         process.shutdown().await;
+    }
+
+    /// P7 dev loop: the providerStream scenario step drives the demo
+    /// plugin's fake model — scripted events out, cancel race included —
+    /// and the dev host captures bridge registrations.
+    #[tokio::test]
+    async fn provider_stream_scenario_against_demo_plugin() {
+        let Some(bin) = demo_plugin_bin() else {
+            eprintln!("demo plugin bin not built; skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = serde_json::json!({
+            "name": "demo",
+            "command": bin,
+            "args": [],
+            "env": {
+                "TACK_DEMO_PROVIDER": serde_json::json!({
+                    "id": "dev-demo-provider", "models": [{"id": "fake-1"}]
+                }).to_string(),
+                "TACK_DEMO_PROVIDER_DELAY_MS": "150",
+            }
+        });
+        std::fs::write(dir.path().join("extension.json"), manifest.to_string()).unwrap();
+        let scenario: Scenario = serde_json::from_str(
+            r#"{
+              "steps": [
+                {"providerStream": {
+                   "model": {"id": "fake-1", "provider": "dev-demo-provider", "api": "ext-provider-bridge"},
+                   "context": {"messages": [{"role": "user", "content": "hi"}]},
+                   "options": {}},
+                 "expectEvents": [
+                   {"type": "start"},
+                   {"type": "thinkingStart"},
+                   {"type": "thinkingDelta", "delta": "thinking: hi"},
+                   {"type": "thinkingEnd"},
+                   {"type": "textStart"},
+                   {"type": "textDelta"},
+                   {"type": "textDelta"},
+                   {"type": "textEnd"},
+                   {"type": "done", "reason": "stop"}],
+                 "timeoutMs": 10000},
+                {"providerStream": {
+                   "model": {"id": "fake-1", "provider": "dev-demo-provider", "api": "ext-provider-bridge"},
+                   "context": {"messages": [{"role": "user", "content": "slow"}]},
+                   "options": {}},
+                 "cancelAfterMs": 50,
+                 "expectEvents": [
+                   {"type": "start"},
+                   {"type": "error", "reason": "aborted"}],
+                 "timeoutMs": 10000}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let (mut process, host, result) = spawn_and_initialize(dir.path(), &scenario.initialize)
+            .await
+            .unwrap();
+        assert!(
+            result.capabilities.provider.and_then(|p| p.stream) == Some(true),
+            "provider capability declared"
+        );
+        // The on_ready registration lands with the dev host.
+        for _ in 0..100 {
+            if !host.registrations().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let registrations = host.registrations();
+        assert_eq!(registrations.len(), 1, "bridge registration captured");
+        assert_eq!(registrations[0]["id"], "dev-demo-provider");
+        assert_eq!(registrations[0]["bridge"], true);
+        let outcomes = run_scenario(&process.client, &host, &scenario).await;
+        process.shutdown().await;
+        for outcome in &outcomes {
+            assert!(
+                outcome.result.is_ok(),
+                "{}: {:?}",
+                outcome.label,
+                outcome.result
+            );
+        }
+        assert_eq!(outcomes.len(), 2);
     }
 
     #[test]

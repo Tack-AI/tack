@@ -661,6 +661,7 @@ impl Agent for TackAcpAgent {
         // dialogs degrade, exec is trust-gated). Bundle MCP servers merge
         // into the connection specs below.
         let agent_dir = tack_session::default_agent_dir();
+        let bridge_state = crate::ext_provider_bridge::ProviderBridgeState::shared();
         let extensions = crate::extension_host::ExtensionManager::load(
             &cwd,
             &agent_dir,
@@ -668,6 +669,7 @@ impl Agent for TackAcpAgent {
             crate::ext_headless::HeadlessExtServices::new(
                 "acp",
                 crate::project_trust::is_trusted(&cwd, &agent_dir),
+                bridge_state.clone(),
             ),
             self.settings.extension_lock_required,
             crate::mcp_config::plugin_mcp_callbacks(
@@ -675,6 +677,7 @@ impl Agent for TackAcpAgent {
                 crate::mcp_elicitation::InteractionMode::Headless,
                 None,
             ),
+            bridge_state,
         )
         .await;
 
@@ -770,6 +773,7 @@ impl Agent for TackAcpAgent {
                 }
                 // Reloaded sessions get config-file MCP servers only.
                 let agent_dir = tack_session::default_agent_dir();
+                let bridge_state = crate::ext_provider_bridge::ProviderBridgeState::shared();
                 let extensions = crate::extension_host::ExtensionManager::load(
                     &cwd,
                     &agent_dir,
@@ -777,6 +781,7 @@ impl Agent for TackAcpAgent {
                     crate::ext_headless::HeadlessExtServices::new(
                         "acp",
                         crate::project_trust::is_trusted(&cwd, &agent_dir),
+                        bridge_state.clone(),
                     ),
                     self.settings.extension_lock_required,
                     crate::mcp_config::plugin_mcp_callbacks(
@@ -784,6 +789,7 @@ impl Agent for TackAcpAgent {
                         crate::mcp_elicitation::InteractionMode::Headless,
                         None,
                     ),
+                    bridge_state,
                 )
                 .await;
                 let mut specs =

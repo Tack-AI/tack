@@ -515,9 +515,10 @@ pub struct TuiApp {
     /// notifications are drained into the steering queue).
     background_tasks: tack_tools::background::BackgroundTaskManager,
     bg_notify_rx: Option<mpsc::UnboundedReceiver<tack_tools::background::TaskNotification>>,
-    /// CodeBuddy rate-limit notices (provider layer has no UI channel; the
-    /// provider's global notifier pushes into this channel).
-    rate_limit_rx: Option<mpsc::UnboundedReceiver<String>>,
+    /// Provider events (rate limits, warnings; the provider layer has no
+    /// UI channel of its own — the global notifier pushes into this
+    /// channel).
+    provider_event_rx: Option<mpsc::UnboundedReceiver<tack_ai::ProviderEvent>>,
     /// LSP registry (language servers stay warm across runs).
     lsp: tack_tools::lsp::LspManager,
     /// Session-wide sub-agent concurrency cap + token budget. Tools are
@@ -696,11 +697,13 @@ impl TuiApp {
         let background_tasks = tack_tools::background::BackgroundTaskManager::new();
         let (bg_notify_tx, app_bg_notify_rx) = mpsc::unbounded_channel();
         background_tasks.set_notify(bg_notify_tx);
-        // CodeBuddy rate-limit events surface as chat notices + desktop
+        // Provider events (rate limits, warnings — native providers and
+        // plugin bridge providers alike) surface as chat notices + desktop
         // notifications (throttled, settings-gated) via this channel.
-        let (rate_limit_tx, rate_limit_rx) = mpsc::unbounded_channel::<String>();
-        tack_ai::codebuddy::set_rate_limit_notifier(Some(std::sync::Arc::new(move |msg| {
-            let _ = rate_limit_tx.send(msg.to_string());
+        let (provider_event_tx, provider_event_rx) =
+            mpsc::unbounded_channel::<tack_ai::ProviderEvent>();
+        tack_ai::set_provider_event_notifier(Some(std::sync::Arc::new(move |event| {
+            let _ = provider_event_tx.send(event);
         })));
         let lsp = settings.lsp_manager(&options.cwd);
         let mut app = TuiApp {
@@ -788,7 +791,7 @@ impl TuiApp {
             context_tools_chars: 0,
             background_tasks,
             bg_notify_rx: Some(app_bg_notify_rx),
-            rate_limit_rx: Some(rate_limit_rx),
+            provider_event_rx: Some(provider_event_rx),
             lsp,
             subagent_limits: None,
             checkpoints: tack_tools::checkpoint::CheckpointManager::new(),
@@ -935,9 +938,11 @@ impl TuiApp {
         cwd: &Path,
         agent_dir: &Path,
     ) -> (Arc<dyn Provider>, crate::extension_host::ExtensionManager) {
+        let bridge_state = crate::ext_provider_bridge::ProviderBridgeState::shared();
         let ext_services = Arc::new(crate::extension_host::TuiExtServices::new(
             event_tx.clone(),
             crate::project_trust::is_trusted(cwd, agent_dir),
+            bridge_state.clone(),
         ));
         let extensions = crate::extension_host::ExtensionManager::load(
             cwd,
@@ -950,6 +955,7 @@ impl TuiApp {
                 crate::mcp_elicitation::InteractionMode::Tui,
                 Some(event_tx.clone()),
             ),
+            bridge_state,
         )
         .await;
         // tack-ext: provider-boundary lifecycle events (before/after request),

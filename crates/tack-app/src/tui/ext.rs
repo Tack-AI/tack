@@ -125,38 +125,6 @@ impl TuiApp {
                     }
                 }
             }
-            "host/registerProvider" => {
-                let provider = params
-                    .get("provider")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                let parsed: Result<tack_ai::providers::RuntimeProviderSpec, _> =
-                    serde_json::from_value(provider);
-                match parsed {
-                    Ok(spec) => {
-                        let id = spec.id.clone();
-                        match tack_ai::providers::register_runtime_provider(spec) {
-                            Ok(()) => {
-                                self.notice(
-                                    crate::i18n::t(
-                                        self.lang,
-                                        "msg.provider_registered",
-                                        &[("id", &id)],
-                                    ),
-                                    NoticeKind::Info,
-                                );
-                                let _ = respond.send(Ok(serde_json::Value::Null));
-                            }
-                            Err(e) => {
-                                let _ = respond.send(Err(e));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let _ = respond.send(Err(format!("bad host/registerProvider params: {e}")));
-                    }
-                }
-            }
             method if method.starts_with("session/") => {
                 let result = self.handle_ext_session_method(method, params).await;
                 let _ = respond.send(result);

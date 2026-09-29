@@ -2,11 +2,26 @@
 
 **[English](plugin-provider-bridge.md) | 简体中文**
 
-> 状态：**设计——未落地**。这是插件路线图（[plugin-roadmap.zh-CN.md](plugin-roadmap.zh-CN.md)
-> §11）的 P7 里程碑设计。背景阅读：[plugin-system.zh-CN.md](plugin-system.zh-CN.md)
-> §3.1（tack-RPC v3 能力面）、§3.1b（headless 降级）、§3.2（身份与加载结果）。
-> P7 落地时，把已落地行为回写进 plugin-system 文档，并在
-> [compatibility.zh-CN.md](compatibility.zh-CN.md) 记录协议新增。
+> 状态：**已落地**。本文档是 P7 里程碑的设计记录；已发布行为的
+> 规范描述在 [plugin-system.zh-CN.md](plugin-system.zh-CN.md) §3.1d，
+> 协议新增记录在 [compatibility.zh-CN.md](compatibility.zh-CN.md) §2.5。
+> 落地时的实现决策（§8 的开放问题以及与下文草图的小偏差）：
+>
+> - **取消转发**：宿主的取消令牌作为单独的进程内参数传给
+>   `ProviderStreamBridge::stream`（它永不过线——§4.1 的排除不变），
+>   因此桥在同一处拥有取消监听、`provider/streamCancel` 与宽限期
+>   合成。宽限期：按倾向定为 **5s**。
+> - **成本（开放问题 2）**：透传——采纳终止 `AssistantMessage`
+>   上报的 `usage`；宿主不根据模型的静态 `cost` 声明重新计算
+>   （与原生 codebuddy provider 的姿态一致）。
+> - **空闲看门狗（开放问题 1）**：v1 不设宿主侧墙钟上限——插件
+>   自己拥有其后端的策略，与原生适配器一致。
+> - **SDK 面**：SDK 额外获得了 `on_ready` 启动 hook（Rust
+>   `PluginBuilder::on_ready`、TS `.onReady`、Python `.on_ready`）——
+>   provider 插件所需的注册入口；没有它，provider 插件在被使用前
+>   没有机会注册。
+> - **死亡监听**改为轮询连接存活（200ms 节奏，沿用 MCP 载体的
+>   先例），而不是 `wait_dead`——其 pump-handle 获取是单等待者的。
 
 ## 1. 缺口
 

@@ -41,7 +41,11 @@ pub struct TuiExtServices {
 }
 
 impl TuiExtServices {
-    pub(crate) fn new(_tx: crate::tui::AppEventTx, _trusted: bool) -> Self {
+    pub(crate) fn new(
+        _tx: crate::tui::AppEventTx,
+        _trusted: bool,
+        _bridge_state: Arc<crate::ext_provider_bridge::ProviderBridgeState>,
+    ) -> Self {
         TuiExtServices { _private: () }
     }
 }
@@ -120,6 +124,7 @@ impl ExtensionManager {
         _services: Arc<dyn Send + Sync + 'static>,
         _lock_required: bool,
         _mcp_callbacks: tack_tools::mcp::McpClientCallbacks,
+        _bridge_state: Arc<crate::ext_provider_bridge::ProviderBridgeState>,
     ) -> Self {
         ExtensionManager::default()
     }

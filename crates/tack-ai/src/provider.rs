@@ -1,15 +1,17 @@
 //! Provider trait and stream options.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::stream::AssistantMessageEventStream;
 use crate::types::{Context, Model, ThinkingBudgets, ThinkingLevel};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CacheRetention {
     None,
     #[default]
@@ -17,7 +19,8 @@ pub enum CacheRetention {
     Long,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ToolChoice {
     #[default]
     Auto,
@@ -121,7 +124,74 @@ pub fn provider_for(model: &Model) -> Option<Arc<dyn Provider>> {
         crate::codebuddy::CODEBUDDY_API => {
             Some(Arc::new(crate::codebuddy::CodeBuddyStreamProvider))
         }
+        // Plugin-served provider bridge (tack-RPC v3 `provider/stream`):
+        // resolves the serving plugin connection from the bridge registry
+        // at stream time.
+        crate::provider_bridge::EXT_PROVIDER_BRIDGE_API => Some(Arc::new(
+            crate::provider_bridge::BridgedProvider::new(model.provider.clone()),
+        )),
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Provider events (rate limits, warnings) — P7c
+// ---------------------------------------------------------------------------
+
+/// Kind of a provider-scoped out-of-band event. `RateLimited` is the native
+/// codebuddy path's kind; bridge providers map their `provider/event`
+/// notification kinds onto these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderEventKind {
+    RateLimited,
+    Warning,
+    Info,
+}
+
+/// A provider-scoped out-of-band event (rate limit, warning, info).
+/// Generalizes the old codebuddy-only rate-limit hook into one channel for
+/// native providers and plugin bridge providers alike: the TUI shows an
+/// inline notice plus a (settings-gated) desktop notification; headless
+/// modes log.
+#[derive(Clone, Debug)]
+pub struct ProviderEvent {
+    pub kind: ProviderEventKind,
+    /// The provider id the event belongs to (e.g. `codebuddy`, or a
+    /// plugin-registered provider id).
+    pub provider: String,
+    pub message: String,
+}
+
+/// Provider event handler installed by tack-app (the TUI installs one;
+/// headless modes leave it unset and events degrade to log lines).
+type ProviderEventNotifier = Arc<dyn Fn(ProviderEvent) + Send + Sync>;
+
+static PROVIDER_EVENT_NOTIFIER: OnceLock<RwLock<Option<ProviderEventNotifier>>> = OnceLock::new();
+
+/// Install (or clear) the provider event handler.
+pub fn set_provider_event_notifier(handler: Option<ProviderEventNotifier>) {
+    let slot = PROVIDER_EVENT_NOTIFIER.get_or_init(|| RwLock::new(None));
+    *slot.write().unwrap_or_else(|e| e.into_inner()) = handler;
+}
+
+/// Emit a provider event: to the installed handler, or to the log when no
+/// handler is installed (headless modes).
+pub fn emit_provider_event(event: ProviderEvent) {
+    let handler = PROVIDER_EVENT_NOTIFIER
+        .get_or_init(|| RwLock::new(None))
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    match handler {
+        Some(handler) => handler(event),
+        None => match event.kind {
+            ProviderEventKind::Info => {
+                tracing::info!("{}: {}", event.provider, event.message)
+            }
+            ProviderEventKind::RateLimited | ProviderEventKind::Warning => {
+                tracing::warn!("{}: {}", event.provider, event.message)
+            }
+        },
     }
 }
 

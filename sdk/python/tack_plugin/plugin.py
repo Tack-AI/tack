@@ -14,9 +14,12 @@ from typing import Any, Awaitable, Callable, Optional
 
 from .peer import (
     ERR_METHOD_NOT_FOUND,
+    ERR_PLUGIN_UNAVAILABLE,
     JsonRpcPeer,
     PeerError,
 )
+from .provider import ProviderEvents, ProviderStreamCx
+from .types import ProviderEventKind
 
 PROTOCOL_VERSION = "3.0.0"
 ERR_INVALID_PARAMS = -32602
@@ -119,6 +122,18 @@ class Host:
     async def register_provider(self, provider: dict) -> None:
         await self._peer.call("host/registerProvider", {"provider": provider})
 
+    async def provider_event(
+        self, provider: str, kind: Any, message: str, detail: Any = None
+    ) -> None:
+        """``provider/event`` notification: rate-limit/warning/info
+        surfaced to the user for a bridge provider. ``kind`` is a
+        ProviderEventKind or its string value."""
+        kind_value = kind.value if isinstance(kind, ProviderEventKind) else str(kind)
+        params: dict[str, Any] = {"provider": provider, "kind": kind_value, "message": message}
+        if detail is not None:
+            params["detail"] = detail
+        await self._peer.notify("provider/event", params)
+
     async def widget_update(self, update: dict) -> None:
         await self._peer.notify("widgets/update", update)
 
@@ -141,6 +156,15 @@ class Plugin:
         self._autocomplete: dict[str, tuple[dict, Callable]] = {}
         self._config_schema: Optional[dict] = None
         self._metrics: Optional[dict] = None
+        self._provider_stream_handler: Optional[Callable] = None
+        self._on_ready: Optional[Callable] = None
+        # streamId -> cancellation event for in-flight provider/stream
+        # handlers (provider/streamCancel sets it; entries drop on
+        # handler completion).
+        self._provider_streams: dict[str, asyncio.Event] = {}
+        # Strong refs for fire-and-forget tasks (on_ready, stream
+        # supervisors) so the loop never garbage-collects them.
+        self._background: set[asyncio.Task] = set()
 
     # -- registration (chainable) -------------------------------------
 
@@ -196,6 +220,27 @@ class Plugin:
         self._metrics = declaration
         return self
 
+    def provider_stream(self, handler: Callable) -> "Plugin":
+        """Serve inference for registered providers (the P7 provider
+        bridge): declares the ``provider.stream`` capability; the host
+        calls ``provider/stream`` for every turn on the models of
+        providers this plugin registered with ``bridge: True``. The
+        handler receives ``(params, events, stream_cx)`` and may be
+        sync or async; events ride :class:`ProviderEvents` and
+        cancellation surfaces on :class:`ProviderStreamCx`."""
+        self._provider_stream_handler = handler
+        return self
+
+    def on_ready(self, handler: Callable) -> "Plugin":
+        """Run once after the initialize handshake is answered — the
+        registration entry point for provider plugins (call
+        ``cx.host.register_provider(...)`` here) and for any plugin
+        that pushes state at startup. Host services gate registrations
+        on the completed handshake, so registering immediately is
+        safe. The handler receives ``(cx)`` and may be sync or async."""
+        self._on_ready = handler
+        return self
+
     # -- serving --------------------------------------------------------
 
     def run(self) -> None:
@@ -247,11 +292,18 @@ class Plugin:
                 capabilities["config"] = {"schema": self._config_schema}
             if self._metrics is not None:
                 capabilities["metrics"] = self._metrics
+            if self._provider_stream_handler is not None:
+                capabilities["provider"] = {"stream": True}
             plugin_info: dict[str, Any] = {"name": self._name}
             if self._version is not None:
                 plugin_info["version"] = self._version
             if self._description is not None:
                 plugin_info["description"] = self._description
+            # The startup hook (provider plugins register their
+            # providers here). Spawned: on_ready must not delay the
+            # handshake answer.
+            if self._on_ready is not None:
+                self._spawn(self._run_ready(cx()))
             return {
                 "protocolVersion": PROTOCOL_VERSION,
                 "plugin": plugin_info,
@@ -291,6 +343,12 @@ class Plugin:
                         f"unknown autocomplete provider {params.get('providerId')!r}",
                     )
                 return await _maybe_await(entry[1](params, cx()))
+            if method == "provider/stream":
+                if self._provider_stream_handler is None:
+                    raise PluginError(
+                        ERR_CAPABILITY_NOT_GRANTED, f"capability not declared for {method}"
+                    )
+                return self._open_provider_stream(params, cx(), host[0])
             raise PluginError(ERR_METHOD_NOT_FOUND, f"unknown method {method}")
 
         async def handle_notification(method: str, params: Any) -> None:
@@ -299,6 +357,10 @@ class Plugin:
                 await _maybe_await(self._event_handler(params, cx()))
             elif method == "widgets/action" and self._widget_action_handler is not None:
                 await _maybe_await(self._widget_action_handler(params, cx()))
+            elif method == "provider/streamCancel":
+                cancel = self._provider_streams.get(params.get("streamId"))
+                if cancel is not None:
+                    cancel.set()
 
         peer = JsonRpcPeer(reader, writer, handle_request, handle_notification)
         host[0] = Host(peer)
@@ -312,6 +374,63 @@ class Plugin:
         if handler is None:
             raise PluginError(ERR_CAPABILITY_NOT_GRANTED, f"capability not declared for {method}")
         return await _maybe_await(handler(params, cx()))
+
+    # -- provider bridge (P7) -------------------------------------------
+
+    def _spawn(self, coro: Awaitable[Any]) -> None:
+        task = asyncio.ensure_future(coro)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def _run_ready(self, ready_cx: Cx) -> None:
+        try:
+            await _maybe_await(self._on_ready(ready_cx))
+        except Exception:  # noqa: BLE001 — startup-hook errors are non-fatal
+            pass
+
+    def _open_provider_stream(self, params: dict, stream_cx_base: Cx, host: Optional[Host]) -> None:
+        stream_id = params.get("streamId")
+        if not isinstance(stream_id, str) or not stream_id:
+            raise PluginError(ERR_INVALID_PARAMS, "provider/stream requires a streamId")
+        if host is None:
+            raise PluginError(ERR_PLUGIN_UNAVAILABLE, "plugin is not serving")
+        cancel = asyncio.Event()
+        self._provider_streams[stream_id] = cancel
+        events = ProviderEvents(host._peer, stream_id, params.get("model"))
+        stream_cx = ProviderStreamCx(stream_cx_base, stream_id, cancel)
+        # The ack is fast: validation is done; the stream rides
+        # provider/streamEvent notifications from here on.
+        self._spawn(self._supervise_provider_stream(stream_id, params, events, stream_cx))
+        return None
+
+    async def _supervise_provider_stream(
+        self,
+        stream_id: str,
+        params: dict,
+        events: ProviderEvents,
+        stream_cx: ProviderStreamCx,
+    ) -> None:
+        """Await the handler so an exception still produces the
+        automatic terminal error event; then drop the cancel entry."""
+        try:
+            failure: Optional[str]
+            try:
+                await _maybe_await(self._provider_stream_handler(params, events, stream_cx))
+            except Exception as err:  # noqa: BLE001 — handler failure becomes the terminal error
+                failure = str(err) or type(err).__name__
+            else:
+                failure = (
+                    None
+                    if events.terminal_sent
+                    else "provider stream handler returned without a terminal event"
+                )
+            if failure is not None:
+                try:
+                    await events.error(failure)
+                except PeerError:
+                    pass
+        finally:
+            self._provider_streams.pop(stream_id, None)
 
 
 # ---------------------------------------------------------------------------

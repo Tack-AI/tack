@@ -26,6 +26,8 @@ APPROVAL_REVIEW = "approval/review"
 AUTOCOMPLETE_PROVIDE = "autocomplete/provide"
 EVENTS_LIFECYCLE = "events/lifecycle"
 WIDGETS_ACTION = "widgets/action"
+PROVIDER_STREAM = "provider/stream"
+PROVIDER_STREAM_CANCEL = "provider/streamCancel"
 WIDGETS_UPDATE = "widgets/update"
 SESSION_GET = "session/get"
 SESSION_SEND_USER_MESSAGE = "session/sendUserMessage"
@@ -38,6 +40,8 @@ UI_INPUT = "ui/input"
 EXEC_RUN = "exec/run"
 LOGS_EMIT = "logs/emit"
 WARNINGS_EMIT = "warnings/emit"
+PROVIDER_STREAM_EVENT = "provider/streamEvent"
+PROVIDER_EVENT = "provider/event"
 HOST_REGISTER_PROVIDER = "host/registerProvider"
 
 class AfterToolCallParams(TypedDict):
@@ -266,6 +270,7 @@ class PluginCapabilities(TypedDict):
     events: NotRequired[list[str]]
     hooks: NotRequired["HookCapabilities"]
     metrics: NotRequired["MetricsDeclaration"]
+    provider: NotRequired["ProviderCapability"]
     tools: NotRequired[list["ToolSpec"]]
     widgets: NotRequired[list["WidgetSpec"]]
 
@@ -275,6 +280,45 @@ class PluginInfo(TypedDict):
     description: NotRequired[str]
     name: str
     version: NotRequired[str]
+
+
+class ProviderCapability(TypedDict):
+    """Provider bridge surface: the plugin serves inference for the providers it registers (host/registerProvider with bridge: true) through provider/stream."""
+    stream: NotRequired[bool]
+
+
+class ProviderEventKind(str, Enum):
+    """Provider event kinds (provider/event)."""
+    RATE_LIMITED = "rateLimited"
+    WARNING = "warning"
+    INFO = "info"
+
+
+class ProviderEventParams(TypedDict):
+    """provider/event params."""
+    detail: NotRequired[Any]
+    kind: "ProviderEventKind"
+    message: str
+    provider: str
+
+
+class ProviderStreamCancelParams(TypedDict):
+    """provider/streamCancel params."""
+    streamId: str
+
+
+class ProviderStreamEventParams(TypedDict):
+    """provider/streamEvent params."""
+    event: Any
+    streamId: str
+
+
+class ProviderStreamParams(TypedDict):
+    """provider/stream params: start one inference stream on a bridge provider."""
+    context: Any
+    model: Any
+    options: Any
+    streamId: str
 
 
 class RegisterProviderParams(TypedDict):

@@ -18,6 +18,7 @@ pub mod local_providers;
 pub mod oauth;
 pub mod overflow;
 pub mod provider;
+pub mod provider_bridge;
 pub mod providers;
 pub mod retry;
 pub mod stream;
@@ -26,7 +27,14 @@ pub mod transcript;
 pub mod transform;
 pub mod types;
 
-pub use provider::{CacheRetention, Provider, StreamOptions, ToolChoice, provider_for};
+pub use provider::{
+    CacheRetention, Provider, ProviderEvent, ProviderEventKind, StreamOptions, ToolChoice,
+    emit_provider_event, provider_for, set_provider_event_notifier,
+};
+pub use provider_bridge::{
+    BridgedProvider, EXT_PROVIDER_BRIDGE_API, ProviderStreamBridge, provider_bridge,
+    register_provider_bridge, unregister_provider_bridge,
+};
 pub use stream::{
     AssistantMessageEvent, AssistantMessageEventSender, AssistantMessageEventStream, EventSender,
     EventStream, event_stream,

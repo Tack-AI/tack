@@ -329,6 +329,8 @@ spawned and handshake-done first):
       "expectError": -32001 },
     { "notify": "events/lifecycle", "params": { "event": "turnStart", "payload": {} } },
     { "expectHostRequest": "ui/select", "respond": "b" },
+    { "providerStream": { "model": {…}, "context": {…}, "options": {} },
+      "expectEvents": [ {"type": "start"}, {"type": "done"} ] },
     { "sleepMs": 50 }
   ]
 }
@@ -336,16 +338,22 @@ spawned and handshake-done first):
 
 `expect` is a recursive subset match; `expectError` asserts the JSON-RPC
 error code; `expectHostRequest` scripts the plugin→host answer queue
-(dialogs, exec); a failing step exits non-zero.
+(dialogs, exec); a failing step exits non-zero. The `providerStream`
+step (P7) drives one inference stream on a provider plugin: the dev host
+assigns the `streamId`, captures `provider/streamEvent` notifications,
+subset-matches them against `expectEvents`, and can script a cancel race
+with `cancelAfterMs` (plus `timeoutMs` for the terminal wait).
 
 ## 7. Run modes
 
 Plugins load in every run mode. Non-TUI modes degrade deterministically:
 `ui/select|confirm|input` answer `ERR_CAPABILITY_NOT_GRANTED`,
-`session/*` and `host/registerProvider` answer `ERR_METHOD_NOT_FOUND`,
-`ui/notify` goes to the log, `exec/run` stays trust-gated. A plugin
-learns the mode and the available surfaces from the initialize payload's
-`mode` and `capabilities`.
+`session/*` answers `ERR_METHOD_NOT_FOUND`, `ui/notify` goes to the
+log, `exec/run` stays trust-gated. `host/registerProvider` is honored
+in every mode (provider registration is mode-independent), and bridged
+providers serve inference headless like native ones. A plugin learns
+the mode and the available surfaces from the initialize payload's `mode`
+and `capabilities`.
 
 ## 8. Security model (unchanged principles)
 
@@ -399,6 +407,11 @@ weaken policy):
         // they shrink the surface, never expand it:
         "mcpServers": ["jira"],      // bundle MCP servers kept
         "tools": ["create_ticket"]   // registered tools kept
+      },
+      "acme-agent@acme": {
+        // Indivisible capability gate: a managed `false` turns a
+        // plugin that declares provider.stream policy-blocked at load.
+        "provider": false
       }
     }
   }

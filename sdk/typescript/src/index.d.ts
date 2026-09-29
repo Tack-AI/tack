@@ -16,6 +16,8 @@ import type {
   LifecycleEventParams,
   LogLevel,
   MetricsDeclaration,
+  ProviderEventKind,
+  ProviderStreamParams,
   SessionInfo,
   Snapshot,
   ToolExecuteParams,
@@ -75,7 +77,41 @@ export interface Host {
   snapshot(): Promise<Snapshot>;
   config(): Promise<any>;
   registerProvider(provider: any): Promise<void>;
+  providerEvent(provider: string, kind: ProviderEventKind, message: string, detail?: any): Promise<void>;
   widgetUpdate(update: WidgetUpdateParams): Promise<void>;
+}
+
+/** The event sink scoped to one `provider/stream` call: sends
+ * `provider/streamEvent` notifications (AssistantMessageEvent-shaped
+ * plain objects) and enforces exactly one terminal event (done/error). */
+export interface ProviderEvents {
+  readonly streamId: string;
+  /** Send one event. Terminal events (`done`/`error`) may be sent
+   * exactly once; a second one rejects. */
+  send(event: any): Promise<void>;
+  /** `textDelta` convenience (`partial` is the accumulated message). */
+  textDelta(contentIndex: number, delta: string, partial: any): Promise<void>;
+  /** `thinkingDelta` convenience (`partial` is the accumulated message). */
+  thinkingDelta(contentIndex: number, delta: string, partial: any): Promise<void>;
+  /** Terminal `done` event; `reason` defaults to the message's
+   * `stopReason` (or `stop`). */
+  done(message: any): Promise<void>;
+  /** Terminal `error` event. `message` defaults to a zeroed assistant
+   * message built from the served model carrying `errorMessage`. */
+  error(errorMessage: string, message?: any): Promise<void>;
+}
+
+/** Stream-scoped context for a `provider/stream` handler: the plugin's
+ * host context plus the stream's cancellation signal. */
+export interface ProviderStreamCx {
+  /** The plugin's host context (mode, trust, config, host client). */
+  cx: Cx;
+  /** This stream's id. */
+  streamId: string;
+  /** Poll the cancellation signal. */
+  isCancelled(): boolean;
+  /** Resolve when the host cancels the stream (`provider/streamCancel`). */
+  cancelled(): Promise<void>;
 }
 
 type Async<F> = F | Promise<F>;
@@ -106,6 +142,18 @@ export interface PluginBuilder {
   ): this;
   configSchema(schema: object): this;
   metrics(declaration: MetricsDeclaration): this;
+  /** Serve inference for registered providers (the P7 provider bridge):
+   * declares the `provider.stream` capability. The host calls
+   * `provider/stream` for every turn on the models of providers this
+   * plugin registered with `bridge: true`; events flow back through
+   * `events`, cancellation surfaces on the stream context. */
+  providerStream(
+    handler: (params: ProviderStreamParams, events: ProviderEvents, cx: ProviderStreamCx) => Async<void>,
+  ): this;
+  /** Fired once after the initialize handshake is answered. The
+   * registration entry point for provider plugins (call
+   * `cx.host.registerProvider(...)` here). */
+  onReady(handler: (cx: Cx) => Async<void>): this;
   run(options?: {
     input?: AsyncIterable<any>;
     output?: { write(s: string, cb?: (err?: Error) => void): unknown };

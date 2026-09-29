@@ -57,11 +57,16 @@ impl std::fmt::Debug for ExtUiRequest {
 
 /// Host services bridge for the TUI: plugin requests cross to the TUI main
 /// loop via the app event channel (plugin calls never run on the loop
-/// thread). Implements the v3 [`PeerHandler`] surface.
+/// thread) or are answered inline (provider registration — see below).
+/// One services object is shared by all plugins; per-plugin attribution
+/// comes from `TaggedServices` injecting the `plugin` field (see the load
+/// loop). Implements the v3 [`PeerHandler`] surface.
 pub struct TuiExtServices {
     tx: crate::tui::AppEventTx,
     /// Project trust: `exec/run` is only honored for trusted contexts.
     trusted: bool,
+    /// Provider bridge state (connections, stream sinks, registrations).
+    bridge_state: Arc<crate::ext_provider_bridge::ProviderBridgeState>,
 }
 
 impl std::fmt::Debug for TuiExtServices {
@@ -73,8 +78,16 @@ impl std::fmt::Debug for TuiExtServices {
 }
 
 impl TuiExtServices {
-    pub(crate) fn new(tx: crate::tui::AppEventTx, trusted: bool) -> Self {
-        TuiExtServices { tx, trusted }
+    pub(crate) fn new(
+        tx: crate::tui::AppEventTx,
+        trusted: bool,
+        bridge_state: Arc<crate::ext_provider_bridge::ProviderBridgeState>,
+    ) -> Self {
+        TuiExtServices {
+            tx,
+            trusted,
+            bridge_state,
+        }
     }
 }
 
@@ -91,14 +104,13 @@ impl PeerHandler for TuiExtServices {
     async fn handle_request(&self, method: &str, params: Value) -> Result<Value, ErrorObject> {
         use tack_ext::rpc3::{ERR_CAPABILITY_NOT_GRANTED, ERR_METHOD_NOT_FOUND, ERR_POLICY_DENIED};
         match method {
-            // Interactive dialogs and the provider bridge cross to the TUI.
+            // Interactive dialogs and session control cross to the TUI.
             "ui/notify"
             | "ui/select"
             | "ui/confirm"
             | "ui/input"
             | "session/get"
-            | "session/sendUserMessage"
-            | "host/registerProvider" => {
+            | "session/sendUserMessage" => {
                 let (tx, rx) = oneshot::channel();
                 self.tx
                     .send(crate::tui::AppEvent::ExtUiRequest(ExtUiRequest {
@@ -115,6 +127,35 @@ impl PeerHandler for TuiExtServices {
                         service_error(ERR_CAPABILITY_NOT_GRANTED, "host closed the request")
                     })?
                     .map_err(|e| service_error(tack_ext::rpc3::ERR_INTERNAL, e))
+            }
+            // Provider registration is mode-independent: it writes the
+            // process-global runtime registry (HTTP shim), and for
+            // `bridge: true` additionally wires the plugin connection as
+            // the serving endpoint (P7b). Handled inline — crossing to the
+            // main loop would needlessly serialize on UI work.
+            "host/registerProvider" => {
+                let provider_id = params
+                    .get("provider")
+                    .and_then(|p| p.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let result = crate::ext_provider_bridge::handle_register_provider(
+                    &self.bridge_state,
+                    params,
+                )
+                .await;
+                if result.is_ok() {
+                    let _ = self.tx.send(crate::tui::AppEvent::Notice(
+                        crate::i18n::t(
+                            crate::i18n::current(),
+                            "msg.provider_registered",
+                            &[("id", &provider_id)],
+                        ),
+                        crate::tui::chat::NoticeKind::Info,
+                    ));
+                }
+                result
             }
             "exec/run" => {
                 if !self.trusted {
@@ -166,6 +207,24 @@ impl PeerHandler for TuiExtServices {
                 let message = payload.get("message").and_then(Value::as_str).unwrap_or("");
                 tracing::warn!(target: "tack_ext::plugin", "plugin warning: {message}");
             }
+            // Bridge provider stream events + provider events (P7b/P7c).
+            // The `plugin` field was injected by TaggedServices.
+            "provider/streamEvent" => {
+                let plugin = payload
+                    .get("plugin")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                self.bridge_state.route_stream_event(&plugin, payload);
+            }
+            "provider/event" => {
+                let plugin = payload
+                    .get("plugin")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                self.bridge_state.route_provider_event(&plugin, payload);
+            }
             // Widget state push. Fire-and-forget into the TUI main loop
             // (full-state replacement; dropped frames are harmless). The
             // `plugin` field was injected by TaggedServices (widget ids are
@@ -192,9 +251,11 @@ impl PeerHandler for TuiExtServices {
     }
 }
 
-/// Per-plugin services wrapper: tags `widgets/update` notifications with
-/// the originating plugin's id before delegating (widget ids are only
-/// unique per plugin; the host key is `<plugin-id>:<widget-id>`).
+/// Per-plugin services wrapper: tags requests and notifications with the
+/// originating plugin's id (spoof-proof overwrite) before delegating — the
+/// provider bridge needs reliable attribution for `host/registerProvider`
+/// and `provider/streamEvent`, and `widgets/update` needs it because widget
+/// ids are only unique per plugin.
 struct TaggedServices {
     plugin: String,
     inner: Arc<dyn PeerHandler>,
@@ -202,13 +263,14 @@ struct TaggedServices {
 
 #[async_trait::async_trait]
 impl PeerHandler for TaggedServices {
-    async fn handle_request(&self, method: &str, params: Value) -> Result<Value, ErrorObject> {
+    async fn handle_request(&self, method: &str, mut params: Value) -> Result<Value, ErrorObject> {
+        if let Value::Object(map) = &mut params {
+            map.insert("plugin".to_string(), Value::String(self.plugin.clone()));
+        }
         self.inner.handle_request(method, params).await
     }
     async fn handle_notification(&self, method: &str, mut payload: Value) {
-        if method == "widgets/update"
-            && let Value::Object(map) = &mut payload
-        {
+        if let Value::Object(map) = &mut payload {
             map.insert("plugin".to_string(), Value::String(self.plugin.clone()));
         }
         self.inner.handle_notification(method, payload).await;
@@ -786,10 +848,21 @@ fn emit_load_telemetry(manager: &ExtensionManager, agent_dir: &Path, mode: &str)
     let mut disabled = 0u64;
     let mut failed = 0u64;
     let mut policy_filtered = 0u64;
+    let mut provider_bridges = 0u64;
     let mut class_counts = [0u64; 5]; // manifest, handshake, register, policy, store
     for plugin in &manager.plugins {
         match plugin.outcome() {
-            "active" => active += 1,
+            "active" => {
+                active += 1;
+                if plugin
+                    .capabilities()
+                    .and_then(|caps| caps.provider.as_ref())
+                    .and_then(|p| p.stream)
+                    == Some(true)
+                {
+                    provider_bridges += 1;
+                }
+            }
             "disabled" => disabled += 1,
             "failed" => {
                 failed += 1;
@@ -815,13 +888,14 @@ fn emit_load_telemetry(manager: &ExtensionManager, agent_dir: &Path, mode: &str)
         disabled,
         failed,
         policy_filtered,
+        provider_bridges,
         class_manifest = class_counts[0],
         class_handshake = class_counts[1],
         class_register = class_counts[2],
         class_policy = class_counts[3],
         class_store = class_counts[4],
         "plugin load: {active} active, {disabled} disabled, {failed} failed, \
-         {policy_filtered} policy-filtered"
+         {policy_filtered} policy-filtered, {provider_bridges} provider-bridging"
     );
     let report = LoadReport {
         version: 1,
@@ -1401,6 +1475,7 @@ impl ExtensionManager {
         services: Arc<dyn PeerHandler>,
         lock_required: bool,
         mcp_callbacks: tack_tools::mcp::McpClientCallbacks,
+        bridge_state: Arc<crate::ext_provider_bridge::ProviderBridgeState>,
     ) -> Self {
         let policy = crate::plugin_policy::PluginPolicy::load();
         // Curated marketplace startup sync (roadmap §9): background,
@@ -1414,6 +1489,7 @@ impl ExtensionManager {
             lock_required,
             mcp_callbacks,
             policy,
+            bridge_state,
         )
         .await
     }
@@ -1422,6 +1498,7 @@ impl ExtensionManager {
     /// entry point reads it from the managed settings file; tests pass
     /// one in directly — `TACK_MANAGED_SETTINGS` is process-global and
     /// parallel tests would race it).
+    #[allow(clippy::too_many_arguments)]
     pub async fn load_with_policy(
         cwd: &Path,
         agent_dir: &Path,
@@ -1430,6 +1507,7 @@ impl ExtensionManager {
         lock_required: bool,
         mcp_callbacks: tack_tools::mcp::McpClientCallbacks,
         policy: Option<crate::plugin_policy::PluginPolicy>,
+        bridge_state: Arc<crate::ext_provider_bridge::ProviderBridgeState>,
     ) -> Self {
         let mut manager = ExtensionManager::default();
         let trusted = crate::project_trust::is_trusted(cwd, agent_dir);
@@ -1798,7 +1876,18 @@ impl ExtensionManager {
                 }
             };
 
-            // Handshake (v3 initialize).
+            // Handshake (v3 initialize). The connection is published to
+            // the provider bridge first so a registration racing the
+            // handshake waits on the capability state instead of failing.
+            let serves_provider_stream = match &handle {
+                PluginHandle::Process(_) => true,
+                #[cfg(feature = "wasm")]
+                PluginHandle::Wasm(_) => true,
+                #[cfg(feature = "wasm")]
+                PluginHandle::WasmComponent(_) => false,
+                PluginHandle::Mcp(_) => false,
+            };
+            bridge_state.register_connection(&id_string, handle.client(), serves_provider_stream);
             let run_mode = match mode {
                 "tui" => RunMode::Tui,
                 "print" => RunMode::Print,
@@ -1889,6 +1978,39 @@ impl ExtensionManager {
                             ));
                         }
                     }
+                    // Managed policy provider-capability narrowing (P5):
+                    // a managed deny of `provider` turns a plugin that
+                    // declares provider.stream policy-blocked — the same
+                    // intersect-at-initialize rule as tools, except the
+                    // capability is indivisible so denial blocks the load.
+                    let declares_provider_stream = register
+                        .capabilities
+                        .provider
+                        .as_ref()
+                        .and_then(|p| p.stream)
+                        == Some(true);
+                    if declares_provider_stream
+                        && let Some(policy) = &policy
+                        && !policy.provider_allowed(&id_string)
+                    {
+                        policy.audit_narrow(
+                            &id_string,
+                            "plugins.provider",
+                            &["stream".to_string()],
+                        );
+                        bridge_state.set_provider_stream_granted(&id_string, false);
+                        handle.shutdown().await;
+                        manager.plugins.push(LoadedPlugin::policy_blocked(
+                            entry,
+                            enabled,
+                            format!(
+                                "provider bridge serving is denied by managed policy ({})",
+                                policy.origin
+                            ),
+                        ));
+                        continue;
+                    }
+                    bridge_state.set_provider_stream_granted(&id_string, declares_provider_stream);
                     // Metrics sidecar (roadmap §9): the declared schema
                     // validates all-or-nothing; a valid declaration on a
                     // supported carrier gets a drained sidecar.
@@ -1939,6 +2061,7 @@ impl ExtensionManager {
                         .push(LoadedPlugin::loaded(entry, enabled, register, handle));
                 }
                 Err(e) => {
+                    bridge_state.remove_connection(&id_string);
                     handle.shutdown().await;
                     manager.plugins.push(LoadedPlugin::failed(
                         entry,
@@ -4604,6 +4727,7 @@ mod tests {
             Arc::new(NoopServices),
             true,
             Default::default(),
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
         )
         .await;
         assert!(
@@ -4748,6 +4872,7 @@ mod tests {
             Arc::new(NoopServices),
             true,
             Default::default(),
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
         )
         .await;
         assert!(
@@ -4795,6 +4920,7 @@ mod tests {
             Arc::new(NoopServices),
             true,
             Default::default(),
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
         )
         .await;
         assert_eq!(manager.plugins.len(), 2);
@@ -4896,6 +5022,7 @@ mod tests {
             Arc::new(NoopServices),
             true,
             Default::default(),
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
         )
         .await;
         assert_eq!(manager.plugins.len(), 1);
@@ -4935,6 +5062,7 @@ mod tests {
             Arc::new(NoopServices),
             true,
             Default::default(),
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
         )
         .await;
         assert_eq!(manager.plugins.len(), 1);
@@ -5033,6 +5161,7 @@ mod tests {
             Arc::new(NoopServices),
             true,
             Default::default(),
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
         )
         .await;
         assert_eq!(manager.plugins.len(), 1, "wasm plugin must load");
@@ -5099,6 +5228,7 @@ mod tests {
             Arc::new(NoopServices),
             true,
             Default::default(),
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
         )
         .await;
         assert_eq!(
@@ -5174,6 +5304,7 @@ mod tests {
             Arc::new(NoopServices),
             true,
             Default::default(),
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
         )
         .await;
         let tools = manager.tools();
@@ -5218,6 +5349,7 @@ mod tests {
             Arc::new(NoopServices),
             true,
             Default::default(),
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
         )
         .await;
         let tools = manager.tools();
@@ -5301,6 +5433,7 @@ mod policy_tests {
             true,
             Default::default(),
             Some(policy),
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
         )
         .await;
         assert_eq!(manager.plugins.len(), 1);
@@ -5343,6 +5476,7 @@ mod policy_tests {
             true,
             Default::default(),
             Some(policy),
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
         )
         .await;
         let forced = manager
@@ -5396,6 +5530,7 @@ mod policy_tests {
             true,
             Default::default(),
             Some(policy),
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
         )
         .await;
         assert_eq!(
@@ -5456,6 +5591,7 @@ mod policy_tests {
             true,
             Default::default(),
             Some(policy),
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
         )
         .await;
         assert!(
@@ -5481,6 +5617,7 @@ mod policy_tests {
             true,
             Default::default(),
             Some(policy),
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
         )
         .await;
         assert_eq!(manager.tools().len(), 1);
@@ -5513,6 +5650,7 @@ mod policy_tests {
             true,
             Default::default(),
             Some(policy),
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
         )
         .await;
         assert_eq!(manager.plugins.len(), 1);
@@ -5536,6 +5674,7 @@ mod policy_tests {
             true,
             Default::default(),
             Some(policy),
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
         )
         .await;
         assert!(
@@ -5586,6 +5725,7 @@ mod policy_tests {
             true,
             Default::default(),
             Some(policy),
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
         )
         .await;
         let report = read_load_report(&agent_dir).expect("report written");

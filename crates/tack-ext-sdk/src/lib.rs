@@ -34,10 +34,12 @@
 mod host;
 mod metrics;
 mod plugin;
+mod provider;
 
 pub use host::{Cx, Host};
 pub use metrics::MetricsRecorder;
 pub use plugin::{Plugin, PluginBuilder};
+pub use provider::{ProviderEvents, ProviderStreamCx};
 
 pub use tack_ext::rpc3; // generated protocol types
 pub use tack_ext::rpc3::{
@@ -46,10 +48,11 @@ pub use tack_ext::rpc3::{
     AutocompleteProviderSpec, AutocompleteSuggestion, BeforeToolCallParams, CommandInvokeParams,
     CommandSpec, ConfigDeclaration, ContentBlock, ContentBlockKind, ExecRunResult,
     HookCapabilities, HostCapabilities, InitializeParams, LifecycleEventParams, LogLevel,
-    MetricOperation, MetricsDeclaration, PluginCapabilities, PluginInfo, RunMode, SessionInfo,
-    Snapshot, ToolCall, ToolExecuteParams, ToolOutput, ToolSpec, TransformContextParams,
-    TransformContextResult, UiInputParams, UiSelectParams, Verdict, VerdictAction,
-    WidgetActionParams, WidgetKind, WidgetSpec, WidgetUpdateParams,
+    MetricOperation, MetricsDeclaration, PluginCapabilities, PluginInfo, ProviderCapability,
+    ProviderEventKind, ProviderEventParams, ProviderStreamCancelParams, ProviderStreamEventParams,
+    ProviderStreamParams, RunMode, SessionInfo, Snapshot, ToolCall, ToolExecuteParams, ToolOutput,
+    ToolSpec, TransformContextParams, TransformContextResult, UiInputParams, UiSelectParams,
+    Verdict, VerdictAction, WidgetActionParams, WidgetKind, WidgetSpec, WidgetUpdateParams,
 };
 pub use tack_ext::v3::PeerError;
 

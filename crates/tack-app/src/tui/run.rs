@@ -51,7 +51,7 @@ impl TuiApp {
         let mut permission_rx = self.permission_rx.take().expect("permission rx");
         let mut compaction_rx = self.compaction_rx.take().expect("compaction rx");
         let mut bg_notify_rx = self.bg_notify_rx.take().expect("bg notify rx");
-        let mut rate_limit_rx = self.rate_limit_rx.take().expect("rate limit rx");
+        let mut provider_event_rx = self.provider_event_rx.take().expect("provider event rx");
         let mut budget_rx = self.budget_rx.take().expect("budget rx");
         tack_tui::terminal::set_title(&format!(
             "tack — {}",
@@ -179,11 +179,21 @@ impl TuiApp {
                     self.handle_bg_notification(note).await;
                     dirty = true;
                 }
-                Some(msg) = rate_limit_rx.recv() => {
-                    // CodeBuddy rate limit: inline notice + (gated,
+                Some(event) = provider_event_rx.recv() => {
+                    // Provider event (rate limit / warning / info — native
+                    // or bridge provider): inline notice + (gated,
                     // throttled) desktop notification.
-                    self.desktop_notify("codebuddy:rate-limit", "CodeBuddy", &msg);
-                    self.notice(msg, chat::NoticeKind::Warning);
+                    let kind = match event.kind {
+                        tack_ai::ProviderEventKind::Info => chat::NoticeKind::Info,
+                        tack_ai::ProviderEventKind::RateLimited
+                        | tack_ai::ProviderEventKind::Warning => chat::NoticeKind::Warning,
+                    };
+                    self.desktop_notify(
+                        &format!("{}:provider-event", event.provider),
+                        &event.provider,
+                        &event.message,
+                    );
+                    self.notice(event.message, kind);
                     dirty = true;
                 }
                 _ = tick.tick() => {

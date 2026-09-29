@@ -226,7 +226,7 @@ Tack 从四级读取配置，**后加载的层级覆盖先加载的**（部分�
 | `lockedProvider` | 锁定 provider（启动和 /model 都拦截） |
 | `lockedModel` | 锁定模型 id |
 | `auditSink` | 审计上报：`{"url": "…", "token": "…", "intervalMs": 5000}`——trace 事件批量 POST（换行分隔 JSON，Bearer 鉴权）。设置后强制开启 observability |
-| `pluginPolicy` | 企业插件策略：`managedPluginsOnly`、`allowedSources`（git/hostPattern/local 来源白名单）、按插件的 `enabled`（压过用户/项目层）与只收窄的 `tools`/`mcpServers` 交集。安装时与加载时双重执行；决策记入审计日志。见 docs/extensions.zh-CN.md §9 |
+| `pluginPolicy` | 企业插件策略：`managedPluginsOnly`、`allowedSources`（git/hostPattern/local 来源白名单）、按插件的 `enabled`（压过用户/项目层）、只收窄的 `tools`/`mcpServers` 交集，以及 `provider` 桥服务闸门（置 `false` 时 provider-stream 插件在加载时被策略阻止）。安装时与加载时双重执行；决策记入审计日志。见 docs/extensions.zh-CN.md §9 |
 
 ### MCP（mcp.json）
 

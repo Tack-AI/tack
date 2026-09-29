@@ -301,6 +301,8 @@ tack ext dev my-plugin s.json      // 交互式运行一个场景
       "expectError": -32001 },
     { "notify": "events/lifecycle", "params": { "event": "turnStart", "payload": {} } },
     { "expectHostRequest": "ui/select", "respond": "b" },
+    { "providerStream": { "model": {…}, "context": {…}, "options": {} },
+      "expectEvents": [ {"type": "start"}, {"type": "done"} ] },
     { "sleepMs": 50 }
   ]
 }
@@ -308,15 +310,21 @@ tack ext dev my-plugin s.json      // 交互式运行一个场景
 
 `expect` 是递归子集匹配；`expectError` 断言 JSON-RPC 错误码；
 `expectHostRequest` 编排插件→宿主的应答队列（对话框、exec）；步骤
-失败时退出码非零。
+失败时退出码非零。`providerStream` 步骤（P7）在 provider 插件上
+驱动一次推理流：dev host 分配 `streamId`，捕获
+`provider/streamEvent` 通知，将其与 `expectEvents` 做子集匹配，
+并可用 `cancelAfterMs` 编排一次取消竞争（终止等待另有
+`timeoutMs`）。
 
 ## 7. 运行模式
 
 所有运行模式都会加载插件。非 TUI 模式确定性降级：
 `ui/select|confirm|input` 返回 `ERR_CAPABILITY_NOT_GRANTED`，
-`session/*` 与 `host/registerProvider` 返回 `ERR_METHOD_NOT_FOUND`，
-`ui/notify` 进日志，`exec/run` 仍由信任门控。插件从 initialize
-payload 的 `mode` 与 `capabilities` 获知当前模式与可用表面。
+`session/*` 返回 `ERR_METHOD_NOT_FOUND`，`ui/notify` 进日志，
+`exec/run` 仍由信任门控。`host/registerProvider` 在每种模式都被
+受理（provider 注册与模式无关），桥接 provider 像原生 provider
+一样在无头模式下供推理。插件从 initialize payload 的 `mode` 与
+`capabilities` 获知当前模式与可用表面。
 
 ## 8. 安全模型（原则不变）
 
@@ -364,6 +372,11 @@ payload 的 `mode` 与 `capabilities` 获知当前模式与可用表面。
         // 只收窄：与插件实际注册集合求交集——只缩不扩：
         "mcpServers": ["jira"],      // 保留的 bundle MCP 服务器
         "tools": ["create_ticket"]   // 保留的已注册工具
+      },
+      "acme-agent@acme": {
+        // 不可分的能力闸门：managed 置 `false` 时，声明了
+        // provider.stream 的插件在加载时被策略阻止。
+        "provider": false
       }
     }
   }

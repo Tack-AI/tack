@@ -133,8 +133,8 @@ host answers `ERR_CAPABILITY_NOT_GRANTED` if it must).
 
 | Direction | Methods/notifications |
 |---|---|
-| host → plugin | `tools/execute`, `commands/invoke`, `hooks/beforeToolCall` (allow/deny/**rewrite**), `hooks/transformContext` (full-context replacement), `hooks/afterToolCall` (per-field result patch), `approval/review` (approval chain), `autocomplete/provide`, `events/lifecycle` (subscription-gated), `widgets/action` |
-| plugin → host | `ui/notify/select/confirm/input` (TUI dialogs), `session/get`, `session/sendUserMessage`, `snapshot/get` (read-only digest), `config/get`, `exec/run` (trust-gated), `host/registerProvider` (LLM provider bridge), `widgets/update`, `logs/emit`, `warnings/emit` |
+| host → plugin | `tools/execute`, `commands/invoke`, `hooks/beforeToolCall` (allow/deny/**rewrite**), `hooks/transformContext` (full-context replacement), `hooks/afterToolCall` (per-field result patch), `approval/review` (approval chain), `autocomplete/provide`, `events/lifecycle` (subscription-gated), `widgets/action`, `provider/stream` + `provider/streamCancel` (provider bridge) |
+| plugin → host | `ui/notify/select/confirm/input` (TUI dialogs), `session/get`, `session/sendUserMessage`, `snapshot/get` (read-only digest), `config/get`, `exec/run` (trust-gated), `host/registerProvider` (LLM provider registration), `provider/streamEvent` + `provider/event` (provider bridge), `widgets/update`, `logs/emit`, `warnings/emit` |
 
 SDKs exist for Rust (`tack-ext-sdk`), TypeScript (`@tack/plugin`), and
 Python (`tack-plugin`); `tack ext new` scaffolds any of them, and
@@ -147,10 +147,13 @@ All four run modes load plugins (see the matrix in §6). Non-TUI modes
 (print/rpc/acp) degrade deterministically: tools, interception,
 lifecycle events, and `exec/run` (trust-gated) work as usual;
 `ui/select|confirm|input` answer `ERR_CAPABILITY_NOT_GRANTED`;
-`session/*` and `host/registerProvider` answer
-`ERR_METHOD_NOT_FOUND`; `ui/notify` goes to the log. A plugin learns
-the mode and the available surfaces from the initialize payload's `mode`
-and `capabilities`.
+`session/*` answers `ERR_METHOD_NOT_FOUND`; `ui/notify` goes to the log.
+`host/registerProvider` is honored in every mode — provider
+registration is mode-independent (it writes the process-global runtime
+registry that every mode's model resolution reads), and bridged
+providers serve inference headless exactly like native ones. A plugin
+learns the mode and the available surfaces from the initialize payload's
+`mode` and `capabilities`.
 
 ### 3.1c The approval chain (`approval/review`)
 
@@ -194,6 +197,48 @@ deny rules → PreToolUse hook decisions → mode gate (plan/acceptEdits/bypass)
   managed `auditSink` deployments see them like policy decisions.
 - Wired surfaces: **TUI and rpc** (the prompt-capable surfaces this
   repo owns); acp and remote-host prompts are a documented follow-up.
+
+### 3.1d Provider bridges (`provider/stream`)
+
+A plugin that declares `capabilities.provider.stream` can serve
+inference **directly** — no HTTP hop. It registers a provider with
+`bridge: true` (typically from the SDK's `on_ready` hook):
+
+```jsonc
+// plugin → host: host/registerProvider
+{ "provider": { "id": "acme-agent", "bridge": true, "models": [ … ] } }
+```
+
+Every model is assigned the reserved api kind **`ext-provider-bridge`**
+(a conflicting explicit `api` is a registration error; `baseUrl`/
+`apiKey`/`headers` are ignored — a bridge manages its own credentials,
+CLI-login style). The models become selectable via `/model` and
+resolvable like any runtime provider, in **all four run modes**. The
+host resolves them to the plugin's serving connection at stream time.
+
+The streaming model fits the v3 peer's 30s request bound:
+`provider/stream` is a **fast ack** (synchronous validation only); the
+turn's events then flow as plugin→host `provider/streamEvent`
+notifications demuxed by `streamId` — one `AssistantMessageEvent` per
+notification, ending with exactly one terminal event (`done`/`error`).
+`provider/streamCancel` aborts an in-flight stream (user pressed Esc);
+the host synthesizes a terminal in-band `Error` after a 5s grace period
+if the plugin goes silent, and also on carrier death or protocol
+violations — so a misbehaving plugin degrades only its own provider and
+the agent loop treats a bridged provider exactly like a native one.
+Carrier support: process and WASI-stdio WASM serve streams; the WIT
+component and MCP carriers structurally cannot (bridge registrations
+from them are rejected). The SDKs own the plumbing (streamId scoping,
+ack/cancel wiring, terminal enforcement); usage/cost is pass-through —
+the plugin is the source of truth for its own billing.
+
+`provider/event` (P7c) surfaces out-of-band conditions — rate limits,
+warnings — exactly like the native rate-limit path: TUI inline notice
+plus a settings-gated desktop notification, log line headless, all
+audited under the `plugin_provider` tracing target alongside the other
+plugin audit targets. Managed policy can deny serving with
+`pluginPolicy.plugins."<id>".provider: false` (the plugin becomes
+policy-blocked at load, audited with `audit_narrow`).
 
 ### 3.2 Identity, load outcome, and the store
 
@@ -375,7 +420,5 @@ gated**).
 - Enterprise policy (P5), metrics sidecar + distribution sync (P6) —
   Level-2 MCP server plugins and the WIT/component WASM carrier (P4)
   landed and are documented in §3.3/§3.4
-- First-class provider bridges — a plugin serving inference directly
-  instead of registering an HTTP endpoint, plus `host/registerProvider`
-  in headless modes — designed in
-  [plugin-provider-bridge.md](plugin-provider-bridge.md) (P7, not landed)
+- First-class provider bridges (P7) landed: §3.1d and
+  [plugin-provider-bridge.md](plugin-provider-bridge.md)

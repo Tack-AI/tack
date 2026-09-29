@@ -30,6 +30,7 @@ from .plugin import (
     text_block,
     text_output,
 )
+from .provider import ProviderEvents, ProviderStreamCx
 
 __all__ = [
     "CANCEL_METHOD",
@@ -47,6 +48,8 @@ __all__ = [
     "PeerError",
     "Plugin",
     "PluginError",
+    "ProviderEvents",
+    "ProviderStreamCx",
     "allow",
     "deny",
     "error_output",

@@ -14,8 +14,9 @@ use crate::rpc3::{
     AfterToolCallParams, AfterToolCallPatch, ApprovalDecision, ApprovalReviewParams,
     AutocompleteProvideParams, AutocompleteProvideResult, BeforeToolCallParams,
     CommandInvokeParams, ERR_CAPABILITY_NOT_GRANTED, ErrorObject, InitializeParams,
-    InitializeResult, LifecycleEventParams, ToolExecuteParams, ToolOutput, TransformContextParams,
-    TransformContextResult, Verdict, WidgetActionParams, method,
+    InitializeResult, LifecycleEventParams, ProviderStreamCancelParams, ProviderStreamParams,
+    ToolExecuteParams, ToolOutput, TransformContextParams, TransformContextResult, Verdict,
+    WidgetActionParams, method,
 };
 
 /// Handshake bound (a plugin that cannot answer initialize quickly is
@@ -136,6 +137,30 @@ impl HostClient {
         Ok(())
     }
 
+    /// `provider/stream`: start one inference stream on a bridge provider.
+    /// The answer is a fast ack (synchronous validation only); the turn's
+    /// events then flow back as `provider/streamEvent` notifications
+    /// demuxed by `streamId`.
+    pub async fn provider_stream(&self, params: &ProviderStreamParams) -> Result<(), PeerError> {
+        let params =
+            serde_json::to_value(params).map_err(|e| PeerError::Transport(e.to_string()))?;
+        self.peer.call(method::PROVIDER_STREAM, params).await?;
+        Ok(())
+    }
+
+    /// `provider/streamCancel` notification (best-effort abort of an
+    /// in-flight stream).
+    pub async fn provider_stream_cancel(&self, stream_id: &str) -> Result<(), PeerError> {
+        let params = ProviderStreamCancelParams {
+            stream_id: stream_id.to_string(),
+        };
+        let params =
+            serde_json::to_value(params).map_err(|e| PeerError::Transport(e.to_string()))?;
+        self.peer
+            .notify(method::PROVIDER_STREAM_CANCEL, params)
+            .await
+    }
+
     /// `events/lifecycle` notification (fire-and-forget).
     pub async fn lifecycle_event(&self, event: &str, payload: Value) -> Result<(), PeerError> {
         let params = LifecycleEventParams {
@@ -210,6 +235,19 @@ pub trait PluginConnection: Send + Sync + std::fmt::Debug {
     async fn lifecycle_event(&self, event: &str, payload: Value) -> Result<(), PeerError>;
     /// `widgets/action` notification.
     async fn widget_action(&self, params: &WidgetActionParams) -> Result<(), PeerError>;
+    /// `provider/stream` (bridge provider inference). Default: the carrier
+    /// does not serve inference — the process and WASI-stdio carriers
+    /// override this through [`HostClient`]; the WIT component and MCP
+    /// carriers structurally cannot (see the carrier matrix in
+    /// `docs/plugin-provider-bridge.md` §4.4).
+    async fn provider_stream(&self, _params: &ProviderStreamParams) -> Result<(), PeerError> {
+        Err(unsupported_capability("provider/stream"))
+    }
+    /// `provider/streamCancel` notification. Default: the carrier does not
+    /// serve inference (see [`Self::provider_stream`]).
+    async fn provider_stream_cancel(&self, _stream_id: &str) -> Result<(), PeerError> {
+        Err(unsupported_capability("provider/stream"))
+    }
     /// Untyped request escape hatch for dev tooling (`ext dev`, `ext
     /// inspect` script arbitrary methods).
     async fn call_raw(&self, rpc_method: &str, params: Value) -> Result<Value, PeerError>;
@@ -278,6 +316,14 @@ impl PluginConnection for HostClient {
         HostClient::widget_action(self, params).await
     }
 
+    async fn provider_stream(&self, params: &ProviderStreamParams) -> Result<(), PeerError> {
+        HostClient::provider_stream(self, params).await
+    }
+
+    async fn provider_stream_cancel(&self, stream_id: &str) -> Result<(), PeerError> {
+        HostClient::provider_stream_cancel(self, stream_id).await
+    }
+
     async fn call_raw(&self, rpc_method: &str, params: Value) -> Result<Value, PeerError> {
         self.peer.call(rpc_method, params).await
     }
@@ -296,5 +342,236 @@ impl PluginConnection for HostClient {
 
     async fn wait_dead(&self) {
         self.peer.wait_dead().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::rpc3::{ERR_METHOD_NOT_FOUND, ProviderStreamEventParams, method};
+    use crate::v3::peer::PeerHandler;
+
+    /// A scripted plugin side: answers `provider/stream` with a fast ack,
+    /// records cancels, and pushes scripted `provider/streamEvent`
+    /// notifications back over its own peer.
+    struct ProviderPlugin {
+        cancelled: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PeerHandler for ProviderPlugin {
+        async fn handle_request(
+            &self,
+            rpc_method: &str,
+            _params: Value,
+        ) -> Result<Value, ErrorObject> {
+            match rpc_method {
+                method::PROVIDER_STREAM => Ok(Value::Null),
+                _ => Err(ErrorObject {
+                    code: ERR_METHOD_NOT_FOUND,
+                    message: format!("unknown method {rpc_method}"),
+                    data: None,
+                }),
+            }
+        }
+        async fn handle_notification(&self, rpc_method: &str, params: Value) {
+            if rpc_method == method::PROVIDER_STREAM_CANCEL {
+                let stream_id = params
+                    .get("streamId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                self.cancelled.lock().unwrap().push(stream_id);
+            }
+        }
+    }
+
+    struct HostSide {
+        received: Mutex<Vec<(String, Value)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PeerHandler for HostSide {
+        async fn handle_notification(&self, rpc_method: &str, params: Value) {
+            if rpc_method == method::PROVIDER_STREAM_EVENT {
+                let stream_id = params
+                    .get("streamId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let event = params.get("event").cloned().unwrap_or(Value::Null);
+                self.received.lock().unwrap().push((stream_id, event));
+            }
+        }
+    }
+
+    fn duplex_pair(
+        plugin: Arc<ProviderPlugin>,
+        host: Arc<HostSide>,
+    ) -> (HostClient, Arc<crate::v3::peer::JsonRpcPeer>) {
+        let (s1, s2) = tokio::io::duplex(64 * 1024);
+        let (r1, w1) = tokio::io::split(s1);
+        let (r2, w2) = tokio::io::split(s2);
+        let host_peer = crate::v3::peer::JsonRpcPeer::new(r1, w1, host);
+        let plugin_peer = crate::v3::peer::JsonRpcPeer::new(r2, w2, plugin);
+        (HostClient::new(host_peer), plugin_peer)
+    }
+
+    #[tokio::test]
+    async fn provider_stream_ack_events_and_cancel_flow() {
+        let plugin = Arc::new(ProviderPlugin {
+            cancelled: Mutex::new(vec![]),
+        });
+        let host = Arc::new(HostSide {
+            received: Mutex::new(vec![]),
+        });
+        let (client, plugin_peer) = duplex_pair(plugin.clone(), host.clone());
+
+        let params = ProviderStreamParams {
+            stream_id: "ps-1".to_string(),
+            model: serde_json::json!({"id": "m"}),
+            context: serde_json::json!({"messages": []}),
+            options: serde_json::json!({}),
+        };
+        // The ack is synchronous validation only: Ok(()).
+        PluginConnection::provider_stream(&client, &params)
+            .await
+            .unwrap();
+
+        // Events then ride plugin->host notifications.
+        for event in [
+            serde_json::json!({"type": "start"}),
+            serde_json::json!({"type": "done"}),
+        ] {
+            let note = ProviderStreamEventParams {
+                stream_id: "ps-1".to_string(),
+                event,
+            };
+            plugin_peer
+                .notify(
+                    method::PROVIDER_STREAM_EVENT,
+                    serde_json::to_value(note).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        for _ in 0..50 {
+            if host.received.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let received = host.received.lock().unwrap().clone();
+        assert_eq!(received.len(), 2, "stream events reached the host side");
+        assert!(received.iter().all(|(id, _)| id == "ps-1"));
+        assert_eq!(received[1].1["type"], "done");
+        drop(received);
+
+        // Cancel rides a host->plugin notification.
+        PluginConnection::provider_stream_cancel(&client, "ps-1")
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            if !plugin.cancelled.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(plugin.cancelled.lock().unwrap().as_slice(), ["ps-1"]);
+    }
+
+    #[tokio::test]
+    async fn default_trait_methods_are_unsupported_capability() {
+        #[derive(Debug)]
+        struct Bare;
+        #[async_trait::async_trait]
+        impl PluginConnection for Bare {
+            async fn initialize(
+                &self,
+                _params: &InitializeParams,
+            ) -> Result<InitializeResult, PeerError> {
+                unreachable!()
+            }
+            async fn tool_execute(
+                &self,
+                _params: &crate::rpc3::ToolExecuteParams,
+            ) -> Result<crate::rpc3::ToolOutput, PeerError> {
+                unreachable!()
+            }
+            async fn command_invoke(
+                &self,
+                _params: &crate::rpc3::CommandInvokeParams,
+            ) -> Result<Value, PeerError> {
+                unreachable!()
+            }
+            async fn before_tool_call(
+                &self,
+                _params: &crate::rpc3::BeforeToolCallParams,
+            ) -> Result<crate::rpc3::Verdict, PeerError> {
+                unreachable!()
+            }
+            async fn transform_context(
+                &self,
+                _params: &crate::rpc3::TransformContextParams,
+            ) -> Result<Option<crate::rpc3::TransformContextResult>, PeerError> {
+                unreachable!()
+            }
+            async fn after_tool_call(
+                &self,
+                _params: &crate::rpc3::AfterToolCallParams,
+            ) -> Result<Option<crate::rpc3::AfterToolCallPatch>, PeerError> {
+                unreachable!()
+            }
+            async fn approval_review(
+                &self,
+                _params: &crate::rpc3::ApprovalReviewParams,
+            ) -> Result<Option<crate::rpc3::ApprovalDecision>, PeerError> {
+                unreachable!()
+            }
+            async fn autocomplete_provide(
+                &self,
+                _params: &crate::rpc3::AutocompleteProvideParams,
+            ) -> Result<crate::rpc3::AutocompleteProvideResult, PeerError> {
+                unreachable!()
+            }
+            async fn lifecycle_event(
+                &self,
+                _event: &str,
+                _payload: Value,
+            ) -> Result<(), PeerError> {
+                unreachable!()
+            }
+            async fn widget_action(
+                &self,
+                _params: &crate::rpc3::WidgetActionParams,
+            ) -> Result<(), PeerError> {
+                unreachable!()
+            }
+            async fn call_raw(&self, _m: &str, _p: Value) -> Result<Value, PeerError> {
+                unreachable!()
+            }
+            async fn notify_raw(&self, _m: &str, _p: Value) -> Result<(), PeerError> {
+                unreachable!()
+            }
+            async fn shutdown(&self) -> Result<(), PeerError> {
+                unreachable!()
+            }
+            fn is_alive(&self) -> bool {
+                false
+            }
+            async fn wait_dead(&self) {}
+        }
+        let bare = Bare;
+        let err = PluginConnection::provider_stream(&bare, &ProviderStreamParams::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ERR_CAPABILITY_NOT_GRANTED);
+        let err = PluginConnection::provider_stream_cancel(&bare, "x")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ERR_CAPABILITY_NOT_GRANTED);
     }
 }

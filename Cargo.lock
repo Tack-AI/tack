@@ -4613,6 +4613,7 @@ dependencies = [
  "serde_json",
  "tack-ext",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

@@ -255,6 +255,36 @@ in `docs/upstream-alignment.md` (§5).
     attribution), `marketplace_sync` (sync outcomes) — all flow
     through the observability JSONL/auditSink pipeline like
     `plugin_policy`.
+- **Provider bridges (P7)**: the v3 surface gained the provider
+  capability and four methods, landed directly in final form (no
+  released plugins or v3 deployments existed):
+  - `PluginCapabilities.provider = { stream }` declares inference
+    serving; `host/registerProvider` payloads gained the optional
+    `bridge` flag (`RuntimeProviderSpec.bridge` — additive optional
+    field; `models.json` is unchanged). Bridge models carry the
+    reserved api kind `ext-provider-bridge`.
+  - `provider/stream` (host→plugin, fast ack) starts one inference
+    stream; `provider/streamCancel` (notification) aborts it;
+    `provider/streamEvent` (plugin→host notification) carries one
+    `AssistantMessageEvent` per message demuxed by `streamId`, exactly
+    one terminal (`done`/`error`) per stream; `provider/event`
+    (plugin→host notification) surfaces provider-scoped rate
+    limits/warnings. `model`/`context`/`event` are provider-shaped
+    JSON parsed by tack-ai's serde types (the OpenRPC document types
+    them free-form, same precedent as `RegisterProviderParams.provider`).
+  - The WIT world is unchanged (`tack:plugin@0.3.0`): the component
+    carrier does not serve inference; bridge registrations from it and
+    from MCP-carrier plugins are rejected with
+    `ERR_CAPABILITY_NOT_GRANTED`. Sessions naming a bridged model
+    resume into the existing model-not-found path when the plugin is
+    gone — the same behavior as a native provider whose CLI
+    disappeared.
+  - New structured-event target: `plugin_provider` (registrations,
+    stream lifecycle, protocol violations, synthesized terminals),
+    pinned at INFO in the managed `auditSink` EnvFilter.
+  - The native rate-limit notifier generalized into the provider-event
+    channel (`tack_ai::set_provider_event_notifier`); the codebuddy
+    provider rides it unchanged in behavior.
 
 **Commitment.**
 

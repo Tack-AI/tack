@@ -1,22 +1,25 @@
 //! The plugin builder, request dispatcher, and serve loop.
 
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::host::{Cx, State};
+use crate::provider::{ProviderEvents, ProviderStreamCx};
 use crate::{Error, PROTOCOL_VERSION};
 use tack_ext::rpc3::{
     AfterToolCallParams, AfterToolCallPatch, ApprovalDecision, ApprovalReviewParams,
     AutocompleteProvideParams, AutocompleteProvideResult, AutocompleteProviderSpec,
     BeforeToolCallParams, CommandInvokeParams, CommandSpec, ConfigDeclaration, ErrorObject,
     HookCapabilities, InitializeParams, InitializeResult, LifecycleEventParams, MetricsDeclaration,
-    PluginCapabilities, PluginInfo, ToolExecuteParams, ToolOutput, ToolSpec,
-    TransformContextParams, TransformContextResult, Verdict, WidgetActionParams, WidgetSpec,
-    method,
+    PluginCapabilities, PluginInfo, ProviderCapability, ProviderStreamCancelParams,
+    ProviderStreamParams, ToolExecuteParams, ToolOutput, ToolSpec, TransformContextParams,
+    TransformContextResult, Verdict, WidgetActionParams, WidgetSpec, method,
 };
 use tack_ext::v3::peer::PeerHandler;
 use tack_ext::v3::{JsonRpcPeer, protocol_compatible};
@@ -51,6 +54,12 @@ type AutocompleteHandler = Arc<
         + Send
         + Sync,
 >;
+type ProviderStreamHandler = Arc<
+    dyn Fn(ProviderStreamParams, ProviderEvents, ProviderStreamCx) -> BoxFuture<Result<(), Error>>
+        + Send
+        + Sync,
+>;
+type ReadyHandler = Arc<dyn Fn(Cx) -> BoxFuture<()> + Send + Sync>;
 
 /// Builds a [`Plugin`]. Every capability is optional and independent;
 /// undeclared capabilities cost nothing (the host skips the calls).
@@ -71,6 +80,8 @@ pub struct PluginBuilder {
     autocomplete: Vec<(AutocompleteProviderSpec, AutocompleteHandler)>,
     config_schema: Option<Value>,
     metrics: Option<MetricsDeclaration>,
+    provider_stream: Option<ProviderStreamHandler>,
+    on_ready: Option<ReadyHandler>,
 }
 
 impl std::fmt::Debug for PluginBuilder {
@@ -237,6 +248,40 @@ impl PluginBuilder {
         self
     }
 
+    /// Serve inference for registered providers (the P7 provider bridge):
+    /// declares the `provider.stream` capability; the host calls
+    /// `provider/stream` for every turn on the models of providers this
+    /// plugin registered with `bridge: true`. Events ride
+    /// [`ProviderEvents`]; cancellation surfaces as
+    /// [`ProviderStreamCx::cancel`].
+    pub fn provider_stream<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn(ProviderStreamParams, ProviderEvents, ProviderStreamCx) -> Fut
+            + Send
+            + Sync
+            + 'static,
+        Fut: Future<Output = Result<(), Error>> + Send + 'static,
+    {
+        self.provider_stream = Some(Arc::new(move |p, events, cx| {
+            Box::pin(handler(p, events, cx)) as BoxFuture<_>
+        }));
+        self
+    }
+
+    /// Run once after the initialize handshake is answered — the
+    /// registration entry point for provider plugins (call
+    /// [`crate::Host::register_provider`] here) and for any plugin that
+    /// pushes state at startup. Host services gate registrations on the
+    /// completed handshake, so registering immediately is safe.
+    pub fn on_ready<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn(Cx) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.on_ready = Some(Arc::new(move |cx| Box::pin(handler(cx)) as BoxFuture<_>));
+        self
+    }
+
     pub fn build(self) -> Plugin {
         Plugin { builder: self }
     }
@@ -279,6 +324,8 @@ impl Plugin {
             autocomplete: Vec::new(),
             config_schema: None,
             metrics: None,
+            provider_stream: None,
+            on_ready: None,
         }
     }
 
@@ -301,6 +348,7 @@ impl Plugin {
         let dispatch = Arc::new(Dispatch {
             plugin: self,
             state: state.clone(),
+            provider_streams: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
         let peer = JsonRpcPeer::new(reader, writer, dispatch);
         let _ = state.peer.set(peer.clone());
@@ -319,6 +367,10 @@ impl Plugin {
 struct Dispatch {
     plugin: Plugin,
     state: Arc<State>,
+    /// streamId -> cancellation for in-flight `provider/stream` handlers
+    /// (`provider/streamCancel` fires the token; entries drop on handler
+    /// completion).
+    provider_streams: Arc<std::sync::Mutex<HashMap<String, CancellationToken>>>,
 }
 
 impl Dispatch {
@@ -383,9 +435,22 @@ impl Dispatch {
                     .clone()
                     .map(|schema| ConfigDeclaration { schema }),
                 metrics: builder.metrics.clone(),
+                provider: builder
+                    .provider_stream
+                    .as_ref()
+                    .map(|_| ProviderCapability { stream: Some(true) }),
             },
         };
         let _ = self.state.init.set(params);
+        // The startup hook (provider plugins register their providers
+        // here). Spawned: on_ready must not delay the handshake answer.
+        if let Some(on_ready) = &builder.on_ready {
+            let handler = on_ready.clone();
+            let cx = self.cx();
+            tokio::spawn(async move {
+                handler(cx).await;
+            });
+        }
         to_value(result)
     }
 }
@@ -468,6 +533,43 @@ impl PeerHandler for Dispatch {
                 };
                 to_value(handler(params, self.cx()).await?)
             }
+            method::PROVIDER_STREAM => {
+                let Some(handler) = &builder.provider_stream else {
+                    return Err(not_granted(rpc_method));
+                };
+                let params: ProviderStreamParams = parse(params)?;
+                let stream_id = params.stream_id.clone();
+                let peer = self.state.peer.get().expect("plugin is serving").clone();
+                let cancel = CancellationToken::new();
+                self.provider_streams
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(stream_id.clone(), cancel.clone());
+                let events = ProviderEvents::new(peer, stream_id.clone(), params.model.clone());
+                let cx = ProviderStreamCx::new(self.cx(), stream_id.clone(), cancel);
+                let handler = handler.clone();
+                let streams = self.provider_streams.clone();
+                // The ack is fast: validation is done; the stream rides
+                // provider/streamEvent notifications from here on.
+                tokio::spawn(async move {
+                    // Await the handler's JoinHandle so a panic still
+                    // produces the automatic terminal error event.
+                    let task = tokio::spawn(handler(params, events.clone(), cx));
+                    match task.await {
+                        Ok(result) => events.enforce_terminal(result).await,
+                        Err(join) => {
+                            let _ = events
+                                .error(format!("provider stream handler panicked: {join}"), None)
+                                .await;
+                        }
+                    }
+                    streams
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&stream_id);
+                });
+                Ok(Value::Null)
+            }
             other => Err(Error::new(
                 tack_ext::rpc3::ERR_METHOD_NOT_FOUND,
                 format!("unknown method {other}"),
@@ -490,6 +592,17 @@ impl PeerHandler for Dispatch {
                     && let Ok(params) = serde_json::from_value::<WidgetActionParams>(params)
                 {
                     handler(params, self.cx()).await;
+                }
+            }
+            method::PROVIDER_STREAM_CANCEL => {
+                if let Ok(params) = serde_json::from_value::<ProviderStreamCancelParams>(params)
+                    && let Some(token) = self
+                        .provider_streams
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&params.stream_id)
+                {
+                    token.cancel();
                 }
             }
             _ => {}

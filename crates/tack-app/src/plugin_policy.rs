@@ -110,12 +110,15 @@ fn looks_like_git_source(source: &str) -> bool {
 
 /// Per-plugin managed rules (`pluginPolicy.plugins."<id>"`). `tools` and
 /// `mcpServers` are narrow-only: they intersect with what the plugin
-/// registers and can never expand it.
+/// registers and can never expand it. `provider` is an indivisible
+/// capability gate: a managed `false` turns a plugin that declares
+/// `provider.stream` policy-blocked at load.
 #[derive(Clone, Debug, Default)]
 pub struct PluginPolicyEntry {
     pub enabled: Option<bool>,
     pub tools: Option<Vec<String>>,
     pub mcp_servers: Option<Vec<String>>,
+    pub provider: Option<bool>,
 }
 
 /// The parsed managed `pluginPolicy`. Absent managed file or absent key
@@ -389,6 +392,16 @@ impl PluginPolicy {
         self.plugins.get(id)?.mcp_servers.as_deref()
     }
 
+    /// The managed provider-capability gate for one plugin: `false`
+    /// denies bridge serving (a plugin declaring `provider.stream` becomes
+    /// policy-blocked at load); absent or `true` allows.
+    pub fn provider_allowed(&self, id: &str) -> bool {
+        self.plugins
+            .get(id)
+            .and_then(|entry| entry.provider)
+            .unwrap_or(true)
+    }
+
     /// Audit a narrow decision (called by the loader after intersecting).
     pub fn audit_narrow(&self, id: &str, kind: &str, dropped: &[String]) {
         if dropped.is_empty() {
@@ -466,6 +479,7 @@ fn parse_policy_entry(raw: &Value) -> PluginPolicyEntry {
         enabled: raw.get("enabled").and_then(Value::as_bool),
         tools: string_list(raw, "tools"),
         mcp_servers: string_list(raw, "mcpServers"),
+        provider: raw.get("provider").and_then(Value::as_bool),
     }
 }
 

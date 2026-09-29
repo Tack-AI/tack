@@ -38,6 +38,8 @@ export function plugin({ name, version, description } = {}) {
     autocomplete: new Map(),
     configSchema: null,
     metrics: null,
+    providerStream: null,
+    onReady: null,
   };
 
   const builder = {
@@ -90,6 +92,21 @@ export function plugin({ name, version, description } = {}) {
       state.metrics = declaration;
       return builder;
     },
+    /** Serve inference for registered providers (the P7 provider
+     * bridge): declares the `provider.stream` capability. The handler
+     * receives (params, events, streamCx); the turn's events flow back
+     * through `events`, cancellation surfaces on `streamCx`. */
+    providerStream(handler) {
+      state.providerStream = handler;
+      return builder;
+    },
+    /** Fired once after the initialize handshake is answered (spawned;
+     * must not delay the answer). The registration entry point for
+     * provider plugins: call `cx.host.registerProvider(...)` here. */
+    onReady(handler) {
+      state.onReady = handler;
+      return builder;
+    },
 
     /** Serve over stdio (default) or a custom transport. Resolves on
      * `shutdown` or when the host closes the transport. */
@@ -106,6 +123,11 @@ export function plugin({ name, version, description } = {}) {
         config: initParams?.config,
         host: hostClient,
       });
+
+      // streamId -> cancel for in-flight `provider/stream` handlers
+      // (`provider/streamCancel` fires it; entries drop when the
+      // handler settles).
+      const providerStreams = new Map();
 
       function onInitialize(params) {
         if (!protocolCompatible(params.protocolVersion)) {
@@ -130,6 +152,15 @@ export function plugin({ name, version, description } = {}) {
           capabilities.autocompleteProviders = [...state.autocomplete.values()].map((a) => a.spec);
         if (state.configSchema) capabilities.config = { schema: state.configSchema };
         if (state.metrics) capabilities.metrics = state.metrics;
+        if (state.providerStream) capabilities.provider = { stream: true };
+        // The startup hook (provider plugins register their providers
+        // here). Spawned: onReady must not delay the handshake answer.
+        if (state.onReady) {
+          const handler = state.onReady;
+          Promise.resolve()
+            .then(() => handler(cx()))
+            .catch(() => {});
+        }
         return {
           protocolVersion: PROTOCOL_VERSION,
           plugin: { name: state.name, version: state.version, description: state.description },
@@ -171,6 +202,40 @@ export function plugin({ name, version, description } = {}) {
             if (!entry) throw invalidParams(`unknown autocomplete provider ${JSON.stringify(params.providerId)}`);
             return entry.handler(params, cx());
           }
+          case "provider/stream": {
+            if (!state.providerStream) throw notGranted(method);
+            const streamId = params?.streamId;
+            if (typeof streamId !== "string" || streamId.length === 0)
+              throw invalidParams("provider/stream requires a streamId");
+            let cancelled = false;
+            let resolveCancel;
+            const cancelPromise = new Promise((resolve) => (resolveCancel = resolve));
+            providerStreams.set(streamId, () => {
+              cancelled = true;
+              resolveCancel();
+            });
+            const events = makeProviderEvents(peer, streamId, params.model);
+            const streamCx = {
+              cx: cx(),
+              streamId,
+              isCancelled: () => cancelled,
+              cancelled: () => cancelPromise,
+            };
+            const handler = state.providerStream;
+            // The ack is fast: validation is done; the stream rides
+            // provider/streamEvent notifications from here on.
+            (async () => {
+              try {
+                await handler(params, events, streamCx);
+                await events.enforceTerminal(null);
+              } catch (err) {
+                await events.enforceTerminal(err);
+              } finally {
+                providerStreams.delete(streamId);
+              }
+            })().catch(() => {});
+            return null;
+          }
           default:
             throw new PeerError(ERR_METHOD_NOT_FOUND, `unknown method ${method}`);
         }
@@ -181,6 +246,8 @@ export function plugin({ name, version, description } = {}) {
           await state.eventHandler(params, cx());
         } else if (method === "widgets/action" && state.widgetActionHandler) {
           await state.widgetActionHandler(params, cx());
+        } else if (method === "provider/streamCancel") {
+          providerStreams.get(params?.streamId)?.();
         }
       }
 
@@ -203,6 +270,80 @@ function notGranted(method) {
   return new PeerError(ERR_CAPABILITY_NOT_GRANTED, `capability not declared for ${method}`);
 }
 
+// ---------------------------------------------------------------------------
+// Provider bridge (P7)
+// ---------------------------------------------------------------------------
+
+function isTerminalEvent(event) {
+  return event?.type === "done" || event?.type === "error";
+}
+
+/** A zeroed assistant message (valid AssistantMessage JSON) carrying an
+ * error, built from the served model's ids. */
+function zeroedAssistantMessage(model, errorMessage) {
+  const idOf = (key) => (typeof model?.[key] === "string" ? model[key] : "");
+  return {
+    content: [],
+    api: idOf("api"),
+    provider: idOf("provider"),
+    model: idOf("id"),
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "error",
+    errorMessage,
+    timestamp: Date.now(),
+  };
+}
+
+/** The event sink scoped to one `provider/stream` call: sends
+ * `provider/streamEvent` notifications and enforces exactly one terminal
+ * event (done/error). */
+function makeProviderEvents(peer, streamId, model) {
+  let terminalSent = false;
+  const events = {
+    streamId,
+    async send(event) {
+      if (isTerminalEvent(event)) {
+        if (terminalSent) throw new Error("provider stream already terminated");
+        terminalSent = true;
+      }
+      await peer.notify("provider/streamEvent", { streamId, event });
+    },
+    textDelta: (contentIndex, delta, partial) =>
+      events.send({ type: "textDelta", contentIndex, delta, partial }),
+    thinkingDelta: (contentIndex, delta, partial) =>
+      events.send({ type: "thinkingDelta", contentIndex, delta, partial }),
+    done: (message) =>
+      events.send({ type: "done", reason: message?.stopReason ?? "stop", message }),
+    error: (errorMessage, message) =>
+      events.send({
+        type: "error",
+        reason: "error",
+        error: message ?? zeroedAssistantMessage(model, errorMessage),
+      }),
+    /** Terminal enforcement: fire an automatic `error` when the handler
+     * failed or returned without a terminal event. */
+    async enforceTerminal(err) {
+      if (err) {
+        await events.error(err?.message ?? String(err)).catch(() => {});
+        return;
+      }
+      if (!terminalSent) {
+        await events
+          .error("provider stream handler returned without a terminal event")
+          .catch(() => {});
+      }
+    },
+  };
+  return events;
+}
+
 /** The plugin → host typed client (ui/exec/session/snapshot/config/…). */
 function makeHostClient(peer) {
   const call = (method, params) => peer.call(method, params ?? null);
@@ -220,6 +361,8 @@ function makeHostClient(peer) {
     snapshot: () => call("snapshot/get"),
     config: () => call("config/get").then((r) => r.config),
     registerProvider: (provider) => call("host/registerProvider", { provider }),
+    providerEvent: (provider, kind, message, detail) =>
+      notify("provider/event", { provider, kind, message, detail }),
     widgetUpdate: (update) => notify("widgets/update", update),
   };
 }
