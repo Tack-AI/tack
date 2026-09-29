@@ -5413,7 +5413,7 @@ mod tests {
         else {
             panic!("expected stdio transport");
         };
-        assert_eq!(command, "/ext/dir/./server.js");
+        assert_eq!(command, &dir.join("./server.js").to_string_lossy().as_ref());
         assert_eq!(cwd.as_deref(), Some(dir));
         assert_eq!(args, &["--port", "8080"], "args are never rewritten");
 
@@ -6240,13 +6240,15 @@ mod policy_tests {
         assert!(reason.contains("allowedSources"), "{reason}");
         assert!(plugin.handle.is_none(), "filtered plugins never spawn");
 
-        // With the install root approved the same plugin loads.
-        let policy = test_policy(&format!(
-            r#"{{"pluginPolicy": {{"allowedSources": [
-                {{"type": "local", "path": "{}"}}
-            ]}}}}"#,
-            _tmp.path().display()
-        ));
+        // With the install root approved the same plugin loads. Build
+        // the JSON with `json!` — interpolating `path.display()` into a
+        // raw string produces invalid escapes on Windows (`C:\Users\…`).
+        let raw = serde_json::json!({"pluginPolicy": {"allowedSources": [
+            {"type": "local", "path": _tmp.path()}
+        ]}});
+        let policy =
+            crate::plugin_policy::PluginPolicy::from_raw(&raw, "/test/managed.json".to_string())
+                .expect("policy parses");
         let manager = ExtensionManager::load_with_policy(
             &cwd,
             &agent_dir,

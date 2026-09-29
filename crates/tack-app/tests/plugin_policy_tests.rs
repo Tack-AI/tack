@@ -82,21 +82,22 @@ async fn managed_policy_gates_install_and_load() {
     std::fs::create_dir_all(&blocked_src).unwrap();
     std::fs::write(blocked_src.join("extension.json"), r#"{"name": "blocked"}"#).unwrap();
 
+    // Serialize with `json!` so the temp path is escaped correctly —
+    // interpolating `display()` into a raw string produces invalid
+    // escapes on Windows (`C:\Users\…`).
+    let managed_json = serde_json::json!({
+        "pluginPolicy": {
+            "allowedSources": [
+                { "type": "local", "path": approved_root }
+            ],
+            "plugins": {
+                "blocked@user": { "enabled": false }
+            }
+        }
+    });
     std::fs::write(
         &managed,
-        format!(
-            r#"{{
-                "pluginPolicy": {{
-                    "allowedSources": [
-                        {{ "type": "local", "path": "{}" }}
-                    ],
-                    "plugins": {{
-                        "blocked@user": {{ "enabled": false }}
-                    }}
-                }}
-            }}"#,
-            approved_root.display()
-        ),
+        serde_json::to_string_pretty(&managed_json).unwrap(),
     )
     .unwrap();
     unsafe {

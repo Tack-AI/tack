@@ -649,10 +649,11 @@ mod tests {
         let root = tmp.path().join("approved");
         let nested = root.join("team").join("plugin");
         std::fs::create_dir_all(&nested).unwrap();
-        let policy = policy(&format!(
-            r#"{{"pluginPolicy": {{"allowedSources": [{{"type": "local", "path": "{}"}}]}}}}"#,
-            root.display()
-        ));
+        // `json!` escapes the temp path correctly — interpolating
+        // `display()` into a raw string breaks on Windows (`C:\…`).
+        let raw = serde_json::json!({"pluginPolicy": {"allowedSources": [{"type": "local", "path": root}]}});
+        let policy = PluginPolicy::from_raw(&raw, "/etc/tack/managed-settings.json".to_string())
+            .expect("policy present");
         assert!(
             policy
                 .check_install_source(nested.to_str().unwrap(), None)

@@ -1014,7 +1014,12 @@ mod tests {
         // rename-claim, and the claimed stale file is cleaned up.
         let stale_path = sync_scratch_dir(agent_dir).join("stale.lock");
         std::fs::write(&stale_path, "pid 1\n").unwrap();
-        let file = std::fs::File::open(&stale_path).unwrap();
+        // Open with write access: Windows `SetFileTime` requires
+        // FILE_WRITE_ATTRIBUTES, which a read-only handle lacks.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stale_path)
+            .unwrap();
         file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(1200))
             .unwrap();
         drop(file);
