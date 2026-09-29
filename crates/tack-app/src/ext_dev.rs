@@ -840,9 +840,9 @@ tack ext test .        # run plugin.scenario.json assertions
 tack ext dev .         # run and stream plugin logs (Ctrl-C to stop)
 ```
 
-Then install it with `tack ext install .` (note: the session loader
-still speaks the v1/v2 protocol until the loader switch lands — use the
-dev tooling above for v3 development).
+Then install it with `tack ext install .` — or add this directory to
+settings `extensionPaths` to load it live from the checkout while you
+iterate. Full walkthrough: docs/plugin-development.md.
 "#;
 
 /// `tack ext new <dir> <rust|ts|python>`: scaffold a plugin.
