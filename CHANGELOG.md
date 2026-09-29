@@ -150,6 +150,14 @@ notice can parse entries (same convention as TS pi).
 
 ### Changed
 
+- **web_search defaults to Bing and the keyless backends back each
+  other up.** The default `webSearch.provider` is now `bing` (was
+  `duckduckgo`), and the two keyless scrape backends (`bing` /
+  `duckduckgo`) automatically fall back to each other when the
+  configured one is unreachable from the current network or returns an
+  empty (bot-walled) page — duckduckgo.com is blocked outright on some
+  networks, which previously made web_search dead on arrival there.
+  Keyed backends (`brave`/`tavily`/`exa`) are unchanged.
 - **Plugin system rework (redesign P3): the ExtensionManager now speaks
   tack-RPC v3** and the v1/v2 NDJSON protocol is removed. Plugins are
   identified as `name@source` (marketplace name, or reserved

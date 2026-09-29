@@ -1,7 +1,8 @@
 //! Web access tools: `web_fetch` (URL → text) and `web_search`
-//! (DuckDuckGo HTML → result list). Read-only network access; HTML is
-//! reduced to text with a small tag-stripping pass (script/style dropped,
-//! block elements become newlines).
+//! (DuckDuckGo/Bing HTML scrape → result list, or a keyed API backend).
+//! Read-only network access; HTML is reduced to text with a small
+//! tag-stripping pass (script/style dropped, block elements become
+//! newlines).
 
 use serde_json::{Value, json};
 use tack_agent_core::{AgentTool, AgentToolResult};
@@ -297,7 +298,8 @@ pub fn html_to_text(html: &str) -> String {
                     "lt" => Some("<".to_string()),
                     "gt" => Some(">".to_string()),
                     "quot" => Some("\"".to_string()),
-                    "nbsp" => Some(" ".to_string()),
+                    "nbsp" | "ensp" | "emsp" => Some(" ".to_string()),
+                    "middot" => Some("\u{00b7}".to_string()),
                     "#39" | "apos" => Some("'".to_string()),
                     _ => entity
                         .strip_prefix('#')
@@ -539,8 +541,14 @@ impl AgentTool for WebFetchTool {
 /// Search backend selection (settings `webSearch.provider`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum SearchBackend {
-    /// DuckDuckGo HTML scrape (default, no key needed).
+    /// Bing HTML scrape (default, no key needed). Free scrape backends
+    /// fall back to each other on failure — the two are unreachable from
+    /// different networks (e.g. duckduckgo.com is blocked in some
+    /// regions), and the operator should not have to know which one
+    /// works where.
     #[default]
+    Bing,
+    /// DuckDuckGo HTML scrape (no key needed).
     DuckDuckGo,
     Brave,
     Tavily,
@@ -550,10 +558,11 @@ pub enum SearchBackend {
 impl SearchBackend {
     pub fn from_setting(value: Option<&str>) -> Self {
         match value {
+            Some("duckduckgo") => SearchBackend::DuckDuckGo,
             Some("brave") => SearchBackend::Brave,
             Some("tavily") => SearchBackend::Tavily,
             Some("exa") => SearchBackend::Exa,
-            _ => SearchBackend::DuckDuckGo,
+            _ => SearchBackend::Bing,
         }
     }
 
@@ -561,7 +570,7 @@ impl SearchBackend {
     /// `webSearch.apiKey` is empty.
     pub fn api_key_env(&self) -> Option<&'static str> {
         match self {
-            SearchBackend::DuckDuckGo => None,
+            SearchBackend::DuckDuckGo | SearchBackend::Bing => None,
             SearchBackend::Brave => Some("BRAVE_API_KEY"),
             SearchBackend::Tavily => Some("TAVILY_API_KEY"),
             SearchBackend::Exa => Some("EXA_API_KEY"),
@@ -685,6 +694,42 @@ async fn search_ddg(query: &str, cancel: &CancellationToken) -> Result<SearchRes
     Ok(parse_ddg_results(&body))
 }
 
+async fn search_bing(query: &str, cancel: &CancellationToken) -> Result<SearchResults, String> {
+    let url = format!("https://www.bing.com/search?q={}", urlencoding(query));
+    let html = tokio::select! {
+        _ = cancel.cancelled() => return Err("Operation aborted".to_string()),
+        r = http_client().get(&url).send() => r.map_err(|e| format!("bing search failed: {e}"))?,
+    };
+    // Bing geo-redirects (www.bing.com → cn.bing.com on some egresses);
+    // the shared client follows redirects, and the markup shape is the
+    // same on both hosts.
+    let body = read_body_capped(html, MAX_BODY_BYTES).await?;
+    Ok(parse_bing_results(&body))
+}
+
+/// Dispatch for the keyless scrape backends (used by the fallback chain).
+async fn scrape_search(
+    backend: &SearchBackend,
+    query: &str,
+    cancel: &CancellationToken,
+) -> Result<SearchResults, String> {
+    match backend {
+        SearchBackend::DuckDuckGo => search_ddg(query, cancel).await,
+        SearchBackend::Bing => search_bing(query, cancel).await,
+        _ => unreachable!("scrape_search is only for keyless backends"),
+    }
+}
+
+/// The keyless scrape backends, configured one first. On transport error
+/// or an empty page (bot wall / layout drift parses to zero results) the
+/// caller tries the next one before giving up.
+fn scrape_chain(configured: &SearchBackend) -> [SearchBackend; 2] {
+    match configured {
+        SearchBackend::Bing => [SearchBackend::Bing, SearchBackend::DuckDuckGo],
+        _ => [SearchBackend::DuckDuckGo, SearchBackend::Bing],
+    }
+}
+
 pub struct WebSearchTool {
     services: ToolServices,
 }
@@ -739,7 +784,36 @@ impl AgentTool for WebSearchTool {
 
         let config = &self.services.web_search;
         let results: SearchResults = match &config.backend {
-            SearchBackend::DuckDuckGo => search_ddg(query, &cancel).await?,
+            backend @ (SearchBackend::DuckDuckGo | SearchBackend::Bing) => {
+                // Keyless scrapes: a backend that is unreachable from this
+                // network (or bot-walled into an empty page) must not kill
+                // the tool — fall through to the other one. Only a double
+                // failure surfaces an error; one empty page alone still
+                // means "no results".
+                let mut results = Vec::new();
+                let mut last_err: Option<String> = None;
+                let mut saw_empty_ok = false;
+                for backend in scrape_chain(backend) {
+                    match scrape_search(&backend, query, &cancel).await {
+                        Ok(r) if !r.is_empty() => {
+                            results = r;
+                            break;
+                        }
+                        Ok(_) => saw_empty_ok = true,
+                        Err(e) => {
+                            tracing::debug!("web_search scrape backend {backend:?} failed: {e}");
+                            last_err = Some(e);
+                        }
+                    }
+                }
+                if results.is_empty()
+                    && !saw_empty_ok
+                    && let Some(e) = last_err
+                {
+                    return Err(e);
+                }
+                results
+            }
             backend => {
                 let api_key = config
                     .api_key
@@ -759,7 +833,7 @@ impl AgentTool for WebSearchTool {
                             SearchBackend::Brave => search_brave(query, &api_key).await,
                             SearchBackend::Tavily => search_tavily(query, &api_key).await,
                             SearchBackend::Exa => search_exa(query, &api_key).await,
-                            SearchBackend::DuckDuckGo => unreachable!(),
+                            SearchBackend::DuckDuckGo | SearchBackend::Bing => unreachable!(),
                         }
                     } => r?,
                 }
@@ -799,6 +873,77 @@ fn urlencoding(s: &str) -> String {
         }
     }
     out
+}
+
+/// Parse Bing result HTML: organic results are `<li class="b_algo">`
+/// blocks containing `<h2><a href="URL">Title</a></h2>` and a `<p>`
+/// snippet. Tag/entity handling reuses html_to_text on the fragments.
+/// Falls back to empty on layout drift (the scrape chain then tries the
+/// other free backend).
+fn parse_bing_results(html: &str) -> Vec<(String, String, String)> {
+    fn fragment_text(fragment: &str) -> String {
+        html_to_text(fragment)
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    let mut results = Vec::new();
+    let mut rest = html;
+    while let Some(start) = rest.find("<li class=\"b_algo\"") {
+        let after = &rest[start..];
+        // b_algo blocks never nest <li>, so the first close tag ends it.
+        let block = match after.find("</li>") {
+            Some(end) => &after[..end],
+            None => after,
+        };
+        rest = &after[block.len()..];
+
+        let Some(h2) = block.find("<h2").map(|i| &block[i..]) else {
+            continue;
+        };
+        let Some(url) = h2
+            .find("href=\"")
+            .map(|i| &h2[i + "href=\"".len()..])
+            .and_then(|s| s.find('"').map(|end| s[..end].to_string()))
+        else {
+            continue;
+        };
+        if !url.starts_with("http") {
+            continue;
+        }
+        let Some(a_open_end) = h2
+            .find("<a")
+            .and_then(|i| h2[i..].find('>').map(|e| i + e + 1))
+        else {
+            continue;
+        };
+        let title = match h2[a_open_end..].find("</a>") {
+            Some(end) => fragment_text(&h2[a_open_end..a_open_end + end]),
+            None => continue,
+        };
+        if title.is_empty() {
+            continue;
+        }
+        // `<p>` or `<p ...>` only — `<pre`/`<picture` must not match.
+        let snippet = block
+            .match_indices("<p")
+            .map(|(i, _)| i)
+            .find(|&i| {
+                block[i + 2..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c == '>' || c.is_whitespace())
+            })
+            .and_then(|i| block[i..].find('>').map(|e| i + e + 1))
+            .and_then(|i| block[i..].find("</p>").map(|e| &block[i..i + e]))
+            .map(fragment_text)
+            .unwrap_or_default();
+        results.push((title, url, snippet));
+    }
+    results
 }
 
 /// Parse DuckDuckGo HTML-lite output (after html_to_text): result blocks look
@@ -843,6 +988,54 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, "Result One");
         assert_eq!(results[1].1, "https://example.com/2");
+    }
+
+    #[test]
+    fn bing_parser_extracts_b_algo_blocks() {
+        // Shape mirrors the live markup (www/cn.bing.com): minified, one
+        // <li class="b_algo"> per organic result.
+        let html = r#"<html><body><ol id="b_results">
+            <li class="b_algo"><h2><a href="https://example.com/one" target="_blank">Result <strong>One</strong></a></h2><div class="b_caption"><p>first &amp; best</p></div></li>
+            <li class="b_ad"><h2><a href="https://ad.example/x">Ad</a></h2></li>
+            <li class="b_algo"><h2><a href="https://example.com/two">Second</a></h2></li>
+            </ol></body></html>"#;
+        let results = parse_bing_results(html);
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert_eq!(results[0].0, "Result One");
+        assert_eq!(results[0].1, "https://example.com/one");
+        assert_eq!(results[0].2, "first & best");
+        assert_eq!(results[1].0, "Second");
+        assert_eq!(results[1].2, "");
+        // Layout drift (bot wall / consent page) parses to empty, which is
+        // what triggers the scrape-chain fallback — never garbage rows.
+        assert!(parse_bing_results("<html><body>unusual traffic</body></html>").is_empty());
+    }
+
+    #[test]
+    fn bing_is_the_default_backend() {
+        assert_eq!(SearchBackend::default(), SearchBackend::Bing);
+        assert_eq!(SearchBackend::from_setting(None), SearchBackend::Bing);
+        assert_eq!(
+            SearchBackend::from_setting(Some("bing")),
+            SearchBackend::Bing
+        );
+        assert_eq!(
+            SearchBackend::from_setting(Some("duckduckgo")),
+            SearchBackend::DuckDuckGo
+        );
+        assert_eq!(SearchBackend::Bing.api_key_env(), None);
+    }
+
+    #[test]
+    fn scrape_chain_starts_with_the_configured_backend() {
+        assert_eq!(
+            scrape_chain(&SearchBackend::Bing),
+            [SearchBackend::Bing, SearchBackend::DuckDuckGo]
+        );
+        assert_eq!(
+            scrape_chain(&SearchBackend::DuckDuckGo),
+            [SearchBackend::DuckDuckGo, SearchBackend::Bing]
+        );
     }
 
     /// Regression: body reads must be capped — an unbounded text() read let

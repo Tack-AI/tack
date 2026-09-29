@@ -151,7 +151,7 @@ Tack 从四级读取配置，**后加载的层级覆盖先加载的**（部分�
 | 键 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `webRender` | string | `"auto"` | headless 渲染：`auto`（JS 空壳自动回退）\| `always` \| `off` |
-| `webSearch.provider` | string | `"duckduckgo"` | 搜索后端：`duckduckgo` \| `brave` \| `tavily` \| `exa` |
+| `webSearch.provider` | string | `"bing"` | 搜索后端：`bing` \| `duckduckgo` \| `brave` \| `tavily` \| `exa`。两个免 key 的抓取后端（`bing`/`duckduckgo`）失败时互相回退 |
 | `webSearch.apiKey` | string | — | 后端 API key（或用 `BRAVE_API_KEY`/`TAVILY_API_KEY`/`EXA_API_KEY` 环境变量） |
 
 ### 会话与历史

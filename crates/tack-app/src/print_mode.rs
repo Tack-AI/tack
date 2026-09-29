@@ -122,10 +122,7 @@ pub const TOOL_SNIPPETS: &[(&str, &str)] = &[
         "Run git commands (validated subcommands, permission-aware read-only classification)",
     ),
     ("web_fetch", "Fetch a URL and return its content as text"),
-    (
-        "web_search",
-        "Search the web (DuckDuckGo) for current information",
-    ),
+    ("web_search", "Search the web for current information"),
 ];
 
 /// Tool guidelines (pi's *ToolSystemPromptContribution.guidelines).

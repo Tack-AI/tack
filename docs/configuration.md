@@ -195,7 +195,7 @@ sensitive params).
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `webRender` | string | `"auto"` | Headless rendering: `auto` (auto-fallback on JS shell pages) \| `always` \| `off` |
-| `webSearch.provider` | string | `"duckduckgo"` | Search backend: `duckduckgo` \| `brave` \| `tavily` \| `exa` |
+| `webSearch.provider` | string | `"bing"` | Search backend: `bing` \| `duckduckgo` \| `brave` \| `tavily` \| `exa`. The two keyless scrapes (`bing`/`duckduckgo`) fall back to each other on failure |
 | `webSearch.apiKey` | string | — | Backend API key (or use the `BRAVE_API_KEY`/`TAVILY_API_KEY`/`EXA_API_KEY` env vars) |
 
 ### Session & history
