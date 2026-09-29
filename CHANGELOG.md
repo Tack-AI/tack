@@ -4,10 +4,17 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
-## [Unreleased]
+## [1.0.5] - 2026-09-30
 
 ### Added
 
+- **Plugin development guide**: new `docs/plugin-development.md` (+
+  zh-CN) — a hands-on tutorial across the three carriers (process /
+  WASM / MCP) and the three SDK languages (Rust / TypeScript / Python):
+  scaffolding with `tack ext new`, the same guardrail plugin written
+  three ways, scenarios, the `extensionPaths` dev loop, and
+  distribution. README and docs/features.md are synchronized with the
+  v3 redesign (they still described the removed v1/v2 protocol).
 - **First-class provider bridges (plugin redesign P7).** Plugins can
   serve inference **directly** — no HTTP shim between the user and the
   model. A plugin declaring `capabilities.provider.stream` registers a
@@ -354,6 +361,9 @@ notice can parse entries (same convention as TS pi).
     cancellation distinctly; BOM-saved component WAT routes to the
     component carrier; dead-at-handshake MCP/component carriers report
     Dead instead of registering as loaded.
+- `tack ext new`'s scaffold README no longer claims the session loader
+  still speaks v1/v2 (it has spoken v3 since P3); it now points at
+  `extensionPaths` for the live dev loop and at the new guide.
 
 ## [1.0.4] - 2026-09-27
 
