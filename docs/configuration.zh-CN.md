@@ -213,6 +213,8 @@ Tack 从四级读取配置，**后加载的层级覆盖先加载的**（部分�
 
 另：`plugins`（对象）——按插件 id（`name@source`，见 docs/plugin-roadmap.zh-CN.md）设置的插件级配置。目前唯一的插件级键是 `enabled`（bool，默认 `true`）：被禁用的插件保持安装但不会被拉起（其元数据仍在 `ext list` 中可见）。可用 `tack ext enable|disable <id>` 管理，也可直接编辑配置文件。
 
+另：`pluginMarketplaces`（对象）——由后台启动同步保持新鲜的策展市场目录。键为市场名；值为来源字符串或对象 `{"source", "ref"?, "path"?, "publicKey"?}`（git 仓库 URL、https `.json` 目录或本地文件/目录）。**仅从全局层与 managed 层读取**（目录可通过 `installed-by-default` 推送代码，项目层不得重定向——与 `updateRepo` 同规则）。见 docs/extensions.zh-CN.md §5.2。
+
 ### Managed 层专属键
 
 仅 managed-settings.json 生效：

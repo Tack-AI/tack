@@ -5,14 +5,60 @@
 
 use serde_json::json;
 use tack_ext_sdk::{
-    AutocompleteProvideResult, AutocompleteProviderSpec, AutocompleteSuggestion, Plugin, ToolSpec,
-    WidgetKind, WidgetSpec, allow, deny, text_output,
+    AutocompleteProvideResult, AutocompleteProviderSpec, AutocompleteSuggestion, MetricOperation,
+    MetricsDeclaration, MetricsRecorder, Plugin, ToolSpec, WidgetKind, WidgetSpec, allow, deny,
+    text_output,
 };
+
+/// The metrics sidecar declaration (the host validates every drained
+/// line against this schema — see plugin_metrics.rs).
+fn metrics_declaration() -> MetricsDeclaration {
+    MetricsDeclaration {
+        operations: [(
+            "demo.metric".to_string(),
+            MetricOperation {
+                description: Some("one demo measurement".to_string()),
+                dimensions: Some(
+                    [(
+                        "outcome".to_string(),
+                        vec!["ok".to_string(), "error".to_string()],
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    }
+}
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     Plugin::builder("tack-v3-demo")
         .version("0.1.0")
+        .metrics(metrics_declaration())
+        .tool(
+            ToolSpec {
+                name: "hello.metric".to_string(),
+                label: None,
+                description:
+                    "Append one demo.metric measurement to the metrics sidecar scratch file"
+                        .to_string(),
+                parameters: json!({"type": "object"}),
+            },
+            |_params, cx| async move {
+                let Some(metrics) = cx.capabilities().metrics.clone() else {
+                    return Err(tack_ext_sdk::Error::from("host offered no metrics sidecar"));
+                };
+                let mut recorder = MetricsRecorder::new(&metrics.scratch_file)
+                    .map_err(|e| tack_ext_sdk::Error::from(e.to_string()))?;
+                recorder
+                    .record("demo.metric", 1.0, &[("outcome", "ok")])
+                    .map_err(|e| tack_ext_sdk::Error::from(e.to_string()))?;
+                Ok(text_output("recorded demo.metric"))
+            },
+        )
         .tool(
             ToolSpec {
                 name: "hello.echo".to_string(),

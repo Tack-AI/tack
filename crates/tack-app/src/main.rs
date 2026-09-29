@@ -390,6 +390,13 @@ enum ExtCommand {
         #[command(subcommand)]
         command: MarketplaceCommand,
     },
+    /// Pack an extension directory into a distributable bundle
+    /// (`<name>-<version>.tgz`) — the air-gapped distribution unit;
+    /// install one with `tack ext install <file.tgz>`
+    Bundle {
+        #[command(subcommand)]
+        command: BundleCommand,
+    },
     /// Scaffold a new tack-RPC v3 plugin (extension.json + SDK starter).
     /// Dev tooling speaks v3 directly; the session loader switches with
     /// the loader rework (see docs/plugin-roadmap.md)
@@ -441,8 +448,29 @@ enum MarketplaceCommand {
         /// Show this marketplace's plugins instead of the marketplace list
         marketplace: Option<String>,
     },
+    /// Sync settings-declared marketplaces now (`pluginMarketplaces`):
+    /// fetch each catalog, activate it if changed, and install any new
+    /// installed-by-default plugins. Startup also syncs in the background;
+    /// this is the manual, synchronous form
+    Sync {
+        /// Sync only this marketplace (default: all declared)
+        marketplace: Option<String>,
+    },
     /// Remove a registered marketplace
     Remove { name: String },
+}
+
+#[derive(Subcommand)]
+enum BundleCommand {
+    /// Pack an extension directory into a deterministic
+    /// `<name>-<version>.tgz` (sorted entries, zeroed mtimes/owners)
+    Pack {
+        /// Extension directory (containing extension.json)
+        dir: std::path::PathBuf,
+        /// Output file (default: `./<name>-<version>.tgz`)
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+    },
 }
 
 /// Install a panic hook that appends crash details to
@@ -1158,8 +1186,14 @@ async fn cmd_ext(command: &ExtCommand) -> Result<()> {
         ExtCommand::Install { source, local } => {
             // `<url>#<ref>` pins a tag/branch/commit (git sources only).
             let (source, cli_rev) = tack_app::extension_host::split_source_ref(source);
+            // A bundle file installs as-is (a `foo@1.0.tgz` name must not
+            // be mistaken for a <plugin>@<marketplace> spec).
+            let is_bundle = tack_app::ext_bundle::is_bundle_path(&source)
+                && std::path::Path::new(&source).is_file();
             // <plugin>@<marketplace> resolves through the catalog.
-            let (source, name, rev, marketplace) =
+            let (source, name, rev, marketplace) = if is_bundle {
+                (source, None, cli_rev, None)
+            } else {
                 match tack_app::extension_host::resolve_marketplace_spec(&source, &agent_dir) {
                     Ok(Some(resolved)) => {
                         // An explicit #ref beats the catalog's "rev" pin.
@@ -1176,7 +1210,8 @@ async fn cmd_ext(command: &ExtCommand) -> Result<()> {
                         eprintln!("{e}");
                         std::process::exit(1);
                     }
-                };
+                }
+            };
             let dir = tack_app::extension_host::install_extension_named(
                 &source,
                 &cwd,
@@ -1298,13 +1333,21 @@ async fn cmd_ext(command: &ExtCommand) -> Result<()> {
                         if plugins.is_empty() {
                             println!("marketplace {marketplace} has no plugins");
                         }
-                        for (name, source, description) in plugins {
-                            match description {
-                                Some(description) => {
-                                    println!("{name}@{marketplace}\t{source}\t{description}")
-                                }
-                                None => println!("{name}@{marketplace}\t{source}"),
+                        for plugin in plugins {
+                            let mut line =
+                                format!("{}@{marketplace}\t{}", plugin.name, plugin.source);
+                            if let Some(version) = &plugin.version {
+                                line.push_str(&format!("\tv{version}"));
                             }
+                            if let Some(description) = &plugin.description {
+                                line.push_str(&format!("\t{description}"));
+                            }
+                            if plugin.installation
+                                != tack_app::extension_host::MarketplaceInstallation::Available
+                            {
+                                line.push_str(&format!("\t[{}]", plugin.installation.as_str()));
+                            }
+                            println!("{line}");
                         }
                     }
                     None => {
@@ -1324,8 +1367,31 @@ async fn cmd_ext(command: &ExtCommand) -> Result<()> {
                 println!("removed marketplace {name}");
                 Ok(())
             }
+            MarketplaceCommand::Sync { marketplace } => {
+                let outcomes =
+                    tack_app::marketplace_sync::sync_all(&agent_dir, marketplace.as_deref()).await;
+                let mut failed = false;
+                for (name, outcome) in outcomes {
+                    use tack_app::marketplace_sync::SyncOutcome;
+                    if matches!(outcome, SyncOutcome::Failed(_)) {
+                        failed = true;
+                    }
+                    println!("{name}\t{}", outcome.label());
+                }
+                if failed {
+                    anyhow::bail!("marketplace sync failed");
+                }
+                Ok(())
+            }
         },
         ExtCommand::New { dir, lang } => tack_app::ext_dev::cmd_ext_new(dir, lang),
+        ExtCommand::Bundle {
+            command: BundleCommand::Pack { dir, output },
+        } => {
+            let out = tack_app::ext_bundle::pack_bundle(dir, output.as_deref())?;
+            println!("wrote {}", out.display());
+            Ok(())
+        }
         ExtCommand::Inspect { dir } => tack_app::ext_dev::cmd_ext_inspect(dir).await,
         ExtCommand::Dev { dir, scenario } => {
             tack_app::ext_dev::cmd_ext_dev(dir, scenario.as_deref()).await

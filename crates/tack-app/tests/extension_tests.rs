@@ -124,11 +124,14 @@ async fn demo_plugin_full_lifecycle() {
 
     // Tools: registered and sanitized (ext__demo_user__hello_echo).
     let tools = manager.tools();
-    assert_eq!(tools.len(), 2);
-    assert_eq!(tools[0].name(), "ext__demo_user__hello_echo");
+    assert_eq!(tools.len(), 3);
+    let echo = tools
+        .iter()
+        .find(|t| t.name() == "ext__demo_user__hello_echo")
+        .expect("echo tool");
 
     // Tool execution crosses to the plugin and back.
-    let result = tools[0]
+    let result = echo
         .execute(
             "call-1",
             serde_json::json!({ "text": "hello-ext" }),
@@ -232,8 +235,12 @@ async fn demo_plugin_in_headless_mode() {
     assert_eq!(manager.plugins.len(), 1, "demo plugin should load headless");
 
     let tools = manager.tools();
-    assert_eq!(tools.len(), 2);
-    let result = tools[0]
+    assert_eq!(tools.len(), 3);
+    let echo = tools
+        .iter()
+        .find(|t| t.name() == "ext__demo_user__hello_echo")
+        .expect("echo tool");
+    let result = echo
         .execute(
             "call-1",
             serde_json::json!({ "text": "headless" }),

@@ -223,6 +223,38 @@ in `docs/upstream-alignment.md` (§5).
   narrowing); blocked plugins stay visible as rows, and decisions are
   audit-logged with rule and layer. The key landed in its final form —
   no v1→v2 migration is planned.
+- **Plugin distribution + observability (P6)**: additive on every
+  existing surface; the new persisted bits landed directly in final
+  form:
+  - **Catalog v2**: entries may carry `installation` (`available |
+    `not-available | installed-by-default`) and an inline `manifest`;
+    unknown entry keys are skipped with a warning, so newer catalogs
+    keep parsing on older hosts. Signature canonicalization is
+    unchanged (unknown keys ride inside the signed payload).
+  - **Curated sync state**: `pluginMarketplaces` (global+managed
+    settings layers only) declares catalogs kept fresh at startup;
+    scratch lives under `marketplaces/.sync/` (lock + state), and a
+    swapped-out catalog is kept as `<name>.json.bak`.
+  - **Load report**: `extensions/last-load.json` (v1) — per-plugin
+    outcome rows with error classes, written after every load and read
+    by `tack doctor`.
+  - **Bundles**: `tack ext bundle pack` writes a deterministic
+    `<name>-<version>.tgz` (single top-level dir, sorted entries,
+    zeroed mtimes); installs extract defensively and record the bundle
+    path as the lockfile source (skipped by `ext upgrade`).
+  - **Metrics sidecar**: plugins declare `capabilities.metrics`
+    (operations + dimension enums, validated all-or-nothing); the host
+    provides `capabilities.metrics.scratchFile` and validates NDJSON
+    measurement lines (`{"operation", "value", "dimensions"}`)
+    strictly per drain. The wire shape was in the OpenRPC schema since
+    v3.0.0; P6 wires the host side (process + WASI-stdio carriers; the
+    WIT component world has no fs and voids declarations with a
+    warning).
+  - New structured-event targets: `plugin_load` (outcome counts by
+    error class), `plugin_metrics` (validated measurements with plugin
+    attribution), `marketplace_sync` (sync outcomes) — all flow
+    through the observability JSONL/auditSink pipeline like
+    `plugin_policy`.
 
 **Commitment.**
 

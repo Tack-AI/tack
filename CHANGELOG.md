@@ -8,6 +8,33 @@ notice can parse entries (same convention as TS pi).
 
 ### Added
 
+- **Plugin redesign P6 — distribution + observability.** Curated
+  marketplace startup sync: `pluginMarketplaces` (global/managed
+  settings layers) declares catalogs kept fresh in the background —
+  git transport degrading to the forge's https archive, fingerprint
+  short-circuit, cross-process lock, backup/rename/swap activation,
+  and a failing sync never blocks startup (`tack ext marketplace sync`
+  is the manual form). Catalog v2 entries gain `installation`
+  (`available | not-available | installed-by-default`, the latter
+  auto-installed by the sync) and an inline `manifest` for rich
+  listing; unknown entry keys warn and skip. Bundle archives are the
+  air-gapped unit: `tack ext bundle pack` writes a deterministic
+  `<name>-<version>.tgz`, and `tack ext install <file.tgz>` extracts
+  it under hostile-input rules (no links, no traversal, size caps)
+  into the normal store. Load telemetry emits counts by outcome
+  (`active | disabled | failed | policy-filtered`) with error classes
+  (`manifest | handshake | register | policy | store`, target
+  `plugin_load`) and persists `extensions/last-load.json`, which
+  `tack doctor` reads to report load failures with causes, lock
+  drift, policy-filtered entries, and WASM component support. The
+  metrics sidecar lets Level-3 plugins emit telemetry untrusted: a
+  declare-at-initialize schema (validated all-or-nothing), a
+  host-provided scratch file (WASI-stdio WASM: dedicated audited
+  preopen), and strict drain validation (≤64 KiB / ≤100 lines, exact
+  dimension sets, finite values, dedup) before measurements enter
+  telemetry with plugin attribution (target `plugin_metrics`); the
+  Rust SDK gains `MetricsRecorder`. See docs/extensions.md §5, §10,
+  §11.
 - **Plugin redesign P5 — enterprise plugin policy.** The managed
   settings layer gains a `pluginPolicy` key: `managedPluginsOnly`
   restricts loading to plugins explicitly named in the managed

@@ -2,6 +2,8 @@
 
 pub mod acp;
 pub mod agents;
+#[cfg(feature = "ext")]
+mod archive_extract;
 pub mod ask_user;
 pub mod atomic_write;
 pub mod auth;
@@ -13,6 +15,8 @@ pub mod cron;
 pub mod debug_image;
 pub mod doctor;
 pub mod eval;
+#[cfg(feature = "ext")]
+pub mod ext_bundle;
 #[cfg(feature = "ext")]
 pub mod ext_dev;
 #[cfg(not(feature = "ext"))]
@@ -37,6 +41,8 @@ pub use extension_host_stub as extension_host;
 pub mod hooks;
 pub mod i18n;
 pub mod logs;
+#[cfg(feature = "ext")]
+pub mod marketplace_sync;
 pub mod mcp_config;
 pub mod mcp_elicitation;
 pub mod mcp_oauth;
@@ -48,6 +54,8 @@ pub mod model;
 pub mod oauth_login;
 pub mod observability;
 pub mod permissions;
+#[cfg(feature = "ext")]
+pub mod plugin_metrics;
 #[cfg(feature = "ext")]
 pub mod plugin_policy;
 pub mod print_mode;

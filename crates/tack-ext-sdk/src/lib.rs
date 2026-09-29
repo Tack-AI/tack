@@ -32,9 +32,11 @@
 //! plugin; use [`Host::log`] / [`Host::warn`] instead.
 
 mod host;
+mod metrics;
 mod plugin;
 
 pub use host::{Cx, Host};
+pub use metrics::MetricsRecorder;
 pub use plugin::{Plugin, PluginBuilder};
 
 pub use tack_ext::rpc3; // generated protocol types

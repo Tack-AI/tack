@@ -219,6 +219,7 @@ tack ext marketplace add acme ./acme-marketplace.json   # or an https URL
 tack ext marketplace list                               # registered catalogs
 tack ext marketplace list acme                          # plugins in a catalog
 tack ext marketplace remove acme
+tack ext marketplace sync [acme]                        # sync declared catalogs now (§5.2)
 ```
 
 `<plugin>@<marketplace>` resolves the source through the catalog and
@@ -231,6 +232,77 @@ requires `--public-key <hex>` once; the key is pinned to
 `<name>.key` and every later resolve/install re-verifies. The signed
 payload is the catalog with the top-level `signature` key removed,
 reserialized with serde_json (BTreeMap key order).
+
+### 5.1 Catalog v2
+
+Catalog entries may carry two more fields; unknown entry keys are
+skipped with a warning (forward compatibility):
+
+```jsonc
+{
+  "plugins": {
+    "review": {
+      "source": "https://git.acme.com/review.git",
+      "rev": "main",
+      // available (default) | not-available | installed-by-default
+      "installation": "installed-by-default",
+      // Rich listing without materializing the plugin (version shown
+      // by `marketplace list <name>`).
+      "manifest": {"name": "review", "version": "1.4.2"}
+    }
+  }
+}
+```
+
+- `not-available` refuses resolution with a clear error (withdrawn by
+  the curator).
+- `installed-by-default` is installed automatically by the curated
+  startup sync (§5.2) when missing — still policy-gated by the install
+  channel (§9). Uninstalling it is undone at the next sync; disable it
+  instead (`tack ext disable <id>`).
+
+### 5.2 Curated startup sync (`pluginMarketplaces`)
+
+Settings-declared catalogs are kept fresh automatically. Declarations
+live in the global or MANAGED settings layers only — a catalog can push
+code via `installed-by-default`, so a project layer must not redirect
+it (same rule as `updateRepo`):
+
+```jsonc
+{
+  "pluginMarketplaces": {
+    "acme": {
+      "source": "https://git.acme.com/tack/plugins.git", // git repo, an
+                                                          // https .json catalog,
+                                                          // or a local file/dir
+      "ref": "main",                 // git ref (default: remote HEAD)
+      "path": "marketplace.json",    // catalog file inside the repo
+      "publicKey": "<ed25519 hex>"   // signed catalogs (TOFU-pinned)
+    },
+    "onprem": "/opt/tack/acme-catalog.json"             // shorthand form
+  }
+}
+```
+
+At startup the sync runs in the background (a failing sync NEVER blocks
+startup; the previous catalog keeps working):
+
+1. A cross-process lock (`marketplaces/.sync/<name>.lock`, stale after
+   10 min) serializes concurrent tack processes.
+2. A fingerprint short-circuit skips unchanged catalogs: `git ls-remote`
+   for git sources, a content hash otherwise.
+3. Transport: git clone; when git fails on an https source it degrades
+   to the forge's archive (`/archive/<ref>.tar.gz` GitHub/Gitea shape,
+   then the GitLab `/-/archive/...` shape), extracted defensively.
+4. Activation is validate → signature-check → backup/rename/swap
+   (`<name>.json.bak` kept). A bad or wrongly-signed sync never
+   replaces the working catalog.
+5. New `installed-by-default` entries are installed through the normal
+   channel (policy-checked, lockfile-recorded; failures are warnings).
+
+`tack ext marketplace sync [name]` is the synchronous manual form.
+Every pass emits structured events (target `marketplace_sync`) that
+flow to the observability JSONL and the managed auditSink.
 
 ## 6. Developer tooling
 
@@ -357,3 +429,81 @@ structured tracing event (target `plugin_policy`) naming the rule and
 the origin layer; with a managed `auditSink` configured those events
 are shipped to the organization collector. `tack ext enable|disable`
 warns when the managed layer pins the opposite value.
+
+## 10. Bundle archives (air-gapped distribution)
+
+A bundle is a `.tgz` of an extension directory — the distribution unit
+for machines that cannot reach a git forge:
+
+```sh
+tack ext bundle pack ./my-plugin            # writes my-plugin-1.2.3.tgz
+tack ext bundle pack ./my-plugin --output dist/plugin.tgz   # (-o works too)
+tack ext install my-plugin-1.2.3.tgz        # installs through the normal channel
+```
+
+- **Packing is deterministic**: sorted entries, zeroed mtimes/owners,
+  normalized modes — the same input bytes always produce the same
+  bundle. `.git` and the output file itself are excluded; symlinks are
+  dereferenced when they stay inside the plugin root, otherwise skipped
+  with a warning.
+- **Installing is defensive**: extraction rejects links, device nodes,
+  absolute paths, and `..` components, with a cumulative size cap
+  (256 MiB) and per-file/entry-count caps. The extracted tree goes
+  through the same staging → manifest re-read → policy check → atomic
+  activation as any other install, and is recorded in the lockfile
+  (the bundle path as source). Bundle installs are skipped by
+  `tack ext upgrade` (no remote to advance to).
+- Managed `allowedSources` `local` rules apply to the bundle path.
+
+## 11. Observability
+
+### 11.1 Load telemetry and `tack doctor`
+
+Every load emits one structured event (target `plugin_load`) with
+counts by outcome (`active | disabled | failed | policy-filtered`)
+broken down by error class (`manifest | handshake | register | policy |
+store`), and persists `~/.tack/agent/extensions/last-load.json` — the
+per-plugin report `tack doctor` reads (doctor never spawns plugins).
+`tack doctor` reports: load failures with their causes and classes,
+policy-filtered entries, lock drift (changed/missing installs), and
+WASM component support.
+
+### 11.2 The metrics sidecar
+
+Level-3 plugins emit telemetry without any host trust in their
+processes: the plugin DECLARES its schema at initialize, the host hands
+over a sandbox-authorized scratch file and validates every drain
+strictly before anything enters telemetry with plugin attribution:
+
+```jsonc
+// initialize result (plugin declares):
+"metrics": {"operations": {
+    "review.run": {"dimensions": {"outcome": ["ok", "error"]}}
+}}
+// initialize params (host offers):
+"metrics": {"scratchFile": "/…/extensions/data/user/review/metrics/metrics.ndjson"}
+// the plugin appends NDJSON measurement lines:
+{"operation": "review.run", "value": 1, "dimensions": {"outcome": "ok"}}
+```
+
+- **Declaration validation is all-or-nothing**: operation ids match
+  `[a-z][a-z0-9_.]{0,63}`, at most 8 dimensions per operation, enums of
+  1–64 non-empty values. Any violation voids the whole declaration with
+  a load warning.
+- **The scratch file** lives in the plugin's data root. WASI-stdio WASM
+  plugins get it through a dedicated read-write preopen (`/metrics`,
+  audit-logged with the other grants). The WIT component world has no
+  filesystem at all, so component-carrier declarations are voided with
+  a warning until a future typed world.
+- **Drain validation**: the host drains every 30s and at shutdown;
+  each drain is capped at 64 KiB / 100 lines (excess is dropped with a
+  violation), dimension sets must match the declaration exactly, values
+  must be finite, duplicate lines within a drain collapse. Three
+  violations disable the sidecar for the session.
+- Validated measurements enter telemetry as structured events (target
+  `plugin_metrics`) with the plugin id attached — shipped via the
+  observability JSONL and the managed auditSink like any other event.
+
+The Rust SDK exposes this as `MetricsRecorder`
+(`cx.capabilities().metrics.scratch_file`); TS/Python plugins append
+the same NDJSON lines directly.

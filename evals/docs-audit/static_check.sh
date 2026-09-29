@@ -97,6 +97,7 @@ crates/tack-app/src/auth.rs
 crates/tack-app/src/project_trust.rs
 crates/tack-app/src/observability.rs
 crates/tack-app/src/plugin_policy.rs
+crates/tack-app/src/marketplace_sync.rs
 crates/tack-app/src/shell_hooks/mod.rs
 crates/tack-app/src/tui/mod.rs
 crates/tack-app/src/mcp_config.rs"

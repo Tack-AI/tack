@@ -25,8 +25,8 @@ use tack_agent_core::{AgentHooks, AgentTool};
 use tack_ext::hooks::{ExtHooks, FailMode};
 use tack_ext::plugin_id::PluginId;
 use tack_ext::rpc3::{
-    ErrorObject, HostCapabilities, HostInfo, InitializeParams, InitializeResult, RunMode,
-    WidgetSpec, WidgetUpdateParams,
+    ErrorObject, HostCapabilities, HostInfo, InitializeParams, InitializeResult,
+    MetricsHostCapability, RunMode, WidgetSpec, WidgetUpdateParams,
 };
 use tack_ext::tool::ExtTool;
 use tack_ext::v3::{PeerHandler, PluginConnection, V3Process};
@@ -557,6 +557,39 @@ impl PluginHandle {
     }
 }
 
+/// Why a plugin failed to load. The telemetry vocabulary of roadmap §9 —
+/// counts by outcome are broken down by these classes. `Policy` is not
+/// constructed here: policy-filtered plugins carry `policy_block` instead
+/// of `error`, so the class is implied by the outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LoadErrorClass {
+    /// Manifest missing/unparseable, or a manifest-declared capability
+    /// (carrier, module, mcpServer entry) is malformed.
+    Manifest,
+    /// Carrier start or the initialize handshake failed.
+    Handshake,
+    /// Registration rejected after a successful handshake.
+    Register,
+    /// Managed plugin policy filtered the plugin (telemetry only — the
+    /// row state is `policy_block`, not `error`).
+    Policy,
+    /// Store/lock layer rejected the checkout (drift, pinning).
+    Store,
+}
+
+impl LoadErrorClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LoadErrorClass::Manifest => "manifest",
+            LoadErrorClass::Handshake => "handshake",
+            LoadErrorClass::Register => "register",
+            LoadErrorClass::Policy => "policy",
+            LoadErrorClass::Store => "store",
+        }
+    }
+}
+
 /// One discovered plugin (running or not). Failure is first-class state:
 /// a plugin that failed to load stays in the list with `error` set, and
 /// every consumer filters on [`LoadedPlugin::is_active`].
@@ -568,6 +601,8 @@ pub struct LoadedPlugin {
     pub enabled: bool,
     /// Load/handshake failure, when any (capabilities empty then).
     pub error: Option<String>,
+    /// Telemetry class of `error` (roadmap §9); None when `error` is None.
+    pub error_class: Option<LoadErrorClass>,
     /// Managed plugin-policy block reason, when the load-time filter
     /// rejected this plugin (rows, not absences — roadmap §8.1/§8.3).
     pub policy_block: Option<String>,
@@ -582,8 +617,92 @@ pub struct LoadedPlugin {
 }
 
 impl LoadedPlugin {
+    /// A plain row (disabled or pending), no failure state.
+    fn row(entry: Discovered, enabled: bool) -> Self {
+        LoadedPlugin {
+            id: entry.id,
+            enabled,
+            error: None,
+            error_class: None,
+            policy_block: None,
+            register: None,
+            handle: None,
+            version: entry.version,
+            dir: entry.dir,
+        }
+    }
+
+    /// A failed row with a telemetry error class.
+    fn failed(
+        entry: Discovered,
+        enabled: bool,
+        class: LoadErrorClass,
+        error: impl Into<String>,
+    ) -> Self {
+        LoadedPlugin {
+            id: entry.id,
+            enabled,
+            error: Some(error.into()),
+            error_class: Some(class),
+            policy_block: None,
+            register: None,
+            handle: None,
+            version: entry.version,
+            dir: entry.dir,
+        }
+    }
+
+    /// A policy-filtered row (the managed policy block reason).
+    fn policy_blocked(entry: Discovered, enabled: bool, reason: String) -> Self {
+        LoadedPlugin {
+            id: entry.id,
+            enabled,
+            error: None,
+            error_class: None,
+            policy_block: Some(reason),
+            register: None,
+            handle: None,
+            version: entry.version,
+            dir: entry.dir,
+        }
+    }
+
+    /// A running row (handshake done, carrier live).
+    fn loaded(
+        entry: Discovered,
+        enabled: bool,
+        register: InitializeResult,
+        handle: PluginHandle,
+    ) -> Self {
+        LoadedPlugin {
+            id: entry.id,
+            enabled,
+            error: None,
+            error_class: None,
+            policy_block: None,
+            register: Some(register),
+            handle: Some(handle),
+            version: entry.version,
+            dir: entry.dir,
+        }
+    }
+
     pub fn is_active(&self) -> bool {
         self.enabled && self.error.is_none() && self.policy_block.is_none()
+    }
+
+    /// The load outcome bucket for telemetry and the doctor report:
+    /// `active | disabled | failed | policy-filtered` (roadmap §9).
+    pub fn outcome(&self) -> &'static str {
+        if self.policy_block.is_some() {
+            "policy-filtered"
+        } else if self.error.is_some() {
+            "failed"
+        } else if !self.enabled {
+            "disabled"
+        } else {
+            "active"
+        }
     }
 
     /// The plugin name (id's name segment).
@@ -604,6 +723,136 @@ impl std::fmt::Debug for LoadedPlugin {
             .field("error", &self.error)
             .field("policy_block", &self.policy_block)
             .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Load telemetry + doctor report
+// ---------------------------------------------------------------------------
+
+/// The on-disk load report (`<agentDir>/extensions/last-load.json`): the
+/// most recent load outcome, consumed by `tack doctor` (which must not
+/// spawn plugins to learn load health). Best-effort — a write failure is
+/// a debug log, never a load problem.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct LoadReport {
+    pub version: u32,
+    /// Unix seconds when the load finished.
+    pub ts: u64,
+    /// Run mode of the load (`tui | print | rpc | acp`).
+    pub mode: String,
+    pub plugins: Vec<LoadReportRow>,
+    pub warnings: Vec<String>,
+}
+
+/// One plugin's row in the load report.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct LoadReportRow {
+    pub id: String,
+    /// `active | disabled | failed | policy-filtered`.
+    pub outcome: String,
+    /// Telemetry error class (`manifest | handshake | register | policy |
+    /// | store`); present for failed and policy-filtered rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    /// Failure cause or policy-block reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub version: String,
+    pub dir: String,
+}
+
+/// The load-report path (`<agentDir>/extensions/last-load.json`).
+pub fn load_report_path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("extensions").join("last-load.json")
+}
+
+/// Read the persisted load report; a missing/corrupt file is None (doctor
+/// reports "no load recorded" rather than failing).
+pub fn read_load_report(agent_dir: &Path) -> Option<LoadReport> {
+    let content = std::fs::read_to_string(load_report_path(agent_dir)).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Aggregate the load outcome into one structured `plugin_load` tracing
+/// event (counts by outcome, broken down by error class — roadmap §9) and
+/// persist the doctor report. The event flows to the observability JSONL
+/// and the managed audit sink like any other structured event.
+fn emit_load_telemetry(manager: &ExtensionManager, agent_dir: &Path, mode: &str) {
+    let mut active = 0u64;
+    let mut disabled = 0u64;
+    let mut failed = 0u64;
+    let mut policy_filtered = 0u64;
+    let mut class_counts = [0u64; 5]; // manifest, handshake, register, policy, store
+    for plugin in &manager.plugins {
+        match plugin.outcome() {
+            "active" => active += 1,
+            "disabled" => disabled += 1,
+            "failed" => {
+                failed += 1;
+                let index = match plugin.error_class {
+                    Some(LoadErrorClass::Manifest) => 0,
+                    Some(LoadErrorClass::Handshake) => 1,
+                    Some(LoadErrorClass::Register) => 2,
+                    Some(LoadErrorClass::Policy) => 3,
+                    Some(LoadErrorClass::Store) => 4,
+                    None => continue,
+                };
+                class_counts[index] += 1;
+            }
+            _ => {
+                policy_filtered += 1;
+                class_counts[3] += 1; // policy
+            }
+        }
+    }
+    tracing::info!(
+        target: "plugin_load",
+        active,
+        disabled,
+        failed,
+        policy_filtered,
+        class_manifest = class_counts[0],
+        class_handshake = class_counts[1],
+        class_register = class_counts[2],
+        class_policy = class_counts[3],
+        class_store = class_counts[4],
+        "plugin load: {active} active, {disabled} disabled, {failed} failed, \
+         {policy_filtered} policy-filtered"
+    );
+    let report = LoadReport {
+        version: 1,
+        ts: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        mode: mode.to_string(),
+        plugins: manager
+            .plugins
+            .iter()
+            .map(|plugin| LoadReportRow {
+                id: plugin.id.to_string(),
+                outcome: plugin.outcome().to_string(),
+                error_class: if plugin.policy_block.is_some() {
+                    Some(LoadErrorClass::Policy.as_str().to_string())
+                } else {
+                    plugin.error_class.map(|c| c.as_str().to_string())
+                },
+                detail: plugin.error.clone().or_else(|| plugin.policy_block.clone()),
+                version: plugin.version.clone(),
+                dir: plugin.dir.display().to_string(),
+            })
+            .collect(),
+        warnings: manager.load_warnings.clone(),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&report) {
+        let path = load_report_path(agent_dir);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = crate::atomic_write::atomic_write(&path, &json) {
+            tracing::debug!("cannot write plugin load report {}: {e}", path.display());
+        }
     }
 }
 
@@ -781,6 +1030,18 @@ pub struct ExtensionManager {
     /// Shared wasmtime engine for WASM-carrier plugins.
     #[cfg(feature = "wasm")]
     wasm_carrier: Option<tack_ext_wasm::WasmCarrier>,
+    /// Metrics sidecars for plugins whose declaration validated (drained
+    /// every 30s and at shutdown; roadmap §9).
+    metrics_sidecars: std::sync::Arc<std::sync::Mutex<Vec<crate::plugin_metrics::MetricsSidecar>>>,
+    /// Stop signal for the drain task (set by shutdown and Drop).
+    metrics_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for ExtensionManager {
+    fn drop(&mut self) {
+        self.metrics_stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl std::fmt::Debug for ExtensionManager {
@@ -1039,6 +1300,9 @@ impl ExtensionManager {
         mcp_callbacks: tack_tools::mcp::McpClientCallbacks,
     ) -> Self {
         let policy = crate::plugin_policy::PluginPolicy::load();
+        // Curated marketplace startup sync (roadmap §9): background,
+        // best-effort — a failing sync never blocks the session.
+        crate::marketplace_sync::start_background_sync(agent_dir.to_path_buf());
         Self::load_with_policy(
             cwd,
             agent_dir,
@@ -1094,16 +1358,9 @@ impl ExtensionManager {
                     None => crate::plugin_policy::LoadOrigin::Dir(&entry.dir),
                 };
                 if let Some(reason) = policy.load_block(&entry.id, origin) {
-                    manager.plugins.push(LoadedPlugin {
-                        id: entry.id,
-                        enabled,
-                        error: None,
-                        policy_block: Some(reason),
-                        register: None,
-                        handle: None,
-                        version: entry.version,
-                        dir: entry.dir,
-                    });
+                    manager
+                        .plugins
+                        .push(LoadedPlugin::policy_blocked(entry, enabled, reason));
                     continue;
                 }
             }
@@ -1113,46 +1370,29 @@ impl ExtensionManager {
                 Ok(content) => match serde_json::from_str::<ExtensionManifest>(&content) {
                     Ok(manifest) => Some(manifest),
                     Err(e) => {
-                        manager.plugins.push(LoadedPlugin {
-                            id: entry.id,
+                        manager.plugins.push(LoadedPlugin::failed(
+                            entry,
                             enabled,
-                            error: Some(format!("bad extension.json: {e}")),
-                            policy_block: None,
-                            register: None,
-                            handle: None,
-                            version: entry.version,
-                            dir: entry.dir,
-                        });
+                            LoadErrorClass::Manifest,
+                            format!("bad extension.json: {e}"),
+                        ));
                         continue;
                     }
                 },
                 Err(e) => {
-                    manager.plugins.push(LoadedPlugin {
-                        id: entry.id,
+                    manager.plugins.push(LoadedPlugin::failed(
+                        entry,
                         enabled,
-                        error: Some(format!("cannot read extension.json: {e}")),
-                        policy_block: None,
-                        register: None,
-                        handle: None,
-                        version: entry.version,
-                        dir: entry.dir,
-                    });
+                        LoadErrorClass::Manifest,
+                        format!("cannot read extension.json: {e}"),
+                    ));
                     continue;
                 }
             };
             let manifest = manifest.expect("manifest checked");
 
             if !enabled {
-                manager.plugins.push(LoadedPlugin {
-                    id: entry.id,
-                    enabled: false,
-                    error: None,
-                    policy_block: None,
-                    register: None,
-                    handle: None,
-                    version: entry.version,
-                    dir: entry.dir,
-                });
+                manager.plugins.push(LoadedPlugin::row(entry, false));
                 continue;
             }
 
@@ -1161,19 +1401,12 @@ impl ExtensionManager {
             if (entry.id.source() == "user" || !entry.id.is_reserved_source())
                 && !lock_allows(&entry, &lock, lock_required)
             {
-                manager.plugins.push(LoadedPlugin {
-                    id: entry.id,
+                manager.plugins.push(LoadedPlugin::failed(
+                    entry,
                     enabled,
-                    error: Some(
-                        "checkout drifted from the locked commit (extensionLockRequired)"
-                            .to_string(),
-                    ),
-                    policy_block: None,
-                    register: None,
-                    handle: None,
-                    version: entry.version,
-                    dir: entry.dir,
-                });
+                    LoadErrorClass::Store,
+                    "checkout drifted from the locked commit (extensionLockRequired)",
+                ));
                 continue;
             }
 
@@ -1188,21 +1421,20 @@ impl ExtensionManager {
                 inner: services.clone(),
             });
             let carrier = manifest.carrier.as_deref().unwrap_or("process");
+            // Metrics sidecar scratch for carriers that support it
+            // ((host path, scratchFile value)); set inside the spawn arms.
+            let mut metrics_scratch: Option<(PathBuf, String)> = None;
             let mut handle = match carrier {
                 "mcp" => {
                     // Level-2 MCP server plugin: the declared server IS
                     // the plugin (no tack-RPC process is spawned).
                     let Some(server) = &manifest.mcp_server else {
-                        manager.plugins.push(LoadedPlugin {
-                            id: entry.id,
+                        manager.plugins.push(LoadedPlugin::failed(
+                            entry,
                             enabled,
-                            error: Some("carrier mcp requires an `mcpServer` entry".to_string()),
-                            policy_block: None,
-                            register: None,
-                            handle: None,
-                            version: entry.version,
-                            dir: entry.dir,
-                        });
+                            LoadErrorClass::Manifest,
+                            "carrier mcp requires an `mcpServer` entry",
+                        ));
                         continue;
                     };
                     let Some(mut spec) = crate::mcp_config::spec_from_entry(
@@ -1210,16 +1442,12 @@ impl ExtensionManager {
                         server,
                         &format!("extension {id_string}"),
                     ) else {
-                        manager.plugins.push(LoadedPlugin {
-                            id: entry.id,
+                        manager.plugins.push(LoadedPlugin::failed(
+                            entry,
                             enabled,
-                            error: Some("carrier mcp: malformed `mcpServer` entry".to_string()),
-                            policy_block: None,
-                            register: None,
-                            handle: None,
-                            version: entry.version,
-                            dir: entry.dir,
-                        });
+                            LoadErrorClass::Manifest,
+                            "carrier mcp: malformed `mcpServer` entry",
+                        ));
                         continue;
                     };
                     // A stdio server runs with the extension directory as
@@ -1238,16 +1466,12 @@ impl ExtensionManager {
                     {
                         Ok(conn) => PluginHandle::Mcp(Some(Arc::new(conn))),
                         Err(e) => {
-                            manager.plugins.push(LoadedPlugin {
-                                id: entry.id,
+                            manager.plugins.push(LoadedPlugin::failed(
+                                entry,
                                 enabled,
-                                error: Some(format!("failed to start (mcp): {e}")),
-                                policy_block: None,
-                                register: None,
-                                handle: None,
-                                version: entry.version,
-                                dir: entry.dir,
-                            });
+                                LoadErrorClass::Handshake,
+                                format!("failed to start (mcp): {e}"),
+                            ));
                             continue;
                         }
                     }
@@ -1256,35 +1480,24 @@ impl ExtensionManager {
                     #[cfg(feature = "wasm")]
                     {
                         let Some(module) = &manifest.module else {
-                            manager.plugins.push(LoadedPlugin {
-                                id: entry.id,
+                            manager.plugins.push(LoadedPlugin::failed(
+                                entry,
                                 enabled,
-                                error: Some("carrier wasm requires `module`".to_string()),
-                                policy_block: None,
-                                register: None,
-                                handle: None,
-                                version: entry.version,
-                                dir: entry.dir,
-                            });
+                                LoadErrorClass::Manifest,
+                                "carrier wasm requires `module`",
+                            ));
                             continue;
                         };
                         let module_path = entry.dir.join(module);
                         let wasm = match std::fs::read(&module_path) {
                             Ok(bytes) => bytes,
                             Err(e) => {
-                                manager.plugins.push(LoadedPlugin {
-                                    id: entry.id,
+                                manager.plugins.push(LoadedPlugin::failed(
+                                    entry,
                                     enabled,
-                                    error: Some(format!(
-                                        "cannot read {}: {e}",
-                                        module_path.display()
-                                    )),
-                                    policy_block: None,
-                                    register: None,
-                                    handle: None,
-                                    version: entry.version,
-                                    dir: entry.dir,
-                                });
+                                    LoadErrorClass::Manifest,
+                                    format!("cannot read {}: {e}", module_path.display()),
+                                ));
                                 continue;
                             }
                         };
@@ -1292,31 +1505,50 @@ impl ExtensionManager {
                             match tack_ext_wasm::WasmCarrier::new() {
                                 Ok(carrier) => manager.wasm_carrier = Some(carrier),
                                 Err(e) => {
-                                    manager.plugins.push(LoadedPlugin {
-                                        id: entry.id,
+                                    manager.plugins.push(LoadedPlugin::failed(
+                                        entry,
                                         enabled,
-                                        error: Some(format!("wasmtime unavailable: {e}")),
-                                        policy_block: None,
-                                        register: None,
-                                        handle: None,
-                                        version: entry.version,
-                                        dir: entry.dir,
-                                    });
+                                        LoadErrorClass::Handshake,
+                                        format!("wasmtime unavailable: {e}"),
+                                    ));
                                     continue;
                                 }
                             }
                         }
                         let carrier_engine = manager.wasm_carrier.as_ref().expect("carrier");
                         let limits = manifest.limits.map(|l| l.to_limits()).unwrap_or_default();
-                        let capabilities = manifest
+                        let mut capabilities = manifest
                             .capabilities
                             .map(|c| c.into_capabilities(&id_string, &entry.dir))
                             .unwrap_or_default();
-                        audit_capability_grants(&id_string, &capabilities);
                         // WIT component vs WASI-stdio core module: the
                         // module format selects the carrier (both are
                         // `carrier: "wasm"` in the manifest).
-                        if tack_ext_wasm::component::is_component(&wasm) {
+                        let is_component = tack_ext_wasm::component::is_component(&wasm);
+                        if !is_component {
+                            // Metrics sidecar: a dedicated preopen for the
+                            // scratch file (audited with the other grants).
+                            match crate::plugin_metrics::create_scratch(&plugin_data_dir(
+                                agent_dir, &entry.id,
+                            )) {
+                                Ok(path) => {
+                                    let host_dir =
+                                        path.parent().map(PathBuf::from).unwrap_or_default();
+                                    capabilities.preopens.push(tack_ext_wasm::PreopenGrant {
+                                        host_path: host_dir,
+                                        guest_path: "/metrics".to_string(),
+                                        access: tack_ext_wasm::PreopenAccess::ReadWrite,
+                                    });
+                                    metrics_scratch =
+                                        Some((path, "/metrics/metrics.ndjson".to_string()));
+                                }
+                                Err(e) => manager.load_warnings.push(format!(
+                                    "extension {id_string}: metrics scratch file unavailable: {e}"
+                                )),
+                            }
+                        }
+                        audit_capability_grants(&id_string, &capabilities);
+                        if is_component {
                             match carrier_engine
                                 .spawn_component(
                                     &wasm,
@@ -1329,18 +1561,12 @@ impl ExtensionManager {
                             {
                                 Ok(plugin) => PluginHandle::WasmComponent(Arc::new(plugin)),
                                 Err(e) => {
-                                    manager.plugins.push(LoadedPlugin {
-                                        id: entry.id,
+                                    manager.plugins.push(LoadedPlugin::failed(
+                                        entry,
                                         enabled,
-                                        error: Some(format!(
-                                            "failed to start (wasm component): {e}"
-                                        )),
-                                        policy_block: None,
-                                        register: None,
-                                        handle: None,
-                                        version: entry.version,
-                                        dir: entry.dir,
-                                    });
+                                        LoadErrorClass::Handshake,
+                                        format!("failed to start (wasm component): {e}"),
+                                    ));
                                     continue;
                                 }
                             }
@@ -1356,16 +1582,12 @@ impl ExtensionManager {
                             {
                                 Ok(plugin) => PluginHandle::Wasm(Some(plugin)),
                                 Err(e) => {
-                                    manager.plugins.push(LoadedPlugin {
-                                        id: entry.id,
+                                    manager.plugins.push(LoadedPlugin::failed(
+                                        entry,
                                         enabled,
-                                        error: Some(format!("failed to start (wasm): {e}")),
-                                        policy_block: None,
-                                        register: None,
-                                        handle: None,
-                                        version: entry.version,
-                                        dir: entry.dir,
-                                    });
+                                        LoadErrorClass::Handshake,
+                                        format!("failed to start (wasm): {e}"),
+                                    ));
                                     continue;
                                 }
                             }
@@ -1373,19 +1595,12 @@ impl ExtensionManager {
                     }
                     #[cfg(not(feature = "wasm"))]
                     {
-                        manager.plugins.push(LoadedPlugin {
-                            id: entry.id,
+                        manager.plugins.push(LoadedPlugin::failed(
+                            entry,
                             enabled,
-                            error: Some(
-                                "carrier wasm requested, but this build has no wasm support"
-                                    .to_string(),
-                            ),
-                            policy_block: None,
-                            register: None,
-                            handle: None,
-                            version: entry.version,
-                            dir: entry.dir,
-                        });
+                            LoadErrorClass::Handshake,
+                            "carrier wasm requested, but this build has no wasm support",
+                        ));
                         continue;
                     }
                 }
@@ -1411,33 +1626,41 @@ impl ExtensionManager {
                     let env: Vec<(String, String)> = manifest.env.clone().into_iter().collect();
                     match V3Process::spawn(command, &args, &env, &entry.dir, services.clone()).await
                     {
-                        Ok(process) => PluginHandle::Process(process),
+                        Ok(process) => {
+                            // Metrics sidecar: per-session scratch file.
+                            match crate::plugin_metrics::create_scratch(&plugin_data_dir(
+                                agent_dir, &entry.id,
+                            )) {
+                                Ok(path) => {
+                                    let absolute =
+                                        path.canonicalize().unwrap_or_else(|_| path.clone());
+                                    metrics_scratch =
+                                        Some((path, absolute.to_string_lossy().to_string()));
+                                }
+                                Err(e) => manager.load_warnings.push(format!(
+                                    "extension {id_string}: metrics scratch file unavailable: {e}"
+                                )),
+                            }
+                            PluginHandle::Process(process)
+                        }
                         Err(e) => {
-                            manager.plugins.push(LoadedPlugin {
-                                id: entry.id,
+                            manager.plugins.push(LoadedPlugin::failed(
+                                entry,
                                 enabled,
-                                error: Some(format!("failed to start: {e}")),
-                                policy_block: None,
-                                register: None,
-                                handle: None,
-                                version: entry.version,
-                                dir: entry.dir,
-                            });
+                                LoadErrorClass::Handshake,
+                                format!("failed to start: {e}"),
+                            ));
                             continue;
                         }
                     }
                 }
                 other => {
-                    manager.plugins.push(LoadedPlugin {
-                        id: entry.id,
+                    manager.plugins.push(LoadedPlugin::failed(
+                        entry,
                         enabled,
-                        error: Some(format!("unknown carrier {other:?}")),
-                        policy_block: None,
-                        register: None,
-                        handle: None,
-                        version: entry.version,
-                        dir: entry.dir,
-                    });
+                        LoadErrorClass::Manifest,
+                        format!("unknown carrier {other:?}"),
+                    ));
                     continue;
                 }
             };
@@ -1467,7 +1690,11 @@ impl ExtensionManager {
                     ui_dialogs: Some(mode == "tui"),
                     exec: Some(trusted),
                     provider_registration: Some(true),
-                    metrics: None,
+                    metrics: metrics_scratch.as_ref().map(|(_, scratch_file)| {
+                        MetricsHostCapability {
+                            scratch_file: scratch_file.clone(),
+                        }
+                    }),
                 },
                 config: None,
             };
@@ -1529,6 +1756,35 @@ impl ExtensionManager {
                             ));
                         }
                     }
+                    // Metrics sidecar (roadmap §9): the declared schema
+                    // validates all-or-nothing; a valid declaration on a
+                    // supported carrier gets a drained sidecar.
+                    if let Some(declaration) = &register.capabilities.metrics {
+                        match crate::plugin_metrics::validate_declaration(declaration) {
+                            Err(reason) => manager.load_warnings.push(format!(
+                                "extension {id_string}: metrics declaration voided: {reason}"
+                            )),
+                            Ok(()) => {
+                                if let Some((path, _)) = &metrics_scratch {
+                                    manager
+                                        .metrics_sidecars
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .push(crate::plugin_metrics::MetricsSidecar::new(
+                                            id_string.clone(),
+                                            path.clone(),
+                                            declaration.clone(),
+                                        ));
+                                } else {
+                                    manager.load_warnings.push(format!(
+                                        "extension {id_string}: metrics declaration voided: the \
+                                         {carrier} carrier has no metrics sidecar (process and \
+                                         WASI-stdio WASM only)"
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     tracing::info!(
                         "extension {} loaded (carrier {}, version {})",
                         id_string,
@@ -1545,32 +1801,23 @@ impl ExtensionManager {
                     if let Some(widgets) = &register.capabilities.widgets {
                         manager.widgets.register_plugin(&id_string, widgets);
                     }
-                    manager.plugins.push(LoadedPlugin {
-                        id: entry.id,
-                        enabled,
-                        error: None,
-                        policy_block: None,
-                        register: Some(register),
-                        handle: Some(handle),
-                        version: entry.version,
-                        dir: entry.dir,
-                    });
+                    manager
+                        .plugins
+                        .push(LoadedPlugin::loaded(entry, enabled, register, handle));
                 }
                 Err(e) => {
                     handle.shutdown().await;
-                    manager.plugins.push(LoadedPlugin {
-                        id: entry.id,
+                    manager.plugins.push(LoadedPlugin::failed(
+                        entry,
                         enabled,
-                        error: Some(format!("handshake failed: {e}")),
-                        policy_block: None,
-                        register: None,
-                        handle: None,
-                        version: entry.version,
-                        dir: entry.dir,
-                    });
+                        LoadErrorClass::Handshake,
+                        format!("handshake failed: {e}"),
+                    ));
                 }
             }
         }
+        emit_load_telemetry(&manager, agent_dir, mode);
+        manager.start_metrics_drain();
         manager
     }
 
@@ -1906,11 +2153,48 @@ impl ExtensionManager {
 
     /// Gracefully stop all running plugins.
     pub async fn shutdown(&mut self) {
+        // Metrics sidecars: plugins flush final measurements during their
+        // own shutdown, so the final drain runs AFTER it.
         for plugin in &mut self.plugins {
             if let Some(handle) = &mut plugin.handle {
                 handle.shutdown().await;
             }
         }
+        self.metrics_stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut sidecars) = self.metrics_sidecars.lock() {
+            for sidecar in sidecars.iter_mut() {
+                crate::plugin_metrics::drain(sidecar);
+            }
+        }
+    }
+
+    /// Spawn the interval drain task when any sidecar registered (30s).
+    fn start_metrics_drain(&self) {
+        {
+            let Ok(sidecars) = self.metrics_sidecars.lock() else {
+                return;
+            };
+            if sidecars.is_empty() {
+                return;
+            }
+        }
+        let shared = self.metrics_sidecars.clone();
+        let stop = self.metrics_stop.clone();
+        crate::task::spawn_guarded("plugin-metrics-drain", async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                if let Ok(mut sidecars) = shared.lock() {
+                    for sidecar in sidecars.iter_mut() {
+                        crate::plugin_metrics::drain(sidecar);
+                    }
+                }
+            }
+            Some(())
+        });
     }
 }
 
@@ -2017,7 +2301,7 @@ pub fn lock_path(agent_dir: &Path) -> PathBuf {
 /// Read the lockfile; a missing file is an empty lock (not an error).
 /// v1 files (bare-name keys, no `store`/`version` fields) are upgraded in
 /// memory: their plugins are `name@user` legacy flat installs.
-fn read_lock(agent_dir: &Path) -> anyhow::Result<ExtensionsLock> {
+pub(crate) fn read_lock(agent_dir: &Path) -> anyhow::Result<ExtensionsLock> {
     let path = lock_path(agent_dir);
     let Ok(content) = std::fs::read_to_string(&path) else {
         return Ok(ExtensionsLock::default());
@@ -2271,6 +2555,20 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Stage a local (non-git) source: a directory copy or a `.tgz` bundle
+/// extraction (hostile-input rules — the air-gapped distribution unit).
+fn stage_local_source(source: &str, staging: &Path) -> anyhow::Result<()> {
+    let source_path = PathBuf::from(source);
+    if crate::ext_bundle::is_bundle_path(source) && source_path.is_file() {
+        crate::ext_bundle::stage_bundle_archive(&source_path, staging)
+    } else if source_path.is_dir() {
+        copy_dir_recursive(&source_path, staging)?;
+        Ok(())
+    } else {
+        anyhow::bail!("{source} is neither a git URL, an existing directory, nor a .tgz bundle")
+    }
+}
+
 /// Split a `<git-url>[#<ref>]` install source into (url, ref).
 pub fn split_source_ref(source: &str) -> (String, Option<String>) {
     match source.rsplit_once('#') {
@@ -2283,7 +2581,7 @@ pub fn split_source_ref(source: &str) -> (String, Option<String>) {
 
 /// Clone a git source into `target` (bounded, piped stdio, scrubbed git
 /// environment: no terminal prompt, no inherited GIT_* config).
-fn git_clone(source: &str, rev: Option<&str>, target: &Path) -> anyhow::Result<()> {
+pub(crate) fn git_clone(source: &str, rev: Option<&str>, target: &Path) -> anyhow::Result<()> {
     let mut clone = std::process::Command::new("git");
     clone
         .arg("clone")
@@ -2405,15 +2703,9 @@ pub fn install_extension_named(
             git_clone(source, rev, &staging)?;
         } else {
             if rev.is_some() {
-                anyhow::bail!(
-                    "`#<ref>` pinning only applies to git URLs; {source} is a local directory"
-                );
+                anyhow::bail!("`#<ref>` pinning only applies to git URLs");
             }
-            let source_dir = PathBuf::from(source);
-            if !source_dir.is_dir() {
-                anyhow::bail!("{source} is neither a git URL nor an existing directory");
-            }
-            copy_dir_recursive(&source_dir, &staging)?;
+            stage_local_source(source, &staging)?;
         }
         let manifest = read_and_check_manifest(&staging)?;
         let name = name_override
@@ -2445,15 +2737,9 @@ pub fn install_extension_named(
         git_clone(source, rev, &staging)?;
     } else {
         if rev.is_some() {
-            anyhow::bail!(
-                "`#<ref>` pinning only applies to git URLs; {source} is a local directory"
-            );
+            anyhow::bail!("`#<ref>` pinning only applies to git URLs");
         }
-        let source_dir = PathBuf::from(source);
-        if !source_dir.is_dir() {
-            anyhow::bail!("{source} is neither a git URL nor an existing directory");
-        }
-        copy_dir_recursive(&source_dir, &staging)?;
+        stage_local_source(source, &staging)?;
     }
 
     let manifest = read_and_check_manifest(&staging)?;
@@ -2839,6 +3125,53 @@ struct MarketplaceSignature {
     value: String,
 }
 
+/// Catalog v2 `installation` state (roadmap §9): `available` (default)
+/// installs on demand; `not-available` refuses resolution with a clear
+/// error; `installed-by-default` is auto-installed by the curated
+/// marketplace startup sync (still policy-gated at install time).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MarketplaceInstallation {
+    #[default]
+    Available,
+    NotAvailable,
+    InstalledByDefault,
+}
+
+impl MarketplaceInstallation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MarketplaceInstallation::Available => "available",
+            MarketplaceInstallation::NotAvailable => "not-available",
+            MarketplaceInstallation::InstalledByDefault => "installed-by-default",
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for MarketplaceInstallation {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        match raw.as_str() {
+            "available" => Ok(MarketplaceInstallation::Available),
+            "not-available" => Ok(MarketplaceInstallation::NotAvailable),
+            "installed-by-default" => Ok(MarketplaceInstallation::InstalledByDefault),
+            other => {
+                // Forward-compatible: an unknown state must not break
+                // listing older/newer catalogs — warn and treat as
+                // available (the safe default: no auto-install).
+                tracing::warn!(
+                    "marketplace catalog: unknown installation state {other:?}; treating as available"
+                );
+                Ok(MarketplaceInstallation::Available)
+            }
+        }
+    }
+}
+
+/// The keys a catalog v2 entry may carry; anything else is skipped with
+/// a warning (forward compatibility with future catalog versions).
+const MARKETPLACE_PLUGIN_KEYS: &[&str] =
+    &["source", "description", "rev", "installation", "manifest"];
+
 #[derive(Clone, Debug, serde::Deserialize)]
 struct MarketplacePlugin {
     source: String,
@@ -2847,10 +3180,22 @@ struct MarketplacePlugin {
     /// Optional git ref (tag/branch/sha) the plugin is pinned to.
     #[serde(default)]
     rev: Option<String>,
+    /// Catalog v2 installation state (default `available`).
+    #[serde(default)]
+    installation: MarketplaceInstallation,
+    /// Catalog v2 inline manifest fallback: rich listing (version,
+    /// declared capabilities) without materializing the plugin.
+    #[serde(default)]
+    manifest: Option<Value>,
 }
 
 fn marketplaces_root(agent_dir: &Path) -> PathBuf {
     agent_dir.join("marketplaces")
+}
+
+/// `marketplaces_root` for the sibling sync module.
+pub(crate) fn marketplaces_root_path(agent_dir: &Path) -> PathBuf {
+    marketplaces_root(agent_dir)
 }
 
 /// The pinned ed25519 public key (hex) for a signed marketplace (TOFU).
@@ -2873,6 +3218,24 @@ fn parse_marketplace(path: &Path) -> anyhow::Result<MarketplaceFile> {
 fn parse_marketplace_with_content(path: &Path) -> anyhow::Result<(MarketplaceFile, String)> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+    // Catalog v2 forward compatibility: unknown entry keys are skipped
+    // with a warning, never a parse failure.
+    if let Ok(Value::Object(root)) = serde_json::from_str::<Value>(&content)
+        && let Some(Value::Object(plugins)) = root.get("plugins")
+    {
+        for (name, entry) in plugins {
+            if let Value::Object(fields) = entry {
+                for key in fields.keys() {
+                    if !MARKETPLACE_PLUGIN_KEYS.contains(&key.as_str()) {
+                        tracing::warn!(
+                            "marketplace {}: plugin {name}: unknown catalog key {key:?} (skipped)",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
     let parsed: MarketplaceFile = serde_json::from_str(&content)
         .map_err(|e| anyhow::anyhow!("bad marketplace JSON {}: {e}", path.display()))?;
     Ok((parsed, content))
@@ -2952,6 +3315,99 @@ fn verify_registered_marketplace(
         );
     };
     verify_marketplace_signature(content, signature, &key)
+}
+
+/// Activate a synced catalog: validate + signature-check, then
+/// backup/rename/swap over the registered `<name>.json` (roadmap §9 —
+/// a failing or hostile sync never destroys the working catalog).
+/// `declared_key` is the settings-declared ed25519 key; a pinned TOFU
+/// key takes precedence when both exist (rotation = delete the .key).
+/// Returns true when the registered catalog changed.
+pub(crate) fn activate_synced_catalog(
+    agent_dir: &Path,
+    name: &str,
+    content: &[u8],
+    declared_key: Option<&str>,
+) -> anyhow::Result<bool> {
+    tack_ext::plugin_id::validate_marketplace_name(name)?;
+    let root = marketplaces_root(agent_dir);
+    std::fs::create_dir_all(&root)?;
+    let target = root.join(format!("{name}.json"));
+    // Fingerprint-idempotent: byte-identical content is a no-op (the
+    // caller's cheap fingerprint already short-circuits; this is the
+    // exact backstop).
+    if let Ok(existing) = std::fs::read(&target)
+        && existing == content
+    {
+        return Ok(false);
+    }
+    let staged = root.join(format!(".staged-{name}-{}.json", std::process::id()));
+    std::fs::write(&staged, content)?;
+    let validation = (|| -> anyhow::Result<Option<String>> {
+        let (parsed, content) = parse_marketplace_with_content(&staged)?;
+        match &parsed.signature {
+            Some(signature) => {
+                let pinned = read_pinned_key(agent_dir, name);
+                if let (Some(pinned), Some(declared)) = (&pinned, declared_key)
+                    && !pinned.eq_ignore_ascii_case(declared)
+                {
+                    tracing::warn!(
+                        "marketplace {name}: settings-declared public key differs from the \
+                         pinned TOFU key; the pinned key wins (remove {} to rotate)",
+                        marketplace_key_path(agent_dir, name).display()
+                    );
+                }
+                let key = pinned.or_else(|| declared_key.map(str::to_string));
+                let Some(key) = key else {
+                    anyhow::bail!(
+                        "marketplace {name}: catalog is signed; declare `publicKey` in \
+                         pluginMarketplaces (trust on first use)"
+                    );
+                };
+                verify_marketplace_signature(&content, signature, &key)?;
+                Ok(Some(key))
+            }
+            None => {
+                if read_pinned_key(agent_dir, name).is_some() {
+                    tracing::warn!(
+                        "marketplace {name}: previously signed catalog replaced by an UNSIGNED \
+                         one — the pinned key no longer protects installs"
+                    );
+                }
+                Ok(None)
+            }
+        }
+    })();
+    let pin = match validation {
+        Ok(pin) => pin,
+        Err(e) => {
+            let _ = std::fs::remove_file(&staged);
+            return Err(e);
+        }
+    };
+    // TOFU pinning: the first signed sync pins the key for every later
+    // resolve/install (same rule as `marketplace add --public-key`).
+    if let Some(key) = pin
+        && read_pinned_key(agent_dir, name).is_none()
+    {
+        std::fs::write(
+            marketplace_key_path(agent_dir, name),
+            format!("{}\n", key.to_lowercase()),
+        )?;
+    }
+    // Backup/rename/swap activation; best-effort rollback on failure.
+    let backup = root.join(format!("{name}.json.bak"));
+    if target.exists() {
+        let _ = std::fs::remove_file(&backup);
+        std::fs::rename(&target, &backup)?;
+    }
+    if let Err(e) = std::fs::rename(&staged, &target) {
+        if backup.exists() {
+            let _ = std::fs::rename(&backup, &target);
+        }
+        return Err(e.into());
+    }
+    Ok(true)
 }
 
 /// Register a marketplace from a local JSON file or an http(s) URL.
@@ -3059,23 +3515,82 @@ pub fn remove_marketplace(name: &str, agent_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// List a marketplace's plugins as (name, source, description).
+/// One catalog entry for listing (catalog v2: installation state + the
+/// inline-manifest version when the entry carries one).
+#[derive(Clone, Debug)]
+pub struct MarketplacePluginInfo {
+    pub name: String,
+    pub source: String,
+    pub description: Option<String>,
+    pub rev: Option<String>,
+    pub installation: MarketplaceInstallation,
+    /// `version` from the inline manifest fallback, when present.
+    pub version: Option<String>,
+}
+
+/// List a marketplace's plugins (catalog v2: installation state and the
+/// inline manifest's version ride along for rich listing without
+/// materializing the plugin).
 pub fn marketplace_plugins(
     agent_dir: &Path,
     marketplace: &str,
-) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
+) -> anyhow::Result<Vec<MarketplacePluginInfo>> {
     tack_ext::plugin_id::validate_marketplace_name(marketplace)?;
     let path = marketplaces_root(agent_dir).join(format!("{marketplace}.json"));
     if !path.is_file() {
         anyhow::bail!("no marketplace named {marketplace}");
     }
     let parsed = parse_marketplace(&path)?;
-    let mut out: Vec<(String, String, Option<String>)> = parsed
+    let mut out: Vec<MarketplacePluginInfo> = parsed
         .plugins
         .into_iter()
-        .map(|(name, plugin)| (name, plugin.source, plugin.description))
+        .map(|(name, plugin)| MarketplacePluginInfo {
+            name,
+            source: plugin.source,
+            description: plugin.description,
+            rev: plugin.rev,
+            installation: plugin.installation,
+            version: plugin
+                .manifest
+                .as_ref()
+                .and_then(|m| m.get("version"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
         .collect();
-    out.sort();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// Catalog entries marked `installed-by-default`, as install specs —
+/// consumed by the curated marketplace startup sync (roadmap §9).
+pub fn marketplace_default_installs(
+    agent_dir: &Path,
+    marketplace: &str,
+) -> anyhow::Result<Vec<MarketplaceResolution>> {
+    tack_ext::plugin_id::validate_marketplace_name(marketplace)?;
+    let path = marketplaces_root(agent_dir).join(format!("{marketplace}.json"));
+    if !path.is_file() {
+        anyhow::bail!("no marketplace named {marketplace}");
+    }
+    let (parsed, content) = parse_marketplace_with_content(&path)?;
+    verify_registered_marketplace(agent_dir, marketplace, &parsed, &content)?;
+    let mut out = Vec::new();
+    for (name, plugin) in &parsed.plugins {
+        if plugin.installation != MarketplaceInstallation::InstalledByDefault {
+            continue;
+        }
+        // The catalog key becomes the install name — a hostile catalog
+        // must not escape the store via `../` or separators.
+        PluginId::new(name, marketplace)?;
+        out.push(MarketplaceResolution {
+            plugin: name.clone(),
+            source: plugin.source.clone(),
+            rev: plugin.rev.clone(),
+            marketplace: marketplace.to_string(),
+        });
+    }
+    out.sort_by(|a, b| a.plugin.cmp(&b.plugin));
     Ok(out)
 }
 
@@ -3118,6 +3633,11 @@ pub fn resolve_marketplace_spec(
     let Some(entry) = parsed.plugins.get(plugin) else {
         anyhow::bail!("marketplace {marketplace} has no plugin named {plugin}");
     };
+    if entry.installation == MarketplaceInstallation::NotAvailable {
+        anyhow::bail!(
+            "marketplace {marketplace} marks {plugin} as not-available (usually: withdrawn by the curator)"
+        );
+    }
     // The catalog key becomes the install name — a hostile catalog must
     // not escape the store via `../` or separators.
     PluginId::new(plugin, marketplace)?;
@@ -3468,6 +3988,227 @@ mod tests {
         .unwrap();
         let err = resolve_marketplace_spec("demo@acme", &agent_dir).unwrap_err();
         assert!(err.to_string().contains("signature"), "{err}");
+    }
+
+    /// Catalog v2: installation states gate resolution and drive
+    /// default installs; the inline manifest enriches listing; unknown
+    /// keys are skipped (forward compatibility).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn catalog_v2_installation_states_and_inline_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let catalog_path = tmp.path().join("corp.json");
+        std::fs::write(
+            &catalog_path,
+            serde_json::to_string(&serde_json::json!({
+                "name": "corp",
+                "plugins": {
+                    "review": {
+                        "source": "https://git.acme.com/review.git",
+                        "installation": "installed-by-default",
+                        "manifest": {"name": "review", "version": "1.4.2"}
+                    },
+                    "old": {
+                        "source": "https://git.acme.com/old.git",
+                        "installation": "not-available"
+                    },
+                    "plain": {
+                        "source": "https://git.acme.com/plain.git",
+                        "futureCatalogKey": {"ignored": true}
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        add_marketplace("corp", catalog_path.to_str().unwrap(), &agent_dir, None)
+            .await
+            .unwrap();
+
+        let plugins = marketplace_plugins(&agent_dir, "corp").unwrap();
+        assert_eq!(plugins.len(), 3);
+        let review = plugins.iter().find(|p| p.name == "review").unwrap();
+        assert_eq!(
+            review.installation,
+            MarketplaceInstallation::InstalledByDefault
+        );
+        assert_eq!(review.version.as_deref(), Some("1.4.2"));
+        let plain = plugins.iter().find(|p| p.name == "plain").unwrap();
+        assert_eq!(plain.installation, MarketplaceInstallation::Available);
+        assert!(plain.version.is_none());
+        assert_eq!(plain.source, "https://git.acme.com/plain.git");
+
+        // not-available refuses resolution with a clear error.
+        let err = resolve_marketplace_spec("old@corp", &agent_dir).unwrap_err();
+        assert!(err.to_string().contains("not-available"), "{err}");
+        // available + installed-by-default resolve normally.
+        assert!(
+            resolve_marketplace_spec("plain@corp", &agent_dir)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            resolve_marketplace_spec("review@corp", &agent_dir)
+                .unwrap()
+                .is_some()
+        );
+
+        // Only installed-by-default entries feed the startup sync.
+        let defaults = marketplace_default_installs(&agent_dir, "corp").unwrap();
+        assert_eq!(defaults.len(), 1);
+        assert_eq!(defaults[0].plugin, "review");
+        assert_eq!(defaults[0].marketplace, "corp");
+    }
+
+    /// A `.tgz` bundle installs through the normal store channel
+    /// (staging → manifest check → lockfile), and upgrade skips it.
+    #[test]
+    fn bundle_install_lands_in_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let plugin = tmp.path().join("demo");
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(
+            plugin.join("extension.json"),
+            r#"{"name": "demo", "version": "1.2.3"}"#,
+        )
+        .unwrap();
+        let bundle =
+            crate::ext_bundle::pack_bundle(&plugin, Some(&tmp.path().join("demo-1.2.3.tgz")))
+                .unwrap();
+        let target = install_extension(bundle.to_str().unwrap(), &cwd, &agent_dir, false).unwrap();
+        assert!(target.join("extension.json").is_file());
+        assert!(target.ends_with("store/user/demo/1.2.3"), "{target:?}");
+        let lock = read_lock(&agent_dir).unwrap();
+        let entry = lock.plugins.get("demo@user").expect("locked");
+        assert_eq!(entry.source, bundle.display().to_string());
+        assert!(
+            entry.resolved_commit.is_none(),
+            "a bundle has no commit pin"
+        );
+        // Upgrades skip non-git installs (no remote to advance to).
+        let outcomes = upgrade_extensions(&agent_dir, None).unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].1.contains("not a git install"), "{outcomes:?}");
+    }
+
+    /// A hostile bundle (path traversal) never escapes the staging dir.
+    #[test]
+    fn hostile_bundle_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        // Hand-roll a traversal archive: raw header bytes (append_data
+        // refuses to write such paths, like any conforming archiver).
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        let body = b"evil";
+        header.set_size(body.len() as u64);
+        header.as_old_mut().name[..11].copy_from_slice(b"../evil.txt");
+        header.set_cksum();
+        let mut builder = tar::Builder::new(Vec::new());
+        builder.append(&header, body.as_slice()).unwrap();
+        let tar = builder.into_inner().unwrap();
+        use std::io::Write as _;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar).unwrap();
+        let bundle = tmp.path().join("hostile.tgz");
+        std::fs::write(&bundle, gz.finish().unwrap()).unwrap();
+        let err = install_extension(bundle.to_str().unwrap(), &cwd, &agent_dir, false).unwrap_err();
+        assert!(err.to_string().contains("escapes"), "{err}");
+        assert!(!agent_dir.join("evil.txt").exists());
+    }
+
+    /// Path of the built demo-plugin bin (fixture), derived from the
+    /// test binary location (…/target/<profile>/deps/…).
+    fn demo_plugin_bin() -> Option<PathBuf> {
+        let mut path = std::env::current_exe().ok()?;
+        path.pop(); // deps/
+        path.pop(); // profile/
+        path.push(format!(
+            "tack-v3-demo-plugin{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        path.is_file().then_some(path)
+    }
+
+    /// Metrics sidecar e2e (roadmap §9): the host offers a scratch file
+    /// at initialize, the plugin appends a schema-valid measurement, and
+    /// the drain validates + consumes it without violations.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metrics_sidecar_records_and_drains() {
+        let Some(bin) = demo_plugin_bin() else {
+            eprintln!("demo plugin bin not built; skipping");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let ext_dir = agent_dir.join("extensions").join("demo");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(
+            ext_dir.join("extension.json"),
+            serde_json::json!({"name": "demo", "command": bin}).to_string(),
+        )
+        .unwrap();
+
+        let mut manager = ExtensionManager::load(
+            &cwd,
+            &agent_dir,
+            "print",
+            Arc::new(NoopServices),
+            true,
+            Default::default(),
+        )
+        .await;
+        assert!(
+            manager.plugins[0].is_active(),
+            "{:?}",
+            manager.plugins[0].error
+        );
+        // The validated declaration registered a sidecar with a
+        // pre-created scratch file in the plugin's data root.
+        assert_eq!(manager.metrics_sidecars.lock().unwrap().len(), 1);
+        let scratch = agent_dir.join("extensions/data/user/demo/metrics/metrics.ndjson");
+        assert!(scratch.is_file(), "scratch file pre-created");
+
+        // The tool writes through the host-provided scratchFile path — a
+        // wiring failure makes it error out.
+        let tool = manager
+            .tools()
+            .into_iter()
+            .find(|t| t.name().contains("hello_metric"))
+            .expect("hello.metric registered");
+        let result = tool
+            .execute(
+                "call-1",
+                serde_json::json!({}),
+                tokio_util::sync::CancellationToken::new(),
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("recorded demo.metric"), "{text}");
+
+        // Drain (sessions drain on a 30s interval; tests drive it
+        // directly): the measurement validates and is consumed.
+        {
+            let mut sidecars = manager.metrics_sidecars.lock().unwrap();
+            crate::plugin_metrics::drain(&mut sidecars[0]);
+            assert_eq!(sidecars[0].violations(), 0);
+            assert_eq!(
+                sidecars[0].offset(),
+                std::fs::metadata(&scratch).unwrap().len(),
+                "the measurement is fully consumed"
+            );
+        }
+        manager.shutdown().await;
     }
 
     // ---- widget registry ----
@@ -4354,5 +5095,81 @@ mod policy_tests {
             "approved origin loads: {:?}",
             manager.plugins[0].policy_block
         );
+    }
+
+    /// The load report persists every outcome bucket with error classes
+    /// (doctor's data source; roadmap §9 load telemetry).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn load_report_records_outcomes_and_classes() {
+        let (_tmp, agent_dir, cwd) = dirs();
+        // failed / manifest: unparseable extension.json.
+        write_flat_plugin(&agent_dir, "broken", "{not json");
+        // failed / handshake: spawn failure.
+        write_flat_plugin(
+            &agent_dir,
+            "nospawn",
+            r#"{"name": "nospawn", "command": "definitely-not-a-real-command-xyz"}"#,
+        );
+        // policy-filtered.
+        write_flat_plugin(
+            &agent_dir,
+            "filtered",
+            r#"{"name": "filtered", "command": "definitely-not-a-real-command-xyz"}"#,
+        );
+        // disabled.
+        write_flat_plugin(
+            &agent_dir,
+            "off",
+            r#"{"name": "off", "command": "definitely-not-a-real-command-xyz"}"#,
+        );
+        set_plugin_enabled(&agent_dir, "off@user", false).unwrap();
+        // managedPluginsOnly: the unlisted `filtered@user` is
+        // policy-filtered; the other three are managed.
+        let policy = test_policy(
+            "{\"pluginPolicy\": {\"managedPluginsOnly\": true, \"plugins\": {
+                \"broken@user\": {}, \"nospawn@user\": {}, \"off@user\": {}
+            }}}",
+        );
+        let _manager = ExtensionManager::load_with_policy(
+            &cwd,
+            &agent_dir,
+            "print",
+            Arc::new(NoopServices),
+            true,
+            Default::default(),
+            Some(policy),
+        )
+        .await;
+        let report = read_load_report(&agent_dir).expect("report written");
+        assert_eq!(report.version, 1);
+        assert_eq!(report.mode, "print");
+        assert_eq!(report.plugins.len(), 4);
+        let row = |name: &str| {
+            report
+                .plugins
+                .iter()
+                .find(|r| r.id == format!("{name}@user"))
+                .unwrap_or_else(|| panic!("row for {name}: {:?}", report.plugins))
+        };
+        let broken = row("broken");
+        assert_eq!(broken.outcome, "failed");
+        assert_eq!(broken.error_class.as_deref(), Some("manifest"));
+        assert!(
+            broken
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("extension.json")
+        );
+        let nospawn = row("nospawn");
+        assert_eq!(nospawn.outcome, "failed");
+        assert_eq!(nospawn.error_class.as_deref(), Some("handshake"));
+        let filtered = row("filtered");
+        assert_eq!(filtered.outcome, "policy-filtered");
+        assert_eq!(filtered.error_class.as_deref(), Some("policy"));
+        assert!(filtered.detail.is_some(), "policy reason recorded");
+        let off = row("off");
+        assert_eq!(off.outcome, "disabled");
+        assert!(off.error_class.is_none());
     }
 }

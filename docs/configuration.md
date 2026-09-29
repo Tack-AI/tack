@@ -264,6 +264,14 @@ is `enabled` (bool, default `true`): a disabled plugin stays installed but
 is never spawned (its metadata still shows up in `ext list`). Manage it
 with `tack ext enable|disable <id>` or edit the file directly.
 
+Also: `pluginMarketplaces` (object) — curated marketplace catalogs kept
+fresh by the background startup sync. Keys are marketplace names; values
+are a source string or an object `{"source", "ref"?, "path"?,
+"publicKey"?}` (git repo URL, https `.json` catalog, or local file/dir).
+Read from the **global and managed layers only** (a catalog can push code
+via `installed-by-default`, so a project layer must not redirect it —
+same rule as `updateRepo`). See docs/extensions.md §5.2.
+
 ### Managed-tier-only keys
 
 Effective only in managed-settings.json:

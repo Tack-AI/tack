@@ -31,6 +31,7 @@ impl Status {
     }
 }
 
+#[derive(Debug)]
 struct Check {
     name: &'static str,
     status: Status,
@@ -266,6 +267,133 @@ fn check_dirs(agent_dir: &Path) -> Vec<Check> {
     checks
 }
 
+/// Plugin health (roadmap §9): the last load's failures with causes,
+/// lock drift, policy-filtered entries, and WASM component support.
+/// Doctor never spawns plugins — load health comes from the report the
+/// last session persisted (`extensions/last-load.json`).
+#[cfg(feature = "ext")]
+fn check_plugins(agent_dir: &Path) -> Vec<Check> {
+    use crate::extension_host::VerifyStatus;
+
+    let mut checks = Vec::new();
+    match crate::extension_host::read_load_report(agent_dir) {
+        None => checks.push(ok("plugins", "no plugin load recorded yet")),
+        Some(report) => {
+            let count = |outcome: &str| {
+                report
+                    .plugins
+                    .iter()
+                    .filter(|row| row.outcome == outcome)
+                    .count()
+            };
+            let failed: Vec<String> = report
+                .plugins
+                .iter()
+                .filter(|row| row.outcome == "failed")
+                .map(|row| {
+                    format!(
+                        "{} ({}): {}",
+                        row.id,
+                        row.error_class.as_deref().unwrap_or("unknown"),
+                        row.detail.as_deref().unwrap_or("no detail")
+                    )
+                })
+                .collect();
+            let summary = format!(
+                "{} active, {} disabled, {} policy-filtered (last load: mode {})",
+                count("active"),
+                count("disabled"),
+                count("policy-filtered"),
+                report.mode,
+            );
+            if failed.is_empty() {
+                checks.push(ok("plugins", summary));
+            } else {
+                let shown = failed.len().min(3);
+                checks.push(warn(
+                    "plugins",
+                    format!(
+                        "{summary}; {} failed: {}{}",
+                        failed.len(),
+                        failed[..shown].join("; "),
+                        if failed.len() > shown {
+                            format!(" (+{} more)", failed.len() - shown)
+                        } else {
+                            String::new()
+                        }
+                    ),
+                    "run `tack ext list` for states and `tack ext inspect <id>` to probe a plugin",
+                ));
+            }
+            // Policy-filtered rows are the managed policy working as
+            // intended — informational, not a health problem.
+            let filtered: Vec<String> = report
+                .plugins
+                .iter()
+                .filter(|row| row.outcome == "policy-filtered")
+                .map(|row| {
+                    format!(
+                        "{} ({})",
+                        row.id,
+                        row.detail.as_deref().unwrap_or("blocked")
+                    )
+                })
+                .collect();
+            if !filtered.is_empty() {
+                checks.push(ok(
+                    "plugin policy",
+                    format!("{} filtered: {}", filtered.len(), filtered.join("; ")),
+                ));
+            }
+        }
+    }
+    match crate::extension_host::verify_extensions(agent_dir) {
+        Ok(results) => {
+            let drifted: Vec<String> = results
+                .iter()
+                .filter_map(|(id, status)| match status {
+                    VerifyStatus::Ok(_) => None,
+                    VerifyStatus::Changed { .. } => Some(format!("{id} (drifted)")),
+                    VerifyStatus::NotAGitRepo => Some(format!("{id} (not a git checkout)")),
+                    VerifyStatus::Missing => Some(format!("{id} (missing)")),
+                })
+                .collect();
+            if drifted.is_empty() {
+                checks.push(ok(
+                    "plugin lock",
+                    format!("{} pinned install(s) clean", results.len()),
+                ));
+            } else {
+                checks.push(warn(
+                    "plugin lock",
+                    format!("{} drifted: {}", drifted.len(), drifted.join("; ")),
+                    "run `tack ext verify`; reinstall drifted plugins (`tack ext upgrade <id>`)",
+                ));
+            }
+        }
+        Err(e) => checks.push(warn(
+            "plugin lock",
+            format!("cannot read the extensions lockfile: {e}"),
+            "fix or delete extensions-lock.json (installs re-pin on next upgrade)",
+        )),
+    }
+    #[cfg(feature = "wasm")]
+    checks.push(match tack_ext_wasm::WasmCarrier::new() {
+        Ok(_) => ok("wasm plugins", "component + WASI carriers available"),
+        Err(e) => warn(
+            "wasm plugins",
+            format!("wasmtime engine unavailable: {e}"),
+            "wasm-carrier plugins will fail to load; check the wasmtime install",
+        ),
+    });
+    #[cfg(not(feature = "wasm"))]
+    checks.push(ok(
+        "wasm plugins",
+        "not compiled in (slim build); wasm-carrier plugins are skipped",
+    ));
+    checks
+}
+
 /// Everything a report run needs, gathered once (text / JSON / bundle all
 /// render from this).
 struct Report {
@@ -296,6 +424,8 @@ async fn collect_report() -> Result<Report> {
     ];
     checks.extend(check_lsp_servers());
     checks.extend(check_dirs(&agent_dir));
+    #[cfg(feature = "ext")]
+    checks.extend(check_plugins(&agent_dir));
     Ok(Report {
         checks,
         cwd,
@@ -519,6 +649,78 @@ mod tests {
         assert_eq!(value["providers"][0]["extra"]["token"], "***");
         assert_eq!(value["oauth"]["access_token"], "***");
         assert_eq!(value["oauth"]["nested"]["password"], "***");
+    }
+
+    #[cfg(feature = "ext")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plugin_checks_report_failures_and_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path();
+        // A last-load report with one failure and one policy-filtered row.
+        let report = serde_json::json!({
+            "version": 1,
+            "ts": 1_700_000_000,
+            "mode": "print",
+            "plugins": [
+                {"id": "good@user", "outcome": "active", "version": "1.0.0", "dir": "/x"},
+                {"id": "bad@user", "outcome": "failed", "error_class": "manifest",
+                 "detail": "bad extension.json: ...", "version": "local", "dir": "/y"},
+                {"id": "acme@corp", "outcome": "policy-filtered", "error_class": "policy",
+                 "detail": "managedPluginsOnly", "version": "2.0.0", "dir": "/z"}
+            ],
+            "warnings": []
+        });
+        std::fs::create_dir_all(agent_dir.join("extensions")).unwrap();
+        std::fs::write(
+            agent_dir.join("extensions/last-load.json"),
+            serde_json::to_string(&report).unwrap(),
+        )
+        .unwrap();
+        let checks = check_plugins(agent_dir);
+        let by_name = |name: &str| checks.iter().find(|c| c.name == name).unwrap();
+        let plugins = by_name("plugins");
+        assert_eq!(plugins.status, Status::Warn, "{plugins:?}");
+        assert!(plugins.detail.contains("bad@user"), "{}", plugins.detail);
+        assert!(plugins.detail.contains("manifest"), "{}", plugins.detail);
+        assert!(plugins.detail.contains("1 active"), "{}", plugins.detail);
+        let policy = by_name("plugin policy");
+        assert_eq!(policy.status, Status::Ok);
+        assert!(policy.detail.contains("acme@corp"), "{}", policy.detail);
+        // Empty lockfile (none on disk) verifies clean.
+        let lock = by_name("plugin lock");
+        assert_eq!(lock.status, Status::Ok, "{lock:?}");
+        // WASM support row is always present.
+        assert!(checks.iter().any(|c| c.name == "wasm plugins"));
+    }
+
+    #[cfg(feature = "ext")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plugin_checks_warn_on_lock_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path();
+        // Lockfile pins a commit but the install dir is gone → Missing.
+        std::fs::create_dir_all(agent_dir.join("extensions")).unwrap();
+        std::fs::write(
+            agent_dir.join("extensions-lock.json"),
+            serde_json::to_string(&serde_json::json!({
+                "version": 2,
+                "plugins": {
+                    "gone@user": {
+                        "source": "https://example.com/x.git",
+                        "resolvedCommit": "abc123",
+                        "installedAt": 1700000000,
+                        "store": true,
+                        "version": "1.0.0"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let checks = check_plugins(agent_dir);
+        let lock = checks.iter().find(|c| c.name == "plugin lock").unwrap();
+        assert_eq!(lock.status, Status::Warn, "{lock:?}");
+        assert!(lock.detail.contains("gone@user"), "{}", lock.detail);
     }
 
     #[test]

@@ -208,14 +208,14 @@ pub async fn refresh_from_npm(
 }
 
 /// Require https (loopback http is allowed for local mirrors and tests).
-fn validate_url_scheme(url: &str, what: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_url_scheme(url: &str, what: &str) -> anyhow::Result<()> {
     if is_https_or_loopback(url) {
         return Ok(());
     }
     bail!("{what} URL must be https (got {url:?}); refusing to fetch catalog data insecurely");
 }
 
-fn is_https_or_loopback(url: &str) -> bool {
+pub(crate) fn is_https_or_loopback(url: &str) -> bool {
     if url.starts_with("https://") {
         return true;
     }

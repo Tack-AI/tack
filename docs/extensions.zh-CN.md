@@ -202,6 +202,7 @@ tack ext marketplace add acme ./acme-marketplace.json   // 或 https URL
 tack ext marketplace list                               // 已注册的目录
 tack ext marketplace list acme                          // 目录里的插件
 tack ext marketplace remove acme
+tack ext marketplace sync [acme]                        // 立即同步声明的目录（§5.2）
 ```
 
 `<plugin>@<marketplace>` 经目录解析来源并按市场键安装（插件 id 成为
@@ -211,6 +212,70 @@ tack ext marketplace remove acme
 `--public-key <hex>`；密钥锁定到 `<name>.key`，之后每次解析/安装
 都重新验证。被签名的内容是把顶层 `signature` 键移除后用 serde_json
 重新序列化的目录（BTreeMap 键序）。
+
+### 5.1 目录格式 v2
+
+目录条目还可携带两个字段；未知条目键记警告并跳过（前向兼容）：
+
+```jsonc
+{
+  "plugins": {
+    "review": {
+      "source": "https://git.acme.com/review.git",
+      "rev": "main",
+      // available（默认）| not-available | installed-by-default
+      "installation": "installed-by-default",
+      // 不物化插件即可富列表（`marketplace list <name>` 显示版本）
+      "manifest": {"name": "review", "version": "1.4.2"}
+    }
+  }
+}
+```
+
+- `not-available` 拒绝解析并给出明确错误（策展方下架）。
+- `installed-by-default` 由启动同步（§5.2）在缺失时自动安装——仍经
+  安装通道的策略门控（§9）。卸载它会在下次同步时被恢复；如不需要
+  请改用禁用（`tack ext disable <id>`）。
+
+### 5.2 策展市场启动同步（`pluginMarketplaces`）
+
+设置中声明的目录会自动保持新鲜。声明只来自全局层与 MANAGED 层——
+目录可以通过 `installed-by-default` 推送代码，项目层不得重定向它
+（与 `updateRepo` 同规则）：
+
+```jsonc
+{
+  "pluginMarketplaces": {
+    "acme": {
+      "source": "https://git.acme.com/tack/plugins.git", // git 仓库、https
+                                                          // .json 目录或本地
+                                                          // 文件/目录
+      "ref": "main",                 // git ref（默认：远端 HEAD）
+      "path": "marketplace.json",    // 仓库内的目录文件
+      "publicKey": "<ed25519 hex>"   // 签名目录（TOFU 锁定）
+    },
+    "onprem": "/opt/tack/acme-catalog.json"             // 简写形式
+  }
+}
+```
+
+启动时同步在后台进行（失败的同步绝不阻塞启动；旧目录继续可用）：
+
+1. 跨进程锁（`marketplaces/.sync/<name>.lock`，10 分钟后视为陈旧）
+   串行化并发 tack 进程。
+2. 指纹短路跳过未变化的目录：git 来源用 `git ls-remote`，其余用
+   内容哈希。
+3. 传输：git clone；git 失败且为 https 来源时降级为 forge 的归档
+   （先 GitHub/Gitea 形态 `/archive/<ref>.tar.gz`，再 GitLab 形态
+   `/-/archive/...`），防御性解包。
+4. 激活 = 校验 → 签名检查 → 备份/改名/交换（保留
+   `<name>.json.bak`）。坏的或签名错误的同步绝不替换可用目录。
+5. 新增的 `installed-by-default` 条目经正常通道安装（策略检查、
+   记录 lockfile；失败仅记警告）。
+
+`tack ext marketplace sync [name]` 是同步的手动形式。每轮同步都发出
+结构化事件（target `marketplace_sync`），汇入观测 JSONL 与 managed
+auditSink。
 
 ## 6. 开发工具
 
@@ -325,3 +390,69 @@ payload 的 `mode` 与 `capabilities` 获知当前模式与可用表面。
 记入审计日志，指明规则与来源层；配置了 managed `auditSink` 时，
 这些事件会上报到组织收集器。当 managed 层钉住相反的值时，
 `tack ext enable|disable` 会给出提示。
+
+## 10. Bundle 归档（离线分发）
+
+bundle 是扩展目录的 `.tgz`——无法访问 git forge 的机器的分发单元：
+
+```sh
+tack ext bundle pack ./my-plugin            // 生成 my-plugin-1.2.3.tgz
+tack ext bundle pack ./my-plugin --output dist/plugin.tgz   // -o 亦可
+tack ext install my-plugin-1.2.3.tgz        // 经正常通道安装
+```
+
+- **打包是确定性的**：条目排序、mtime/属主置零、权限规整——相同
+  输入总产生相同字节。`.git` 与输出文件本身被排除；指向插件根内
+  的符号链接按目标内容打包，其余记警告并跳过。
+- **安装是防御性的**：解包拒绝链接、设备节点、绝对路径与 `..`
+  分量，并有累计大小上限（256 MiB）与单文件/条目数上限。解出的
+  目录树与任何安装一样经过 staging → 清单复读 → 策略检查 → 原子
+  激活，并记入 lockfile（bundle 路径作为来源）。
+  `tack ext upgrade` 跳过 bundle 安装（没有可前进的远端）。
+- managed `allowedSources` 的 `local` 规则适用于 bundle 路径。
+
+## 11. 可观测性
+
+### 11.1 加载遥测与 `tack doctor`
+
+每次加载发出一条结构化事件（target `plugin_load`）：按结果计数
+（`active | disabled | failed | policy-filtered`），并按错误类别
+细分（`manifest | handshake | register | policy | store`）；同时
+持久化 `~/.tack/agent/extensions/last-load.json`——`tack doctor`
+读取的逐插件报告（doctor 绝不启动插件）。`tack doctor` 报告：
+带原因与类别的加载失败、被策略过滤的条目、锁漂移（变化/缺失的
+安装）、WASM component 支持。
+
+### 11.2 指标 sidecar
+
+Level-3 插件在宿主不信任其进程的前提下发出遥测：插件在 initialize
+时声明 schema，宿主交出经沙箱授权的 scratch 文件，并在任何内容带
+着插件归属进入遥测之前严格校验每次抽取：
+
+```jsonc
+// initialize 结果（插件声明）：
+"metrics": {"operations": {
+    "review.run": {"dimensions": {"outcome": ["ok", "error"]}}
+}}
+// initialize 参数（宿主提供）：
+"metrics": {"scratchFile": "/…/extensions/data/user/review/metrics/metrics.ndjson"}
+// 插件追加 NDJSON 测量行：
+{"operation": "review.run", "value": 1, "dimensions": {"outcome": "ok"}}
+```
+
+- **声明校验全有或全无**：操作 id 匹配 `[a-z][a-z0-9_.]{0,63}`，
+  每操作至多 8 个维度，枚举为 1–64 个非空值。任何违规使整个声明
+  作废并记加载警告。
+- **scratch 文件** 位于插件数据根。WASI-stdio WASM 插件通过专用
+  读写 preopen（`/metrics`，与其他授权一起记审计）获得。WIT
+  component world 完全没有文件系统，component 载体的声明暂记警告
+  作废，待未来的类型化 world。
+- **抽取校验**：宿主每 30 秒及关闭时抽取；每次抽取上限 64 KiB /
+  100 行（超出部分记违规并丢弃），维度集合必须与声明完全一致，
+  数值必须有限，同批重复行去重。三次违规本会话禁用该 sidecar。
+- 校验通过的测量以结构化事件（target `plugin_metrics`）携带插件
+  id 进入遥测——与其他事件一样汇入观测 JSONL 与 managed auditSink。
+
+Rust SDK 以 `MetricsRecorder` 提供此能力
+（`cx.capabilities().metrics.scratch_file`）；TS/Python 插件可直接
+追加同样的 NDJSON 行。

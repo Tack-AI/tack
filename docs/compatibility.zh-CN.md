@@ -201,6 +201,33 @@ ACP 侧的破坏性变更只通过上游 crate 升级进入，会在 CHANGELOG �
   （克隆/网络之前与激活之前）与加载时（发现过滤 + 注册收窄）双重
   执行；被阻止的插件保留为可见行，决策连规则与来源层一并记入审计
   日志。该键直接以最终形态落地——不规划 v1→v2 迁移。
+- **插件分发 + 可观测（P6）**：对所有既有面均为只增；新增的
+  持久化位直接以最终形态落地：
+  - **目录 v2**：条目可携带 `installation`（`available |
+    not-available | installed-by-default`）与内联 `manifest`；
+    未知条目键记警告并跳过，新目录在旧宿主上也能解析。签名规范化
+    不变（未知键随被签名载荷一起传输）。
+  - **策展同步状态**：`pluginMarketplaces`（仅全局 + managed 设置
+    层）声明启动时保持新鲜的目录；暂存位于
+    `marketplaces/.sync/`（锁 + 状态），被换下的目录保留为
+    `<name>.json.bak`。
+  - **加载报告**：`extensions/last-load.json`（v1）——带错误类别
+    的逐插件结果行，每次加载后写入，`tack doctor` 读取。
+  - **Bundle**：`tack ext bundle pack` 写出确定性的
+    `<name>-<version>.tgz`（单一顶层目录、条目排序、mtime 置
+    零）；安装时防御性解包并把 bundle 路径记为 lockfile 来源
+    （`ext upgrade` 跳过）。
+  - **指标 sidecar**：插件声明 `capabilities.metrics`（操作 + 维度
+    枚举，全有或全无校验）；宿主提供
+    `capabilities.metrics.scratchFile` 并严格校验 NDJSON 测量行
+    （`{"operation", "value", "dimensions"}`）。线上形状自
+    v3.0.0 起就在 OpenRPC schema 中；P6 接通宿主侧（process 与
+    WASI-stdio 载体；WIT component world 无文件系统，声明记警告
+    作废）。
+  - 新的结构化事件 target：`plugin_load`（按错误类别计数的结果）、
+    `plugin_metrics`（带插件归属的校验通过测量）、
+    `marketplace_sync`（同步结果）——与 `plugin_policy` 一样汇入
+    观测 JSONL/auditSink 管道。
 
 **承诺。**
 
