@@ -492,6 +492,13 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
                 (settings.subagents_max_concurrent > 0)
                     .then_some(settings.subagents_max_concurrent),
                 (settings.subagents_budget_tokens > 0).then_some(settings.subagents_budget_tokens),
+            )
+            // Plugin inheritance (subagents.inheritPlugins): hook bridges
+            // and plugin tools shared from this session's extensions.
+            .with_plugin_inheritance(settings.subagents_inherit_plugins)
+            .with_extension_hooks(extensions.hooks())
+            .with_extension_tools(
+                extensions.tools_with_untrusted(Some(services.untrusted_seen.clone())),
             ),
         ));
         // MCP servers from mcp.json (global + project) + extension bundles.

@@ -132,6 +132,35 @@ Python（`tack-plugin`）；`tack ext new` 生成任一脚手架，
 `ERR_METHOD_NOT_FOUND`；`ui/notify` 进日志。插件从 initialize
 payload 的 `mode` 与 `capabilities` 获知当前模式与可用表面。
 
+### 3.1c 审批链（`approval/review`）
+
+当内置权限流程即将提示人工时，声明了
+`capabilities.hooks.approvalReview` 的插件优先参与裁决——按加载
+顺序，first-claim-wins；null 结果传给下一个审查者。与内置模式的
+组合顺序：
+
+```text
+deny 规则 → PreToolUse hook 裁决 → 模式门（plan/acceptEdits/bypass）
+  → allow 规则 + allow-always 缓存 → 插件审批链
+  → PermissionRequest hooks → 用户提示
+```
+
+- 认领的 `allow`/`reviewed` 一次性放行该调用（不写入 allow-always
+  状态）；`reviewed` 用于区分审查者自己做过审查（LLM 复核、自己的
+  UI）与无差别自动放行（体现在审计事件中）。`askUser` 交回内置
+  提示。
+- 审批链只看到"本来要提示人工"的调用：被 allow 规则/模式放行的
+  调用不会到达（插件可经 `hooks/beforeToolCall` 观察它们），bypass
+  模式与无头 print 运行根本不提示。
+- 失败开放（fail-open）：审查者出错——包括未实现 `approval/review`
+  的载体（目前是 Level-2 MCP 与 WIT component 载体）返回
+  `unsupported_capability`——降级为"跳过"；每次调用带标准 30s 请求
+  超时。认领、跳过与审查者失败都是结构化 tracing 事件（target
+  `plugin_approval`），managed `auditSink` 部署会像看到策略决策一样
+  看到它们。
+- 已接线 surface：**TUI 与 rpc**（本仓库拥有的两个可提示 surface）；
+  acp 与 remote-host 的提示是文档化的后续项。
+
 ### 3.2 身份、加载结果与 store
 
 每个插件有稳定的 id **`name@source`**（市场名，或保留的
@@ -236,6 +265,9 @@ tack ext marketplace remove acme
 - **WASM 默认全沙箱**：无 preopened 目录、无网络、无环境变量；能力授予
   是显式路径（fs/网络白名单为 v2.x 设计项）。
 - **managed hooks**：企业可锁定只执行托管 hooks。
+- **子代理继承插件护栏**：子代理循环默认运行会话的插件钩子桥
+  （`subagents.inheritPlugins: "hooks"`），委派无法绕过护栏插件的
+  `beforeToolCall` 裁决；`"full"` 额外继承插件工具。
 - 裁决链顺序：SessionHooks → **生命周期 hooks** → 权限 hooks →
   队列/预算 → tack-ext 插件（最后看到的就是最终参数）。
 
@@ -246,6 +278,7 @@ tack ext marketplace remove acme
 | hooks 引擎（全部事件） | ✓ | PreToolUse/PostToolUse/UserPromptSubmit/Compact/SubagentStop | PreToolUse/PostToolUse | — |
 | prompt/agent handler（LLM 评估） | ✓ | ✓ | ✓ | — |
 | tack-ext 插件（process + wasm） | ✓ | ✓（headless 降级） | ✓（headless 降级） | ✓（headless 降级） |
+| 审批链（`approval/review`） | ✓ | —（bypass 无提示） | ✓ | — |
 | bundle 资源（hooks/mcp/skills） | ✓ | ✓ | ✓ | mcp |
 | 声明式 widget / autocomplete | ✓ | —（声明被接受但忽略） | — | — |
 

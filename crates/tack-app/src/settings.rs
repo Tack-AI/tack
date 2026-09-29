@@ -205,6 +205,10 @@ pub struct Settings {
     /// across all children of a session (subagents.budgetTokens; 0 = none).
     pub subagents_max_concurrent: usize,
     pub subagents_budget_tokens: u64,
+    /// Plugin inheritance for sub-agent child loops
+    /// (subagents.inheritPlugins; default "hooks"). Layered like any
+    /// settings key, so managed settings can pin it.
+    pub subagents_inherit_plugins: SubagentInheritance,
     /// Supply-chain enforcement for installed extensions (default true):
     /// a user-dir plugin whose git HEAD drifted from its lockfile commit is
     /// skipped at startup. false downgrades the mismatch to a warning.
@@ -290,6 +294,7 @@ impl Default for Settings {
             notifications: true,
             subagents_max_concurrent: 0,
             subagents_budget_tokens: 0,
+            subagents_inherit_plugins: SubagentInheritance::default(),
             extension_lock_required: true,
             raw: serde_json::Value::Object(serde_json::Map::new()),
         }
@@ -384,6 +389,65 @@ fn deep_merge(base: &mut serde_json::Value, overlay: &serde_json::Value) {
             }
         }
         (base, overlay) => *base = overlay.clone(),
+    }
+}
+
+/// Which parts of the session's active plugin set sub-agent child loops
+/// inherit (settings `subagents.inheritPlugins`).
+///
+/// Children are non-interactive (no permission prompts), so without
+/// inheritance a spawned sub-agent would bypass guardrail plugins
+/// (`hooks/beforeToolCall` deny/rewrite verdicts) entirely — the default
+/// `Hooks` closes that hole without changing the child tool surface.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SubagentInheritance {
+    /// Nothing: children run built-in tools + deny rules only (the legacy
+    /// behavior; plugin hooks never see child tool calls).
+    None,
+    /// Plugin hook bridges (tool-call interception, context transform,
+    /// result patching) follow the child; plugin tools do not.
+    #[default]
+    Hooks,
+    /// Hooks + plugin tools (`ext__*`) join the child tool set. Agent
+    /// definition `tools` whitelists still narrow the combined set.
+    Full,
+}
+
+impl SubagentInheritance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubagentInheritance::None => "none",
+            SubagentInheritance::Hooks => "hooks",
+            SubagentInheritance::Full => "full",
+        }
+    }
+
+    /// Settings parse: unknown values warn and fall back to the default
+    /// (same bad-value discipline as the rest of the settings loader).
+    pub fn from_setting(value: Option<&str>) -> Self {
+        match value {
+            None => SubagentInheritance::default(),
+            Some("none") => SubagentInheritance::None,
+            Some("hooks") => SubagentInheritance::Hooks,
+            Some("full") => SubagentInheritance::Full,
+            Some(other) => {
+                tracing::warn!(
+                    "unknown subagents.inheritPlugins {other:?}; using {:?}",
+                    SubagentInheritance::default().as_str()
+                );
+                SubagentInheritance::default()
+            }
+        }
+    }
+
+    /// Whether plugin hook bridges follow the child loop.
+    pub fn inherits_hooks(self) -> bool {
+        matches!(self, SubagentInheritance::Hooks | SubagentInheritance::Full)
+    }
+
+    /// Whether plugin tools join the child tool set.
+    pub fn inherits_tools(self) -> bool {
+        matches!(self, SubagentInheritance::Full)
     }
 }
 
@@ -897,6 +961,11 @@ impl Settings {
                 .and_then(|s| s.get("budgetTokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
+            subagents_inherit_plugins: SubagentInheritance::from_setting(
+                raw.get("subagents")
+                    .and_then(|s| s.get("inheritPlugins"))
+                    .and_then(|v| v.as_str()),
+            ),
             extension_lock_required: get_bool(&raw, "extensionLockRequired", true),
             raw,
         }
@@ -1087,6 +1156,50 @@ impl Settings {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn subagents_inherit_plugins_defaults_and_overrides() {
+        // Default: hooks (guardrail plugins follow sub-agent children).
+        let settings = Settings::from_raw(serde_json::json!({}));
+        assert_eq!(
+            settings.subagents_inherit_plugins,
+            SubagentInheritance::Hooks
+        );
+        assert!(settings.subagents_inherit_plugins.inherits_hooks());
+        assert!(!settings.subagents_inherit_plugins.inherits_tools());
+
+        let settings = Settings::from_raw(serde_json::json!({
+            "subagents": { "inheritPlugins": "none" }
+        }));
+        assert_eq!(
+            settings.subagents_inherit_plugins,
+            SubagentInheritance::None
+        );
+        assert!(!settings.subagents_inherit_plugins.inherits_hooks());
+
+        let settings = Settings::from_raw(serde_json::json!({
+            "subagents": { "inheritPlugins": "full" }
+        }));
+        assert_eq!(
+            settings.subagents_inherit_plugins,
+            SubagentInheritance::Full
+        );
+        assert!(settings.subagents_inherit_plugins.inherits_hooks());
+        assert!(settings.subagents_inherit_plugins.inherits_tools());
+
+        // Unknown values fall back to the default (with a warning).
+        let settings = Settings::from_raw(serde_json::json!({
+            "subagents": { "inheritPlugins": "everything" }
+        }));
+        assert_eq!(
+            settings.subagents_inherit_plugins,
+            SubagentInheritance::Hooks
+        );
+        // as_str round-trips the documented values.
+        assert_eq!(SubagentInheritance::None.as_str(), "none");
+        assert_eq!(SubagentInheritance::Hooks.as_str(), "hooks");
+        assert_eq!(SubagentInheritance::Full.as_str(), "full");
+    }
 
     #[test]
     fn mcp_sampling_elicitation_defaults_and_overrides() {

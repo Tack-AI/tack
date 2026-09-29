@@ -58,6 +58,7 @@ Special merge rules (**not** simple last-wins):
 | `budgetDowngradeModel` | string | last entry of fallbackModels | Downgrade target model ("provider/id") |
 | `subagents.maxConcurrent` | number | `0` (unlimited) | Subagent concurrency cap: shared semaphore over simultaneously running subagent loops; excess waits in queue |
 | `subagents.budgetTokens` | number | `0` (unlimited) | Shared subagent token budget: cap on cumulative usage of all subagents this session (including background ones); new subagent calls are rejected past the limit (subagents don't land in the session file, so budget hooks can't see their usage — hence the separate control) |
+| `subagents.inheritPlugins` | string | `"hooks"` | Which plugin surfaces subagent child loops inherit: `none` (built-in tools + deny rules only) \| `hooks` (plugin hook bridges — beforeToolCall interception, context transform, result patching — follow the child, closing the guardrail bypass) \| `full` (hooks + plugin tools; agent-definition `tools` whitelists still narrow the combined set). Layered like any settings key, so managed settings can pin it |
 
 ### Feature flags (features.*)
 

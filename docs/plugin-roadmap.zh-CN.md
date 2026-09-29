@@ -426,6 +426,18 @@ P4 落地时对上面的草图做了两处有意偏离，记录在
 5. **子代理继承**：子代理会话继承完整插件集还是收窄集合
    （Codex `SessionIsolation`）；加载结果过滤器让两种做法都很便
    宜。需要产品决策。
+   → **已解决**：`subagents.inheritPlugins`（`none | hooks | full`，
+   默认 `hooks`）。子代理是非交互的，所以按插件面拆分而非按插件：
+   钩子桥默认跟随子代理（派生的子代理不得绕过护栏插件），插件工
+   具仅 `full` 档注入。父代理已加载的插件在进程内共享（不重新
+   spawn），managed 层可钉死该键。
 6. **审批链范围**：`approval/review` 是 Codex
    `ApprovalReviewContributor` 的插件对应物；它与内置权限模式
    的组合方式（顺序、短路）需要一轮协议原型验证。
+   → **已解决**：审批链恰好位于"将要提示人工"的点上——deny 规则
+   → PreToolUse 裁决 → 模式门 → allow 规则/缓存 → 插件审批链（按
+   加载顺序，first-claim-wins）→ PermissionRequest hooks → 用户
+   提示。认领的 `allow`/`reviewed` 一次性放行（审计可区分），
+   `askUser` 交回内置提示，审查者错误降级为跳过（fail-open）。已
+   接线 TUI 与 rpc 两个 surface；acp/remote-host 的提示是文档化的
+   后续项。

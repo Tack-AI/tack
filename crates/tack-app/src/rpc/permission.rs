@@ -88,6 +88,10 @@ pub(crate) struct RpcPermissionHooks {
     rules: PermissionRules,
     events: EventSink,
     run_cancel: tokio_util::sync::CancellationToken,
+    /// Plugin approval chain (tack-RPC `approval/review`): reviewers get
+    /// first crack at a decision that would otherwise be emitted as a
+    /// `permission_request` event (see `crate::approval`).
+    approval_chain: crate::approval::ApprovalChain,
 }
 
 impl std::fmt::Debug for RpcPermissionHooks {
@@ -134,6 +138,35 @@ impl AgentHooks for RpcPermissionHooks {
         let key = allow_always_key(ctx.tool_name, ctx.args);
         if self.state.lock().await.allow_always.contains(&key) {
             return Outcome::Allow;
+        }
+
+        // Plugin approval chain: reviewers get first crack at the decision
+        // that would otherwise be parked on a client answer.
+        if !self.approval_chain.is_empty() {
+            let policy = match mode {
+                SessionMode::Ask => "ask",
+                SessionMode::AcceptEdits => "acceptEdits",
+                SessionMode::Plan => "plan",
+                SessionMode::Bypass => "bypass",
+            };
+            let request = crate::approval::ApprovalRequest {
+                approval_id: ctx.tool_call_id.to_string(),
+                tool_call_id: ctx.tool_call_id.to_string(),
+                tool_name: ctx.tool_name.to_string(),
+                arguments: ctx.args.clone(),
+                approval_policy: policy.to_string(),
+                evidence: json!({
+                    "surface": "rpc",
+                    "readOnly": read_only,
+                }),
+            };
+            if let Some(crate::approval::ChainDecision {
+                action: crate::approval::ChainAction::Allow | crate::approval::ChainAction::Reviewed,
+                ..
+            }) = self.approval_chain.review(&request).await
+            {
+                return Outcome::Allow;
+            }
         }
 
         // Prompt the client: park until answered, cancelled, or timed out.
@@ -206,6 +239,7 @@ pub(crate) fn rpc_permission_hooks(
     rules: PermissionRules,
     events: EventSink,
     run_cancel: tokio_util::sync::CancellationToken,
+    approval_chain: crate::approval::ApprovalChain,
 ) -> Arc<RpcPermissionHooks> {
     Arc::new(RpcPermissionHooks {
         session_id,
@@ -213,5 +247,6 @@ pub(crate) fn rpc_permission_hooks(
         rules,
         events,
         run_cancel,
+        approval_chain,
     })
 }

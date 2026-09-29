@@ -105,6 +105,11 @@ pub struct TuiPermissionHooks {
         Vec<crate::shell_hooks::HookGroup>,
         String,
     )>,
+    /// Plugin approval chain (tack-RPC `approval/review`): reviewers get
+    /// first crack at a decision that would otherwise reach the dialog
+    /// (see `crate::approval` for the composition contract). Empty chain
+    /// = no plugin participation.
+    pub approval_chain: crate::approval::ApprovalChain,
 }
 
 #[async_trait::async_trait]
@@ -190,9 +195,37 @@ impl tack_agent_core::AgentHooks for TuiPermissionHooks {
 }
 
 impl TuiPermissionHooks {
-    /// The dialog path: PermissionRequest hooks may answer in place of the
+    /// The dialog path: the plugin approval chain gets first crack at the
+    /// decision; then PermissionRequest hooks may answer in place of the
     /// user (allow/deny); otherwise the overlay prompt decides.
     async fn prompt_user(&self, ctx: &BeforeToolCallContext<'_>) -> BeforeToolCallOutcome {
+        if !self.approval_chain.is_empty() {
+            let request = crate::approval::ApprovalRequest {
+                approval_id: ctx.tool_call_id.to_string(),
+                tool_call_id: ctx.tool_call_id.to_string(),
+                tool_name: ctx.tool_name.to_string(),
+                arguments: ctx.args.clone(),
+                approval_policy: lock_recover(&self.mode).as_str().to_string(),
+                evidence: serde_json::json!({
+                    "surface": "tui",
+                    "untrustedSeen": self
+                        .untrusted_seen
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "readOnly": is_read_only_tool(ctx.tool_name, ctx.args),
+                }),
+            };
+            // allow/reviewed both approve one-shot (nothing persists
+            // into the allow-always cache or permissions.json); askUser
+            // (explicit defer) and all-pass both reach the built-in
+            // prompt below.
+            if let Some(crate::approval::ChainDecision {
+                action: crate::approval::ChainAction::Allow | crate::approval::ChainAction::Reviewed,
+                ..
+            }) = self.approval_chain.review(&request).await
+            {
+                return BeforeToolCallOutcome::Allow;
+            }
+        }
         if let Some((engine, groups, session_id)) = &self.permission_request
             && !groups.is_empty()
         {
@@ -367,6 +400,7 @@ mod tests {
                 untrusted_seen: untrusted,
                 hook_decisions: crate::shell_hooks::HookDecisions::default(),
                 permission_request: None,
+                approval_chain: crate::approval::ApprovalChain::empty(),
             },
             rx,
         )
@@ -417,5 +451,71 @@ mod tests {
         });
         assert!(answered);
         assert!(matches!(outcome, BeforeToolCallOutcome::Allow));
+    }
+
+    /// Approval-chain reviewer stub: claims with a scripted action.
+    #[derive(Debug)]
+    struct ClaimReviewer(crate::approval::ChainAction);
+
+    #[async_trait::async_trait]
+    impl crate::approval::ApprovalReviewer for ClaimReviewer {
+        async fn review(
+            &self,
+            request: &crate::approval::ApprovalRequest,
+        ) -> Option<crate::approval::ChainDecision> {
+            // The params the plugin would see: policy + tool identity.
+            assert_eq!(request.approval_policy, "ask");
+            assert_eq!(request.tool_name, "bash");
+            Some(crate::approval::ChainDecision {
+                action: self.0,
+                reason: None,
+            })
+        }
+    }
+
+    /// A chain claim (allow) approves the call without any UI prompt —
+    /// and persists nothing into the allow-always cache.
+    #[tokio::test]
+    async fn approval_chain_claim_skips_dialog() {
+        let message = tack_ai::AssistantMessage::pending(&test_model());
+        let untrusted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (mut hooks, mut rx) = hooks(PermissionMode::Ask, untrusted);
+        hooks.approval_chain.push(
+            "fake@user".into(),
+            Arc::new(ClaimReviewer(crate::approval::ChainAction::Allow)),
+        );
+        // Matches neither the allow rule nor the allow-always cache: the
+        // built-in flow WOULD prompt.
+        let args = serde_json::json!({ "command": "rm -rf build" });
+        let outcome = hooks.before_tool_call(&ctx(&message, &args)).await;
+        assert!(matches!(outcome, BeforeToolCallOutcome::Allow));
+        assert!(rx.try_recv().is_err(), "no prompt expected");
+        // One-shot approve: nothing new persisted into the cache.
+        assert_eq!(lock_recover(&hooks.allow_always).len(), 1);
+    }
+
+    /// askUser defers to the built-in dialog (the chain claims, but the
+    /// human still decides).
+    #[tokio::test]
+    async fn approval_chain_ask_user_falls_through_to_dialog() {
+        let message = tack_ai::AssistantMessage::pending(&test_model());
+        let untrusted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (mut hooks, mut rx) = hooks(PermissionMode::Ask, untrusted);
+        hooks.approval_chain.push(
+            "fake@user".into(),
+            Arc::new(ClaimReviewer(crate::approval::ChainAction::AskUser)),
+        );
+        let args = serde_json::json!({ "command": "rm -rf build" });
+        let c = ctx(&message, &args);
+        let (outcome, answered) = tokio::join!(hooks.before_tool_call(&c), async {
+            let query = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("prompt expected")
+                .expect("query");
+            query.respond.send(PermissionChoice::Deny).unwrap();
+            true
+        });
+        assert!(answered);
+        assert!(matches!(outcome, BeforeToolCallOutcome::Block { .. }));
     }
 }

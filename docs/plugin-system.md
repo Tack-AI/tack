@@ -152,6 +152,37 @@ lifecycle events, and `exec/run` (trust-gated) work as usual;
 the mode and the available surfaces from the initialize payload's `mode`
 and `capabilities`.
 
+### 3.1c The approval chain (`approval/review`)
+
+When the built-in permission flow is about to prompt a human, plugins
+that declared `capabilities.hooks.approvalReview` get first crack at the
+decision — in load order, first-claim-wins; a null result passes to the
+next reviewer. Composition with the built-in modes:
+
+```text
+deny rules → PreToolUse hook decisions → mode gate (plan/acceptEdits/bypass)
+  → allow rules + allow-always cache → PLUGIN APPROVAL CHAIN
+  → PermissionRequest hooks → user prompt
+```
+
+- A claimed `allow`/`reviewed` approves the call one-shot (nothing
+  persists into allow-always state); `reviewed` exists so a reviewer
+  that vetted the call itself (an LLM pass, its own UI) is
+  distinguishable from a blanket auto-allow in the audit event.
+  `askUser` defers to the built-in prompt.
+- The chain sees only calls that WOULD prompt: allow-rule/mode-approved
+  calls never reach it (plugins observe those via
+  `hooks/beforeToolCall`), and bypass mode / headless print runs never
+  prompt at all.
+- Fail-open: a reviewer error — including `unsupported_capability` from
+  carriers that do not implement `approval/review` (Level-2 MCP and WIT
+  component carriers today) — degrades to "pass", and every call carries
+  the standard 30s request timeout. Claims, passes, and reviewer
+  failures are structured tracing events (target `plugin_approval`), so
+  managed `auditSink` deployments see them like policy decisions.
+- Wired surfaces: **TUI and rpc** (the prompt-capable surfaces this
+  repo owns); acp and remote-host prompts are a documented follow-up.
+
 ### 3.2 Identity, load outcome, and the store
 
 Every plugin has a stable id **`name@source`** (marketplace name, or the
@@ -268,6 +299,10 @@ gated**).
   path (fs/network allowlists are a v2.x design item).
 - **Managed hooks**: enterprises can lock down execution to managed hooks
   only.
+- **Subagents inherit plugin guardrails**: child loops run the session's
+  plugin hook bridges by default (`subagents.inheritPlugins: "hooks"`),
+  so delegation cannot bypass a guardrail plugin's `beforeToolCall`
+  verdicts; `"full"` additionally inherits plugin tools.
 - Verdict chain order: SessionHooks → **lifecycle hooks** → permission
   hooks → queue/budget → tack-ext plugins (what the last one sees is the
   final set of arguments).
@@ -279,6 +314,7 @@ gated**).
 | hooks engine (all events) | ✓ | PreToolUse/PostToolUse/UserPromptSubmit/Compact/SubagentStop | PreToolUse/PostToolUse | — |
 | prompt/agent handlers (LLM evaluation) | ✓ | ✓ | ✓ | — |
 | tack-ext plugins (process + wasm) | ✓ | ✓ (headless degradation) | ✓ (headless degradation) | ✓ (headless degradation) |
+| approval chain (`approval/review`) | ✓ | — (no prompts in bypass) | ✓ | — |
 | bundle resources (hooks/mcp/skills) | ✓ | ✓ | ✓ | mcp |
 | declarative widgets / autocomplete | ✓ | — (declarations accepted but ignored) | — | — |
 

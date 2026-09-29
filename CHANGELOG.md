@@ -8,6 +8,35 @@ notice can parse entries (same convention as TS pi).
 
 ### Added
 
+- **Plugin approval chain (`approval/review`) wired into the host.**
+  When the built-in permission flow is about to prompt a human, active
+  plugins that declared `capabilities.hooks.approvalReview` get first
+  crack at the decision — load order, first-claim-wins, a null result
+  passes to the next reviewer. Composition: deny rules → PreToolUse
+  hook decisions → mode gate → allow rules/cache → **plugin approval
+  chain** → PermissionRequest hooks → user prompt, so the chain only
+  ever sees calls that would prompt. Claimed `allow`/`reviewed`
+  approve one-shot (nothing persists into allow-always state; the two
+  actions stay distinguishable in the audit event), `askUser` defers
+  to the built-in prompt, and reviewer errors — including
+  `unsupported_capability` from carriers without the method — degrade
+  to pass (fail-open). Claims/passes are structured tracing events
+  (target `plugin_approval`) for managed `auditSink` deployments.
+  Wired in the TUI and rpc surfaces; acp/remote-host prompts are a
+  documented follow-up. Resolves roadmap open question #6; see
+  docs/plugin-system.md §3.1c.
+- **Subagent plugin inheritance (`subagents.inheritPlugins`).**
+  Subagent child loops used to see no plugin surfaces at all — a
+  spawned subagent ran straight past guardrail plugins' `beforeToolCall`
+  verdicts. The new settings key (`none | hooks | full`, default
+  `hooks`) shares the parent's loaded plugins in-process: `hooks` runs
+  plugin hook bridges inside the child (after its `permissions.deny`
+  rules, matching surface chain order); `full` additionally adds plugin
+  tools to the child tool set (agent-definition `tools` whitelists
+  still narrow the combined set); `none` restores the legacy behavior.
+  The key layers like any settings key, so managed settings can pin
+  it. Resolves roadmap open question #5; see docs/features.md
+  "Plugin inheritance".
 - **Plugin redesign P6 — distribution + observability.** Curated
   marketplace startup sync: `pluginMarketplaces` (global/managed
   settings layers) declares catalogs kept fresh in the background —

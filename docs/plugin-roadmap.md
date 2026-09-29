@@ -457,7 +457,21 @@ recorded in [compatibility.md](compatibility.md):
 5. **Subagent inheritance**: full plugin set vs narrowed set for
    subagent sessions (Codex `SessionIsolation`); the load-outcome
    filter makes either cheap. Needs a product decision.
+   → **Resolved**: `subagents.inheritPlugins` (`none | hooks | full`,
+   default `hooks`). Children are non-interactive, so the split is by
+   surface, not by plugin: hook bridges follow the child by default
+   (a spawned subagent must not bypass guardrail plugins), plugin tools
+   only under `full`. The parent's loaded plugins are shared in-process
+   (no respawn), and managed settings can pin the key.
 6. **Approval chain scope**: `approval/review` is the plugin analogue of
    Codex's `ApprovalReviewContributor`; deciding how it composes with
    the built-in permission modes (order, short-circuit) needs one
    session of protocol prototyping.
+   → **Resolved**: the chain sits exactly at the would-prompt point —
+   deny rules → PreToolUse decisions → mode gate → allow rules/cache →
+   plugin approval chain (load order, first-claim-wins) →
+   PermissionRequest hooks → user prompt. Claimed `allow`/`reviewed`
+   approve one-shot (audit-distinguished), `askUser` defers to the
+   built-in prompt, and reviewer errors degrade to pass (fail-open).
+   Wired in the TUI and rpc surfaces; acp/remote-host prompts are a
+   documented follow-up.

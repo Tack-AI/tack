@@ -303,6 +303,30 @@ whether to merge or discard.
 
 Both keys are `0` = unlimited (default).
 
+### Plugin inheritance
+
+```jsonc
+// settings.json
+{ "subagents": { "inheritPlugins": "hooks" } }
+```
+
+Subagents are non-interactive (no permission prompts), so the plugin
+surfaces they inherit are a deliberate choice:
+
+- `"hooks"` (**default**): plugin hook bridges (tool-call interception,
+  context transform, result patching) run inside the child loop, ordered
+  after the child's `permissions.deny` rules — a spawned subagent cannot
+  bypass a guardrail plugin's `beforeToolCall` verdicts. Plugin tools are
+  NOT added (the child's tool surface stays the built-in coding set).
+- `"full"`: hooks + plugin tools (`ext__*`) join the child tool set,
+  narrowed by the agent definition's `tools` whitelist like any tool.
+- `"none"`: legacy behavior — children see no plugin surfaces at all
+  (guardrail plugins don't see child tool calls).
+
+The parent's loaded plugins are shared in-process (no respawn); the
+JSON-RPC peer multiplexes concurrent parent/child calls. The key layers
+like any settings key, so managed settings can pin it.
+
 ### Controlled git tool
 
 Built-in `git` tool: the agent invokes git structurally with `command:

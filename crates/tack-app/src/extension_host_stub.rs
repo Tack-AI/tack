@@ -148,6 +148,11 @@ impl ExtensionManager {
         true
     }
 
+    /// The plugin approval chain: always empty without the `ext` feature.
+    pub fn approval_chain(&self) -> crate::approval::ApprovalChain {
+        crate::approval::ApprovalChain::empty()
+    }
+
     /// Fan an event out to subscribed plugins (fire-and-forget).
     pub async fn notify(&self, _event: &str, _payload: Value) {}
 

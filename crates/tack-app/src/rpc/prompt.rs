@@ -98,6 +98,15 @@ pub(crate) async fn spawn_prompt(
         {
             let deny_rules = crate::permissions::PermissionRules::load(settings, &agent_dir);
             let state_guard = state.lock().await;
+            // Plugin inheritance (subagents.inheritPlugins): hook bridges
+            // and plugin tools shared from this session's extensions.
+            let (ext_hooks, ext_tools) = {
+                let extensions = state_guard.extensions.lock().await;
+                (
+                    extensions.hooks(),
+                    extensions.tools_with_untrusted(Some(services.untrusted_seen.clone())),
+                )
+            };
             let mut subagent_tool = crate::subagent_tool::SubagentTool::new(
                 provider.clone(),
                 model.clone(),
@@ -118,7 +127,10 @@ pub(crate) async fn spawn_prompt(
                 settings.locked_model.clone(),
             )
             .with_background(state_guard.background.clone())
-            .with_shared_limits(state_guard.subagent_limits.clone());
+            .with_shared_limits(state_guard.subagent_limits.clone())
+            .with_plugin_inheritance(settings.subagents_inherit_plugins)
+            .with_extension_hooks(ext_hooks)
+            .with_extension_tools(ext_tools);
             if settings.features.shell_hooks {
                 let cfg = crate::shell_hooks::load_hooks_config(settings, &agent_dir);
                 let start_groups = cfg.take_groups(crate::shell_hooks::HookEvent::SubagentStart);
@@ -379,12 +391,14 @@ pub(crate) async fn spawn_prompt(
             let permission_state = state_guard.permission.clone();
             let event_sink = state_guard.event_sink.clone();
             let session_id = session_id.clone();
+            let approval_chain = state_guard.extensions.lock().await.approval_chain();
             hook_list.push(super::permission::rpc_permission_hooks(
                 session_id,
                 permission_state,
                 deny_rules,
                 event_sink,
                 cancel.clone(),
+                approval_chain,
             ));
         }
         // tack-ext plugin hooks see the final arguments after every other

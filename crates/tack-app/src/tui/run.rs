@@ -693,7 +693,16 @@ impl TuiApp {
                 self.hook_engine.clone(),
             )
             .with_shared_limits(subagent_limits)
-            .with_background(self.background_tasks.clone()),
+            .with_background(self.background_tasks.clone())
+            // Plugin inheritance (subagents.inheritPlugins): hook bridges
+            // and plugin tools shared from this session's loaded
+            // extensions; the tool gates per surface on the mode.
+            .with_plugin_inheritance(self.settings.subagents_inherit_plugins)
+            .with_extension_hooks(self.extensions.hooks())
+            .with_extension_tools(
+                self.extensions
+                    .tools_with_untrusted(Some(services.untrusted_seen.clone())),
+            ),
         ));
         // rpiv-todo: persistent session todo list.
         tools.push(Arc::new(tack_tools::todo::TodoTool::new(
@@ -823,6 +832,7 @@ impl TuiApp {
                 } else {
                     None
                 },
+                approval_chain: self.extensions.approval_chain(),
             }),
             Arc::new(QueueHooks {
                 steering: self.steering.clone(),

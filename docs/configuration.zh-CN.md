@@ -52,6 +52,7 @@ Tack 从四级读取配置，**后加载的层级覆盖先加载的**（部分�
 | `budgetDowngradeModel` | string | fallbackModels 末位 | downgrade 目标模型（"provider/id"） |
 | `subagents.maxConcurrent` | number | `0`（不限） | 子代理并发上限：同时运行的子代理循环数，超出排队的共享信号量 |
 | `subagents.budgetTokens` | number | `0`（不限） | 子代理共享 token 预算：本次会话所有子代理（含后台）累计用量上限，超出后拒绝新的子代理调用（子代理不落会话文件，预算钩子看不到它们的用量，故单独管控） |
+| `subagents.inheritPlugins` | string | `"hooks"` | 子代理循环继承哪些插件面：`none`（仅内置工具 + deny 规则）\| `hooks`（插件钩子桥——beforeToolCall 拦截、上下文变换、结果补丁——跟随子代理，堵住护栏绕过缺口）\| `full`（钩子 + 插件工具；agent 定义的 `tools` 白名单仍会收窄合并后的集合）。与普通设置键一样分层，managed 层可钉死 |
 
 ### 功能开关（features.*）
 

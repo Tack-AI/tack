@@ -25,8 +25,9 @@ use tack_agent_core::{AgentHooks, AgentTool};
 use tack_ext::hooks::{ExtHooks, FailMode};
 use tack_ext::plugin_id::PluginId;
 use tack_ext::rpc3::{
-    ErrorObject, HostCapabilities, HostInfo, InitializeParams, InitializeResult,
-    MetricsHostCapability, RunMode, WidgetSpec, WidgetUpdateParams,
+    ApprovalDecisionAction, ApprovalReviewParams, ErrorObject, HostCapabilities, HostInfo,
+    InitializeParams, InitializeResult, MetricsHostCapability, RunMode, ToolCall, WidgetSpec,
+    WidgetUpdateParams,
 };
 use tack_ext::tool::ExtTool;
 use tack_ext::v3::{PeerHandler, PluginConnection, V3Process};
@@ -1052,6 +1053,66 @@ impl std::fmt::Debug for ExtensionManager {
     }
 }
 
+/// Whether the plugin's handshake capabilities opt into the approval
+/// chain (`capabilities.hooks.approvalReview`).
+fn declares_approval_review(caps: Option<&tack_ext::rpc3::PluginCapabilities>) -> bool {
+    caps.and_then(|c| c.hooks.as_ref())
+        .and_then(|h| h.approval_review)
+        == Some(true)
+}
+
+/// Approval-chain reviewer over a plugin connection (`approval/review`).
+/// Errors degrade to "pass" (fail-open: a broken or incapable reviewer
+/// must not wedge every prompt — carriers that do not implement
+/// `approval/review` answer `unsupported_capability`).
+#[derive(Debug)]
+struct PluginApprovalReviewer {
+    client: Arc<dyn PluginConnection>,
+}
+
+#[async_trait::async_trait]
+impl crate::approval::ApprovalReviewer for PluginApprovalReviewer {
+    async fn review(
+        &self,
+        request: &crate::approval::ApprovalRequest,
+    ) -> Option<crate::approval::ChainDecision> {
+        let params = ApprovalReviewParams {
+            approval_id: request.approval_id.clone(),
+            approval_policy: request.approval_policy.clone(),
+            evidence: Some(request.evidence.clone()),
+            tool_call: ToolCall {
+                arguments: request.arguments.clone(),
+                tool_call_id: request.tool_call_id.clone(),
+                tool_name: request.tool_name.clone(),
+            },
+        };
+        match self.client.approval_review(&params).await {
+            Ok(Some(decision)) => {
+                let action = match decision.action {
+                    ApprovalDecisionAction::Allow => crate::approval::ChainAction::Allow,
+                    ApprovalDecisionAction::Reviewed => crate::approval::ChainAction::Reviewed,
+                    ApprovalDecisionAction::AskUser => crate::approval::ChainAction::AskUser,
+                };
+                Some(crate::approval::ChainDecision {
+                    action,
+                    reason: decision.reason,
+                })
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::debug!(
+                    target: "plugin_approval",
+                    decision = "reviewer-error",
+                    error = %e,
+                    approval_id = request.approval_id.as_str(),
+                    "approval reviewer failed; passing to the next reviewer"
+                );
+                None
+            }
+        }
+    }
+}
+
 /// One discovered plugin directory: its id, version, and path.
 #[derive(Debug)]
 struct Discovered {
@@ -2011,6 +2072,29 @@ impl ExtensionManager {
     /// serialization.
     pub fn is_empty(&self) -> bool {
         !self.plugins.iter().any(|p| p.is_active())
+    }
+
+    /// The session's plugin approval chain (`approval/review`): active
+    /// plugins that declared `capabilities.hooks.approvalReview`, in load
+    /// order. Consulted by the permission layer at the point it would
+    /// prompt a human (see `crate::approval`).
+    pub fn approval_chain(&self) -> crate::approval::ApprovalChain {
+        let mut chain = crate::approval::ApprovalChain::empty();
+        for plugin in self.plugins.iter().filter(|p| p.is_active()) {
+            if !declares_approval_review(plugin.capabilities()) {
+                continue;
+            }
+            let Some(handle) = &plugin.handle else {
+                continue;
+            };
+            chain.push(
+                plugin.id.to_string(),
+                Arc::new(PluginApprovalReviewer {
+                    client: handle.client(),
+                }),
+            );
+        }
+        chain
     }
 
     /// Fan a lifecycle event out to subscribed plugins (fire-and-forget).
@@ -5171,5 +5255,178 @@ mod policy_tests {
         let off = row("off");
         assert_eq!(off.outcome, "disabled");
         assert!(off.error_class.is_none());
+    }
+
+    // ---- approval chain (approval/review) ----
+
+    #[test]
+    fn approval_chain_capability_gating() {
+        use tack_ext::rpc3::{HookCapabilities, PluginCapabilities};
+        let caps = |approval_review: Option<bool>| PluginCapabilities {
+            hooks: Some(HookCapabilities {
+                approval_review,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(declares_approval_review(Some(&caps(Some(true)))));
+        assert!(!declares_approval_review(Some(&caps(Some(false)))));
+        // Absent flag = not implemented (same rule as the other hooks).
+        assert!(!declares_approval_review(Some(&caps(None))));
+        assert!(!declares_approval_review(Some(
+            &PluginCapabilities::default()
+        )));
+        assert!(!declares_approval_review(None));
+    }
+
+    /// A handle-less plugin row (e.g. register kept for a carrier that
+    /// died after the handshake) must not enter the chain.
+    #[test]
+    fn approval_chain_skips_plugins_without_handle() {
+        let id = PluginId::new("reviewer", "user").unwrap();
+        let register = InitializeResult {
+            capabilities: tack_ext::rpc3::PluginCapabilities {
+                hooks: Some(tack_ext::rpc3::HookCapabilities {
+                    approval_review: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            plugin: tack_ext::rpc3::PluginInfo {
+                description: None,
+                name: "reviewer".into(),
+                version: None,
+            },
+            protocol_version: "3".into(),
+        };
+        let manager = ExtensionManager {
+            plugins: vec![LoadedPlugin {
+                id,
+                enabled: true,
+                error: None,
+                error_class: None,
+                policy_block: None,
+                register: Some(register),
+                handle: None,
+                version: "1.0.0".into(),
+                dir: PathBuf::new(),
+            }],
+            load_warnings: Vec::new(),
+            commands: HashMap::new(),
+            widgets: WidgetRegistry::default(),
+            bundle_hooks: crate::shell_hooks::HookConfig::default(),
+            bundle_mcp_servers: Vec::new(),
+            bundle_skill_dirs: Vec::new(),
+            #[cfg(feature = "wasm")]
+            wasm_carrier: None,
+            metrics_sidecars: Default::default(),
+            metrics_stop: Default::default(),
+        };
+        assert!(manager.approval_chain().is_empty());
+    }
+
+    /// Plugin-side answer script for the reviewer wire test.
+    struct ScriptedApproval {
+        reply: Result<Value, tack_ext::rpc3::ErrorObject>,
+        seen: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PeerHandler for ScriptedApproval {
+        async fn handle_request(
+            &self,
+            method: &str,
+            params: Value,
+        ) -> Result<Value, tack_ext::rpc3::ErrorObject> {
+            assert_eq!(method, "approval/review");
+            self.seen.lock().unwrap().push(params);
+            self.reply.clone()
+        }
+    }
+
+    /// (reviewer, plugin peer guard, captured params) over an in-memory
+    /// duplex — same seam as the tack-ext hooks tests.
+    fn reviewer_pair(
+        reply: Result<Value, tack_ext::rpc3::ErrorObject>,
+    ) -> (
+        PluginApprovalReviewer,
+        Arc<tack_ext::v3::JsonRpcPeer>,
+        Arc<std::sync::Mutex<Vec<Value>>>,
+    ) {
+        struct Noop;
+        #[async_trait::async_trait]
+        impl PeerHandler for Noop {}
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (s1, s2) = tokio::io::duplex(8192);
+        let (r1, w1) = tokio::io::split(s1);
+        let (r2, w2) = tokio::io::split(s2);
+        let client =
+            tack_ext::v3::HostClient::new(tack_ext::v3::JsonRpcPeer::new(r1, w1, Arc::new(Noop)));
+        let plugin = tack_ext::v3::JsonRpcPeer::new(
+            r2,
+            w2,
+            Arc::new(ScriptedApproval {
+                reply,
+                seen: seen.clone(),
+            }),
+        );
+        (
+            PluginApprovalReviewer {
+                client: Arc::new(client),
+            },
+            plugin,
+            seen,
+        )
+    }
+
+    fn approval_request() -> crate::approval::ApprovalRequest {
+        crate::approval::ApprovalRequest {
+            approval_id: "call-1".into(),
+            tool_call_id: "call-1".into(),
+            tool_name: "bash".into(),
+            arguments: serde_json::json!({"command": "rm -rf build"}),
+            approval_policy: "ask".into(),
+            evidence: serde_json::json!({"surface": "tui", "untrustedSeen": false}),
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_reviewer_maps_decisions() {
+        use crate::approval::{ApprovalReviewer, ChainAction};
+        for (wire, expected) in [
+            ("allow", ChainAction::Allow),
+            ("reviewed", ChainAction::Reviewed),
+            ("askUser", ChainAction::AskUser),
+        ] {
+            let (reviewer, _plugin, seen) = reviewer_pair(Ok(serde_json::json!({
+                "action": wire,
+                "reason": "checked"
+            })));
+            let decision = reviewer.review(&approval_request()).await.expect("claim");
+            assert_eq!(decision.action, expected);
+            assert_eq!(decision.reason.as_deref(), Some("checked"));
+            let params = seen.lock().unwrap().remove(0);
+            assert_eq!(params["approvalId"], "call-1");
+            assert_eq!(params["approvalPolicy"], "ask");
+            assert_eq!(params["toolCall"]["toolName"], "bash");
+            assert_eq!(params["toolCall"]["toolCallId"], "call-1");
+            assert!(params["evidence"].is_object());
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_reviewer_null_and_error_pass() {
+        use crate::approval::ApprovalReviewer as _;
+        // Null result = pass to the next reviewer.
+        let (reviewer, _plugin, _seen) = reviewer_pair(Ok(Value::Null));
+        assert_eq!(reviewer.review(&approval_request()).await, None);
+        // Transport/method error (e.g. unsupported_capability from a
+        // carrier) = pass, never a block.
+        let (reviewer, _plugin, _seen) = reviewer_pair(Err(tack_ext::rpc3::ErrorObject {
+            code: -32002,
+            message: "capability not granted".into(),
+            data: None,
+        }));
+        assert_eq!(reviewer.review(&approval_request()).await, None);
     }
 }

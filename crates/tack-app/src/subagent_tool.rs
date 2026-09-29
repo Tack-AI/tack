@@ -133,6 +133,19 @@ pub struct SubagentTool {
     cwd: Option<std::path::PathBuf>,
     /// settings `cacheRetention` propagated to the child agent loop.
     cache_retention: Option<tack_ai::CacheRetention>,
+    /// settings `subagents.inheritPlugins`: which parts of the parent's
+    /// active plugin set follow the child (default Hooks — without hook
+    /// inheritance a spawned sub-agent would bypass guardrail plugins'
+    /// beforeToolCall verdicts entirely).
+    inherit_plugins: crate::settings::SubagentInheritance,
+    /// Plugin hook bridges shared from the parent's loaded extensions
+    /// (consumed when inherit_plugins is Hooks|Full). The underlying
+    /// plugin connections are Arc-shared with the parent session; the
+    /// JSON-RPC peer multiplexes concurrent parent/child calls.
+    extension_hooks: Vec<Arc<dyn AgentHooks>>,
+    /// Plugin tools shared from the parent's loaded extensions (consumed
+    /// when inherit_plugins is Full).
+    extension_tools: Vec<Arc<dyn AgentTool>>,
 }
 
 /// Progress callback for background sub-agents (tool activity lines).
@@ -157,6 +170,9 @@ impl Clone for SubagentTool {
             memory_dir_override: self.memory_dir_override.clone(),
             cwd: self.cwd.clone(),
             cache_retention: self.cache_retention,
+            inherit_plugins: self.inherit_plugins,
+            extension_hooks: self.extension_hooks.clone(),
+            extension_tools: self.extension_tools.clone(),
         }
     }
 }
@@ -184,6 +200,9 @@ impl SubagentTool {
             memory_dir_override: None,
             cwd: None,
             cache_retention: None,
+            inherit_plugins: crate::settings::SubagentInheritance::default(),
+            extension_hooks: Vec::new(),
+            extension_tools: Vec::new(),
         }
     }
 
@@ -263,6 +282,28 @@ impl SubagentTool {
     /// provider default resolution: TACK_CACHE_RETENTION env, then short).
     pub fn with_cache_retention(mut self, retention: Option<tack_ai::CacheRetention>) -> Self {
         self.cache_retention = retention;
+        self
+    }
+
+    /// settings `subagents.inheritPlugins`: which plugin surfaces follow
+    /// the child loop (see `SubagentInheritance`).
+    pub fn with_plugin_inheritance(mut self, mode: crate::settings::SubagentInheritance) -> Self {
+        self.inherit_plugins = mode;
+        self
+    }
+
+    /// Plugin hook bridges (`ExtensionManager::hooks()`) shared from the
+    /// parent session; enforced in the child when inheritance is Hooks|Full.
+    pub fn with_extension_hooks(mut self, hooks: Vec<Arc<dyn AgentHooks>>) -> Self {
+        self.extension_hooks = hooks;
+        self
+    }
+
+    /// Plugin tools (`ExtensionManager::tools_with_untrusted(..)`) shared
+    /// from the parent session; added to the child tool set when
+    /// inheritance is Full.
+    pub fn with_extension_tools(mut self, tools: Vec<Arc<dyn AgentTool>>) -> Self {
+        self.extension_tools = tools;
         self
     }
 
@@ -776,7 +817,13 @@ impl SubagentTool {
             _ => services,
         };
         let tools = tack_tools::create_coding_tools(&services);
-        let tools = crate::cli_flags::filter_feature_tools(tools, &self.features);
+        let mut tools = crate::cli_flags::filter_feature_tools(tools, &self.features);
+        // Plugin inheritance (subagents.inheritPlugins "full"): plugin
+        // tools join BEFORE the agent-definition whitelist so `tools`
+        // narrows the combined set uniformly (ext__<plugin>__<tool> names).
+        if self.inherit_plugins.inherits_tools() {
+            tools.extend(self.extension_tools.iter().cloned());
+        }
         let tools = match &agent_def {
             Some(def) if !def.tools.is_empty() => tools
                 .into_iter()
@@ -793,13 +840,25 @@ impl SubagentTool {
         // Child hooks: non-interactive, so no permission prompts — but the
         // session's `permissions.deny` rules MUST still apply, or a spawned
         // sub-agent would bypass the deny list entirely (headless CI safety
-        // net). NoopHooks when no deny rules are configured.
-        let hooks: Arc<dyn AgentHooks> = if self.deny_rules.deny.is_empty() {
-            Arc::new(NoopHooks)
-        } else {
-            Arc::new(crate::permissions::DenyRulesHooks {
-                rules: self.deny_rules.clone(),
-            })
+        // net). Plugin hook bridges follow the deny rules when inheritance
+        // allows (default "hooks"): hard blocks first, then plugin verdicts
+        // — the same order as the parent surfaces' chains. NoopHooks when
+        // neither is configured.
+        let hooks: Arc<dyn AgentHooks> = {
+            let mut chain: Vec<Arc<dyn AgentHooks>> = Vec::new();
+            if !self.deny_rules.deny.is_empty() {
+                chain.push(Arc::new(crate::permissions::DenyRulesHooks {
+                    rules: self.deny_rules.clone(),
+                }));
+            }
+            if self.inherit_plugins.inherits_hooks() {
+                chain.extend(self.extension_hooks.iter().cloned());
+            }
+            match chain.len() {
+                0 => Arc::new(NoopHooks),
+                1 => chain.pop().expect("len checked"),
+                _ => Arc::new(tack_agent_core::HooksChain::new(chain)),
+            }
         };
         let config = AgentLoopConfig {
             model,
@@ -1246,6 +1305,155 @@ mod tests {
             .await
             .unwrap();
         assert!(text.contains("deny-MISSING"), "{text}");
+    }
+
+    // ---- plugin inheritance (subagents.inheritPlugins) ----
+
+    /// Guardrail-plugin stand-in: blocks every bash call with a
+    /// distinctive verdict (the needle the probe looks for).
+    #[derive(Debug)]
+    struct GuardrailHooks;
+
+    #[async_trait::async_trait]
+    impl tack_agent_core::AgentHooks for GuardrailHooks {
+        async fn before_tool_call(
+            &self,
+            ctx: &tack_agent_core::hooks::BeforeToolCallContext<'_>,
+        ) -> tack_agent_core::hooks::BeforeToolCallOutcome {
+            if ctx.tool_name == "bash" {
+                return tack_agent_core::hooks::BeforeToolCallOutcome::Block {
+                    reason: Some("plugin-guardrail-blocked".into()),
+                    terminate: false,
+                };
+            }
+            tack_agent_core::hooks::BeforeToolCallOutcome::Allow
+        }
+    }
+
+    /// Plugin-tool stand-in (`ext__fake__probe`): answers with a
+    /// distinctive output text.
+    #[derive(Debug)]
+    struct FakeExtTool;
+
+    #[async_trait::async_trait]
+    impl tack_agent_core::AgentTool for FakeExtTool {
+        fn name(&self) -> &'static str {
+            "ext__fake__probe"
+        }
+        fn label(&self) -> &str {
+            "fake"
+        }
+        fn description(&self) -> &str {
+            "fake plugin tool"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({ "type": "object" })
+        }
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _params: serde_json::Value,
+            _cancel: CancellationToken,
+            _on_update: &(dyn Fn(tack_agent_core::AgentToolResult) + Send + Sync),
+        ) -> Result<tack_agent_core::AgentToolResult, String> {
+            Ok(tack_agent_core::AgentToolResult::text("fake-tool-output"))
+        }
+    }
+
+    fn hook_probe_tool(mode: crate::settings::SubagentInheritance) -> super::SubagentTool {
+        super::SubagentTool::new(
+            Arc::new(
+                super::subagent_tool_test_support::ToolResultProbeProvider::new(
+                    "bash",
+                    json!({ "command": "echo probe-hook" }),
+                    "plugin-guardrail-blocked",
+                ),
+            ),
+            super::subagent_tool_test_support::test_model(),
+            Arc::new(tack_ai::oauth::StaticAuth::from(None)),
+        )
+        .with_plugin_inheritance(mode)
+        .with_extension_hooks(vec![Arc::new(GuardrailHooks)])
+    }
+
+    /// Default ("hooks"): a guardrail plugin's beforeToolCall verdict
+    /// applies inside the child loop — without inheritance a sub-agent
+    /// would run straight past the plugin's deny list.
+    #[tokio::test]
+    async fn hooks_inheritance_enforces_plugin_hooks_in_child() {
+        let tool = hook_probe_tool(crate::settings::SubagentInheritance::Hooks);
+        let (text, _) = tool
+            .run(
+                json!({ "task": "run the probe command" }),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(text.contains("needle-found"), "{text}");
+    }
+
+    /// "none" restores the legacy behavior: plugin hooks never see child
+    /// tool calls (the harmless echo actually executes).
+    #[tokio::test]
+    async fn none_inheritance_skips_plugin_hooks() {
+        let tool = hook_probe_tool(crate::settings::SubagentInheritance::None);
+        let (text, _) = tool
+            .run(
+                json!({ "task": "run the probe command" }),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(text.contains("needle-missing"), "{text}");
+    }
+
+    fn tool_probe_tool(mode: crate::settings::SubagentInheritance) -> super::SubagentTool {
+        super::SubagentTool::new(
+            Arc::new(
+                super::subagent_tool_test_support::ToolResultProbeProvider::new(
+                    "ext__fake__probe",
+                    json!({}),
+                    "fake-tool-output",
+                ),
+            ),
+            super::subagent_tool_test_support::test_model(),
+            Arc::new(tack_ai::oauth::StaticAuth::from(None)),
+        )
+        .with_plugin_inheritance(mode)
+        .with_extension_tools(vec![Arc::new(FakeExtTool)])
+    }
+
+    /// "full": plugin tools join the child tool set and execute.
+    #[tokio::test]
+    async fn full_inheritance_adds_plugin_tools_to_child() {
+        let tool = tool_probe_tool(crate::settings::SubagentInheritance::Full);
+        let (text, _) = tool
+            .run(
+                json!({ "task": "call the probe tool" }),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(text.contains("needle-found"), "{text}");
+    }
+
+    /// "hooks": plugin tools are NOT in the child set — the same call
+    /// ends in an unknown-tool error result, never the tool's output.
+    #[tokio::test]
+    async fn hooks_inheritance_excludes_plugin_tools() {
+        let tool = tool_probe_tool(crate::settings::SubagentInheritance::Hooks);
+        let (text, _) = tool
+            .run(
+                json!({ "task": "call the probe tool" }),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(text.contains("needle-missing"), "{text}");
     }
 
     /// Regression: managed lockedProvider/lockedModel must bind delegated
@@ -1861,6 +2069,80 @@ pub(crate) mod subagent_tool_test_support {
                         "deny-enforced"
                     } else {
                         "deny-MISSING"
+                    },
+                    0,
+                )
+            };
+            sender.finish(event);
+            stream
+        }
+    }
+
+    /// Hook/tool-inheritance probe: the first request issues a fixed
+    /// `tool_name` call; the second request inspects the context for the
+    /// tool result and reports "needle-found" when any result text
+    /// contains `needle`, else "needle-missing". Generic successor of
+    /// `DenyProbeProvider` (a block verdict's reason and a fake tool's
+    /// output are both just needles in the tool result).
+    #[derive(Debug)]
+    pub struct ToolResultProbeProvider {
+        pub tool_name: &'static str,
+        pub arguments: serde_json::Value,
+        pub needle: &'static str,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ToolResultProbeProvider {
+        pub fn new(
+            tool_name: &'static str,
+            arguments: serde_json::Value,
+            needle: &'static str,
+        ) -> Self {
+            ToolResultProbeProvider {
+                tool_name,
+                arguments,
+                needle,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Provider for ToolResultProbeProvider {
+        fn stream(
+            &self,
+            _model: &Model,
+            context: &Context,
+            _options: StreamOptions,
+        ) -> AssistantMessageEventStream {
+            let (sender, stream) = tack_ai::stream::event_stream();
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let event = if call == 0 {
+                let mut message = tack_ai::AssistantMessage::pending(&test_model());
+                message.stop_reason = tack_ai::StopReason::ToolUse;
+                message.content = vec![tack_ai::ContentBlock::ToolCall {
+                    id: "call-1".into(),
+                    name: self.tool_name.into(),
+                    arguments: self.arguments.clone(),
+                    thought_signature: None,
+                    namespace: None,
+                }];
+                tack_ai::AssistantMessageEvent::Done {
+                    reason: tack_ai::StopReason::ToolUse,
+                    message,
+                }
+            } else {
+                let found = context.messages.iter().any(|m| match m {
+                    tack_ai::Message::ToolResult(tr) => tr.content.iter().any(|c| match c {
+                        tack_ai::InputContentBlock::Text { text, .. } => text.contains(self.needle),
+                        _ => false,
+                    }),
+                    _ => false,
+                });
+                done_event(
+                    if found {
+                        "needle-found"
+                    } else {
+                        "needle-missing"
                     },
                     0,
                 )

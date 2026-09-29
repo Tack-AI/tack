@@ -2,6 +2,7 @@
 
 pub mod acp;
 pub mod agents;
+pub mod approval;
 #[cfg(feature = "ext")]
 mod archive_extract;
 pub mod ask_user;
