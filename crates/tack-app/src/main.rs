@@ -591,7 +591,7 @@ async fn async_main() -> Result<()> {
 
     // --mode rpc is an alias for the rpc subcommand.
     if cli.command.is_none() && cli.mode.as_deref() == Some("rpc") {
-        return run_rpc(&cli).await;
+        return close_codebuddy_after(run_rpc(&cli)).await;
     }
 
     match &cli.command {
@@ -602,13 +602,13 @@ async fn async_main() -> Result<()> {
                 api_key: cli.api_key.clone(),
                 thinking: parse_thinking(&cli)?,
             };
-            return tack_app::acp::serve(&overrides).await;
+            return close_codebuddy_after(tack_app::acp::serve(&overrides)).await;
         }
         Some(Command::Rpc) => {
-            return run_rpc(&cli).await;
+            return close_codebuddy_after(run_rpc(&cli)).await;
         }
         Some(Command::McpServe) => {
-            return cmd_mcp_serve(&cli).await;
+            return close_codebuddy_after(cmd_mcp_serve(&cli)).await;
         }
         Some(Command::Doctor { json, bundle }) => {
             let code = if let Some(path) = bundle {
@@ -641,14 +641,14 @@ async fn async_main() -> Result<()> {
             report,
             baseline,
         }) => {
-            return cmd_eval(
+            return close_codebuddy_after(cmd_eval(
                 &cli,
                 dir,
                 *runs,
                 filter.as_deref(),
                 report.as_ref(),
                 baseline.as_ref(),
-            )
+            ))
             .await;
         }
         Some(Command::Serve {
@@ -660,7 +660,7 @@ async fn async_main() -> Result<()> {
             tls_cert,
             tls_key,
         }) => {
-            return cmd_serve(
+            return close_codebuddy_after(cmd_serve(
                 &cli,
                 listen,
                 auth_token,
@@ -669,7 +669,7 @@ async fn async_main() -> Result<()> {
                 *tls,
                 tls_cert,
                 tls_key,
-            )
+            ))
             .await;
         }
         Some(Command::Login {
@@ -707,7 +707,11 @@ async fn async_main() -> Result<()> {
         }
         Some(Command::Compact) => {
             let cwd = std::env::current_dir()?;
-            let code = tack_app::print_mode::run_compact(cwd).await?;
+            let result = tack_app::print_mode::run_compact(cwd).await;
+            // Reap codebuddy CLI children before exit — `std::process::exit`
+            // runs no destructors and the session registry is a static.
+            tack_ai::codebuddy::close_all_sessions().await;
+            let code = result?;
             std::process::exit(code);
         }
         Some(Command::DebugImage) => {
@@ -1470,7 +1474,7 @@ async fn run_default(cli: &Cli, flags: tack_app::cli_flags::CliFlags) -> Result<
             model::enforce_locked(&loaded, &model).map_err(anyhow::Error::msg)?;
             let auth = model::resolve_auth(&model.provider, cli.api_key.clone(), &agent_dir);
             let thinking = parse_thinking(cli)?;
-            let code = tack_app::tui::run_tui(tack_app::tui::TuiOptions {
+            let result = tack_app::tui::run_tui(tack_app::tui::TuiOptions {
                 model,
                 auth,
                 thinking,
@@ -1480,7 +1484,12 @@ async fn run_default(cli: &Cli, flags: tack_app::cli_flags::CliFlags) -> Result<
                 session_dir: cli.session_dir.clone(),
                 flags,
             })
-            .await?;
+            .await;
+            // Reap codebuddy CLI children before exit — `std::process::exit`
+            // runs no destructors and the session registry is a static, so
+            // without this sweep quitting the TUI orphans the CLI process.
+            tack_ai::codebuddy::close_all_sessions().await;
+            let code = result?;
             std::process::exit(code);
         }
         anyhow::bail!("no prompt given; use -p \"task\" or a subcommand (acp)");
@@ -1564,7 +1573,7 @@ async fn run_default(cli: &Cli, flags: tack_app::cli_flags::CliFlags) -> Result<
         }
     }
 
-    let code = print_mode::run_print(print_mode::PrintOptions {
+    let result = print_mode::run_print(print_mode::PrintOptions {
         prompt,
         model,
         auth,
@@ -1576,8 +1585,24 @@ async fn run_default(cli: &Cli, flags: tack_app::cli_flags::CliFlags) -> Result<
         file_images,
         flags,
     })
-    .await?;
+    .await;
+    // Reap codebuddy CLI children before exit (same static-registry /
+    // no-destructors trap as the TUI path above; run_print already closes
+    // its own session on the happy path, this covers early-error exits).
+    tack_ai::codebuddy::close_all_sessions().await;
+    let code = result?;
     std::process::exit(code);
+}
+
+/// Run an agent-loop mode, then close every codebuddy CLI session it
+/// spawned. The provider's session registry is a process-wide static
+/// (never dropped), so without this sweep a mode exit orphans the CLI
+/// child processes (they only die later on their own stdin-EOF/idle
+/// handling, if at all).
+async fn close_codebuddy_after(run: impl std::future::Future<Output = Result<()>>) -> Result<()> {
+    let result = run.await;
+    tack_ai::codebuddy::close_all_sessions().await;
+    result
 }
 
 /// Map the clap CLI onto the shared flag bundle.

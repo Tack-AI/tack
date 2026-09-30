@@ -190,6 +190,38 @@ logs/session files and hangs after the initialize handshake with zero
 log output; copy `~/.codebuddy` somewhere writable and point the env var
 at the copy, auth included).
 
+## Process-lifecycle pitfalls (orphaned CLI on quit, 2026-09-30)
+
+A user report read "Ctrl+C quit the TUI, but a `tack` process is still
+alive". It was NOT a tack process: the leaked CLI's argv carries
+`--allowedTools mcp__tack`, so `ps aux | grep tack` matches it —
+confirm with `ps -p <pid> -o command=` before blaming the binary.
+
+**The CLI child survived every exit path**, three compounding facts:
+
+1. the session registry is a process-wide `static SESSIONS`
+   (`OnceLock<Mutex<HashMap<…>>>`) — Rust never runs `Drop` for statics;
+2. the TUI/print/compact paths exit through `std::process::exit` — no
+   destructors run AT ALL;
+3. so both safeguards were dead code at exit: `CodeBuddySession::drop`
+   (`kill_tree` + `start_kill`) and tokio's `kill_on_drop(true)` (fires
+   only when the `Child` handle is actually dropped). The sole reaper
+   was the 2-hour idle eviction, which runs on the next `get_or_spawn`
+   — inside the same, already-dead process.
+
+The CLI did eventually die on its own (stdin EOF once the pipes closed),
+but "eventually" is not a guarantee. `close_all_sessions()` already
+existed with a "process shutdown" doc comment but was NEVER wired up;
+the fix routes every agent-loop mode exit through it: TUI, print, and
+compact call it before `std::process::exit`, and rpc / acp / mcp-serve /
+eval / serve are wrapped in `close_codebuddy_after(...)` (covered by
+`close_all_sessions_reaps_registered_cli`). Remaining edge: a
+signal-killed `tack serve` (SIGTERM/SIGINT default termination) still
+cannot clean up — that needs signal handlers, not destructors.
+Diagnosis note: the TUI's double-Ctrl+C quit has a quit-grace window
+that cancels the in-flight turn first, so the shutdown sweep does not
+block on a session lock held mid-turn.
+
 ## Looks like a pitfall but isn't
 
 - **The model emits `<tool_info>`/`<tool_result>` markers as text**: the model

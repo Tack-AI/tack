@@ -3874,3 +3874,72 @@ async fn ask_drive(
         }
     }
 }
+
+#[cfg(test)]
+mod shutdown_tests {
+    #![allow(clippy::unwrap_used, unsafe_code)]
+    use super::*;
+
+    fn python3_available() -> bool {
+        std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    fn mock_model() -> Model {
+        Model {
+            provider: PROVIDER_ID.into(),
+            id: "mock-shutdown".into(),
+            name: "Mock Model".into(),
+            api: CODEBUDDY_API.into(),
+            base_url: String::new(),
+            reasoning: true,
+            thinking_level_map: None,
+            input: vec![],
+            cost: crate::ModelCost::default(),
+            context_window: 200_000,
+            max_tokens: 32_768,
+            sampling_params: None,
+            headers: None,
+            compat: None,
+        }
+    }
+
+    /// The session registry is a process-wide static (never dropped) and
+    /// the app exits via `std::process::exit` (no destructors run), so
+    /// `close_all_sessions` is what reaps CLI children on quit: it must
+    /// drain the registry AND kill each child process.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn close_all_sessions_reaps_registered_cli() {
+        if !python3_available() {
+            eprintln!("python3 unavailable; skipping");
+            return;
+        }
+        let fixture = format!(
+            "{}/tests/fixtures/mock_codebuddy.py",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let agent_dir =
+            std::env::temp_dir().join(format!("tack-cb-shutdown-{}", std::process::id()));
+        // SAFETY: no other test in this binary resolves the CLI through
+        // CODEBUDDY_PATH or reads TACK_AGENT_DIR.
+        unsafe {
+            std::env::set_var("CODEBUDDY_PATH", &fixture);
+            std::env::set_var("TACK_AGENT_DIR", &agent_dir);
+        }
+        let key = "shutdown-reap-test";
+        let session = get_or_spawn(key, &mock_model(), None, None).await.unwrap();
+        assert!(sessions().lock().await.contains_key(key));
+        assert!(session.lock().await.child.id().is_some());
+
+        close_all_sessions().await;
+
+        assert!(!sessions().lock().await.contains_key(key));
+        // start_kill already signalled the CLI; wait() must return a
+        // non-success status (SIGKILL on Unix, TerminateProcess on
+        // Windows) rather than hang on a live process.
+        let status = session.lock().await.child.wait().await.unwrap();
+        assert!(!status.success(), "CLI should have been killed: {status}");
+    }
+}

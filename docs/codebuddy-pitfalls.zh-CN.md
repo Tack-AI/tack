@@ -142,6 +142,35 @@ JSONL）。本文记录 Tack codebuddy provider 实际踩过的坑、定位方�
 CLI 静默卡死（它无法写日志/会话文件，initialize 握手之后零日志输出；
 把 `~/.codebuddy` 拷到可写位置（含登录态）再把环境变量指过去）。
 
+## 进程生命周期的坑（退出后 CLI 成为孤儿进程，2026-09-30）
+
+有用户报告："Ctrl+C 退出 TUI 后，还有一个 `tack` 进程没退出"。那其实
+**不是** tack 进程：被泄漏的 CLI 的 argv 里带着 `--allowedTools
+mcp__tack`，所以 `ps aux | grep tack` 会匹配到它 —— 下结论前先用
+`ps -p <pid> -o command=` 确认二进制到底是谁。
+
+**CLI 子进程在所有退出路径上都会幸存**，三个叠加的事实：
+
+1. 会话注册表是进程级 `static SESSIONS`
+   （`OnceLock<Mutex<HashMap<…>>>`）—— Rust 永远不会 drop static；
+2. TUI/print/compact 路径通过 `std::process::exit` 退出 —— 完全不运行
+   任何析构函数；
+3. 于是两道保险在退出时都成了死代码：`CodeBuddySession::drop`
+   （`kill_tree` + `start_kill`）和 tokio 的 `kill_on_drop(true)`（只在
+   `Child` 句柄真正被 drop 时才触发）。唯一的收割者是 2 小时空闲驱逐，
+   而它只会在下一次 `get_or_spawn` 时运行 —— 在同一个已经死掉的进程里。
+
+CLI 最终确实会自己死掉（管道关闭后 stdin EOF），但"最终"不是保证。
+`close_all_sessions()` 早就存在（doc 注释写着 "process shutdown"）却从
+未被接线；修复把每个 agent 循环模式的退出都接上了它：TUI、print、
+compact 在 `std::process::exit` 前调用，rpc / acp / mcp-serve / eval /
+serve 用 `close_codebuddy_after(...)` 包装（测试
+`close_all_sessions_reaps_registered_cli` 覆盖）。剩余边界：被信号打死
+的 `tack serve`（SIGTERM/SIGINT 默认终止）仍然无法清理 —— 那需要信号
+处理器，而不是析构函数。诊断备注：TUI 双击 Ctrl+C 退出有 quit-grace
+窗口，会先取消进行中的 turn，所以关机清扫不会卡在 mid-turn 持有的
+session 锁上。
+
 ## 不坑但像坑
 
 - **模型以文本吐 `<tool_info>`/`<tool_result>` 标记**：这是模型在模仿

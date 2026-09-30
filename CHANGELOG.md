@@ -70,6 +70,16 @@ overflow-compaction retries carry the goal recitation: that retry path
 bypasses `transform_context`, so without the recitation there was no
 trailing user message to deliver and every overflow compaction fell
 into the lossy paste.
+- **CodeBuddy: quitting tack orphans the CLI child process**: the
+  provider's CLI session registry is a process-wide static (never
+  dropped) and the TUI/print/compact paths exit through
+  `std::process::exit` (no destructors run), so `kill_on_drop` and the
+  session `Drop` impl never fired — every quit left a `codebuddy` CLI
+  process behind (visible in `ps` via its `--allowedTools mcp__tack`
+  argv) until its own stdin-EOF/idle handling eventually reaped it. The
+  already-existing `close_all_sessions()` sweep is now wired into every
+  agent-loop mode exit: TUI, print, compact, rpc, acp, mcp-serve, eval
+  and serve.
 
 ## [1.0.7] - 2026-09-30
 
