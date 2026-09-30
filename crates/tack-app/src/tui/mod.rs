@@ -168,6 +168,14 @@ pub enum AppEvent {
     },
     /// A plugin asks the host for a UI dialog / exec (tack-ext bridge).
     ExtUiRequest(crate::extension_host::ExtUiRequest),
+    /// An extension slash-command finished on its spawned task
+    /// (dispatched off the UI loop — awaiting inline would deadlock
+    /// against the plugin's own ExtUiRequest callbacks). Failures
+    /// surface as a notice; success is silent.
+    ExtCommandResult {
+        name: String,
+        result: Result<serde_json::Value, String>,
+    },
     /// v2.1: a plugin pushed a widget state update (full-state snapshot).
     #[cfg(feature = "ext")]
     ExtWidgetUpdate {
@@ -1649,6 +1657,21 @@ impl TuiApp {
                 self.handle_ext_ui_request(request).await;
                 #[cfg(not(feature = "ext"))]
                 let _ = request;
+            }
+            AppEvent::ExtCommandResult { name, result } => {
+                // A successful command speaks through the plugin's own
+                // host calls (ui/notify, widgets, …) — only failures get
+                // a notice.
+                if let Err(error) = result {
+                    self.notice(
+                        crate::i18n::t(
+                            self.lang,
+                            "msg.ext_command_failed",
+                            &[("name", &name), ("error", &error)],
+                        ),
+                        NoticeKind::Error,
+                    );
+                }
             }
             #[cfg(feature = "ext")]
             AppEvent::ExtWidgetUpdate { plugin, update } => {

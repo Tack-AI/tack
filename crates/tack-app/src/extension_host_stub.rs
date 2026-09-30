@@ -105,6 +105,19 @@ pub struct ExtensionManager {
     pub bundle_skill_dirs: Vec<PathBuf>,
 }
 
+/// Owned off-loop command invoker (mirrors the real module). Never
+/// constructed without extensions — `command_invoker` always returns
+/// `None` — so there is nothing to invoke.
+#[derive(Debug)]
+pub struct CommandInvoker;
+
+impl CommandInvoker {
+    /// Unreachable: no plugin can exist to resolve a command to.
+    pub async fn invoke(self, _args: String) -> Result<Value, String> {
+        unreachable!("CommandInvoker cannot be constructed without the ext feature")
+    }
+}
+
 impl std::fmt::Debug for ExtensionManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExtensionManager")
@@ -189,9 +202,15 @@ impl ExtensionManager {
         Arc::new(ExtSinkHandle::default())
     }
 
-    /// Invoke an extension command (run by the TUI command dispatcher).
+    /// Invoke an extension command (tests/headless; TUI uses
+    /// `command_invoker`). Always errors: no extensions exist.
     pub async fn invoke_command(&self, name: &str, _args: &str) -> Result<Value, String> {
         Err(format!("unknown extension command {name:?}"))
+    }
+
+    /// No extensions, so no command ever resolves to an invoker.
+    pub fn command_invoker(&self, _name: &str) -> Option<CommandInvoker> {
+        None
     }
 
     /// Gracefully stop all plugins.

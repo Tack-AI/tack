@@ -1149,6 +1149,36 @@ pub const DEFAULT_EVENTS: &[&str] = &[
 // ExtensionManager
 // ---------------------------------------------------------------------------
 
+/// Owned handle for invoking one extension slash-command off the UI
+/// loop (see [`ExtensionManager::command_invoker`] for why the invoke
+/// must not be awaited inline).
+pub struct CommandInvoker {
+    client: Arc<dyn PluginConnection>,
+    name: String,
+}
+
+impl std::fmt::Debug for CommandInvoker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandInvoker")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl CommandInvoker {
+    /// `commands/invoke` against the owning plugin; the result lands as
+    /// an `AppEvent::ExtCommandResult` on the TUI main loop.
+    pub async fn invoke(self, args: String) -> Result<Value, String> {
+        self.client
+            .command_invoke(&tack_ext::rpc3::CommandInvokeParams {
+                name: self.name,
+                args: Some(args),
+            })
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 pub struct ExtensionManager {
     /// All discovered plugins, including disabled and failed ones.
     pub plugins: Vec<LoadedPlugin>,
@@ -2463,7 +2493,9 @@ impl ExtensionManager {
         self.commands.keys().cloned().collect()
     }
 
-    /// Invoke an extension command (run by the TUI command dispatcher).
+    /// Invoke an extension command. Direct caller-side await — used by
+    /// tests and headless paths where no UI loop pumps plugin→host
+    /// callbacks. The TUI uses [`Self::command_invoker`] instead.
     pub async fn invoke_command(&self, name: &str, args: &str) -> Result<Value, String> {
         let Some(index) = self.commands.get(name) else {
             return Err(format!("unknown extension command {name:?}"));
@@ -2480,6 +2512,21 @@ impl ExtensionManager {
             })
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// Resolve an extension command to an owned invoker for off-loop
+    /// dispatch. The TUI must never await `commands/invoke` inline on
+    /// its event loop: a plugin whose handler calls back into the host
+    /// (ui/notify, ui/select, …) is answered by that very loop, so an
+    /// inline await deadlocks until the 30s request timeout. Cloning
+    /// the connection is cheap (Arc inside).
+    pub fn command_invoker(&self, name: &str) -> Option<CommandInvoker> {
+        let index = *self.commands.get(name)?;
+        let handle = self.plugins.get(index)?.handle.as_ref()?;
+        Some(CommandInvoker {
+            client: handle.client(),
+            name: name.to_string(),
+        })
     }
 
     /// Declarative widgets: spec + current state, keyed `<plugin-id>:<id>`.

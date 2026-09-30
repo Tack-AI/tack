@@ -4,6 +4,19 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [Unreleased]
+
+### Fixed
+
+- **Extension slash-commands no longer freeze the TUI for 30s**: a
+  plugin whose command handler calls back into the host (`ui/notify`,
+  `ui/select`, …) deadlocked against the UI loop — the loop awaited
+  `commands/invoke` inline while the plugin's host request waited for
+  that same loop, so nothing rendered until the 30s request timeout
+  fired and the command reported `request timed out`. The dispatcher
+  now runs the invoke on a spawned task and lands the result as an app
+  event, keeping the loop free to answer plugin callbacks.
+
 ## [1.0.5] - 2026-09-30
 
 ### Added

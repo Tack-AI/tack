@@ -5,7 +5,7 @@
 
 use super::chat::TranscriptItem;
 use super::permission::PermissionMode;
-use super::{ChatEntry, NoticeKind, TuiApp, lock_recover};
+use super::{AppEvent, ChatEntry, NoticeKind, TuiApp, lock_recover};
 
 pub use super::dialogs::{
     Dialog, InputDialog, ModelDialog, ModelEntry, MultiSelectDialog, ScopedModelsDialog,
@@ -258,19 +258,19 @@ impl TuiApp {
             "" => {}
             other => {
                 // Extension commands take precedence over templates (TS order:
-                // builtin → extension → template).
-                if self.extensions.command_names().contains(&other.to_string()) {
-                    match self.extensions.invoke_command(other, args).await {
-                        Ok(_) => {}
-                        Err(e) => self.notice(
-                            crate::i18n::t(
-                                self.lang,
-                                "msg.ext_command_failed",
-                                &[("name", other), ("error", &e.to_string())],
-                            ),
-                            NoticeKind::Error,
-                        ),
-                    }
+                // builtin → extension → template). The invoke runs on a
+                // spawned task, never inline on the UI loop: a plugin whose
+                // handler calls back into the host (ui/notify, ui/select, …)
+                // is answered by this very loop, so an inline await
+                // deadlocks until the 30s request timeout.
+                if let Some(invoker) = self.extensions.command_invoker(other) {
+                    let tx = self.event_tx.clone();
+                    let name = other.to_string();
+                    let args = args.to_string();
+                    crate::task::spawn_guarded("ext-command", async move {
+                        let result = invoker.invoke(args).await;
+                        let _ = tx.send(AppEvent::ExtCommandResult { name, result });
+                    });
                     return;
                 }
                 // Prompt templates as commands (/<name> args).
