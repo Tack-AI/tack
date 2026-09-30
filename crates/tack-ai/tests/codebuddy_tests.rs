@@ -714,18 +714,61 @@ async fn codebuddy_jsonl_rebuild_on_divergence() {
         result_with_timeout(provider.stream(&model, &context, options("cb-e2e-jsonl"))).await;
     assert_eq!(msg1.stop_reason, tack_ai::StopReason::Stop);
 
-    // Turn 2 with EDITED history → fingerprint mismatch → native rebuild:
-    // JSONL written with the settled prefix [u1, a1'], respawn --resume,
-    // then the unresolved tail ("again") is delivered to the resumed CLI.
+    // Turn 2 with EDITED history → fingerprint mismatch → native rebuild.
+    // The edited history carries a SETTLED tool turn: the rebuilt JSONL
+    // must project it to native function_call/function_call_result records
+    // (the lossy text-marker projection made post-compaction models stop
+    // instead of calling tools — see codebuddy_jsonl module docs).
+    let tool_assistant = tack_ai::AssistantMessage {
+        content: vec![
+            tack_ai::ContentBlock::Thinking {
+                thinking: "check things".into(),
+                thinking_signature: None,
+                redacted: None,
+            },
+            tack_ai::ContentBlock::ToolCall {
+                id: "call-1".into(),
+                name: "echo".into(),
+                arguments: json!({"text": "hi"}),
+                thought_signature: None,
+                namespace: None,
+            },
+        ],
+        api: CODEBUDDY_API.into(),
+        provider: "codebuddy".into(),
+        model: model.id.clone(),
+        response_model: None,
+        response_id: None,
+        provider_thinking_level: None,
+        diagnostics: None,
+        usage: tack_ai::Usage::zero(),
+        stop_reason: tack_ai::StopReason::ToolUse,
+        deferred: None,
+        error_message: None,
+        raw_stop_reason: None,
+        end_turn: None,
+        timestamp: 1,
+    };
+    let tool_result = tack_ai::ToolResultMessage {
+        tool_call_id: "call-1".into(),
+        tool_name: "echo".into(),
+        content: vec![tack_ai::InputContentBlock::text("hi")],
+        details: None,
+        usage: None,
+        is_error: false,
+        timestamp: 2,
+    };
     let mut edited = msg1.clone();
     edited.content = vec![tack_ai::ContentBlock::text("echo: EDITED")];
+    let settled_prefix = vec![
+        Message::user("say hi"),
+        Message::Assistant(tool_assistant),
+        Message::ToolResult(tool_result),
+        Message::Assistant(edited.clone()),
+    ];
     let context = Context {
         system_prompt: None,
-        messages: vec![
-            Message::user("say hi"),
-            Message::Assistant(edited.clone()),
-            Message::user("again"),
-        ],
+        messages: [settled_prefix.clone(), vec![Message::user("again")]].concat(),
         tools: vec![],
     };
     let stream = provider.stream(&model, &context, options("cb-e2e-jsonl"));
@@ -742,7 +785,8 @@ async fn codebuddy_jsonl_rebuild_on_divergence() {
         requests.contains("RESUME mock-session-mock-jsonl OK"),
         "{requests}"
     );
-    // The session file holds the settled prefix (2 records, chained).
+    // The session file holds the settled prefix with the tool turn as
+    // NATIVE records (reasoning → function_call → function_call_result).
     // (project hash = cwd with [/\\:] → '-', dashes collapsed — the mock
     // computes the same; cargo test's cwd is the crate root.)
     let cwd = std::env::current_dir()
@@ -779,10 +823,23 @@ async fn codebuddy_jsonl_rebuild_on_divergence() {
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
-    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines.len(), 5, "{lines:?}");
     assert_eq!(lines[0]["role"], "user");
-    assert_eq!(lines[1]["role"], "assistant");
-    assert_eq!(lines[1]["content"][0]["text"], "echo: EDITED");
+    assert_eq!(lines[1]["type"], "reasoning");
+    assert_eq!(lines[2]["type"], "function_call");
+    assert_eq!(lines[2]["callId"], "call-1");
+    assert_eq!(lines[2]["name"], "mcp__tack__echo");
+    assert_eq!(lines[3]["type"], "function_call_result");
+    assert_eq!(lines[3]["callId"], "call-1");
+    assert_eq!(lines[3]["status"], "completed");
+    assert!(
+        lines[3]["output"]["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("hi")),
+        "{lines:?}"
+    );
+    assert_eq!(lines[4]["role"], "assistant");
+    assert_eq!(lines[4]["content"][0]["text"], "echo: EDITED");
     for line in &lines {
         assert_eq!(line["sessionId"], "mock-session-mock-jsonl");
     }
@@ -791,13 +848,15 @@ async fn codebuddy_jsonl_rebuild_on_divergence() {
     // rebuild, no third spawn.
     let context = Context {
         system_prompt: None,
-        messages: vec![
-            Message::user("say hi"),
-            Message::Assistant(edited),
-            Message::user("again"),
-            Message::Assistant(msg2.clone()),
-            Message::user("once more"),
-        ],
+        messages: [
+            settled_prefix,
+            vec![
+                Message::user("again"),
+                Message::Assistant(msg2.clone()),
+                Message::user("once more"),
+            ],
+        ]
+        .concat(),
         tools: vec![],
     };
     let stream = provider.stream(&model, &context, options("cb-e2e-jsonl"));
@@ -1183,4 +1242,107 @@ async fn codebuddy_stream_text_and_tool_bridge() {
         "{requests}"
     );
     assert!(requests.contains("MCP-SEND tools/call"), "{requests}");
+}
+
+/// Transcript-replay fallback hygiene. A diverged context that ENDS with
+/// an assistant message leaves no user tail for the native JSONL rebuild
+/// to deliver, so the provider falls back to the flattened paste. That
+/// paste must NOT carry thinking blocks verbatim — they became the
+/// strongest echo source in the model's own context (observed live: one
+/// 810-char reasoning block + its text re-emitted byte-identically three
+/// times after compactions, re-running the same reads each time).
+#[cfg_attr(
+    windows,
+    ignore = "multi-turn mock e2e hangs on Windows CI; Windows spawn path covered by spawn_cli_runs_cmd_shim"
+)]
+#[tokio::test(flavor = "multi_thread")]
+async fn codebuddy_transcript_replay_omits_thinking() {
+    if !python3_or_skip() {
+        return;
+    }
+    let (_serial, env) = serial_mock_env().await;
+    let argv_dir = &env.argv_dir;
+    let provider: Arc<dyn Provider> = Arc::new(tack_ai::codebuddy::CodeBuddyStreamProvider);
+    let model = model_with_id("mock-replay");
+
+    // Turn 1: establish the session.
+    let context = Context {
+        system_prompt: None,
+        messages: vec![Message::user("say hi")],
+        tools: vec![],
+    };
+    let msg1 =
+        result_with_timeout(provider.stream(&model, &context, options("cb-e2e-replay"))).await;
+    assert_eq!(msg1.stop_reason, tack_ai::StopReason::Stop);
+
+    // Turn 2: diverged history that ends with an assistant message — no
+    // deliverable user tail → transcript replay. The assistant carries a
+    // thinking block with a unique marker string.
+    let assistant = tack_ai::AssistantMessage {
+        content: vec![
+            tack_ai::ContentBlock::Thinking {
+                thinking: "MY SECRET PLAN 7f3a9c".into(),
+                thinking_signature: None,
+                redacted: None,
+            },
+            tack_ai::ContentBlock::text("visible answer"),
+        ],
+        api: CODEBUDDY_API.into(),
+        provider: "codebuddy".into(),
+        model: model.id.clone(),
+        response_model: None,
+        response_id: None,
+        provider_thinking_level: None,
+        diagnostics: None,
+        usage: tack_ai::Usage::zero(),
+        stop_reason: tack_ai::StopReason::Stop,
+        deferred: None,
+        error_message: None,
+        raw_stop_reason: None,
+        end_turn: None,
+        timestamp: 1,
+    };
+    let context = Context {
+        system_prompt: None,
+        messages: vec![
+            Message::user("different question"),
+            Message::Assistant(assistant),
+        ],
+        tools: vec![],
+    };
+    let msg2 =
+        result_with_timeout(provider.stream(&model, &context, options("cb-e2e-replay"))).await;
+    assert_eq!(msg2.stop_reason, tack_ai::StopReason::Stop);
+
+    // The mock echoes every user message back as "echo: <text>", so the
+    // reply IS the paste the provider delivered.
+    let tack_ai::ContentBlock::Text { text, .. } = &msg2.content[0] else {
+        panic!("expected text, got {:?}", msg2.content)
+    };
+    assert!(
+        text.contains("conversation history replayed after a context change"),
+        "replay marker missing: {text}"
+    );
+    assert!(
+        text.contains("ALREADY HAPPENED"),
+        "anti-echo instruction missing: {text}"
+    );
+    assert!(text.contains("different question"), "{text}");
+    assert!(
+        text.contains("visible answer"),
+        "assistant text must survive the paste: {text}"
+    );
+    assert!(
+        !text.contains("MY SECRET PLAN 7f3a9c"),
+        "thinking block must not be pasted verbatim: {text}"
+    );
+
+    // Fresh spawn for the replay — no --resume against a session file.
+    let requests = std::fs::read_to_string(argv_dir.join("requests-mock-replay.log")).unwrap();
+    assert_eq!(
+        requests.lines().filter(|l| l.starts_with("SPAWN")).count(),
+        2,
+        "initial spawn + transcript-respawn spawn only: {requests}"
+    );
+    assert!(!requests.contains("RESUME"), "{requests}");
 }

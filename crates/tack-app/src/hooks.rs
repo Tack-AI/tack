@@ -745,7 +745,20 @@ impl AgentHooks for SessionHooks {
         }
         let _in_flight = CompactionInFlight::try_acquire(&self.session)?;
         self.run_pre_compact_hooks().await;
-        self.run_compaction().await
+        let mut rebuilt = self.run_compaction().await?;
+        // The agent loop retries the turn with this context DIRECTLY — no
+        // second transform_context pass — so the goal recitation must be
+        // appended here or the retry loses it. Besides focus, the trailing
+        // user message doubles as the deliverable resume input for
+        // provider-side session rebuilds (codebuddy native JSONL): without
+        // it they fall back to the lossy flattened transcript replay.
+        if self.settings.goal_recitation
+            && let Some(summary) = last_compaction_summary(&rebuilt)
+            && let Some(recitation) = tack_session::goal_recitation_message(summary)
+        {
+            rebuilt.push(recitation);
+        }
+        Some(rebuilt)
     }
 }
 

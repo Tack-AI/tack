@@ -62,7 +62,7 @@ pub const PROVIDER_ID: &str = "codebuddy";
 /// SDK MCP servers under whatever name the client sends — verified generic in
 /// codebuddy-code 2.156.0 (`registerSdkMcpServers`/`applySdkMcpServers` and
 /// the `mcp__${name}__` tool matcher carry no `pi` special-casing).
-const MCP_SERVER_NAME: &str = "tack";
+pub(crate) const MCP_SERVER_NAME: &str = "tack";
 
 /// Windows command-line limits make argv a dangerous channel for tack's
 /// assembled system prompt: CreateProcessW caps the command line at 32767
@@ -2899,7 +2899,7 @@ impl CodeBuddySession {
         if rotate {
             tracing::debug!("codebuddy: rotating to fresh session id (post-abort)");
         }
-        let fresh = CodeBuddySession::rebuild_native(
+        let mut fresh = CodeBuddySession::rebuild_native(
             &self.key.clone(),
             &self.model_id.clone(),
             self.system_prompt.as_deref(),
@@ -2909,6 +2909,12 @@ impl CodeBuddySession {
             context,
         )
         .await?;
+        // spawn_new starts with an EMPTY tool list; without carrying the
+        // current tools over, the resumed CLI's tools/list is answered with
+        // [] for the rest of this turn — the model then "has no tools":
+        // refusals ("the bash tool isn't available") or reasoning loops
+        // (observed against the real CLI, 95+ empty responses).
+        fresh.tools = self.tools.clone();
         kill_tree(&self.child);
         let _ = self.child.kill().await;
         *self = fresh;
@@ -2944,21 +2950,26 @@ impl CodeBuddySession {
             (None, false) => read_cb_session_id(key).unwrap_or_else(jsonl::new_uuid),
             (_, true) => jsonl::new_uuid(),
         };
-        // Rebuild history up to the last assistant message; the trailing
-        // unresolved turn is delivered NATIVELY by sync after the resume
-        // (reference: resume session + fresh prompt). Tool results in the
-        // tail can't be delivered — a fresh CLI has no parked calls for
-        // them — and an empty tail would leave the CLI with nothing to
-        // answer; both go down the transcript fallback.
+        // Rebuild history up to the start of the trailing user/system
+        // run; that tail is delivered NATIVELY by sync after the resume
+        // (reference: resume session + fresh prompt). Settled tool turns —
+        // including tool results after the last assistant message — ride
+        // the rebuilt prefix now that they project to native
+        // function_call/function_call_result records (previously a tool
+        // result in the tail forced the transcript fallback).
         let split = context
             .messages
             .iter()
-            .rposition(|m| matches!(m, Message::Assistant(_)))
+            .rposition(|m| matches!(m, Message::Assistant(_) | Message::ToolResult(_)))
             .map(|i| i + 1)
             .unwrap_or(0);
         let tail = &context.messages[split..];
-        if tail.is_empty() || tail.iter().any(|m| matches!(m, Message::ToolResult(_))) {
-            return Err("unresolved tail is not a plain user turn; transcript fallback".into());
+        // The tail is user/system-only by construction; sync delivers
+        // user messages and SKIPS system ones, so a tail with no user
+        // message (empty, or system-only) would resume the CLI with
+        // nothing to answer — transcript fallback instead.
+        if !tail.iter().any(|m| matches!(m, Message::User(_))) {
+            return Err("no user tail to deliver; transcript fallback".into());
         }
         let records = jsonl::pi_to_cb_records(&context.messages[..split]);
         // No settled prefix (e.g. compaction folded every assistant reply
@@ -3006,7 +3017,7 @@ impl CodeBuddySession {
         let _ = self.child.kill().await;
         let effort = self.effort.clone();
         let key = self.key.clone();
-        let fresh = CodeBuddySession::spawn_new(
+        let mut fresh = CodeBuddySession::spawn_new(
             &key,
             &self.model_id.clone(),
             self.system_prompt.as_deref(),
@@ -3014,9 +3025,20 @@ impl CodeBuddySession {
             None,
         )
         .await?;
+        // Same tools carry-over as respawn_native (see there).
+        fresh.tools = self.tools.clone();
         *self = fresh;
+        // Anti-echo marker: the flattened paste puts the model's own prior
+        // words back into its context as PLAIN TEXT, and reasoning models
+        // strongly echo salient in-context text — observed live: one
+        // 810-char reasoning block + its text were re-emitted
+        // byte-identically three times after compactions (each echo also
+        // re-ran the same reads). Spell out that the history is final.
         let mut transcript = String::from(
-            "[conversation history replayed after a context change; continue from here]\n\n",
+            "[conversation history replayed after a context change. Everything below has \
+             ALREADY HAPPENED and is final: do not repeat or paraphrase these messages, \
+             do not re-answer earlier user turns, and do not re-run tool calls that \
+             already have results below. Continue from the end with NEW work.]\n\n",
         );
         // A deferred system prompt (Windows argv limits) rides the replay.
         if let Some(prompt) = self.pending_system_prompt.take() {
@@ -3032,24 +3054,32 @@ impl CodeBuddySession {
                     transcript.push_str("\n\n");
                 }
                 Message::Assistant(assistant) => {
-                    transcript.push_str("## Assistant\n");
+                    let mut section = String::new();
                     for block in &assistant.content {
                         match block {
-                            ContentBlock::Text { text, .. } => transcript.push_str(text),
-                            ContentBlock::Thinking { thinking, .. } => {
-                                transcript.push_str(thinking)
-                            }
+                            ContentBlock::Text { text, .. } => section.push_str(text),
+                            // Thinking is scratchpad: pasted verbatim it
+                            // became the strongest echo source in the
+                            // replay (see the marker above). The summary,
+                            // text, and tool markers carry the state.
+                            ContentBlock::Thinking { .. } => {}
                             ContentBlock::ToolCall {
                                 name, arguments, ..
                             } => {
-                                transcript.push_str(&format!(
+                                section.push_str(&format!(
                                     "\n[called tool {name} with {arguments}]\n"
                                 ));
                             }
                             _ => {}
                         }
                     }
-                    transcript.push_str("\n\n");
+                    // A thinking-only assistant message (aborted before
+                    // any visible output) leaves no section at all.
+                    if !section.trim().is_empty() {
+                        transcript.push_str("## Assistant\n");
+                        transcript.push_str(&section);
+                        transcript.push_str("\n\n");
+                    }
                 }
                 Message::ToolResult(result) => {
                     transcript.push_str("## Tool result\n");

@@ -8,6 +8,31 @@ notice can parse entries (same convention as TS pi).
 
 ### Fixed
 
+- **CodeBuddy post-compaction turns stall out — early stop, "tool isn't
+  available" refusals, or reasoning loops**: three compounding defects in
+  the JSONL session rebuild that runs on context divergence (compaction,
+  history edit):
+  1. the rebuilt CLI session lost its tool list — `spawn_new` starts with
+     an empty list, so the resumed CLI's `tools/list` was answered with
+     `[]` for the whole post-respawn turn. The model then refused ("the
+     bash tool isn't available to me right now") or spun in reasoning
+     loops (observed 95+ empty responses against the real CLI). The
+     current tools now ride the respawn;
+  2. the projection flattened every tool call/result into `[tool:name]` /
+     `[tool_result:id]` text markers, so the resumed history contained
+     zero real tool structure and the model mimicked the markers as
+     literal text and ended its turn (the "stuck after Compacted context"
+     report). Settled tool turns now project to the CLI's NATIVE
+     `reasoning` / `function_call` / `function_call_result` records with
+     the same `messageId`/`conversationRequestId` linkage the CLI writes
+     itself — verified against the real CLI to keep calling tools after a
+     compaction-shaped rebuild (new `cb_rebuild_repro` example). Only
+     dangling calls (no result in the rebuilt slice) and orphan results
+     still degrade to text markers, since a resumed CLI must not see
+     calls it would park on;
+  3. a settled tool result trailing the last assistant message forced the
+     whole rebuild down the lossy transcript-replay fallback; such tails
+     now ride the rebuilt prefix natively.
 - **CodeBuddy `codebuddy CLI idle: no events for 5 minutes` on parallel
   tool calls**: the CLI's `stream_event` channel can drop a parallel
   tool_use block entirely (observed on CLI 2.156.0 with hy4-preview-f:
@@ -20,6 +45,21 @@ notice can parse entries (same convention as TS pi).
   as a fresh parked call — complete name + arguments ride the frame;
   only the model's tool_use id is synthesized — so every dispatched
   frame gets its result and the turn continues natively.
+- **CodeBuddy: the model repeats an earlier thought verbatim after a
+compaction** — the same reasoning block + text re-emitted
+byte-identically (observed 3×), re-running the same file reads each
+time. The transcript-replay fallback (taken when a native session
+rebuild has no deliverable user tail) pasted THINKING blocks into the
+flattened history verbatim, and reasoning models strongly echo their
+own reasoning when it reappears as plain in-context text; each echo
+then landed in the next compaction's retained tail and reinforced
+itself. Thinking is no longer pasted (the summary, text, and tool
+markers carry the state), the replay marker now spells out that the
+history is final and must not be repeated, re-answered, or re-run, and
+overflow-compaction retries carry the goal recitation: that retry path
+bypasses `transform_context`, so without the recitation there was no
+trailing user message to deliver and every overflow compaction fell
+into the lossy paste.
 
 ## [1.0.7] - 2026-09-30
 

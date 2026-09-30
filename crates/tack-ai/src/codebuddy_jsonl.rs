@@ -14,13 +14,25 @@
 //! {"id":"…","timestamp":1730000000000,"type":"message","role":"user",
 //!  "content":[{"type":"input_text","text":"…"}],
 //!  "providerData":{"agent":"sdk"},"sessionId":"…","cwd":"…"}
-//! {"id":"…","parentId":"…","timestamp":…,"type":"message","role":"assistant",
-//!  "status":"completed","content":[{"type":"output_text","text":"…"}],…}
+//! {"id":"…","parentId":"…","timestamp":…,"type":"function_call",
+//!  "callId":"…","name":"mcp__tack__bash","arguments":"{…}",…}
+//! {"id":"…","parentId":"…","timestamp":…,"type":"function_call_result",
+//!  "callId":"…","name":"mcp__tack__bash","status":"completed",
+//!  "output":{"type":"text","text":"[{…}]"},…}
 //! ```
 //!
-//! The projection is deliberately lossy (reference: piToCbMessages) — the
-//! JSONL record types carry text only; tool calls/results become inline
-//! markers (`[tool:name]`, `[tool_result:id]`), images `[image]`.
+//! The projection keeps the NATIVE record types the CLI writes itself
+//! (`reasoning` / `function_call` / `function_call_result`) — a deliberate
+//! deviation from the reference plugin's lossy piToCbMessages (text markers
+//! `[tool:name]` / `[tool_result:id]`). The lossy form degrades the model
+//! after a compaction-triggered rebuild: with zero function_call records in
+//! the resumed history the model mimics the text markers and ends its turn
+//! instead of calling tools (observed 2026-09-30 on kimi-k2.8-preview: the
+//! post-compaction reply was the literal text "[thinking]\n…" with
+//! finish_reason=stop — the turn ended and the session looked hung). Only
+//! UNANSWERED calls (no matching result in the rebuilt prefix) and orphan
+//! results still degrade to text markers: a resumed CLI must not see calls
+//! it would park on, and a result record without its call is invalid.
 
 use std::path::{Path, PathBuf};
 
@@ -100,10 +112,93 @@ pub(crate) fn new_uuid() -> String {
     )
 }
 
-/// Lossy text projection of pi messages into JSONL records
-/// (reference: piToCbMessages). Each entry is (role, text).
-pub(crate) fn pi_to_cb_records(messages: &[Message]) -> Vec<(String, String)> {
-    let mut out = Vec::new();
+/// One record in the rebuilt session JSONL (see module docs for why tool
+/// turns project to native records instead of text markers).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CbRecord {
+    /// `message` record (user → input_text; assistant → output_text +
+    /// status completed). Assistant records carry the turn's `message_id`
+    /// for providerData linkage (see below).
+    Message {
+        role: &'static str,
+        text: String,
+        message_id: Option<String>,
+    },
+    /// `reasoning` record for a thinking block.
+    Reasoning { text: String, message_id: String },
+    /// `function_call` record; `arguments` is the serialized JSON object
+    /// string (CodeBuddy stores it stringified). `reasoning` duplicates the
+    /// turn's thinking text, as the CLI's own records do.
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+        reasoning: Option<String>,
+        message_id: String,
+    },
+    /// `function_call_result` record; `output_text` is the JSON-stringified
+    /// MCP content-block array the CLI's own records carry.
+    FunctionCallResult {
+        call_id: String,
+        name: String,
+        output_text: String,
+        message_id: String,
+    },
+}
+
+/// API-side message id format (`01a0f265e42b7276ba769e8b12123374` — a uuid
+/// without dashes). All records of one assistant turn (reasoning, message,
+/// calls, results) share it; the replay groups turns by it. Unlinked
+/// records confuse the grouping and can send the model into a reasoning
+/// loop (observed with the real CLI: 95+ reasoning-only responses).
+fn new_message_id() -> String {
+    new_uuid().replace('-', "")
+}
+
+/// MCP-qualify a bare tack tool name the way the CLI sees it
+/// (`mcp__tack__bash`).
+fn mcp_tool_name(name: &str) -> String {
+    format!("mcp__{}__{name}", crate::codebuddy::MCP_SERVER_NAME)
+}
+
+/// JSON-stringified MCP content-block array for a function_call_result's
+/// `output.text` (real CLI records stringify `[{"type":"text",…}]`).
+fn mcp_output_text(content: &[InputContentBlock]) -> String {
+    let blocks: Vec<Value> = content
+        .iter()
+        .map(|b| match b {
+            InputContentBlock::Text { text, .. } => json!({"type":"text","text":text}),
+            InputContentBlock::Image { data, mime_type } => {
+                json!({"type":"image","data":data,"mimeType":mime_type})
+            }
+        })
+        .collect();
+    if blocks.is_empty() {
+        return json!([{"type":"text","text":""}]).to_string();
+    }
+    Value::Array(blocks).to_string()
+}
+
+/// Project pi messages into JSONL records. Settled tool turns (every call
+/// has its result inside `messages`) become native
+/// reasoning/function_call/function_call_result records in the CLI's own
+/// ordering (reasoning → assistant text → calls); dangling calls and
+/// orphan results degrade to the reference text markers.
+pub(crate) fn pi_to_cb_records(messages: &[Message]) -> Vec<CbRecord> {
+    use std::collections::{HashMap, HashSet};
+    let answered: HashSet<&str> = messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::ToolResult(r) => Some(r.tool_call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    // call_id → (M-qualified name, turn message_id) of every call record
+    // emitted so far — pairs a result with its call; results for calls we
+    // never emitted (or never saw) degrade to text markers.
+    let mut emitted: HashMap<String, (String, String)> = HashMap::new();
+
+    let mut out: Vec<CbRecord> = Vec::new();
     for message in messages {
         match message {
             Message::User(user) => {
@@ -118,28 +213,100 @@ pub(crate) fn pi_to_cb_records(messages: &[Message]) -> Vec<(String, String)> {
                         .collect::<Vec<_>>()
                         .join("\n"),
                 };
-                out.push(("user".to_string(), text));
+                out.push(CbRecord::Message {
+                    role: "user",
+                    text,
+                    message_id: None,
+                });
             }
             Message::Assistant(assistant) => {
-                let text = assistant
-                    .content
-                    .iter()
-                    .map(|b| match b {
-                        ContentBlock::Text { text, .. } => text.clone(),
-                        ContentBlock::ToolCall { name, .. } => format!("[tool:{name}]"),
-                        ContentBlock::Thinking { .. } => "[thinking]".to_string(),
-                        ContentBlock::Image { .. } => "[image]".to_string(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                out.push(("assistant".to_string(), text));
+                let message_id = new_message_id();
+                let mut thinking_parts: Vec<String> = Vec::new();
+                let mut text_parts: Vec<String> = Vec::new();
+                let mut calls: Vec<CbRecord> = Vec::new();
+                for block in &assistant.content {
+                    match block {
+                        ContentBlock::Thinking { thinking, .. } => {
+                            if !thinking.is_empty() {
+                                thinking_parts.push(thinking.clone());
+                            }
+                        }
+                        ContentBlock::Text { text, .. } => text_parts.push(text.clone()),
+                        ContentBlock::Image { .. } => text_parts.push("[image]".to_string()),
+                        ContentBlock::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                            ..
+                        } => {
+                            if answered.contains(id.as_str()) {
+                                let qualified = mcp_tool_name(name);
+                                emitted.insert(id.clone(), (qualified.clone(), message_id.clone()));
+                                calls.push(CbRecord::FunctionCall {
+                                    call_id: id.clone(),
+                                    name: qualified,
+                                    arguments: if arguments.is_object() {
+                                        arguments.to_string()
+                                    } else {
+                                        "{}".to_string()
+                                    },
+                                    reasoning: None, // filled in below
+                                    message_id: message_id.clone(),
+                                });
+                            } else {
+                                // Dangling call (its result was cut or the
+                                // turn was interrupted): a native record
+                                // would leave the resumed CLI waiting on a
+                                // result that never comes — text marker.
+                                text_parts.push(format!("[tool:{name}]"));
+                            }
+                        }
+                    }
+                }
+                // Real CLI ordering per turn: reasoning → assistant text →
+                // calls; the reasoning text is duplicated onto each call's
+                // providerData.reasoning.
+                let thinking_text = thinking_parts.join("\n\n");
+                if !thinking_text.is_empty() {
+                    out.push(CbRecord::Reasoning {
+                        text: thinking_text.clone(),
+                        message_id: message_id.clone(),
+                    });
+                }
+                let reasoning = (!thinking_text.is_empty()).then_some(thinking_text);
+                for call in &mut calls {
+                    if let CbRecord::FunctionCall {
+                        reasoning: slot, ..
+                    } = call
+                    {
+                        *slot = reasoning.clone();
+                    }
+                }
+                let text = text_parts.join("\n");
+                if !text.is_empty() {
+                    out.push(CbRecord::Message {
+                        role: "assistant",
+                        text,
+                        message_id: Some(message_id),
+                    });
+                }
+                out.append(&mut calls);
             }
-            // Tool results become user records with an inline marker.
             Message::ToolResult(result) => {
-                out.push((
-                    "user".to_string(),
-                    format!("[tool_result:{}]", result.tool_call_id),
-                ));
+                if let Some((name, message_id)) = emitted.get(&result.tool_call_id) {
+                    out.push(CbRecord::FunctionCallResult {
+                        call_id: result.tool_call_id.clone(),
+                        name: name.clone(),
+                        output_text: mcp_output_text(&result.content),
+                        message_id: message_id.clone(),
+                    });
+                } else {
+                    out.push(CbRecord::Message {
+                        role: "user",
+                        text: format!("[tool_result:{}]", result.tool_call_id),
+                        message_id: None,
+                    });
+                }
             }
             // System messages become user records with an inline marker
             // (codebuddy has no system role in this record format).
@@ -153,13 +320,14 @@ pub(crate) fn pi_to_cb_records(messages: &[Message]) -> Vec<(String, String)> {
                             InputContentBlock::Image { .. } => None,
                         })
                         .collect::<Vec<_>>()
-                        .join(
-                            "
-",
-                        ),
+                        .join("\n"),
                 };
                 if !text.is_empty() {
-                    out.push(("user".to_string(), format!("[system]{text}")));
+                    out.push(CbRecord::Message {
+                        role: "user",
+                        text: format!("[system]{text}"),
+                        message_id: None,
+                    });
                 }
             }
         }
@@ -172,7 +340,7 @@ pub(crate) fn pi_to_cb_records(messages: &[Message]) -> Vec<(String, String)> {
 pub(crate) fn write_session_jsonl(
     session_id: &str,
     cwd: &str,
-    records: &[(String, String)],
+    records: &[CbRecord],
 ) -> Result<PathBuf, String> {
     write_session_jsonl_in(&codebuddy_dir(), session_id, cwd, records)
 }
@@ -182,7 +350,7 @@ fn write_session_jsonl_in(
     base: &Path,
     session_id: &str,
     cwd: &str,
-    records: &[(String, String)],
+    records: &[CbRecord],
 ) -> Result<PathBuf, String> {
     let path = session_jsonl_path_in(base, session_id, cwd);
     if let Some(dir) = path.parent() {
@@ -194,27 +362,84 @@ fn write_session_jsonl_in(
         .unwrap_or(0);
     let mut lines: Vec<String> = Vec::with_capacity(records.len());
     let mut parent_id: Option<String> = None;
-    for (role, text) in records {
+    // Session-wide request id (real CLI files share one across all turns).
+    let conversation_request_id = new_message_id();
+    for record in records {
         let id = new_uuid();
-        let mut record = json!({
+        let mut json = json!({
             "id": id,
             "timestamp": timestamp,
-            "type": "message",
-            "role": role,
-            "providerData": { "agent": "sdk" },
             "sessionId": session_id,
             "cwd": cwd,
         });
         if let Some(parent) = &parent_id {
-            record["parentId"] = json!(parent);
+            json["parentId"] = json!(parent);
         }
-        if role == "assistant" {
-            record["status"] = json!("completed");
-            record["content"] = json!([{ "type": "output_text", "text": text }]);
-        } else {
-            record["content"] = json!([{ "type": "input_text", "text": text }]);
+        // providerData mirrors the CLI's own linkage: every record carries
+        // conversationRequestId; all records of one assistant turn share
+        // messageId (real files also carry model/traceId — unknown at
+        // rebuild time, and the resume tolerated their absence).
+        let mut provider_data = json!({
+            "agent": "sdk",
+            "conversationRequestId": conversation_request_id,
+        });
+        match record {
+            CbRecord::Message {
+                role,
+                text,
+                message_id,
+            } => {
+                json["type"] = json!("message");
+                json["role"] = json!(role);
+                if *role == "assistant" {
+                    json["status"] = json!("completed");
+                    json["content"] = json!([{ "type": "output_text", "text": text }]);
+                } else {
+                    json["content"] = json!([{ "type": "input_text", "text": text }]);
+                    provider_data["startsNewUserRequest"] = json!(true);
+                }
+                if let Some(message_id) = message_id {
+                    provider_data["messageId"] = json!(message_id);
+                }
+            }
+            CbRecord::Reasoning { text, message_id } => {
+                json["type"] = json!("reasoning");
+                json["content"] = json!([]);
+                json["rawContent"] = json!([{ "type": "reasoning_text", "text": text }]);
+                provider_data["messageId"] = json!(message_id);
+            }
+            CbRecord::FunctionCall {
+                call_id,
+                name,
+                arguments,
+                reasoning,
+                message_id,
+            } => {
+                json["type"] = json!("function_call");
+                json["callId"] = json!(call_id);
+                json["name"] = json!(name);
+                json["arguments"] = json!(arguments);
+                provider_data["messageId"] = json!(message_id);
+                if let Some(reasoning) = reasoning {
+                    provider_data["reasoning"] = json!(reasoning);
+                }
+            }
+            CbRecord::FunctionCallResult {
+                call_id,
+                name,
+                output_text,
+                message_id,
+            } => {
+                json["type"] = json!("function_call_result");
+                json["name"] = json!(name);
+                json["callId"] = json!(call_id);
+                json["status"] = json!("completed");
+                json["output"] = json!({ "type": "text", "text": output_text });
+                provider_data["messageId"] = json!(message_id);
+            }
         }
-        lines.push(record.to_string());
+        json["providerData"] = provider_data;
+        lines.push(json.to_string());
         parent_id = Some(id);
     }
     let mut body = lines.join("\n");
@@ -329,20 +554,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn records_project_lossy_text() {
+    /// Assistant/ToolResult builder shared by the projection tests.
+    fn tool_turn(call_id: &str, thinking: &str) -> (AssistantMessage, ToolResultMessage) {
         let assistant = AssistantMessage {
             content: vec![
                 ContentBlock::text("hello"),
                 ContentBlock::Thinking {
-                    thinking: "hmm".into(),
+                    thinking: thinking.into(),
                     thinking_signature: None,
                     redacted: None,
                 },
                 ContentBlock::ToolCall {
-                    id: "t1".into(),
+                    id: call_id.into(),
                     name: "bash".into(),
-                    arguments: json!({}),
+                    arguments: json!({"command": "ls"}),
                     thought_signature: None,
                     namespace: None,
                 },
@@ -363,7 +588,7 @@ mod tests {
             timestamp: 0,
         };
         let result = ToolResultMessage {
-            tool_call_id: "t1".into(),
+            tool_call_id: call_id.into(),
             tool_name: "bash".into(),
             content: vec![InputContentBlock::text("ok")],
             details: None,
@@ -371,18 +596,123 @@ mod tests {
             is_error: false,
             timestamp: 0,
         };
+        (assistant, result)
+    }
+
+    #[test]
+    fn settled_tool_turn_projects_native_records() {
+        let (assistant, result) = tool_turn("t1", "hmm");
         let records = pi_to_cb_records(&[
             Message::user("hi"),
             Message::Assistant(assistant),
             Message::ToolResult(result),
         ]);
-        assert_eq!(records.len(), 3);
-        assert_eq!(records[0], ("user".to_string(), "hi".to_string()));
-        assert_eq!(records[1].0, "assistant");
-        assert_eq!(records[1].1, "hello\n[thinking]\n[tool:bash]");
+        assert_eq!(records.len(), 5);
+        // CLI ordering: reasoning → assistant text → function_call → result;
+        // the whole turn shares one message_id.
+        let CbRecord::Message {
+            role: "user",
+            text,
+            message_id: None,
+        } = &records[0]
+        else {
+            panic!("expected user message, got {:?}", records[0]);
+        };
+        assert_eq!(text, "hi");
+        let CbRecord::Reasoning { text, message_id } = &records[1] else {
+            panic!("expected reasoning, got {:?}", records[1]);
+        };
+        assert_eq!(text, "hmm");
+        let turn_id = message_id.clone();
+        assert_eq!(turn_id.len(), 32, "uuid without dashes: {turn_id}");
         assert_eq!(
             records[2],
-            ("user".to_string(), "[tool_result:t1]".to_string())
+            CbRecord::Message {
+                role: "assistant",
+                text: "hello".into(),
+                message_id: Some(turn_id.clone()),
+            }
+        );
+        assert_eq!(
+            records[3],
+            CbRecord::FunctionCall {
+                call_id: "t1".into(),
+                name: "mcp__tack__bash".into(),
+                arguments: "{\"command\":\"ls\"}".into(),
+                reasoning: Some("hmm".into()),
+                message_id: turn_id.clone(),
+            }
+        );
+        let CbRecord::FunctionCallResult {
+            call_id,
+            name,
+            output_text,
+            message_id,
+        } = &records[4]
+        else {
+            panic!("expected function_call_result, got {:?}", records[4]);
+        };
+        assert_eq!(call_id, "t1");
+        assert_eq!(name, "mcp__tack__bash");
+        assert_eq!(*message_id, turn_id, "result shares the turn id");
+        // Compare parsed — serde_json map key order is not stable.
+        assert_eq!(
+            serde_json::from_str::<Value>(output_text).unwrap(),
+            json!([{"type":"text","text":"ok"}])
+        );
+    }
+
+    /// A call whose result is not in the rebuilt slice (cut-point dropped
+    /// it, or the turn was interrupted) must NOT become a native record —
+    /// the resumed CLI would park on a result that never comes.
+    #[test]
+    fn dangling_call_degrades_to_text_marker() {
+        let (assistant, _result) = tool_turn("t1", "");
+        let records = pi_to_cb_records(&[Message::user("hi"), Message::Assistant(assistant)]);
+        // Empty thinking emits no reasoning record; the call folds into the
+        // assistant text as the reference marker.
+        let [user, assistant] = &records[..] else {
+            panic!("expected 2 records, got {records:?}");
+        };
+        assert!(matches!(
+            user,
+            CbRecord::Message {
+                role: "user",
+                message_id: None,
+                ..
+            }
+        ));
+        let CbRecord::Message {
+            role: "assistant",
+            text,
+            message_id: Some(_),
+        } = assistant
+        else {
+            panic!("expected assistant message, got {assistant:?}");
+        };
+        assert_eq!(text, "hello\n[tool:bash]");
+    }
+
+    /// A result without its call record (e.g. the call fell before the
+    /// rebuilt slice) degrades to the reference user-text marker.
+    #[test]
+    fn orphan_result_degrades_to_text_marker() {
+        let (_assistant, result) = tool_turn("t1", "");
+        let records = pi_to_cb_records(&[Message::user("hi"), Message::ToolResult(result)]);
+        assert_eq!(
+            records,
+            vec![
+                CbRecord::Message {
+                    role: "user",
+                    text: "hi".into(),
+                    message_id: None,
+                },
+                CbRecord::Message {
+                    role: "user",
+                    text: "[tool_result:t1]".into(),
+                    message_id: None,
+                },
+            ]
         );
     }
 
@@ -390,8 +720,16 @@ mod tests {
     fn write_and_verify_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let records = vec![
-            ("user".to_string(), "one".to_string()),
-            ("assistant".to_string(), "two".to_string()),
+            CbRecord::Message {
+                role: "user",
+                text: "one".into(),
+                message_id: None,
+            },
+            CbRecord::Message {
+                role: "assistant",
+                text: "two".into(),
+                message_id: Some("m1".into()),
+            },
         ];
         let path = write_session_jsonl_in(dir.path(), "sid-1", "/tmp/proj", &records).unwrap();
         assert!(verify_written_session(&path, "sid-1", 2).is_empty());
@@ -409,9 +747,82 @@ mod tests {
         assert_eq!(lines[1]["content"][0]["type"], "output_text");
         assert_eq!(lines[1]["status"], "completed");
         assert_eq!(lines[0]["providerData"]["agent"], "sdk");
+        // Linkage mirrors real CLI files: session-wide request id; user
+        // records start a request; assistant records carry messageId.
+        assert_eq!(lines[0]["providerData"]["startsNewUserRequest"], true);
+        assert!(
+            lines[0]["providerData"]["conversationRequestId"]
+                .as_str()
+                .is_some_and(|s| s.len() == 32)
+        );
+        assert_eq!(
+            lines[0]["providerData"]["conversationRequestId"],
+            lines[1]["providerData"]["conversationRequestId"]
+        );
+        assert_eq!(lines[1]["providerData"]["messageId"], "m1");
+        assert!(lines[0].get("messageId").is_none());
         // Verify catches a wrong id / wrong count.
         assert!(!verify_written_session(&path, "other", 2).is_empty());
         assert!(!verify_written_session(&path, "sid-1", 5).is_empty());
+    }
+
+    /// On-disk field shapes for the native record types, mirrored from real
+    /// CLI session files (~/.codebuddy/projects/*/*.jsonl).
+    #[test]
+    fn native_records_serialize_cli_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = vec![
+            CbRecord::Reasoning {
+                text: "hmm".into(),
+                message_id: "m1".into(),
+            },
+            CbRecord::FunctionCall {
+                call_id: "t1".into(),
+                name: "mcp__tack__bash".into(),
+                arguments: "{\"command\":\"ls\"}".into(),
+                reasoning: Some("hmm".into()),
+                message_id: "m1".into(),
+            },
+            CbRecord::FunctionCallResult {
+                call_id: "t1".into(),
+                name: "mcp__tack__bash".into(),
+                output_text: "[{\"type\":\"text\",\"text\":\"ok\"}]".into(),
+                message_id: "m1".into(),
+            },
+        ];
+        let path = write_session_jsonl_in(dir.path(), "sid-2", "/tmp/proj", &records).unwrap();
+        assert!(verify_written_session(&path, "sid-2", 3).is_empty());
+        let lines: Vec<Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        // reasoning: content [] + rawContent reasoning_text, no role.
+        assert_eq!(lines[0]["type"], "reasoning");
+        assert_eq!(lines[0]["rawContent"][0]["type"], "reasoning_text");
+        assert_eq!(lines[0]["rawContent"][0]["text"], "hmm");
+        assert!(lines[0].get("role").is_none());
+        // function_call: callId/name/arguments (stringified JSON).
+        assert_eq!(lines[1]["type"], "function_call");
+        assert_eq!(lines[1]["callId"], "t1");
+        assert_eq!(lines[1]["name"], "mcp__tack__bash");
+        assert_eq!(lines[1]["arguments"], "{\"command\":\"ls\"}");
+        // function_call_result: status + output.text JSON-stringified blocks.
+        assert_eq!(lines[2]["type"], "function_call_result");
+        assert_eq!(lines[2]["callId"], "t1");
+        assert_eq!(lines[2]["status"], "completed");
+        assert_eq!(lines[2]["output"]["type"], "text");
+        assert_eq!(
+            lines[2]["output"]["text"],
+            "[{\"type\":\"text\",\"text\":\"ok\"}]"
+        );
+        for line in &lines {
+            assert_eq!(line["providerData"]["agent"], "sdk");
+            assert_eq!(line["providerData"]["messageId"], "m1");
+            assert_eq!(line["sessionId"], "sid-2");
+        }
+        // The turn's thinking duplicates onto the call's providerData.
+        assert_eq!(lines[1]["providerData"]["reasoning"], "hmm");
     }
 
     /// Regression: a rebuild with no settled prefix (split == 0) writes an
