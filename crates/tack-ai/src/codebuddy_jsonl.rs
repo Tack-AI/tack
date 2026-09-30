@@ -249,6 +249,12 @@ pub(crate) fn verify_written_session(
         ));
         return warnings;
     }
+    // Empty file + empty expectation (native rebuild with no settled
+    // prefix — split == 0) is sound; there is no first/last record to
+    // check for sessionId drift.
+    if lines.is_empty() {
+        return warnings;
+    }
     let first: Result<Value, _> = serde_json::from_str(lines[0]);
     let last: Result<Value, _> = serde_json::from_str(lines[lines.len() - 1]);
     match (first, last) {
@@ -406,5 +412,19 @@ mod tests {
         // Verify catches a wrong id / wrong count.
         assert!(!verify_written_session(&path, "other", 2).is_empty());
         assert!(!verify_written_session(&path, "sid-1", 5).is_empty());
+    }
+
+    /// Regression: a rebuild with no settled prefix (split == 0) writes an
+    /// empty file and expects 0 records — verify must not index `lines[0]`
+    /// on the empty vec (panicked in production after a compaction folded
+    /// every assistant reply out of the context).
+    #[test]
+    fn verify_empty_session_is_sound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_session_jsonl_in(dir.path(), "sid-empty", "/tmp/proj", &[]).unwrap();
+        assert!(verify_written_session(&path, "sid-empty", 0).is_empty());
+        // A genuinely missing file still warns even when 0 are expected.
+        let missing = dir.path().join("nope.jsonl");
+        assert!(!verify_written_session(&missing, "sid-empty", 0).is_empty());
     }
 }

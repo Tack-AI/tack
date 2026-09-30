@@ -4,6 +4,20 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [Unreleased]
+
+### Fixed
+
+- **CodeBuddy crash after compaction** (`index out of bounds: the len is 0
+  but the index is 0` in `codebuddy_jsonl.rs`): once context compaction
+  folded every assistant reply into the summary, a native session rebuild
+  had no settled prefix — it rewrote the CLI's session file to empty and
+  the post-write integrity check indexed `lines[0]` on zero lines,
+  panicking the provider task (and cascading into `event stream ended
+  without a final result`). Empty-prefix rebuilds now fall back to
+  transcript replay, and the verifier treats an empty file with zero
+  expected records as sound.
+
 ## [1.0.6] - 2026-09-30
 
 ### Added

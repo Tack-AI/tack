@@ -2892,6 +2892,15 @@ impl CodeBuddySession {
             return Err("unresolved tail is not a plain user turn; transcript fallback".into());
         }
         let records = jsonl::pi_to_cb_records(&context.messages[..split]);
+        // No settled prefix (e.g. compaction folded every assistant reply
+        // into the summary, or the CLI died before its first answer): a
+        // native resume would rewrite the CLI's session file to EMPTY and
+        // re-deliver the whole context through sync — same effect as the
+        // transcript replay, but it clobbers the live session file and
+        // resumes an empty JSONL, which the CLI is not known to accept.
+        if records.is_empty() {
+            return Err("no settled prefix to rebuild; transcript fallback".into());
+        }
         let path = jsonl::write_session_jsonl(&session_id, &cwd, &records)?;
         let warnings = jsonl::verify_written_session(&path, &session_id, records.len());
         for warning in &warnings {
