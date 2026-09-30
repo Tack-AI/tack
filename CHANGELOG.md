@@ -6,6 +6,14 @@ notice can parse entries (same convention as TS pi).
 
 ## [Unreleased]
 
+### Added
+
+- **`/ext` slash command**: inspect installed plugins from inside the TUI
+  (`/ext` or `/ext list`) — id, load state (active/disabled/failed/
+  policy-filtered), version, directory, contributed capabilities, and
+  load warnings. Read-only snapshot of the session-start load; plugin
+  management stays on the `tack ext` CLI.
+
 ### Fixed
 
 - **Extension slash-commands no longer freeze the TUI for 30s**: a

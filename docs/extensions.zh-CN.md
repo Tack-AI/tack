@@ -140,7 +140,12 @@ tack ext enable review@acme     // 无歧义时裸名 "review" 也可以
 ```
 
 `tack ext list` 展示 `id`、状态（active/disabled）、版本、布局
-（store/legacy）与目录。
+（store/legacy）与目录。在 TUI 内，`/ext`（或 `/ext list`）渲染同一份
+会话启动时的快照——每个被发现的插件及其加载结果
+（active/disabled/failed/policy-filtered）、声明的能力或失败原因，
+以及加载警告。它是只读的：插件的安装在 CLI 上进行、会话启动时加载
+（生产会话内的热加载是非目标，见
+[plugin-roadmap.zh-CN.md](plugin-roadmap.zh-CN.md)）。
 
 ## 4. 安装、升级、校验
 

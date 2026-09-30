@@ -322,6 +322,10 @@ const EN: &[(&str, &str)] = &[
         "cmd.desc.mcp",
         "Browse MCP resources/prompts, insert into editor",
     ),
+    (
+        "cmd.desc.ext",
+        "List installed plugins and their load state",
+    ),
     ("cmd.desc.settings", "Open the settings menu"),
     (
         "cmd.desc.theme",
@@ -847,6 +851,19 @@ const EN: &[(&str, &str)] = &[
         "session.body",
         "**Session**\n- file: `{file}`\n- id: `{id}`\n- context: {tokens} tokens ({pct}% of {window}k)\n- totals: ↑{input} ↓{output} R{cr} W{cw} — ${cost}\n",
     ),
+    // -- /ext --
+    (
+        "ext.header",
+        "**Plugins** (loaded at session start; restart to pick up new installs)\n\n",
+    ),
+    ("ext.none", "(no plugins installed)\n"),
+    ("ext.row", "- `{id}` — **{state}** · {version}\n  `{dir}`\n"),
+    ("ext.row_detail", "  ↳ {detail}\n"),
+    ("ext.warnings_header", "\n**Load warnings**\n"),
+    (
+        "ext.unknown",
+        "unknown /ext subcommand `{sub}` — usage: `/ext [list]`",
+    ),
     // -- /cost --
     ("cost.header", "**Usage & cost**\n\n"),
     ("cost.no_usage", "(no usage recorded yet)\n"),
@@ -1207,6 +1224,7 @@ const ZH: &[(&str, &str)] = &[
     ("cmd.desc.reload", "重新加载设置/技能/提示词模板"),
     ("cmd.desc.trust", "信任本项目的 .pi 设置/资源/MCP 服务器"),
     ("cmd.desc.mcp", "浏览 MCP 资源/提示词并插入编辑器"),
+    ("cmd.desc.ext", "列出已安装插件及其加载状态"),
     ("cmd.desc.settings", "打开设置菜单"),
     ("cmd.desc.theme", "切换颜色主题（支持 light/dark 自动配对）"),
     (
@@ -1605,6 +1623,19 @@ const ZH: &[(&str, &str)] = &[
     (
         "session.body",
         "**会话**\n- 文件：`{file}`\n- id：`{id}`\n- 上下文：{tokens} tokens（占 {window}k 的 {pct}%）\n- 总计：↑{input} ↓{output} R{cr} W{cw} — ${cost}\n",
+    ),
+    // -- /ext --
+    (
+        "ext.header",
+        "**插件**（会话启动时加载的快照；新装插件需重启会话生效）\n\n",
+    ),
+    ("ext.none", "（没有安装插件）\n"),
+    ("ext.row", "- `{id}` — **{state}** · {version}\n  `{dir}`\n"),
+    ("ext.row_detail", "  ↳ {detail}\n"),
+    ("ext.warnings_header", "\n**加载警告**\n"),
+    (
+        "ext.unknown",
+        "未知的 /ext 子命令 `{sub}` —— 用法：`/ext [list]`",
     ),
     // -- /cost --
     ("cost.header", "**用量与费用**\n\n"),

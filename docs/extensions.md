@@ -154,7 +154,13 @@ tack ext enable review@acme     # bare "review" works when unambiguous
 ```
 
 `tack ext list` shows `id`, state (active/disabled), version, layout
-(store/legacy), and directory.
+(store/legacy), and directory. Inside the TUI, `/ext` (or `/ext list`)
+renders the same session-start snapshot — every discovered plugin with
+its load outcome (active/disabled/failed/policy-filtered), contributed
+capabilities or failure reason, and load warnings. It is read-only:
+plugins install/uninstall on the CLI and load at session start (hot
+reload in production sessions is a non-goal, see
+[plugin-roadmap.md](plugin-roadmap.md)).
 
 ## 4. Install, upgrade, verify
 

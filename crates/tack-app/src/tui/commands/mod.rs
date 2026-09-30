@@ -54,6 +54,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/reload", "cmd.desc.reload"),
     ("/trust", "cmd.desc.trust"),
     ("/mcp", "cmd.desc.mcp"),
+    ("/ext", "cmd.desc.ext"),
     ("/settings", "cmd.desc.settings"),
     ("/theme", "cmd.desc.theme"),
     ("/share", "cmd.desc.share"),
@@ -115,6 +116,8 @@ const KEYBINDING_DOCS: &[(&str, &str)] = &[
 ];
 
 pub(crate) mod context;
+#[cfg(feature = "ext")]
+mod ext;
 mod mcp;
 mod models;
 mod select;
@@ -254,6 +257,8 @@ impl TuiApp {
             "reload" => self.command_reload(),
             "trust" => self.open_trust_dialog(),
             "mcp" => self.command_mcp().await,
+            #[cfg(feature = "ext")]
+            "ext" => self.command_ext(args),
             "quit" | "exit" => self.should_quit = true,
             "" => {}
             other => {
