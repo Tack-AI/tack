@@ -4,6 +4,23 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [Unreleased]
+
+### Fixed
+
+- **CodeBuddy `codebuddy CLI idle: no events for 5 minutes` on parallel
+  tool calls**: the CLI's `stream_event` channel can drop a parallel
+  tool_use block entirely (observed on CLI 2.156.0 with hy4-preview-f:
+  two parallel `bash` calls streamed as one), while the CLI still
+  dispatches a `tools/call` MCP frame for every call in its complete
+  assistant message and awaits the whole batch. The orphan frame was
+  never answered, so the CLI went silent mid-turn and the idle watchdog
+  killed it five minutes later. The tool boundary now drains the rest of
+  the frame burst (short idle grace) and MATERIALIZES any unpaired frame
+  as a fresh parked call — complete name + arguments ride the frame;
+  only the model's tool_use id is synthesized — so every dispatched
+  frame gets its result and the turn continues natively.
+
 ## [1.0.7] - 2026-09-30
 
 ### Fixed

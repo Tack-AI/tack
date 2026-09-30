@@ -63,6 +63,19 @@
    `resolve_parked` 按 request_id 应答——因为 `map_tool_args` 的参数归一化
    （如 bash 自动补 `timeout:120`）会让 (name, arguments) 精确匹配失效，
    同名并行调用的乱序结果会因此错配。
+7. **并行 tool_use 块可以整块蒸发**（CLI 2.156.0 + hy4-preview-f）：两个
+   并行 `bash` 调用在流里只出现一个——第二个块在任何 `stream_event` 里
+   都没出现过。但 CLI 的完整 assistant 消息里有两个，所以两个 `tools/call`
+   帧都会派发，且 CLI 要等整批结果；没有 parked 对应物的帧一直无人应答，
+   CLI 在 turn 中途静默，5 分钟后被 F18 idle watchdog 杀掉（报错
+   `codebuddy CLI idle: no events for 5 minutes`）。修复：边界处在配对前
+   先把整批帧排空（250ms 无活动宽限，每来一行重置——否则"等到 pending ≥
+   parked"的循环会在同批靠后的帧到达前退出），然后把每个未配对的帧**物化**
+   为新的 parked 调用：帧里带完整的 name + arguments，只有模型的 tool_use id
+   无法恢复（用 `adopted-<request_id>` 合成）。定位备注：这次又是双方持久化
+   记录一锤定音——CLI history 里有两个 `function_call`，Tack 会话里只有
+   一个 toolCall，而第二条 `function_call_result` 的文本原文就是
+   `turn aborted (CLI idle)`，正是 watchdog 自己的清理消息。
 
 ## 不坑但像坑
 

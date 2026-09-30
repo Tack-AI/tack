@@ -2611,7 +2611,12 @@ impl CodeBuddySession {
     /// match. Frames stay in pending_mcp_calls; the pairing is recorded on
     /// the parked call so resolve_parked answers exactly that frame —
     /// arg normalization (map_tool_args) would otherwise defeat the
-    /// (name, arguments) match.
+    /// (name, arguments) match. Frames that pair with NOTHING are blocks
+    /// the stream dropped entirely: they are materialized as fresh parked
+    /// calls, because the CLI awaits EVERY frame it dispatched and an
+    /// unanswered one wedges the turn (observed on 2.156.0 + hy4-preview-f:
+    /// two parallel bash calls streamed as one; the unseen frame's response
+    /// never came and the 5-minute idle watchdog killed the turn).
     async fn adopt_mcp_tool_args(
         &mut self,
         partial: &mut AssistantMessage,
@@ -2635,6 +2640,34 @@ impl CodeBuddySession {
                     );
                     break;
                 }
+                line = self.io.recv_channel() => match line {
+                    Some(line) => line,
+                    None => return,
+                },
+            };
+            match self.handle_mcp_control(&line).await {
+                Ok(true) => {}
+                Ok(false) => self.io.buffer.push_back(line),
+                Err(error) => {
+                    tracing::debug!("codebuddy: MCP handling failed at boundary: {error}");
+                    break;
+                }
+            }
+        }
+        // The wait above stops once every PARKED call has a frame — but
+        // frames for DROPPED blocks trail in the same burst (the CLI
+        // dispatches the whole parallel batch back-to-back), so drain a
+        // little longer before pairing: a short idle grace, reset on every
+        // inbound line, still capped by the boundary deadline. Skipping
+        // this leaves a late frame unpaired and unmaterialized — the same
+        // wedge the materialization below exists to prevent.
+        let grace = std::time::Duration::from_millis(250);
+        loop {
+            let idle = tokio::time::Instant::now() + grace;
+            let line = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep_until(if idle < deadline { idle } else { deadline }) => break,
                 line = self.io.recv_channel() => match line {
                     Some(line) => line,
                     None => return,
@@ -2695,6 +2728,42 @@ impl CodeBuddySession {
             {
                 *arguments = adopted;
             }
+        }
+        // Frames still unpaired belong to tool_use blocks the stream
+        // dropped entirely. Materialize each as a fresh parked call: the
+        // frame carries the complete name + arguments; only the model's
+        // tool_use id is unrecoverable, so synthesize one from the control
+        // request id (unique per CLI process).
+        let orphans: Vec<(usize, String, String, Value)> = self
+            .pending_mcp_calls
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| !used[*j])
+            .map(|(j, f)| (j, f.request_id.clone(), f.name.clone(), f.arguments.clone()))
+            .collect();
+        for (j, request_id, name, arguments) in orphans {
+            tracing::warn!(
+                "codebuddy: stream dropped tool call \"{name}\"; materializing it from tools/call frame {request_id}"
+            );
+            let arguments = map_tool_args(&name, arguments);
+            let tool_use_id = if request_id.is_empty() {
+                format!("adopted-frame-{j}")
+            } else {
+                format!("adopted-{request_id}")
+            };
+            partial.content.push(ContentBlock::ToolCall {
+                id: tool_use_id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+                thought_signature: None,
+                namespace: None,
+            });
+            self.parked.push(ParkedCall {
+                tool_use_id,
+                name,
+                arguments,
+                mcp_request_id: Some(request_id),
+            });
         }
     }
 

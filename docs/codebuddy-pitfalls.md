@@ -90,6 +90,23 @@ deepseek-v4-pro):
    (e.g. bash auto-adding `timeout:120`) breaks exact (name, arguments)
    matching, and out-of-order results of same-name parallel calls would be
    mismatched as a result.
+7. **A parallel tool_use block can vanish ENTIRELY** (CLI 2.156.0 +
+   hy4-preview-f): two parallel `bash` calls streamed as one — the second
+   block never appeared in any `stream_event`. The CLI's complete assistant
+   message still holds both, so BOTH `tools/call` frames are dispatched and
+   the CLI awaits the whole batch; the frame with no parked counterpart was
+   left unanswered, the CLI went silent mid-turn, and the F18 idle watchdog
+   killed the turn 5 minutes later (`codebuddy CLI idle: no events for 5
+   minutes`). Fix: at the boundary, drain the rest of the frame burst
+   (250 ms idle grace, reset on activity — the "wait until pending ≥
+   parked" loop otherwise exits before the batch's trailing frames arrive)
+   and MATERIALIZE each unpaired frame as a fresh parked call: the frame
+   carries the complete name + arguments; only the model's tool_use id is
+   unrecoverable (synthesized as `adopted-<request_id>`). Diagnosis note:
+   both sides' persisted records settled it again — the CLI history held two
+   `function_call`s, Tack's session one toolCall, and the second
+   `function_call_result`'s text was literally `turn aborted (CLI idle)`,
+   the watchdog's own cleanup message.
 
 ## Looks like a pitfall but isn't
 

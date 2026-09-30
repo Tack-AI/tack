@@ -515,6 +515,83 @@ while True:
             "usage": {"input_tokens": 35, "output_tokens": 14},
             "total_cost_usd": 0,
         })
+    elif "parallel-dropped" in text:
+        # DROPPED parallel block (observed on the 2.156.0 wire with
+        # hy4-preview-f): the stream_event channel shows only ONE of the
+        # two tool_use blocks — the second vanished outright — but the
+        # CLI's complete assistant message holds both, so BOTH tools/call
+        # frames are dispatched up front. The provider must MATERIALIZE
+        # the missing call from its frame: the CLI awaits the whole
+        # parallel batch, so an unanswered frame wedges the turn until
+        # the 5-minute idle watchdog kills it.
+        send({"type": "stream_event", "event": {
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 11, "output_tokens": 0}},
+        }, "session_id": SESSION})
+        send({"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_d1",
+                              "name": "mcp__tack__echo", "input": {}},
+        }, "session_id": SESSION})
+        send({"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "input_json_delta",
+                      "partial_json": "{\"text\":\"one\"}"},
+        }, "session_id": SESSION})
+        send({"type": "stream_event", "event": {
+            "type": "content_block_stop", "index": 0,
+        }, "session_id": SESSION})
+        send({"type": "stream_event", "event": {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use"},
+            "usage": {"input_tokens": 11, "output_tokens": 9},
+        }, "session_id": SESSION})
+        send({"type": "stream_event", "event": {"type": "message_stop"},
+              "session_id": SESSION})
+        # Two tools/call frames from the complete assistant message; the
+        # second has no streamed counterpart.
+        req_one = mcp_send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                            "params": {"name": "echo", "arguments": {"text": "one"}}})
+        req_two = mcp_send({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                            "params": {"name": "echo", "arguments": {"text": "two"}}})
+        result_one = mcp_await(req_one)
+        result_two = mcp_await(req_two)
+        mcp_rpc({"jsonrpc": "2.0", "id": 102, "method": "tools/list"})
+        mcp_rpc({"jsonrpc": "2.0", "id": 103, "method": "tools/list"})
+        # Stale echo: the real CLI re-yields the completed message with
+        # the REAL ids (the materialized call's id differs — the echo is
+        # skipped wholesale until the next turn's first stream_event).
+        for tool_use_id, text_in in (("toolu_d1", "one"), ("toolu_d2", "two")):
+            send({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": tool_use_id,
+                         "name": "mcp__tack__echo", "input": {"text": text_in}}
+                    ],
+                    "usage": {"input_tokens": 11, "output_tokens": 9},
+                },
+                "session_id": SESSION,
+            })
+        send_tool_result_echo("toolu_d1", mcp_result_text(result_one))
+        send_tool_result_echo("toolu_d2", mcp_result_text(result_two))
+        stream_text_turn(["tool said: pong"], 24, 5)
+        send({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "IGNORED-DUPLICATE"}],
+                "usage": {"input_tokens": 24, "output_tokens": 5},
+            },
+            "session_id": SESSION,
+        })
+        send({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "done", "session_id": SESSION,
+            "usage": {"input_tokens": 35, "output_tokens": 14},
+            "total_cost_usd": 0,
+        })
     elif "retry-thinking" in text:
         # API RETRY mid-turn (observed with deepseek-v4-pro): the first
         # attempt's thinking block never stops; a second message_start

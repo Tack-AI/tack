@@ -483,6 +483,107 @@ async fn codebuddy_stream_event_parallel_tangled_args() {
     );
 }
 
+/// Dropped parallel block (real 2.156.0 + hy4-preview-f wire): the
+/// stream_event channel showed only ONE of two tool_use blocks — the
+/// second vanished outright — but the CLI's complete assistant message
+/// held both, so BOTH tools/call frames were dispatched up front. The
+/// CLI awaits the whole parallel batch, so leaving the orphan frame
+/// unanswered wedged the turn until the 5-minute idle watchdog killed
+/// it. The provider must MATERIALIZE the missing call from its
+/// tools/call frame and resolve both natively.
+#[cfg_attr(
+    windows,
+    ignore = "multi-turn mock e2e hangs on Windows CI; Windows spawn path covered by spawn_cli_runs_cmd_shim"
+)]
+#[tokio::test(flavor = "multi_thread")]
+async fn codebuddy_stream_event_parallel_dropped_block() {
+    if !python3_or_skip() {
+        return;
+    }
+    let (_serial, env) = serial_mock_env().await;
+    let provider: Arc<dyn Provider> = Arc::new(tack_ai::codebuddy::CodeBuddyStreamProvider);
+    let model = model_with_id("mock-dropped");
+
+    // --- Turn 1: one streamed block, two tools/call frames ------------
+    let context = Context {
+        system_prompt: None,
+        messages: vec![Message::user("parallel-dropped")],
+        tools: vec![echo_tool()],
+    };
+    let stream = provider.stream(&model, &context, options("cb-e2e-dropped"));
+    let msg1 = result_with_timeout(stream).await;
+    assert_eq!(msg1.stop_reason, tack_ai::StopReason::ToolUse);
+    let calls: Vec<_> = msg1
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            tack_ai::ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+                ..
+            } => Some((id.clone(), name.clone(), arguments.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 2, "{:?}", msg1.content);
+    assert_eq!(calls[0].0, "toolu_d1");
+    assert_eq!(calls[0].1, "echo");
+    assert_eq!(calls[0].2["text"], "one");
+    // The dropped block keeps its frame's name + arguments; only the
+    // model's tool_use id is unrecoverable (synthesized).
+    assert!(calls[1].0.starts_with("adopted-"), "{}", calls[1].0);
+    assert_eq!(calls[1].1, "echo");
+    assert_eq!(calls[1].2["text"], "two");
+
+    // --- Turn 2: both results resolve (the materialized call answers
+    // exactly its own frame via the recorded request_id) ---------------
+    let mut context = Context {
+        system_prompt: None,
+        messages: vec![
+            Message::user("parallel-dropped"),
+            Message::Assistant(msg1.clone()),
+        ],
+        tools: vec![],
+    };
+    for (id, name, _) in &calls {
+        context
+            .messages
+            .push(Message::ToolResult(tack_ai::ToolResultMessage {
+                tool_call_id: id.clone(),
+                tool_name: name.clone(),
+                content: vec![tack_ai::InputContentBlock::text("pong")],
+                details: None,
+                usage: None,
+                is_error: false,
+                timestamp: 0,
+            }));
+    }
+    let stream = provider.stream(&model, &context, options("cb-e2e-dropped"));
+    let msg2 = result_with_timeout(stream).await;
+    assert_eq!(msg2.stop_reason, tack_ai::StopReason::Stop);
+    let tack_ai::ContentBlock::Text { text, .. } = &msg2.content[0] else {
+        panic!("expected text, got {:?}", msg2.content)
+    };
+    assert_eq!(text, "tool said: pong");
+
+    // Exactly one CLI process: no wedge, no transcript respawn.
+    let requests = std::fs::read_to_string(env.argv_dir.join("requests-mock-dropped.log")).unwrap();
+    assert_eq!(
+        requests.lines().filter(|l| l.starts_with("SPAWN")).count(),
+        1,
+        "{requests}"
+    );
+    assert_eq!(
+        requests
+            .lines()
+            .filter(|l| l.starts_with("MCP-SEND tools/call"))
+            .count(),
+        2,
+        "{requests}"
+    );
+}
+
 /// Tool input delivered ENTIRELY at content_block_start (no input_json
 /// deltas at all): the provider must seed arguments from
 /// content_block.input (reference: arguments ?? {} + parsePartialJson
