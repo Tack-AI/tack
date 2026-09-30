@@ -2,11 +2,16 @@
 
 **English | [简体中文](codebuddy-pitfalls.zh-CN.md)**
 
-The `codebuddy` CLI's stream-json protocol is **lossy in its streaming replay
-of tool-call arguments**. This document records the pitfalls Tack's codebuddy
-provider actually hit, how they were located, and the fixes, for future
-maintainers. The fix implementation is in `crates/tack-ai/src/codebuddy.rs`
-(0d482e0).
+The `codebuddy` CLI is a Claude-Code fork driven over a stateful
+stream-json protocol, and Tack keeps ONE CLI process alive for the whole
+session — so the provider owns two hard problems: **a lossy streaming
+replay of tool-call arguments**, and **keeping three state machines in
+sync** (tack's context ↔ the live CLI process ↔ the CLI's session JSONL)
+across compactions, aborts, and respawns. This document records the
+pitfalls Tack's codebuddy provider actually hit, how they were located,
+and the fixes, for future maintainers. The fix implementations live in
+`crates/tack-ai/src/codebuddy.rs` and `codebuddy_jsonl.rs` (0d482e0 and
+later).
 
 ## Symptoms (a real session, deepseek-v4-pro)
 
@@ -108,6 +113,83 @@ deepseek-v4-pro):
    `function_call_result`'s text was literally `turn aborted (CLI idle)`,
    the watchdog's own cleanup message.
 
+## Session-rebuild pitfalls (post-compaction stall, 2026-09-30)
+
+A user report read "Compacted context (115255 tokens) — then the session
+looks hung". Nothing was wedged: the turn had ENDED. The defects below
+all live in the JSONL session rebuild (the path that runs when tack's
+context diverges from the CLI session — compaction, history edit),
+diagnosed from both sides' persisted records plus the CLI's own traces:
+
+1. **The respawn wiped the tool list.** `spawn_new` starts with
+   `tools: []`, and `respawn_native`/`respawn_transcript` replace `*self`
+   with that fresh session — so for the whole post-respawn turn, the
+   CLI's `tools/list` MCP request was answered with an EMPTY list. The
+   model's behavior without tools spans the full spectrum: refusal text
+   ("the bash tool isn't available to me right now—only my internal
+   reasoning tool is"), hallucinated restrictions ("bash is restricted to
+   `date +%F` only"), or an outright reasoning loop (95+ short
+   reasoning-only responses over 4 minutes, each one API round-trip,
+   never emitting a call). Fix: carry `self.tools` into the fresh
+   session on respawn.
+2. **The lossy text-marker projection teaches the model to stop.** The
+   reference projection flattened tool calls/results into `[tool:name]` /
+   `[tool_result:id]` text markers, so the rebuilt history contained ZERO
+   real tool structure. kimi-k2.8 then answered the post-compaction
+   prompt with the LITERAL text `"[thinking]\n继续深入。读 README…"` and
+   `finish_reason=stop` — it mimicked the markers instead of calling
+   tools. From the user's seat: the agent announced it would keep
+   working, then silence — indistinguishable from a hang. Fix: project
+   settled tool turns to the CLI's NATIVE `reasoning` / `function_call` /
+   `function_call_result` records (format mirrored from real CLI session
+   files, including `messageId`/`conversationRequestId` providerData
+   linkage and `providerData.reasoning` on calls). The CLI replays them
+   into proper API `tool_calls`/`tool` messages — verified by resuming a
+   tack-written file through the real CLI: immediate tool call, correct
+   answer. Only DANGLING calls (no matching result in the rebuilt slice)
+   and ORPHAN results still degrade to markers: a native call without its
+   result would park the resumed CLI forever.
+3. **A settled tool result after the last assistant message forced the
+   transcript fallback.** The rebuild split rejected any tail containing
+   a tool result (a fresh CLI has no parked calls to deliver them to).
+   With native result records, such tails ride the rebuilt prefix; the
+   fallback now only fires when the context ends mid tool turn.
+4. **The transcript-replay paste taught the model to repeat itself
+   verbatim.** When the native rebuild has no deliverable user tail
+   (auto-compaction mid-turn — the context ends with a tool result), the
+   fallback flattens the whole context into one user message, and it
+   used to paste THINKING blocks verbatim too. The model's own
+   reasoning, re-presented as plain in-context text, is a prime echo
+   source: one 810-char reasoning block + its 115-char text came back
+   byte-identically THREE times (each echo re-ran the same file reads),
+   and every echo landed in the next compaction's retained tail,
+   reinforcing the pattern. Fixes: thinking is no longer pasted (the
+   summary, text, and tool markers carry the state), the replay marker
+   spells out that the history is final ("do not repeat … re-answer …
+   re-run"), and the overflow-compaction retry carries the goal
+   recitation — it bypasses `transform_context`, so without it there was
+   no trailing user message and every overflow compaction fell into the
+   paste.
+5. **Empty-prefix rebuild panicked the provider task** (`index out of
+   bounds: the len is 0 but the index is 0`, fixed in v1.0.7). Once a
+   compaction folded EVERY assistant reply into the summary, a native
+   rebuild had no settled prefix at all — it rewrote the CLI's session
+   file to EMPTY and the post-write integrity check indexed `lines[0]`
+   on zero lines, panicking the provider task and surfacing to the user
+   as `event stream ended without a final result`. Empty-prefix rebuilds
+   now fall back to transcript replay (the `no settled prefix to
+   rebuild` WARN), and the verifier treats an empty file with zero
+   expected records as sound.
+
+Verification kit: `cargo run -p tack-ai --example cb_rebuild_repro --
+<model>` drives the REAL CLI through a compaction-shaped rebuild and
+asserts the model still calls tools (control phase on a fresh session
+included). Note the run needs a writable `CODEBUDDY_CONFIG_DIR` — a
+sandboxed shell silently wedges the CLI (it cannot write its
+logs/session files and hangs after the initialize handshake with zero
+log output; copy `~/.codebuddy` somewhere writable and point the env var
+at the copy, auth included).
+
 ## Looks like a pitfall but isn't
 
 - **The model emits `<tool_info>`/`<tool_result>` markers as text**: the model
@@ -117,3 +199,18 @@ deepseek-v4-pro):
 - **`[tool:bash]` / `[tool_result:call_…]` in the CLI session JSONL are
   compacted display forms**; the real content is in the function_call records
   in the same directory — don't be misled by the placeholder text.
+- **The transcript-fallback WARNs are designed paths, not malfunctions**:
+  `JSONL rebuild failed (no settled prefix to rebuild; transcript
+  fallback)` / `no user tail to deliver; transcript fallback` mean the
+  native rebuild had nothing safe to resume with, so the provider
+  replayed the flattened transcript instead. The conversation continues
+  with full context — only native tool structure and the CLI-side cache
+  are lost. Occasional occurrences (aggressive compaction folding every
+  assistant turn, the CLI dying before its first answer) are normal;
+  investigate only if EVERY compaction falls back while the retained
+  tail visibly contains assistant turns.
+- **A locally installed + authenticated codebuddy CLI breaks the
+  `model_switch_rebinds_provider_adapter` TUI test** (tack-app): the
+  test assumes no CLI in the environment; with a real one present,
+  `resolve_model` discovers it and the assertion built on the
+  bare-model fallback fails. Environmental — not a code bug.

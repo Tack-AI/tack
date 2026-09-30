@@ -2,9 +2,13 @@
 
 **[English](codebuddy-pitfalls.md) | 简体中文**
 
-`codebuddy` CLI 的 stream-json 协议在**工具调用参数的流式重放**上是有损的。
-本文记录 Tack codebuddy provider 实际踩过的坑、定位方法和修复方案，供后续
-维护者参考。修复实现见 `crates/tack-ai/src/codebuddy.rs`（0d482e0）。
+`codebuddy` CLI 是一个 Claude-Code fork，通过有状态的 stream-json 协议驱
+动，而 Tack 让**同一个** CLI 进程长驻整个会话——所以 provider 要扛起两
+个难题：**工具调用参数的流式重放是有损的**，以及**跨压缩/中断/respawn
+维持三个状态机一致**（tack 上下文 ↔ 存活的 CLI 进程 ↔ CLI 的 session
+JSONL）。本文记录 Tack codebuddy provider 实际踩过的坑、定位方法和修复
+方案，供后续维护者参考。修复实现见 `crates/tack-ai/src/codebuddy.rs` 与
+`codebuddy_jsonl.rs`（0d482e0 及之后）。
 
 ## 症状（一次真实会话，deepseek-v4-pro）
 
@@ -77,6 +81,67 @@
    一个 toolCall，而第二条 `function_call_result` 的文本原文就是
    `turn aborted (CLI idle)`，正是 watchdog 自己的清理消息。
 
+## 会话重建的坑（压缩后"卡住"，2026-09-30）
+
+用户报告"Compacted context (115255 tokens)——然后会话好像卡住了"。实际
+没有任何东西卡死：turn 已经**结束**了。下列缺陷全部住在 JSONL 会话重
+建路径里（tack 上下文与 CLI 会话分叉时触发——压缩、历史编辑），靠双
+方持久化记录 + CLI 自己的 trace 逐层定位：
+
+1. **respawn 把工具列表清空了。** `spawn_new` 以 `tools: []` 起步，而
+   `respawn_native`/`respawn_transcript` 用这个新会话整体替换 `*self`
+   ——于是 respawn 后的整个 turn 里，CLI 的 `tools/list` MCP 请求拿到的
+   是空列表。模型在没有工具时的表现覆盖整个频谱：拒绝（"the bash tool
+   isn't available to me right now—only my internal reasoning tool
+   is"）、幻觉出的限制（"bash 只能跑 `date +%F`"）、乃至 reasoning 死
+   循环（4 分钟内 95+ 次短 reasoning 响应，每次都是一次 API 往返，永远
+   不发出调用）。修复：respawn 时把 `self.tools` 带进新会话。
+2. **有损文本标记投影教会模型提前收工。** 参照实现的投影把 tool
+   call/result 拍平成 `[tool:name]` / `[tool_result:id]` 文本标记，重建
+   历史里真实的工具结构为零。kimi-k2.8 于是用字面文本
+   `"[thinking]\n继续深入。读 README…"` 回答压缩后的提示并以
+   `finish_reason=stop` 收工——它在模仿标记而不是调用工具。用户视角：
+   代理说了要继续干活，然后就没声了——与挂起无法区分。修复：settled 的
+   工具轮次投影为 CLI **原生**的 `reasoning` / `function_call` /
+   `function_call_result` 记录（格式逐字段对齐真实 CLI 会话文件，包括
+   `messageId`/`conversationRequestId` 链接字段和调用上的
+   `providerData.reasoning`）。CLI 会把它们重放成标准的 API
+   `tool_calls`/`tool` 消息——已用真实 CLI resume 我们写的文件验证：
+   立即发起工具调用并答对。只有**悬空调用**（重建切片里没有配对结果）
+   和**孤儿结果**仍降级为文本标记：原生调用没有结果会让 resume 的 CLI
+   永远干等。
+3. **最后一条 assistant 消息之后的 settled tool result 会强制走
+   transcript 兜底。** 旧的切分逻辑拒绝任何含 tool result 的尾部（新
+   CLI 没有 parked 调用可以投递）。有了原生结果记录后，这类尾部随重建
+   前缀走；兜底现在只在上下文结束于工具轮次中途时触发。
+4. **transcript 兜底的粘贴教会模型逐字复读。** 当 native 重建没有可
+   投递的 user 尾部时（任务中途的自动压缩——上下文以 tool result 结
+   尾），兜底把整个上下文拍平成一条 user 消息，而且过去连 thinking
+   块也逐字粘贴。模型自己的推理以纯文本形式重新出现在上下文里，是
+   最強的 echo 源：一段 810 字符的 reasoning + 115 字符的文本被逐字
+   节复读了三遍（每遍都重跑了同样的文件读取），而且每次复读都落入
+   下一次压缩的 retained tail，自我强化。修复：thinking 不再粘贴
+   （状态由摘要、text 和工具标记承载），replay 标记明确声明历史已经
+   终结（"不要重复……不要重新回答……不要重跑"），且 overflow 压缩的
+   retry 现在也携带 goal recitation——该路径绕过
+   `transform_context`，没有 recitation 就没有可投递的尾部 user 消
+   息，每次 overflow 压缩都会落入有损粘贴。
+5. **空前缀重建把 provider task 搞 panic 了**（`index out of bounds:
+   the len is 0 but the index is 0`，v1.0.7 修复）。当压缩把所有
+   assistant 回复都折进摘要后，native 重建连一条 settled 前缀都没
+   有——它把 CLI 的 session 文件重写成**空文件**，而写入后的完整性
+   检查在零行文件上索引了 `lines[0]`，直接 panic 掉 provider task，
+   用户侧表现为 `event stream ended without a final result`。现在空
+   前缀重建回退 transcript replay（即 `no settled prefix to
+   rebuild` 这条 WARN 的来源），且校验器把"零条预期记录的空文件"
+   视为正常。
+
+验证工具：`cargo run -p tack-ai --example cb_rebuild_repro -- <model>`
+会用真实 CLI 跑一遍压缩形状的重建并断言模型仍会调用工具（含全新会话的
+对照组）。注意运行需要可写的 `CODEBUDDY_CONFIG_DIR`——沙箱 shell 会让
+CLI 静默卡死（它无法写日志/会话文件，initialize 握手之后零日志输出；
+把 `~/.codebuddy` 拷到可写位置（含登录态）再把环境变量指过去）。
+
 ## 不坑但像坑
 
 - **模型以文本吐 `<tool_info>`/`<tool_result>` 标记**：这是模型在模仿
@@ -84,3 +149,16 @@
   属于模型行为，provider 层无解。
 - **CLI 会话 JSONL 里 `[tool:bash]` / `[tool_result:call_…]` 是压缩展示
   形式**，真实内容在同目录的 function_call 记录里，别被占位文本误导。
+- **transcript 兜底的两条 WARN 是设计内路径，不是故障**：
+  `JSONL rebuild failed (no settled prefix to rebuild; transcript
+  fallback)` / `no user tail to deliver; transcript fallback` 表示
+  native 重建没有可安全 resume 的材料，provider 改为重放拍平的
+  transcript。对话会带着完整上下文继续——损失的只有原生工具结构和
+  CLI 侧缓存。偶发（激进压缩折掉全部 assistant 轮次、CLI 首次回答前
+  挂掉）属正常；只有当**每次**压缩都走兜底、且 retained tail 里明明
+  有 assistant 轮次时才值得查。
+- **本机已安装且已登录的 codebuddy CLI 会让
+  `model_switch_rebinds_provider_adapter` 这个 TUI 测试失败**
+  （tack-app）：测试假设环境里**没有** CLI；真 CLI 存在时
+  `resolve_model` 会发现它，基于 bare-model 兜底写出的断言就挂了。
+  属于环境问题，不是代码 bug。
