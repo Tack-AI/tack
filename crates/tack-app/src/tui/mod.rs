@@ -100,9 +100,19 @@ pub(crate) fn fold_run_stats(base: &FooterStats, a: &tack_ai::AssistantMessage) 
     s.cache_read += a.usage.cache_read;
     s.cache_write += a.usage.cache_write;
     s.cost += a.usage.cost.total;
-    // Context grows by what the model has generated (tool results are not
-    // tracked here; good enough for a live percentage).
-    s.context_tokens += output;
+    // Context: once the prompt side of the usage is known (every adapter
+    // reports it from the first message_start, codebuddy included), the
+    // per-request total IS the real context size — system prompt, history
+    // and tool results included — so adopt it instead of the stale
+    // pre-run estimate. Otherwise (usage only in the final chunk, or an
+    // output-only report) keep approximating growth by generated output.
+    let prompt = a.usage.input + a.usage.cache_read + a.usage.cache_write;
+    s.context_tokens = if prompt > 0 {
+        // usage.output can lag the streamed text; top up with the estimate.
+        tack_session::calculate_context_tokens(&a.usage) + output.saturating_sub(a.usage.output)
+    } else {
+        s.context_tokens + output
+    };
     s
 }
 
@@ -1977,15 +1987,32 @@ mod tests {
         assert_eq!(s.output, 240);
         assert_eq!(s.cache_read, 520);
         assert!((s.cost - 0.51).abs() < 1e-9);
-        assert_eq!(s.context_tokens, 10_040);
+        // Real per-request usage replaces the stale pre-run estimate.
+        assert_eq!(s.context_tokens, 360);
+
+        // Prompt side known but output not yet reported: the generated text
+        // estimate keeps the live percentage moving.
+        let mut b = tack_ai::AssistantMessage::pending(&model);
+        b.usage.input = 300;
+        b.usage.cache_read = 20;
+        b.content = vec![tack_ai::ContentBlock::text("x".repeat(400))];
+        let s2 = fold_run_stats(&base, &b);
+        assert_eq!(s2.context_tokens, 320 + 100);
+
+        // Output-only usage is not a context size: fall back to growth by
+        // generated output.
+        let mut c = tack_ai::AssistantMessage::pending(&model);
+        c.usage.output = 40;
+        let s3 = fold_run_stats(&base, &c);
+        assert_eq!(s3.context_tokens, 10_040);
 
         // No usage yet (provider reports only in the final chunk): output is
         // estimated from generated text so the footer still moves mid-stream.
-        let mut b = tack_ai::AssistantMessage::pending(&model);
-        b.content = vec![tack_ai::ContentBlock::text("x".repeat(400))];
-        let s2 = fold_run_stats(&base, &b);
-        assert_eq!(s2.output, 200 + 100, "chars/4 fallback");
-        assert_eq!(s2.context_tokens, 10_100);
+        let mut d = tack_ai::AssistantMessage::pending(&model);
+        d.content = vec![tack_ai::ContentBlock::text("x".repeat(400))];
+        let s4 = fold_run_stats(&base, &d);
+        assert_eq!(s4.output, 200 + 100, "chars/4 fallback");
+        assert_eq!(s4.context_tokens, 10_100);
     }
 
     /// A MessageUpdate snapshots the whole assistant message, so the latest

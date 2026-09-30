@@ -6,6 +6,16 @@ notice can parse entries (same convention as TS pi).
 
 ## [Unreleased]
 
+### Changed
+
+- **Live footer context percentage is exact mid-stream**: once the provider
+  reports the prompt side of the usage (every adapter does from the first
+  `message_start`, CodeBuddy included), the footer's context indicator uses
+  the real per-request size — system prompt, history and tool results
+  included — instead of the stale pre-run estimate plus generated output.
+  Providers that only report usage in the final chunk keep the old
+  output-growth approximation.
+
 ### Fixed
 
 - **CodeBuddy post-compaction turns stall out — early stop, "tool isn't
