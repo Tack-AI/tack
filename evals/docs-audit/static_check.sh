@@ -53,10 +53,13 @@ HOOKS_MD=docs/hooks.md
 #                                                            apt/docker/cargo 命令的 flag，非 tack CLI
 #   --manifest-path --quiet                                  : plugin-development.md 引用的是脚手架
 #                                                            生成的 cargo 命令的 flag，非 tack CLI
+#   --example                                              : codebuddy-pitfalls.md 的验证命令
+#                                                            `cargo run -p tack-ai --example cb_rebuild_repro`
+#                                                            引用的是 cargo flag，非 tack CLI
 # Doc flags that are not tack's own CLI flags: cargo/rustup flags used in
 # build instructions, and CodeBuddy CLI flags (`codebuddy` is the external
 # tool tack embeds — docs/codebuddy.md and features.md describe ITS flags).
-EXCLUDE_DOC_FLAGS="--all --all-targets --allowed --depth --extension --generate-notes --get --git-dir --hard --input-format --locked --no-extensions --oneline --output-format --package --path --plan --release --rpc --stdio --workspace --effort --include-partial-messages --permission-mode --setting-sources --strict-mcp-config --system-prompt --tools --no-install-recommends --pids-limit --cpus --memory --doc --manifest-path --quiet"
+EXCLUDE_DOC_FLAGS="--all --all-targets --allowed --depth --example --extension --generate-notes --get --git-dir --hard --input-format --locked --no-extensions --oneline --output-format --package --path --plan --release --rpc --stdio --workspace --effort --include-partial-messages --permission-mode --setting-sources --strict-mcp-config --system-prompt --tools --no-install-recommends --pids-limit --cpus --memory --doc --manifest-path --quiet"
 
 # Implemented-but-undocumented settings keys we deliberately do not warn about:
 # (none currently — shellPath/appendSystemPrompt are documented in configuration.md)
