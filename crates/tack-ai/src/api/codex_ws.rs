@@ -598,12 +598,16 @@ pub async fn spawn_producer(
     params: Value,
     cancel: CancellationToken,
 ) -> Result<mpsc::UnboundedReceiver<Result<String, String>>, String> {
-    let ws_url = if base_url.starts_with("https://") {
-        base_url.replacen("https://", "wss://", 1)
+    // Same endpoint resolution as the SSE path (TS
+    // `resolveCodexWebSocketUrl`), then swap the scheme.
+    let http_url = super::openai_responses::resolve_codex_url(base_url);
+    let url = if let Some(rest) = http_url.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = http_url.strip_prefix("http://") {
+        format!("ws://{rest}")
     } else {
-        base_url.replacen("http://", "ws://", 1)
+        http_url
     };
-    let url = format!("{ws_url}/responses");
 
     let mut headers = vec![(
         "OpenAI-Beta".to_string(),

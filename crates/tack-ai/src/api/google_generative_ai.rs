@@ -477,11 +477,28 @@ async fn run(
     options: StreamOptions,
     sender: AssistantMessageEventSender,
 ) {
-    let base = model.base_url.trim_end_matches('/');
-    let url = format!(
-        "{base}/v1beta/models/{}:streamGenerateContent?alt=sse",
-        urlencoding(&model.id)
-    );
+    let base = model.base_url.trim().trim_end_matches('/');
+    let url = if base.is_empty() {
+        // TS: without an explicit baseUrl the genai SDK falls back to
+        // GOOGLE_GEMINI_BASE_URL (then its built-in host) plus the default
+        // v1beta version path.
+        let host = std::env::var("GOOGLE_GEMINI_BASE_URL")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "https://generativelanguage.googleapis.com".to_string());
+        format!(
+            "{host}/v1beta/{}:streamGenerateContent?alt=sse",
+            t_model(&model.id)
+        )
+    } else {
+        // An explicit baseUrl is version-inclusive (TS sets apiVersion=""
+        // so the SDK appends nothing).
+        format!(
+            "{base}/{}:streamGenerateContent?alt=sse",
+            t_model(&model.id)
+        )
+    };
     let auth = match options.api_key.clone() {
         Some(key) => GoogleAuth::Header(key),
         None => {
@@ -828,20 +845,15 @@ fn tack_ai_now_millis() -> u64 {
     crate::types::now_millis()
 }
 
-/// Minimal percent-encoding for path segments (model ids are safe, but
-/// custom ids may contain slashes). Non-ASCII characters are encoded as
-/// their UTF-8 BYTE sequence — `%{codepoint:02X}` produces garbage above
-/// U+00FF (e.g. '中' => %4E2D, a 4-digit "hex byte").
-pub(crate) fn urlencoding(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
+/// TS genai SDK `tModel` (Gemini branch): resource-prefixed ids pass
+/// through verbatim, bare ids get the `models/` prefix. Ids are
+/// interpolated raw (no percent-encoding), matching the SDK.
+pub(crate) fn t_model(id: &str) -> String {
+    if id.starts_with("models/") || id.starts_with("tunedModels/") {
+        id.to_string()
+    } else {
+        format!("models/{id}")
     }
-    out
 }
 
 #[cfg(test)]
@@ -881,18 +893,21 @@ mod tests {
         })
     }
 
+    /// TS genai SDK `tModel` (Gemini branch): bare ids get `models/`,
+    /// resource-prefixed ids pass through verbatim.
+    #[test]
+    fn t_model_prefixes_bare_ids() {
+        assert_eq!(t_model("gemini-2.5-flash"), "models/gemini-2.5-flash");
+        assert_eq!(
+            t_model("models/gemini-2.5-flash"),
+            "models/gemini-2.5-flash"
+        );
+        assert_eq!(t_model("tunedModels/x"), "tunedModels/x");
+    }
+
     /// Regression: the output/error payload must be nested under a `response`
     /// key inside functionResponse (TS google-shared convertMessages), not
     /// flat alongside `name`.
-    #[test]
-    fn urlencoding_percent_encodes_utf8_bytes() {
-        assert_eq!(urlencoding("gemini-2.5-flash"), "gemini-2.5-flash");
-        assert_eq!(urlencoding("a/b c"), "a%2Fb%20c");
-        // Above U+00FF: UTF-8 bytes, not the raw codepoint.
-        assert_eq!(urlencoding("中"), "%E4%B8%AD");
-        assert_eq!(urlencoding("é"), "%C3%A9");
-    }
-
     #[test]
     fn tool_result_payload_nests_under_response_key() {
         let context = Context {

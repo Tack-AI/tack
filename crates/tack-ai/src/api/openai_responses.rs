@@ -441,44 +441,62 @@ fn resolve_cache_retention(options: &StreamOptions) -> CacheRetention {
     CacheRetention::Short
 }
 
-fn normalize_azure_base_url(base_url: &str) -> String {
-    let trimmed = base_url.trim().trim_end_matches('/').to_string();
-    let is_azure_host = trimmed.contains(".openai.azure.com")
-        || trimmed.contains(".cognitiveservices.azure.com")
-        || trimmed.contains(".ai.azure.com");
-    if !is_azure_host {
-        return trimmed;
-    }
+/// TS `normalizeAzureBaseUrl`: real URL parsing — azure-host detection is a
+/// hostname suffix match, and the /openai/v1 rewrite drops any query.
+fn normalize_azure_base_url(base_url: &str) -> Result<String, String> {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    let mut url = reqwest::Url::parse(trimmed)
+        .map_err(|_| format!("Invalid Azure OpenAI base URL: {base_url}"))?;
+    let is_azure_host = url.host_str().is_some_and(|host| {
+        host.ends_with(".openai.azure.com")
+            || host.ends_with(".cognitiveservices.azure.com")
+            || host.ends_with(".ai.azure.com")
+    });
     // Azure hosts need /openai/v1 as the base path so /responses and
     // ?api-version=v1 resolve correctly.
-    let path = trimmed
-        .find("://")
-        .and_then(|i| {
-            trimmed[i + 3..]
-                .find('/')
-                .map(|p| trimmed[i + 3 + p..].to_string())
-        })
-        .unwrap_or_default();
-    if path.is_empty() || path == "/openai" || path == "/openai/v1/responses" {
-        let host_end = trimmed
-            .find("://")
-            .map(|i| i + 3 + trimmed[i + 3..].find('/').unwrap_or(trimmed.len() - i - 3))
-            .unwrap_or(trimmed.len());
-        return format!("{}/openai/v1", &trimmed[..host_end]);
+    let path = url.path().trim_end_matches('/');
+    if is_azure_host && (path.is_empty() || path == "/openai" || path == "/openai/v1/responses") {
+        url.set_path("/openai/v1");
+        url.set_query(None);
     }
-    trimmed
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+/// Codex ChatGPT-backend URL resolution (TS `resolveCodexUrl`): the
+/// Responses endpoint lives under `/codex`, and custom bases may already
+/// include part of that suffix.
+pub(crate) fn resolve_codex_url(base_url: &str) -> String {
+    const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
+    let trimmed = base_url.trim().trim_end_matches('/');
+    let normalized = if trimmed.is_empty() {
+        DEFAULT_CODEX_BASE_URL
+    } else {
+        trimmed
+    };
+    if normalized.ends_with("/codex/responses") {
+        normalized.to_string()
+    } else if normalized.ends_with("/codex") {
+        format!("{normalized}/responses")
+    } else {
+        format!("{normalized}/codex/responses")
+    }
 }
 
 fn resolve_azure_base_url(model: &Model) -> Result<String, String> {
+    // TS treats empty env values as unset (`||` chains).
     let base = std::env::var("AZURE_OPENAI_BASE_URL")
         .ok()
-        .map(|v| v.trim().to_string());
-    let resource = std::env::var("AZURE_OPENAI_RESOURCE_NAME").ok();
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let resource = std::env::var("AZURE_OPENAI_RESOURCE_NAME")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
     let resolved = base
         .or_else(|| resource.map(|r| format!("https://{r}.openai.azure.com/openai/v1")))
         .or_else(|| (!model.base_url.is_empty()).then(|| model.base_url.clone()));
     match resolved {
-        Some(url) => Ok(normalize_azure_base_url(&url)),
+        Some(url) => normalize_azure_base_url(&url),
         None => Err(
             "Azure OpenAI base URL is required. Set AZURE_OPENAI_BASE_URL or AZURE_OPENAI_RESOURCE_NAME, or model.baseUrl."
                 .to_string(),
@@ -489,10 +507,15 @@ fn resolve_azure_base_url(model: &Model) -> Result<String, String> {
 fn resolve_azure_deployment_name(model: &Model) -> String {
     if let Ok(map) = std::env::var("AZURE_OPENAI_DEPLOYMENT_NAME_MAP") {
         for entry in map.split(',') {
-            if let Some((id, deployment)) = entry.trim().split_once('=')
-                && id.trim() == model.id
-            {
-                return deployment.trim().to_string();
+            // TS `pair.split("=", 2)`: a second `=` ends the value, and
+            // entries with an empty key or value are skipped.
+            let mut parts = entry.split('=');
+            let (Some(id), Some(deployment)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let (id, deployment) = (id.trim(), deployment.trim());
+            if !id.is_empty() && !deployment.is_empty() && id == model.id {
+                return deployment.to_string();
             }
         }
     }
@@ -793,10 +816,18 @@ async fn run(
         },
         _ => model.base_url.trim_end_matches('/').to_string(),
     };
-    let mut url = format!("{base_url}/responses");
+    let mut url = if flavor == ResponsesFlavor::Codex {
+        resolve_codex_url(&base_url)
+    } else {
+        format!("{base_url}/responses")
+    };
     if flavor == ResponsesFlavor::Azure {
-        let api_version =
-            std::env::var("AZURE_OPENAI_API_VERSION").unwrap_or_else(|_| "v1".to_string());
+        // TS treats an empty AZURE_OPENAI_API_VERSION as unset (default v1).
+        let api_version = std::env::var("AZURE_OPENAI_API_VERSION")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "v1".to_string());
         url = format!("{url}?api-version={api_version}");
     }
 
@@ -1567,5 +1598,79 @@ mod tests {
         let params = build_params(&m, &context, &options, ResponsesFlavor::Azure).unwrap();
         assert_eq!(params["tool_choice"], json!("auto"));
         assert_eq!(params["tools"].as_array().unwrap().len(), 1);
+    }
+
+    /// Codex URL resolution mirrors TS `resolveCodexUrl`: the Responses
+    /// endpoint lives under `/codex`, tolerant of bases that already carry it.
+    #[test]
+    fn codex_url_resolution() {
+        assert_eq!(
+            resolve_codex_url("https://chatgpt.com/backend-api"),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            resolve_codex_url("https://chatgpt.com/backend-api/"),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            resolve_codex_url("https://chatgpt.com/backend-api/codex"),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            resolve_codex_url("https://chatgpt.com/backend-api/codex/responses"),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            resolve_codex_url(""),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            resolve_codex_url("http://localhost:8080"),
+            "http://localhost:8080/codex/responses"
+        );
+    }
+
+    /// TS `normalizeAzureBaseUrl`: azure hosts get /openai/v1 when the path
+    /// is empty, /openai, or /openai/v1/responses; hostname matching is a
+    /// real suffix match and the rewrite drops the query.
+    #[test]
+    fn azure_base_url_normalization() {
+        assert_eq!(
+            normalize_azure_base_url("https://res.openai.azure.com").unwrap(),
+            "https://res.openai.azure.com/openai/v1"
+        );
+        assert_eq!(
+            normalize_azure_base_url("https://res.openai.azure.com/").unwrap(),
+            "https://res.openai.azure.com/openai/v1"
+        );
+        assert_eq!(
+            normalize_azure_base_url("https://res.openai.azure.com/openai").unwrap(),
+            "https://res.openai.azure.com/openai/v1"
+        );
+        assert_eq!(
+            normalize_azure_base_url("https://res.openai.azure.com/openai/v1/responses").unwrap(),
+            "https://res.openai.azure.com/openai/v1"
+        );
+        // Query is dropped on rewrite.
+        assert_eq!(
+            normalize_azure_base_url("https://res.openai.azure.com/openai?x=1").unwrap(),
+            "https://res.openai.azure.com/openai/v1"
+        );
+        // Non-matching paths and non-azure hosts pass through.
+        assert_eq!(
+            normalize_azure_base_url("https://res.openai.azure.com/openai/v1").unwrap(),
+            "https://res.openai.azure.com/openai/v1"
+        );
+        assert_eq!(
+            normalize_azure_base_url("https://proxy.example.com").unwrap(),
+            "https://proxy.example.com"
+        );
+        // Suffix match, not substring: the host must END with the suffix.
+        assert_eq!(
+            normalize_azure_base_url("https://x.openai.azure.com.evil.com").unwrap(),
+            "https://x.openai.azure.com.evil.com"
+        );
+        // Invalid URLs are an error, matching TS.
+        assert!(normalize_azure_base_url("not a url").is_err());
     }
 }

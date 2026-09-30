@@ -114,7 +114,7 @@ pub const BUILTIN_PROVIDERS: &[BuiltinProviderDef] = &[
     BuiltinProviderDef {
         id: "google",
         name: "Google",
-        base_url: "https://generativelanguage.googleapis.com",
+        base_url: "https://generativelanguage.googleapis.com/v1beta",
         api: "google-generative-ai",
         env_keys: &["GEMINI_API_KEY"],
     },

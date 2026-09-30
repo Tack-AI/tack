@@ -81,9 +81,17 @@ TS pi 行为一致）。本地 provider 探测到的目录与 models.json 的
    （含 `AWS_SESSION_TOKEN`）
 4. `AWS_BEDROCK_SKIP_AUTH=1`（假凭据，本地调试）
 
-**区域解析**：模型 id 中的 ARN → `AWS_REGION` / `AWS_DEFAULT_REGION` →
-base-url 中的 region → `eu.` 前缀 → 默认 `us-east-1`。
-SDK 默认链（IMDS/ECS/SSO/web-identity）**未实现**。
+**区域/端点解析**（TS `shouldUseExplicitBedrockEndpoint`）：自定义
+（非标准）base URL 总是原样使用。标准的
+`bedrock-runtime.<region>.amazonaws.com` base 只有在未配置
+`AWS_REGION` / `AWS_DEFAULT_REGION` 且没有 ambient `AWS_PROFILE`
+时才被固定；否则按解析出的 region 重新推导端点，让 env/profile 覆盖
+目录默认值。region 优先级：模型 id 中（`:bedrock:` 服务的）ARN →
+`AWS_REGION` / `AWS_DEFAULT_REGION` → 被固定的标准 base URL 中的
+region → 活动 profile 在 `~/.aws/config` 中的 `region` → 默认
+`us-east-1`。base 为空的模型默认 us-east-1 端点（`eu.*` id 为
+eu-central-1，与 TS 目录一致）。SDK 默认链的其余部分
+（IMDS/ECS/SSO/web-identity）**未实现**。
 
 ## Google Vertex（`google-vertex`）
 
@@ -99,9 +107,12 @@ SDK 默认链（IMDS/ECS/SSO/web-identity）**未实现**。
 
 token 缓存到临近过期。**project** 来自
 `GOOGLE_CLOUD_PROJECT` / `GCLOUD_PROJECT` / SA `project_id` / metadata
-server；**location** 来自 `GOOGLE_CLOUD_LOCATION`，缺省回退到 GCE 上由实例
-zone 推导的 region（默认 `global`）。metadata server 的 base URL 可用
-`TACK_GCE_METADATA_URL` 覆盖（测试用）。
+server；**location** 来自 `GOOGLE_CLOUD_LOCATION`，且在 ADC 模式下
+必填（TS pi 缺失时会报错）。`GOOGLE_VERTEX_BASE_URL` 覆盖默认端点
+host；models.json 中的自定义 `baseUrl` 作为 collection 级 base 使用
+（除非已含版本段，否则追加 `/v1`），不支持 `{location}` 模板——与
+TS pi 一致。metadata server 的 base URL 可用 `TACK_GCE_METADATA_URL`
+覆盖（测试用）。
 
 ## 本地 provider（零配置）
 

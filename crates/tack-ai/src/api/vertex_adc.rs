@@ -79,9 +79,6 @@ impl std::fmt::Debug for GoogleTokenSource {
 pub struct Adc {
     pub source: GoogleTokenSource,
     pub project: Option<String>,
-    /// GCP location (region) when the source implies one — currently only
-    /// the GCE metadata server, derived from the instance zone.
-    pub location: Option<String>,
 }
 
 impl GoogleTokenSource {
@@ -224,34 +221,19 @@ async fn metadata_get(client: &reqwest::Client, url: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Derive the GCP region from an instance zone path
-/// (`projects/123/zones/us-central1-a` → `us-central1`).
-fn region_from_zone(zone_path: &str) -> Option<String> {
-    let zone = zone_path.trim().trim_end_matches('/').rsplit('/').next()?;
-    let (region, suffix) = zone.rsplit_once('-')?;
-    if region.is_empty() || suffix.len() != 1 || !suffix.chars().all(|c| c.is_ascii_alphabetic()) {
-        return None;
-    }
-    Some(region.to_string())
-}
-
 /// Probe the GCE metadata server (use a short-timeout client — it only
 /// answers on GCP). Returns the metadata token source plus the instance
-/// project and the region derived from the instance zone.
+/// project. (The instance zone is NOT consulted for a location — TS
+/// `resolveLocation` only honors GOOGLE_CLOUD_LOCATION.)
 pub async fn gce_metadata_adc_at(client: &reqwest::Client, base_url: &str) -> Option<Adc> {
     let base = base_url.trim_end_matches('/');
     let project_url = format!("{base}/computeMetadata/v1/project/project-id");
-    let zone_url = format!("{base}/computeMetadata/v1/instance/zone");
-    let (project, zone) = tokio::join!(
-        metadata_get(client, &project_url),
-        metadata_get(client, &zone_url),
-    );
+    let project = metadata_get(client, &project_url).await?;
     Some(Adc {
         source: GoogleTokenSource::GceMetadata {
             base_url: base.to_string(),
         },
-        project: Some(project?),
-        location: zone.as_deref().and_then(region_from_zone),
+        project: Some(project),
     })
 }
 
@@ -335,7 +317,6 @@ pub fn parse_credentials_json(value: &Value) -> Result<Adc, String> {
                     .get("project_id")
                     .and_then(Value::as_str)
                     .map(str::to_string),
-                location: None,
             })
         }
         Some("authorized_user") => {
@@ -361,7 +342,6 @@ pub fn parse_credentials_json(value: &Value) -> Result<Adc, String> {
                     .get("project_id")
                     .and_then(Value::as_str)
                     .map(str::to_string),
-                location: None,
             })
         }
         other => Err(format!("unsupported credentials type {other:?}")),
@@ -548,30 +528,14 @@ mod tests {
         assert!(debug.contains("client-id-1"), "{debug}");
     }
 
-    #[test]
-    fn region_from_zone_parses_zone_paths() {
-        assert_eq!(
-            region_from_zone("projects/123456/zones/us-central1-a").as_deref(),
-            Some("us-central1")
-        );
-        assert_eq!(region_from_zone("us-east4-b").as_deref(), Some("us-east4"));
-        assert_eq!(
-            region_from_zone("europe-west1-c/").as_deref(),
-            Some("europe-west1")
-        );
-        assert_eq!(region_from_zone(""), None);
-        assert_eq!(region_from_zone("global"), None);
-    }
-
     #[tokio::test]
-    async fn metadata_adc_resolves_project_and_location() {
+    async fn metadata_adc_resolves_project() {
         let mock =
             MockMetadata::start("test-project-123", "projects/123/zones/us-central1-a").await;
         let adc = gce_metadata_adc_at(&short_timeout_client(), &mock.base_url)
             .await
             .expect("metadata ADC should resolve");
         assert_eq!(adc.project.as_deref(), Some("test-project-123"));
-        assert_eq!(adc.location.as_deref(), Some("us-central1"));
         let GoogleTokenSource::GceMetadata { base_url } = &adc.source else {
             panic!("expected GceMetadata source");
         };

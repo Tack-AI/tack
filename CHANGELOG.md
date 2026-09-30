@@ -17,6 +17,51 @@ notice can parse entries (same convention as TS pi).
   without a final result`). Empty-prefix rebuilds now fall back to
   transcript replay, and the verifier treats an empty file with zero
   expected records as sound.
+- **`openai-codex` 404 on every request**: the Codex ChatGPT backend
+  serves Responses under `/codex`, but the request URL was built as
+  `{baseUrl}/responses`, so `https://chatgpt.com/backend-api/responses`
+  answered `404 {"detail":"Not Found"}`. Both transports (SSE and the
+  WebSocket path) now resolve the endpoint like TS pi's
+  `resolveCodexUrl` — appending `/codex/responses`, tolerant of custom
+  base URLs that already end in `/codex` or `/codex/responses`.
+- **Provider endpoint URLs aligned with TS pi across the board** (a
+  follow-up audit of every adapter against the upstream SDK semantics):
+  - **Google Gemini 404/duplicated version path**: catalog models carry a
+    version-inclusive `baseUrl` (`.../v1beta`), but the adapter appended
+    another `/v1beta`. The adapter now treats an explicit `baseUrl` as
+    version-inclusive (TS sets `apiVersion=""`), prefixes bare model ids
+    with `models/` like the SDK's `tModel` (resource-rooted ids pass
+    through verbatim, no percent-encoding), and falls back to
+    `GOOGLE_GEMINI_BASE_URL` when no base is set.
+  - **Google Vertex**: custom `baseUrl` is now honored in BOTH auth modes
+    as a collection-scope base (`/v1` appended only when no `v<digits>` /
+    `v<digits>beta<digits>` path segment is present), `{location}`-
+    templated bases are ignored (TS `resolveCustomBaseUrl`),
+    `GOOGLE_VERTEX_BASE_URL` overrides the default host, the
+    multi-regional `us`/`eu` locations use the
+    `aiplatform.<loc>.rep.googleapis.com` host, and third-party
+    `publisher/model` ids expand to `publishers/<pub>/models/<id>`. ADC
+    mode now requires `GOOGLE_CLOUD_LOCATION` like TS pi (the silent
+    metadata-zone / `global` fallback was removed).
+  - **Anthropic**: requests go to `/v1/messages?beta=true`, matching the
+    SDK's beta surface used by TS pi.
+  - **Azure OpenAI**: base-URL normalization now uses real URL parsing —
+    azure-host detection is a hostname suffix match (no more substring
+    false positives), the `/openai/v1` rewrite drops any query string,
+    invalid bases are an explicit error, and empty
+    `AZURE_OPENAI_BASE_URL` / `AZURE_OPENAI_RESOURCE_NAME` /
+    `AZURE_OPENAI_API_VERSION` values are treated as unset (TS `||`
+    semantics). The deployment-name map skips empty keys/values and stops
+    the value at a second `=` like TS.
+  - **Amazon Bedrock**: a standard `bedrock-runtime.<region>.amazonaws.com`
+    base URL no longer overrides a configured `AWS_REGION` /
+    `AWS_DEFAULT_REGION` or an ambient `AWS_PROFILE` — the endpoint is
+    re-derived from the resolved region (TS
+    `shouldUseExplicitBedrockEndpoint`), fixing SigV4-signed requests
+    landing on the wrong regional host. Region resolution now matches the
+    TS order (bedrock-service ARN → env → pinned standard base → active
+    profile's `region` in `~/.aws/config` → `us-east-1`), and non-standard
+    custom bases (VPC/proxy) stay pinned.
 
 ## [1.0.6] - 2026-09-30
 

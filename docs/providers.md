@@ -84,10 +84,18 @@ Implemented without the AWS SDK:
    (including `AWS_SESSION_TOKEN`)
 4. `AWS_BEDROCK_SKIP_AUTH=1` (fake credentials, local debugging)
 
-**Region resolution**: ARN in the model id → `AWS_REGION` /
-`AWS_DEFAULT_REGION` → region in the base-url → `eu.` prefix → default
-`us-east-1`. The SDK default chain (IMDS/ECS/SSO/web-identity) is **not
-implemented**.
+**Region/endpoint resolution** (TS `shouldUseExplicitBedrockEndpoint`):
+a custom (non-standard) base URL is always used as-is. A standard
+`bedrock-runtime.<region>.amazonaws.com` base is pinned only when neither
+`AWS_REGION` / `AWS_DEFAULT_REGION` nor an ambient `AWS_PROFILE` is set;
+otherwise the endpoint is re-derived from the resolved region so the
+env/profile wins over catalog defaults. Region priority: ARN (`:bedrock:`
+service) in the model id → `AWS_REGION` / `AWS_DEFAULT_REGION` → region
+in a pinned standard base URL → the active profile's `region` in
+`~/.aws/config` → default `us-east-1`. Models with an empty base default
+to the us-east-1 endpoint (`eu.*` ids to eu-central-1, matching the TS
+catalog). The rest of the SDK default chain (IMDS/ECS/SSO/web-identity) is
+**not implemented**.
 
 ## Google Vertex (`google-vertex`)
 
@@ -104,10 +112,13 @@ Two auth modes:
 
 Tokens are cached until near expiry. **project** comes from
 `GOOGLE_CLOUD_PROJECT` / `GCLOUD_PROJECT` / SA `project_id` / metadata
-server; **location** comes from `GOOGLE_CLOUD_LOCATION`, falling back on
-GCE to the region derived from the instance zone (default `global`). The
-metadata server's base URL can be overridden with `TACK_GCE_METADATA_URL`
-(for tests).
+server; **location** comes from `GOOGLE_CLOUD_LOCATION` and is required in
+ADC mode (TS pi errors without it). `GOOGLE_VERTEX_BASE_URL` overrides the
+default endpoint host; a custom `baseUrl` in models.json is used as a
+collection-scope base (`/v1` appended unless it already carries a version
+segment) and `{location}` templating is not supported — same as TS pi.
+The metadata server's base URL can be overridden with
+`TACK_GCE_METADATA_URL` (for tests).
 
 ## Local providers (zero config)
 

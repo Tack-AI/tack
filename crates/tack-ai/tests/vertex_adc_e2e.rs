@@ -61,6 +61,9 @@ async fn vertex_adc_bearer_flow() {
         std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", credentials.path());
         std::env::remove_var("GOOGLE_CLOUD_API_KEY");
         std::env::remove_var("GOOGLE_CLOUD_PROJECT"); // comes from the SA JSON
+        // ADC mode requires a location (TS `resolveLocation`), even though a
+        // collection-scope custom base doesn't put it in the URL.
+        std::env::set_var("GOOGLE_CLOUD_LOCATION", "us-central1");
     }
 
     let mut model = Model {
@@ -111,6 +114,7 @@ async fn vertex_adc_bearer_flow() {
 
     unsafe {
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
+        std::env::remove_var("GOOGLE_CLOUD_LOCATION");
     }
 }
 

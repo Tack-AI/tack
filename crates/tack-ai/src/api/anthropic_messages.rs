@@ -666,7 +666,12 @@ async fn run(
 
     // --- request ---
     let client = crate::api::http_client();
-    let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
+    // TS uses the SDK's beta surface (`client.beta.messages.create`), which
+    // posts to `/v1/messages?beta=true`.
+    let url = format!(
+        "{}/v1/messages?beta=true",
+        model.base_url.trim_end_matches('/')
+    );
 
     // Beta headers.
     let mut betas: Vec<String> = Vec::new();

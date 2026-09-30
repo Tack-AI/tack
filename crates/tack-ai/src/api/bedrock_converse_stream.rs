@@ -48,44 +48,104 @@ impl crate::provider::Provider for BedrockConverseStreamProvider {
     }
 }
 
-/// Region resolution order (TS): ARN in model id > env > base_url-derived >
-/// id-prefix heuristic > us-east-1.
-fn resolve_region(model: &Model) -> String {
-    // arn:aws[-...]:bedrock:{region}:...
-    if model.id.starts_with("arn:") {
-        let parts: Vec<&str> = model.id.split(':').collect();
-        if parts.len() > 3 && !parts[3].is_empty() {
-            return parts[3].to_string();
-        }
-    }
-    for var in ["AWS_REGION", "AWS_DEFAULT_REGION"] {
-        if let Ok(region) = std::env::var(var)
-            && !region.is_empty()
-        {
-            return region;
-        }
-    }
-    if let Some(region) = model
-        .base_url
-        .strip_prefix("https://bedrock-runtime.")
-        .and_then(|rest| rest.strip_suffix(".amazonaws.com"))
-        && !region.is_empty()
-    {
-        return region.to_string();
-    }
-    if model.id.starts_with("eu.") {
-        return "eu-central-1".to_string();
-    }
-    "us-east-1".to_string()
+/// Region embedded in an inference-profile ARN (TS
+/// `/^arn:aws(?:-[a-z0-9-]+)?:bedrock:([a-z0-9-]+):/` — bedrock service
+/// ARNs only).
+fn arn_region(model_id: &str) -> Option<String> {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^arn:aws(?:-[a-z0-9-]+)?:bedrock:([a-z0-9-]+):").expect("valid regex")
+    });
+    Some(RE.captures(model_id)?.get(1)?.as_str().to_string())
 }
 
-fn resolve_endpoint(model: &Model, region: &str) -> String {
-    let base = model.base_url.trim_end_matches('/');
-    if base.is_empty() {
-        format!("https://bedrock-runtime.{region}.amazonaws.com")
+/// Region embedded in a standard AWS Bedrock runtime endpoint hostname
+/// (TS `getStandardBedrockEndpointRegion`).
+fn standard_endpoint_region(base_url: &str) -> Option<String> {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^bedrock-runtime(?:-fips)?\.([a-z0-9-]+)\.amazonaws\.com(?:\.cn)?$")
+            .expect("valid regex")
+    });
+    let host = reqwest::Url::parse(base_url)
+        .ok()?
+        .host_str()?
+        .to_lowercase();
+    Some(RE.captures(&host)?.get(1)?.as_str().to_string())
+}
+
+/// TS `getConfiguredBedrockRegion`: env-only on the tack side (StreamOptions
+/// carries no region field).
+fn configured_region() -> Option<String> {
+    ["AWS_REGION", "AWS_DEFAULT_REGION"].iter().find_map(|var| {
+        std::env::var(var)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
+}
+
+fn ambient_profile() -> Option<String> {
+    std::env::var("AWS_PROFILE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// The reproducible part of the AWS SDK default region chain: the region
+/// from ~/.aws/config for the active profile (AWS_PROFILE, else default).
+fn profile_chain_region(profile: Option<&str>) -> Option<String> {
+    let home = dirs::home_dir()?;
+    credentials::profile_region(&home, profile.unwrap_or("default"))
+}
+
+/// Region + endpoint resolution (TS `shouldUseExplicitBedrockEndpoint` plus
+/// the SDK region chain). A non-standard base URL (VPC/proxy) is always
+/// pinned; a standard bedrock hostname is only pinned when neither a
+/// configured region nor an ambient AWS_PROFILE exists — otherwise the
+/// endpoint is re-derived from the resolved region so AWS_REGION /
+/// AWS_PROFILE win over catalog defaults.
+fn resolve_region_endpoint(model: &Model) -> (String, String) {
+    resolve_region_endpoint_with(model, configured_region(), ambient_profile())
+}
+
+/// Pure core of [`resolve_region_endpoint`] with the env-derived inputs
+/// injected, so tests don't touch the process environment.
+fn resolve_region_endpoint_with(
+    model: &Model,
+    configured: Option<String>,
+    profile: Option<String>,
+) -> (String, String) {
+    let base = model.base_url.trim().trim_end_matches('/');
+    // TS bakes these defaults into the per-model catalog baseUrl; tack's
+    // embedded catalog leaves it empty, so supply them here.
+    let effective_base = if base.is_empty() {
+        if model.id.starts_with("eu.") {
+            "https://bedrock-runtime.eu-central-1.amazonaws.com".to_string()
+        } else {
+            "https://bedrock-runtime.us-east-1.amazonaws.com".to_string()
+        }
     } else {
         base.to_string()
-    }
+    };
+    let endpoint_region = standard_endpoint_region(&effective_base);
+    let explicit = endpoint_region.is_none() || (configured.is_none() && profile.is_none());
+
+    let region = arn_region(&model.id)
+        .or(configured)
+        .or_else(|| {
+            explicit
+                .then_some(())
+                .and_then(|()| endpoint_region.clone())
+        })
+        .or_else(|| profile.is_none().then(|| "us-east-1".to_string()))
+        .or_else(|| profile_chain_region(profile.as_deref()))
+        .unwrap_or_else(|| "us-east-1".to_string());
+
+    let endpoint = if explicit {
+        effective_base
+    } else {
+        format!("https://bedrock-runtime.{region}.amazonaws.com")
+    };
+    (region, endpoint)
 }
 
 fn map_stop_reason(reason: &str) -> (StopReason, Option<String>) {
@@ -517,8 +577,7 @@ async fn run(
         Err(e) => fail!(output, sender, e, false),
     };
 
-    let region = resolve_region(&model);
-    let endpoint = resolve_endpoint(&model, &region);
+    let (region, endpoint) = resolve_region_endpoint(&model);
     let encoded_id = sigv4::aws_uri_encode(&model.id, true);
     let url = format!("{endpoint}/model/{encoded_id}/converse-stream");
     let host = reqwest::Url::parse(&endpoint)
@@ -932,5 +991,106 @@ mod tests {
         let frame = decoder.feed(&bytes).unwrap().remove(0);
         let err = state.handle_frame(&frame).unwrap_err();
         assert_eq!(err, "Bedrock Throttling error: slow down");
+    }
+
+    #[test]
+    fn arn_region_extraction() {
+        assert_eq!(
+            arn_region(
+                "arn:aws:bedrock:eu-west-1:123456789012:inference-profile/eu.anthropic.claude"
+            )
+            .as_deref(),
+            Some("eu-west-1")
+        );
+        assert_eq!(
+            arn_region("arn:aws-us-gov:bedrock:us-gov-west-1:123:profile/x").as_deref(),
+            Some("us-gov-west-1")
+        );
+        // Non-bedrock service ARNs do not carry a usable region (TS regex).
+        assert_eq!(arn_region("arn:aws:s3:us-west-2:123:bucket/x"), None);
+        assert_eq!(arn_region("us.anthropic.claude-sonnet-4-5"), None);
+    }
+
+    #[test]
+    fn standard_endpoint_region_parsing() {
+        assert_eq!(
+            standard_endpoint_region("https://bedrock-runtime.us-east-1.amazonaws.com").as_deref(),
+            Some("us-east-1")
+        );
+        assert_eq!(
+            standard_endpoint_region("https://bedrock-runtime-fips.us-east-1.amazonaws.com")
+                .as_deref(),
+            Some("us-east-1")
+        );
+        assert_eq!(
+            standard_endpoint_region("https://bedrock-runtime.cn-north-1.amazonaws.com.cn")
+                .as_deref(),
+            Some("cn-north-1")
+        );
+        assert_eq!(standard_endpoint_region("https://proxy.example.com"), None);
+        assert_eq!(standard_endpoint_region(""), None);
+    }
+
+    #[test]
+    fn region_endpoint_resolution() {
+        // Default catalog model (empty base): pinned to us-east-1.
+        assert_eq!(
+            resolve_region_endpoint_with(&test_model(), None, None),
+            (
+                "us-east-1".to_string(),
+                "https://bedrock-runtime.us-east-1.amazonaws.com".to_string()
+            )
+        );
+        // eu.* ids default to eu-central-1 (TS catalog baseUrl).
+        let mut eu = test_model();
+        eu.id = "eu.anthropic.claude-sonnet-4-5".into();
+        assert_eq!(
+            resolve_region_endpoint_with(&eu, None, None).1,
+            "https://bedrock-runtime.eu-central-1.amazonaws.com"
+        );
+        // Custom (non-standard) base: always pinned, even with a configured
+        // region.
+        let mut custom = test_model();
+        custom.base_url = "https://bedrock.proxy.example.com/".into();
+        assert_eq!(
+            resolve_region_endpoint_with(&custom, None, None),
+            (
+                "us-east-1".to_string(),
+                "https://bedrock.proxy.example.com".to_string()
+            )
+        );
+        assert_eq!(
+            resolve_region_endpoint_with(&custom, Some("eu-west-1".to_string()), None).1,
+            "https://bedrock.proxy.example.com"
+        );
+
+        // Standard base + configured region: the endpoint is re-derived
+        // from the region (TS `shouldUseExplicitBedrockEndpoint`).
+        let mut m = test_model();
+        m.base_url = "https://bedrock-runtime.us-east-1.amazonaws.com".into();
+        assert_eq!(
+            resolve_region_endpoint_with(&m, Some("eu-west-1".to_string()), None),
+            (
+                "eu-west-1".to_string(),
+                "https://bedrock-runtime.eu-west-1.amazonaws.com".to_string()
+            )
+        );
+        // ARN in the model id still wins over the configured region.
+        m.id = "arn:aws:bedrock:ap-southeast-2:123:inference-profile/x".into();
+        assert_eq!(
+            resolve_region_endpoint_with(&m, Some("eu-west-1".to_string()), None).1,
+            "https://bedrock-runtime.ap-southeast-2.amazonaws.com"
+        );
+        // Standard base + ambient profile: not pinned either; the region
+        // falls through the profile chain (a bogus profile has none) to
+        // us-east-1.
+        let m = test_model();
+        assert_eq!(
+            resolve_region_endpoint_with(&m, None, Some("tack-test-no-such-profile".to_string())),
+            (
+                "us-east-1".to_string(),
+                "https://bedrock-runtime.us-east-1.amazonaws.com".to_string()
+            )
+        );
     }
 }
