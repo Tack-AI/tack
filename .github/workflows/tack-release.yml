@@ -203,7 +203,7 @@ jobs:
             dist/*.zip
           if-no-files-found: error
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             dist/*.tar.gz
@@ -236,7 +236,7 @@ jobs:
       # The checksum file is part of the verification chain for `tack
       # update` — it needs provenance just like the binaries.
       - name: Attest checksums
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: assets/SHA256SUMS.txt
       - name: Publish release
