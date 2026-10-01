@@ -306,7 +306,7 @@ Two more MCP switches in settings.json:
 | Key | Notes |
 |---|---|
 | `mcpSampling` | boolean, default `false`. When `true`, MCP servers may request LLM completions in reverse (`sampling/createMessage`): executed in an isolated context with the current session's provider/model (server-provided messages are treated as `<untrusted_content>` and never enter the main session; tools/toolChoice and audio are refused), usage counts toward the session and is logged. The capability is not advertised when off. |
-| `mcpElicitation` | boolean, default `true`. MCP servers may ask the user for structured input (`elicitation/create`): the TUI pops a per-field text input (string/number/integer/boolean/enum conversion per schema, Esc cancels); headless modes like print/rpc/acp/serve auto-decline; URL mode always declines. |
+| `mcpElicitation` | boolean, default `true`. MCP servers may ask the user for structured input (`elicitation/create`): the TUI pops a per-field text input (string/number/integer/boolean/enum conversion per schema, Esc cancels); `tack serve` forwards the form to dialog-capable remote clients and declines when none is connected; print/rpc/acp auto-decline; URL mode always declines. |
 
 ## Environment variables
 

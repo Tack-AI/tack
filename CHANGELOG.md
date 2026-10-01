@@ -8,6 +8,22 @@ notice can parse entries (same convention as TS pi).
 
 ### Added
 
+- **Plugin surfaces over the remote protocol**: `tack serve` now exposes
+  plugin slash commands, declarative widgets, autocomplete providers,
+  `ui/select`/`ui/confirm`/`ui/input` dialogs and MCP elicitation to
+  remote clients as an additive v1 protocol extension. New commands:
+  `list_ext_commands`, `invoke_ext_command`, `list_ext_widgets`,
+  `ext_widget_action`, `list_ext_autocomplete`, `ext_autocomplete`,
+  `ext_dialog_response`. Server-push events (`ext_widget_update`,
+  `ext_widgets_removed`, `ext_dialog_request`, `ext_dialog_closed`) are
+  gated on hello capability negotiation (`ext_widgets`, `ext_dialogs`),
+  so pre-extension clients see exactly the original v1 event stream.
+  Plugin dialogs broadcast to every dialog-capable client (first answer
+  wins) and fail fast when nobody can answer. `tack client` opts into
+  both capabilities and gains `/ext`, `/widgets`, `/complete`, `/answer`
+  and `/cancel` commands; plugin command invocations run off the
+  connection loop so a command can itself show a dialog the same client
+  answers.
 - **Plugin approval chain wired on every prompt-capable surface**: ACP
   (`session/request_permission`) and remote-host sessions now consult
   reviewer plugins (`capabilities.hooks.approvalReview`) at the

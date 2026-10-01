@@ -6,6 +6,22 @@ use serde_json::Value;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Hello capability (client → server): opt into extension widget events
+/// (`ext_widget_update` / `ext_widgets_removed`). Without it the server
+/// never sends those events to the connection — pre-extension clients
+/// keep their exact v1 event stream.
+pub const CAP_EXT_WIDGETS: &str = "ext_widgets";
+/// Hello capability (client → server): opt into extension dialog events
+/// (`ext_dialog_request` / `ext_dialog_closed`) — plugin
+/// `ui/select`/`ui/confirm`/`ui/input` and MCP elicitation. Only
+/// connections with this capability are counted as dialog answerers: a
+/// plugin dialog with no capable client connected fails fast instead of
+/// parking unanswered.
+pub const CAP_EXT_DIALOGS: &str = "ext_dialogs";
+/// The extension-surface capabilities this protocol version defines
+/// (echoed in the server hello so clients can feature-detect).
+pub const SERVER_CAPABILITIES: &[&str] = &[CAP_EXT_WIDGETS, CAP_EXT_DIALOGS];
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
@@ -288,6 +304,92 @@ pub struct ProtocolError {
     pub details: Option<Value>,
 }
 
+/// A plugin-contributed slash command (tack-RPC `commands/invoke`).
+/// Extension surfaces are an additive v1 extension: they appear only in
+/// NEW command/event variants and optional hello fields, which
+/// pre-extension peers tolerate (unknown variants decode as the `Unknown`
+/// catch-all; unknown fields are skipped).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ExtCommandSpec {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Full state of one declarative plugin widget, keyed `<plugin>:<id>`.
+/// Updates are idempotent full-state replacements (`rev` bumps per
+/// applied update).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ExtWidgetState {
+    pub key: String,
+    pub plugin: String,
+    /// "statusLineSegment" | "markdownPanel" | "listPanel".
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Latest state snapshot, shaped per the widget kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<Value>,
+    pub visible: bool,
+    pub rev: u64,
+}
+
+/// A plugin-contributed autocomplete provider.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ExtAutocompleteProviderInfo {
+    /// Host key `<plugin>:<provider-id>`, used in `ext_autocomplete`.
+    pub key: String,
+    pub plugin: String,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Token prefix that triggers the provider (e.g. `#`).
+    pub trigger: String,
+}
+
+/// One autocomplete suggestion. `insert_text` absent = insert `value`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ExtAutocompleteSuggestion {
+    pub label: String,
+    pub value: String,
+    #[serde(rename = "insertText", skip_serializing_if = "Option::is_none")]
+    pub insert_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// One form field of an MCP elicitation dialog, flattened from the
+/// server's requested schema.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ExtElicitField {
+    pub name: String,
+    /// "string" | "number" | "integer" | "boolean" | "enum".
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub required: bool,
+    /// Enum choices when `kind == "enum"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
+}
+
+/// Which plugin dialog an `ext_dialog_request` carries.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ExtDialogKind {
+    /// Pick one of `options`; answer value = the chosen option string.
+    #[serde(rename = "select")]
+    Select,
+    /// Yes/no; answer value = boolean.
+    #[serde(rename = "confirm")]
+    Confirm,
+    /// Free text; answer value = string.
+    #[serde(rename = "input")]
+    Input,
+    /// MCP elicitation form; answer value = the content object.
+    #[serde(rename = "elicitation")]
+    Elicitation,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
@@ -363,6 +465,60 @@ pub enum Command {
     /// List the server's available models (built-in catalog + models.json).
     #[serde(rename = "list_models")]
     ListModels,
+    /// List plugin-contributed slash commands (host-global; empty when no
+    /// plugins are loaded or the build has no extension support).
+    #[serde(rename = "list_ext_commands")]
+    ListExtCommands,
+    /// Invoke a plugin slash command. The reply may be delayed past other
+    /// responses: the plugin can itself show a dialog
+    /// (`ext_dialog_request`) that this same connection answers while the
+    /// invocation is in flight.
+    #[serde(rename = "invoke_ext_command")]
+    InvokeExtCommand {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        args: Option<String>,
+    },
+    /// Snapshot of every declarative plugin widget (host-global).
+    #[serde(rename = "list_ext_widgets")]
+    ListExtWidgets,
+    /// Report a widget interaction to the OWNING plugin (fire-and-forget;
+    /// the empty reply just confirms the widget key resolved).
+    #[serde(rename = "ext_widget_action")]
+    ExtWidgetAction {
+        key: String,
+        action: String,
+        #[serde(rename = "itemId", skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+    },
+    /// List plugin autocomplete providers (host-global).
+    #[serde(rename = "list_ext_autocomplete")]
+    ListExtAutocomplete,
+    /// Query one plugin autocomplete provider (degrades to an empty list
+    /// on unknown key / dead plugin, like the TUI contract).
+    #[serde(rename = "ext_autocomplete")]
+    ExtAutocomplete {
+        #[serde(rename = "providerKey")]
+        provider_key: String,
+        query: String,
+        #[serde(rename = "cursorOffset")]
+        cursor_offset: u32,
+    },
+    /// Answer a `ServerEvent::ExtDialogRequest`. Fire-and-forget
+    /// semantics; the server still replies (empty result) so clients can
+    /// detect an unknown/expired request id (another client answered
+    /// first, or the dialog timed out). `cancelled` maps per kind:
+    /// select/input → null answer, confirm → false, elicitation → the
+    /// MCP "cancel" action.
+    #[serde(rename = "ext_dialog_response")]
+    ExtDialogResponse {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(default)]
+        cancelled: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        value: Option<Value>,
+    },
     /// Catch-all: commands added by NEWER peers decode as `Unknown`
     /// instead of failing the whole frame (additive-extension tolerance).
     /// Never serialized.
@@ -400,6 +556,24 @@ pub enum CommandResult {
     PermissionResponse,
     #[serde(rename = "list_models")]
     ListModels { models: Vec<ModelMetadata> },
+    #[serde(rename = "list_ext_commands")]
+    ListExtCommands { commands: Vec<ExtCommandSpec> },
+    #[serde(rename = "invoke_ext_command")]
+    InvokeExtCommand { result: Value },
+    #[serde(rename = "list_ext_widgets")]
+    ListExtWidgets { widgets: Vec<ExtWidgetState> },
+    #[serde(rename = "ext_widget_action")]
+    ExtWidgetAction,
+    #[serde(rename = "list_ext_autocomplete")]
+    ListExtAutocomplete {
+        providers: Vec<ExtAutocompleteProviderInfo>,
+    },
+    #[serde(rename = "ext_autocomplete")]
+    ExtAutocomplete {
+        suggestions: Vec<ExtAutocompleteSuggestion>,
+    },
+    #[serde(rename = "ext_dialog_response")]
+    ExtDialogResponse,
     /// Catch-all for results added by newer peers (never serialized).
     #[serde(other)]
     Unknown,
@@ -415,6 +589,11 @@ pub enum ClientMessage {
         /// --auth-token/--auth-token-file).
         #[serde(skip_serializing_if = "Option::is_none", default)]
         token: Option<String>,
+        /// Extension surfaces the client opts into (`CAP_EXT_*`).
+        /// Absent = pre-extension client: the server sends it none of the
+        /// gated events. Unknown values are ignored (forward tolerance).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
     },
     #[serde(rename = "request")]
     Request { id: String, request: Command },
@@ -461,6 +640,50 @@ pub enum ServerEvent {
         /// Raw tool input.
         input: Value,
     },
+    /// A plugin pushed a widget state update (`widgets/update`): full
+    /// replacement of the addressed widget's state. Only sent to
+    /// connections that opted into `CAP_EXT_WIDGETS`.
+    #[serde(rename = "ext_widget_update")]
+    ExtWidgetUpdate { widget: ExtWidgetState },
+    /// A plugin died: its widgets vanished with it (no UI residue).
+    /// Only sent to `CAP_EXT_WIDGETS` connections.
+    #[serde(rename = "ext_widgets_removed")]
+    ExtWidgetsRemoved { plugin: String, keys: Vec<String> },
+    /// A plugin (`ui/select`/`ui/confirm`/`ui/input`) or an MCP server
+    /// (elicitation) asks the user a question. Plugin connections are
+    /// host-global, so — like `PermissionRequest` with several attached
+    /// clients — the request is broadcast to every `CAP_EXT_DIALOGS`
+    /// connection and the FIRST `ext_dialog_response` wins; the others
+    /// get `ext_dialog_closed`. Answer semantics per kind are documented
+    /// on [`ExtDialogKind`].
+    #[serde(rename = "ext_dialog_request")]
+    ExtDialogRequest {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        /// Originating plugin id or MCP server name.
+        source: String,
+        kind: ExtDialogKind,
+        title: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        /// `select` only.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<String>,
+        /// `input` only.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        placeholder: Option<String>,
+        /// `elicitation` only.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        fields: Vec<ExtElicitField>,
+    },
+    /// A dialog was resolved without this connection's answer (another
+    /// client answered first, it timed out, or the last dialog-capable
+    /// client disconnected): dismiss any prompt showing `request_id`.
+    #[serde(rename = "ext_dialog_closed")]
+    ExtDialogClosed {
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
     /// Catch-all for events added by newer peers: consumers must ignore
     /// them instead of failing the frame (never serialized).
     #[serde(other)]
@@ -476,6 +699,11 @@ pub enum ServerMessage {
         #[serde(rename = "connectionId")]
         connection_id: String,
         snapshot: ServerSnapshot,
+        /// Extension-surface capabilities the server supports
+        /// (`SERVER_CAPABILITIES`). Absent on pre-extension servers —
+        /// clients must treat that as "no extension surfaces".
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
     },
     #[serde(rename = "hello_error")]
     HelloError { error: ProtocolError },

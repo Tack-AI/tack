@@ -35,6 +35,9 @@ pub struct RemoteClient {
     pump: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub connection_id: String,
     pub snapshot: ServerSnapshot,
+    /// Extension-surface capabilities the server advertised in its hello
+    /// (empty on pre-extension servers — treat as "no ext surfaces").
+    pub server_capabilities: Vec<String>,
 }
 
 impl Drop for RemoteClient {
@@ -56,7 +59,13 @@ impl std::fmt::Debug for RemoteClient {
 impl RemoteClient {
     /// Handshake + spawn the read pump. `stream` is any connected transport.
     /// `token` is sent in the hello when the server requires auth.
-    pub async fn connect<S>(stream: S, token: Option<String>) -> Result<Arc<Self>, ProtocolError>
+    /// `capabilities` opts the connection into extension-surface events
+    /// (`CAP_EXT_*`); pass an empty vec for the pre-extension event stream.
+    pub async fn connect<S>(
+        stream: S,
+        token: Option<String>,
+        capabilities: Vec<String>,
+    ) -> Result<Arc<Self>, ProtocolError>
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
@@ -69,6 +78,7 @@ impl RemoteClient {
             &ClientMessage::Hello {
                 version: PROTOCOL_VERSION,
                 token,
+                capabilities,
             },
         )
         .await?;
@@ -76,11 +86,12 @@ impl RemoteClient {
         let first: ServerMessage = read_frame(&mut reader)
             .await?
             .ok_or(ProtocolError::ConnectionClosed)?;
-        let (connection_id, snapshot) = match first {
+        let (connection_id, snapshot, server_capabilities) = match first {
             ServerMessage::Hello {
                 version,
                 connection_id,
                 snapshot,
+                capabilities,
             } => {
                 // Protocol versions are ordered integers (no semver). A
                 // server speaking a NEWER protocol may rely on behavior
@@ -96,7 +107,7 @@ impl RemoteClient {
                         ),
                     });
                 }
-                (connection_id, snapshot)
+                (connection_id, snapshot, capabilities)
             }
             ServerMessage::HelloError { error } => {
                 return Err(ProtocolError::ServerError {
@@ -122,6 +133,7 @@ impl RemoteClient {
             pump: std::sync::Mutex::new(None),
             connection_id,
             snapshot,
+            server_capabilities,
         });
 
         let pump = tokio::spawn(async move {
@@ -266,6 +278,7 @@ mod tests {
                 version,
                 connection_id: "conn-1".to_string(),
                 snapshot: snapshot(),
+                capabilities: SERVER_CAPABILITIES.iter().map(|s| s.to_string()).collect(),
             },
         )
         .await
@@ -282,7 +295,7 @@ mod tests {
             server_handshake_with_version(&mut server_stream, PROTOCOL_VERSION + 1).await;
         });
 
-        let err = RemoteClient::connect(client_stream, None)
+        let err = RemoteClient::connect(client_stream, None, Vec::new())
             .await
             .unwrap_err();
         assert!(
@@ -307,7 +320,7 @@ mod tests {
             let server = tokio::spawn(async move {
                 server_handshake_with_version(&mut server_stream, version).await;
             });
-            let client = RemoteClient::connect(client_stream, None).await;
+            let client = RemoteClient::connect(client_stream, None, Vec::new()).await;
             assert!(client.is_ok(), "version {version} must connect");
             server.await.unwrap();
         }
@@ -336,7 +349,9 @@ mod tests {
             buf.len()
         });
 
-        let client = RemoteClient::connect(client_stream, None).await.unwrap();
+        let client = RemoteClient::connect(client_stream, None, Vec::new())
+            .await
+            .unwrap();
         drop(client);
         tokio::time::timeout(std::time::Duration::from_secs(5), server)
             .await
@@ -355,7 +370,9 @@ mod tests {
             let _: Option<ClientMessage> = read_frame(&mut server_stream).await.unwrap();
         });
 
-        let client = RemoteClient::connect(client_stream, None).await.unwrap();
+        let client = RemoteClient::connect(client_stream, None, Vec::new())
+            .await
+            .unwrap();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             client.request(Command::List),
@@ -376,7 +393,9 @@ mod tests {
             // Drop immediately.
         });
 
-        let client = RemoteClient::connect(client_stream, None).await.unwrap();
+        let client = RemoteClient::connect(client_stream, None, Vec::new())
+            .await
+            .unwrap();
         server.await.unwrap();
         // Give the read pump a moment to observe EOF.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -419,7 +438,9 @@ mod tests {
             .unwrap();
         });
 
-        let client = RemoteClient::connect(client_stream, None).await.unwrap();
+        let client = RemoteClient::connect(client_stream, None, Vec::new())
+            .await
+            .unwrap();
         client.set_request_timeout(std::time::Duration::from_millis(100));
 
         let err = tokio::time::timeout(
@@ -463,7 +484,9 @@ mod tests {
             .unwrap();
         });
 
-        let client = RemoteClient::connect(client_stream, None).await.unwrap();
+        let client = RemoteClient::connect(client_stream, None, Vec::new())
+            .await
+            .unwrap();
         let err = client.request(Command::List).await.unwrap_err();
         let ProtocolError::ServerError { code, message } = err else {
             panic!("expected ServerError, got {err:?}")
@@ -494,7 +517,7 @@ mod tests {
             .unwrap();
         });
 
-        let err = RemoteClient::connect(client_stream, None)
+        let err = RemoteClient::connect(client_stream, None, Vec::new())
             .await
             .unwrap_err();
         assert!(

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use tack_protocol::RemoteClient;
 use tack_protocol::schemas::{
-    Command, CommandResult, ServerEvent, TranscriptItem, TranscriptProgress,
+    Command, CommandResult, ExtDialogKind, ServerEvent, TranscriptItem, TranscriptProgress,
 };
 
 /// TLS options for `tack client`.
@@ -16,6 +16,96 @@ pub struct TlsOptions {
     pub tls: bool,
     pub ca: Option<std::path::PathBuf>,
     pub insecure: bool,
+}
+
+/// The extension surfaces `tack client` opts into (it can answer dialogs
+/// and prints widget updates).
+fn ext_capabilities() -> Vec<String> {
+    vec![
+        tack_protocol::schemas::CAP_EXT_WIDGETS.to_string(),
+        tack_protocol::schemas::CAP_EXT_DIALOGS.to_string(),
+    ]
+}
+
+/// Plugin dialogs this client is being asked: request id → (kind, select
+/// options). Shared between the event pump (registers/dismisses) and the
+/// input loop's /answer.
+type PendingDialogs = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<String, (ExtDialogKind, Vec<String>)>>,
+>;
+
+/// `/answer <id> <value>`: parse the value per dialog kind and send the
+/// `ext_dialog_response`. Parse errors keep the dialog pending.
+async fn answer_dialog(
+    client: &RemoteClient,
+    pending: &PendingDialogs,
+    request_id: &str,
+    value: &str,
+) {
+    let kind = {
+        pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(request_id)
+            .cloned()
+    };
+    let Some((kind, options)) = kind else {
+        eprintln!("[no pending dialog {request_id} (already answered or closed?)]");
+        return;
+    };
+    let parsed: Option<serde_json::Value> = match kind {
+        ExtDialogKind::Confirm => match value.to_ascii_lowercase().as_str() {
+            "yes" | "y" | "true" | "1" => Some(serde_json::Value::Bool(true)),
+            "no" | "n" | "false" | "0" => Some(serde_json::Value::Bool(false)),
+            _ => {
+                eprintln!("[confirm dialog: answer yes or no]");
+                None
+            }
+        },
+        ExtDialogKind::Select => {
+            if options.iter().any(|o| o == value) {
+                Some(serde_json::Value::String(value.to_string()))
+            } else {
+                eprintln!("[select dialog: answer one of: {}]", options.join(", "));
+                None
+            }
+        }
+        ExtDialogKind::Input => Some(serde_json::Value::String(value.to_string())),
+        ExtDialogKind::Elicitation => match serde_json::from_str::<serde_json::Value>(value) {
+            Ok(parsed) if parsed.is_object() => Some(parsed),
+            _ => {
+                eprintln!("[elicitation: answer a JSON object, e.g. {{\"field\":\"value\"}}]");
+                None
+            }
+        },
+    };
+    let Some(parsed) = parsed else {
+        return;
+    };
+    match client
+        .request(Command::ExtDialogResponse {
+            request_id: request_id.to_string(),
+            cancelled: false,
+            value: Some(parsed),
+        })
+        .await
+    {
+        Ok(_) => {
+            pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(request_id);
+            eprintln!("[dialog {request_id} answered]");
+        }
+        Err(e) => {
+            // Unknown/expired id: another client won, or it timed out.
+            pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(request_id);
+            eprintln!("[dialog {request_id} no longer pending: {e}]");
+        }
+    }
 }
 
 /// Derive the TLS server name from a "host:port" dial address. Handles
@@ -190,14 +280,14 @@ async fn connect_ws(
         let (ws, _) = tokio_tungstenite::client_async(&url, tls_stream)
             .await
             .context("websocket handshake failed")?;
-        return RemoteClient::connect(WsFrameStream::new(ws), token)
+        return RemoteClient::connect(WsFrameStream::new(ws), token, ext_capabilities())
             .await
             .map_err(anyhow::Error::from);
     }
     let (ws, _) = tokio_tungstenite::client_async(&url, stream)
         .await
         .context("websocket handshake failed")?;
-    RemoteClient::connect(WsFrameStream::new(ws), token)
+    RemoteClient::connect(WsFrameStream::new(ws), token, ext_capabilities())
         .await
         .map_err(anyhow::Error::from)
 }
@@ -224,7 +314,7 @@ async fn connect_addr(
         #[cfg(unix)]
         {
             let stream = tokio::net::UnixStream::connect(path).await?;
-            return RemoteClient::connect(stream, token)
+            return RemoteClient::connect(stream, token, ext_capabilities())
                 .await
                 .map_err(anyhow::Error::from);
         }
@@ -246,11 +336,11 @@ async fn connect_addr(
         let tls_stream = connector.connect(name, stream).await.with_context(|| {
             format!("TLS handshake with {addr} failed (wrong cert? try --tls-ca or --tls-insecure)")
         })?;
-        return RemoteClient::connect(tls_stream, token)
+        return RemoteClient::connect(tls_stream, token, ext_capabilities())
             .await
             .map_err(anyhow::Error::from);
     }
-    RemoteClient::connect(stream, token)
+    RemoteClient::connect(stream, token, ext_capabilities())
         .await
         .map_err(anyhow::Error::from)
 }
@@ -267,6 +357,16 @@ pub async fn run_client(
         "connected ({} sessions on server)",
         client.snapshot.sessions.len()
     );
+    let ext_surfaces = !client.server_capabilities.is_empty();
+    if ext_surfaces {
+        eprintln!(
+            "server extension surfaces: {}",
+            client.server_capabilities.join(", ")
+        );
+    }
+    // A plugin command invocation may park on a dialog THIS client
+    // answers — the 30s default request timeout would fire first.
+    client.set_request_timeout(std::time::Duration::from_secs(10 * 60));
 
     let cwd = std::env::current_dir()?;
     let result = client
@@ -311,14 +411,99 @@ pub async fn run_client(
         "session {session_id} ({}:{})",
         session.model.provider, session.model.id
     );
-    eprintln!("type a prompt and hit enter; /quit to exit, /abort to cancel a run");
+    if ext_surfaces {
+        eprintln!("type a prompt and hit enter; /quit to exit, /abort to cancel a run");
+        eprintln!(
+            "ext: /ext [name args] · /widgets · /complete [key query] · /answer <id> <value> · /cancel <id>"
+        );
+    } else {
+        eprintln!("type a prompt and hit enter; /quit to exit, /abort to cancel a run");
+    }
 
-    // Event pump: assistant text to stdout, tool activity to stderr.
+    // Plugin dialogs this client is being asked, keyed by request id
+    // (shared between the event pump, which registers/dismisses them,
+    // and the input loop's /answer).
+    let pending_dialogs: PendingDialogs = Default::default();
+
+    // Event pump: assistant text to stdout, tool activity + plugin UI
+    // (dialogs, widgets) to stderr.
     let mut events = client.subscribe();
     let pump_session = session_id.clone();
+    let pump_dialogs = pending_dialogs.clone();
     tokio::spawn(async move {
         loop {
             match events.recv().await {
+                Ok(ServerEvent::ExtDialogRequest {
+                    request_id,
+                    source,
+                    kind,
+                    title,
+                    message,
+                    options,
+                    placeholder,
+                    fields,
+                }) => {
+                    eprintln!("\n[dialog {request_id}] {source} asks: {title}");
+                    if let Some(message) = &message {
+                        eprintln!("  {message}");
+                    }
+                    match kind {
+                        ExtDialogKind::Select => {
+                            for option in &options {
+                                eprintln!("  - {option}");
+                            }
+                            eprintln!("  answer with: /answer {request_id} <option>");
+                        }
+                        ExtDialogKind::Confirm => {
+                            eprintln!("  answer with: /answer {request_id} yes|no");
+                        }
+                        ExtDialogKind::Input => {
+                            if let Some(placeholder) = &placeholder {
+                                eprintln!("  ({placeholder})");
+                            }
+                            eprintln!("  answer with: /answer {request_id} <text>");
+                        }
+                        ExtDialogKind::Elicitation => {
+                            for field in &fields {
+                                eprintln!(
+                                    "  - {} ({}{})",
+                                    field.name,
+                                    field.kind,
+                                    if field.required { ", required" } else { "" }
+                                );
+                            }
+                            eprintln!(
+                                "  answer with: /answer {request_id} {{\"field\":\"value\",…}} (JSON object)"
+                            );
+                        }
+                    }
+                    eprintln!("  or dismiss with: /cancel {request_id}");
+                    pump_dialogs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(request_id, (kind, options));
+                }
+                Ok(ServerEvent::ExtDialogClosed { request_id }) => {
+                    if pump_dialogs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&request_id)
+                        .is_some()
+                    {
+                        eprintln!("[dialog {request_id}] closed");
+                    }
+                }
+                Ok(ServerEvent::ExtWidgetUpdate { widget }) => {
+                    eprintln!(
+                        "[widget {} updated ({}{}); /widgets to inspect]",
+                        widget.key,
+                        widget.kind,
+                        if widget.visible { "" } else { ", hidden" }
+                    );
+                }
+                Ok(ServerEvent::ExtWidgetsRemoved { plugin, keys }) => {
+                    eprintln!("[plugin {plugin} widgets removed: {}]", keys.join(", "));
+                }
                 Ok(ServerEvent::SessionProgress {
                     session_id,
                     progress,
@@ -385,27 +570,196 @@ pub async fn run_client(
         if text.is_empty() {
             continue;
         }
-        match text {
-            "/quit" | "/exit" => break,
-            "/abort" => {
-                let _ = client
-                    .request(Command::Abort {
-                        session_id: session_id.clone(),
-                    })
-                    .await;
-                eprintln!("[aborted]");
-            }
-            _ => {
-                if let Err(e) = client
-                    .request(Command::Prompt {
-                        session_id: session_id.clone(),
-                        text: text.to_string(),
-                    })
-                    .await
-                {
-                    eprintln!("[prompt failed: {e}]");
+        // Ext-surface commands (`/ext`, `/widgets`, `/complete`,
+        // `/answer`, `/cancel`) — handled first; they parse their own
+        // arguments. Unknown slash commands fall through to a prompt,
+        // matching the previous behavior for any other text.
+        if let Some(command) = text.strip_prefix('/') {
+            let (verb, args) = match command.split_once(' ') {
+                Some((verb, args)) => (verb, args.trim()),
+                None => (command, ""),
+            };
+            match verb {
+                "quit" | "exit" => break,
+                "abort" => {
+                    let _ = client
+                        .request(Command::Abort {
+                            session_id: session_id.clone(),
+                        })
+                        .await;
+                    eprintln!("[aborted]");
+                    continue;
                 }
+                "ext" if ext_surfaces => {
+                    if args.is_empty() {
+                        match client.request(Command::ListExtCommands).await {
+                            Ok(CommandResult::ListExtCommands { commands }) => {
+                                if commands.is_empty() {
+                                    eprintln!("[no plugin commands on this server]");
+                                }
+                                for spec in commands {
+                                    match spec.description {
+                                        Some(description) => {
+                                            eprintln!("  {} — {}", spec.name, description)
+                                        }
+                                        None => eprintln!("  {}", spec.name),
+                                    }
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => eprintln!("[list failed: {e}]"),
+                        }
+                    } else {
+                        let (name, rest) = match args.split_once(' ') {
+                            Some((name, rest)) => (name, rest.trim()),
+                            None => (args, ""),
+                        };
+                        match client
+                            .request(Command::InvokeExtCommand {
+                                name: name.to_string(),
+                                args: if rest.is_empty() {
+                                    None
+                                } else {
+                                    Some(rest.to_string())
+                                },
+                            })
+                            .await
+                        {
+                            Ok(CommandResult::InvokeExtCommand { result }) => {
+                                let pretty = serde_json::to_string_pretty(&result)
+                                    .unwrap_or_else(|_| result.to_string());
+                                crate::cli_output::print_out(&format!("{pretty}\n"));
+                            }
+                            Ok(_) => {}
+                            Err(e) => eprintln!("[invoke failed: {e}]"),
+                        }
+                    }
+                    continue;
+                }
+                "widgets" if ext_surfaces => {
+                    match client.request(Command::ListExtWidgets).await {
+                        Ok(CommandResult::ListExtWidgets { widgets }) => {
+                            if widgets.is_empty() {
+                                eprintln!("[no plugin widgets on this server]");
+                            }
+                            for widget in widgets {
+                                eprintln!(
+                                    "  {} ({}, rev {}{}){}",
+                                    widget.key,
+                                    widget.kind,
+                                    widget.rev,
+                                    if widget.visible { "" } else { ", hidden" },
+                                    widget.title.map(|t| format!(" — {t}")).unwrap_or_default()
+                                );
+                                if let Some(state) = &widget.state {
+                                    let pretty = serde_json::to_string_pretty(state)
+                                        .unwrap_or_else(|_| state.to_string());
+                                    eprintln!("    {pretty}");
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[list failed: {e}]"),
+                    }
+                    continue;
+                }
+                "complete" if ext_surfaces => {
+                    if args.is_empty() {
+                        match client.request(Command::ListExtAutocomplete).await {
+                            Ok(CommandResult::ListExtAutocomplete { providers }) => {
+                                if providers.is_empty() {
+                                    eprintln!("[no autocomplete providers on this server]");
+                                }
+                                for provider in providers {
+                                    eprintln!(
+                                        "  {} (trigger {:?}){}",
+                                        provider.key,
+                                        provider.trigger,
+                                        provider
+                                            .description
+                                            .map(|d| format!(" — {d}"))
+                                            .unwrap_or_default()
+                                    );
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => eprintln!("[list failed: {e}]"),
+                        }
+                    } else {
+                        let (key, query) = match args.split_once(' ') {
+                            Some((key, query)) => (key, query),
+                            None => {
+                                eprintln!("usage: /complete <providerKey> <query>");
+                                continue;
+                            }
+                        };
+                        match client
+                            .request(Command::ExtAutocomplete {
+                                provider_key: key.to_string(),
+                                query: query.to_string(),
+                                cursor_offset: query.len() as u32,
+                            })
+                            .await
+                        {
+                            Ok(CommandResult::ExtAutocomplete { suggestions }) => {
+                                if suggestions.is_empty() {
+                                    eprintln!("[no suggestions]");
+                                }
+                                for suggestion in suggestions {
+                                    eprintln!(
+                                        "  {}{}",
+                                        suggestion.label,
+                                        suggestion
+                                            .detail
+                                            .map(|d| format!(" — {d}"))
+                                            .unwrap_or_default()
+                                    );
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => eprintln!("[complete failed: {e}]"),
+                        }
+                    }
+                    continue;
+                }
+                "answer" if ext_surfaces => {
+                    let Some((request_id, value)) = args.split_once(' ') else {
+                        eprintln!("usage: /answer <requestId> <value>");
+                        continue;
+                    };
+                    answer_dialog(&client, &pending_dialogs, request_id, value.trim()).await;
+                    continue;
+                }
+                "cancel" if ext_surfaces => {
+                    if args.is_empty() {
+                        eprintln!("usage: /cancel <requestId>");
+                        continue;
+                    }
+                    let _ = client
+                        .request(Command::ExtDialogResponse {
+                            request_id: args.to_string(),
+                            cancelled: true,
+                            value: None,
+                        })
+                        .await;
+                    pending_dialogs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(args);
+                    eprintln!("[dialog {args} cancelled]");
+                    continue;
+                }
+                _ => {}
             }
+        }
+        if let Err(e) = client
+            .request(Command::Prompt {
+                session_id: session_id.clone(),
+                text: text.to_string(),
+            })
+            .await
+        {
+            eprintln!("[prompt failed: {e}]");
         }
     }
 

@@ -243,7 +243,7 @@ settings.json 的另外两个 MCP 开关：
 | 键 | 说明 |
 |---|---|
 | `mcpSampling` | boolean，默认 `false`。为 `true` 时允许 MCP server 反向请求 LLM 补全（`sampling/createMessage`）：用当前会话的 provider/model 在隔离上下文中执行（server 提供的消息按 `<untrusted_content>` 处理、不进主会话；拒绝 tools/toolChoice 与 audio），usage 计入会话并写日志。默认关闭时不声明该能力。 |
-| `mcpElicitation` | boolean，默认 `true`。MCP server 可向用户请求结构化输入（`elicitation/create`）：TUI 逐字段弹文本输入框（按 schema 做 string/number/integer/boolean/enum 类型转换，Esc 取消）；print/rpc/acp/serve 等 headless 模式自动 decline；URL 模式一律 decline。 |
+| `mcpElicitation` | boolean，默认 `true`。MCP server 可向用户请求结构化输入（`elicitation/create`）：TUI 逐字段弹文本输入框（按 schema 做 string/number/integer/boolean/enum 类型转换，Esc 取消）；`tack serve` 会把表单转发给具备 dialog 能力的远程客户端（无可用客户端时 decline）；print/rpc/acp 自动 decline；URL 模式一律 decline。 |
 
 ## 环境变量
 

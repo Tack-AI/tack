@@ -57,11 +57,53 @@ pub struct WidgetEntry {
     _private: (),
 }
 
+impl WidgetEntry {
+    /// Unreachable: no widget can exist without the ext feature.
+    pub fn to_protocol(&self) -> tack_protocol::schemas::ExtWidgetState {
+        unreachable!("WidgetEntry cannot be constructed without the ext feature")
+    }
+}
+
+/// Off-lock widget action route (real impl holds the owning plugin's
+/// connection). Never constructed without extensions.
+#[derive(Debug)]
+pub struct WidgetActionRoute {
+    _private: (),
+}
+
+impl WidgetActionRoute {
+    /// Unreachable: `widget_action_route` always returns `None` here.
+    pub async fn notify(self, _action: String, _item_id: Option<String>) {
+        unreachable!("WidgetActionRoute cannot be constructed without the ext feature")
+    }
+}
+
 /// A registered autocomplete provider. Never constructed without
 /// extensions; `App::ext_ac_providers` is always empty.
 #[derive(Clone, Debug)]
 pub struct ExtAutocompleteProvider {
     _private: (),
+}
+
+impl ExtAutocompleteProvider {
+    /// Unreachable: no provider can exist without the ext feature.
+    pub fn key(&self) -> &str {
+        unreachable!("ExtAutocompleteProvider cannot be constructed without the ext feature")
+    }
+
+    /// Unreachable: no provider can exist without the ext feature.
+    pub fn to_protocol(&self) -> tack_protocol::schemas::ExtAutocompleteProviderInfo {
+        unreachable!("ExtAutocompleteProvider cannot be constructed without the ext feature")
+    }
+
+    /// Unreachable: no provider can exist without the ext feature.
+    pub async fn provide_protocol(
+        &self,
+        _query: &str,
+        _cursor_offset: usize,
+    ) -> Vec<tack_protocol::schemas::ExtAutocompleteSuggestion> {
+        unreachable!("ExtAutocompleteProvider cannot be constructed without the ext feature")
+    }
 }
 
 /// Event sink handed to the provider-events wrapper. Accepts events and
@@ -179,6 +221,11 @@ impl ExtensionManager {
         Vec::new()
     }
 
+    /// Extension slash commands with descriptions: always empty.
+    pub fn command_specs(&self) -> Vec<tack_protocol::schemas::ExtCommandSpec> {
+        Vec::new()
+    }
+
     /// Declarative widgets: always empty.
     pub fn widgets(&self) -> &[WidgetEntry] {
         &[]
@@ -211,6 +258,30 @@ impl ExtensionManager {
     /// No extensions, so no command ever resolves to an invoker.
     pub fn command_invoker(&self, _name: &str) -> Option<CommandInvoker> {
         None
+    }
+
+    /// Remote widget update application: always `None` (unknown widget)
+    /// without extensions.
+    pub fn apply_widget_update_remote(
+        &mut self,
+        _plugin: &str,
+        _id: &str,
+        _state: Value,
+        _visible: Option<bool>,
+    ) -> Option<tack_protocol::schemas::ExtWidgetState> {
+        None
+    }
+
+    /// Widget action routing: always `None` (unknown key) without
+    /// extensions.
+    pub fn widget_action_route(&self, _key: &str) -> Option<WidgetActionRoute> {
+        None
+    }
+
+    /// A dead plugin's widgets vanish: nothing to remove without
+    /// extensions.
+    pub fn remove_plugin_widgets(&mut self, _plugin: &str) -> Vec<String> {
+        Vec::new()
     }
 
     /// Gracefully stop all plugins.

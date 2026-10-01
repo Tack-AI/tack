@@ -560,6 +560,14 @@ message catch-all), and remote sessions default to bypass mode — old clients
 that can't answer never receive the new `permission_request` events, staying
 wire-compatible with TS `@earendil-works/pi-protocol` v1.
 
+Plugin surfaces are exposed the same way (`ext_*` commands + gated events,
+opt-in via hello `capabilities`: `ext_widgets`, `ext_dialogs`): remote
+clients can list/invoke plugin slash commands, list widgets and report
+widget actions, query autocomplete providers, and answer plugin
+`ui/select`/`ui/confirm`/`ui/input` dialogs and MCP elicitations
+(broadcast, first answer wins). `tack client` opts into both and provides
+`/ext`, `/widgets`, `/complete`, `/answer`, `/cancel`.
+
 ### Managed settings (organization-enforced)
 
 The organization-level policy file (path in configuration.md) can: force
@@ -733,9 +741,11 @@ requests to the client:
   input from the user. `"mcpElicitation": true` (**on by default**). The TUI
   prompts field by field per the server-given JSON schema
   (string/number/integer/boolean/enum auto type conversion, required-empty
-  re-asks, Esc = cancel); headless modes like print/rpc/acp/serve auto-
-  decline; URL mode (server-specified browser flow) is always declined. The
-  decision logic (mode × switch → prompt/decline) lives in
+  re-asks, Esc = cancel); `tack serve` forwards the form to dialog-capable
+  remote clients (`ext_dialog_request`, first answer wins) and declines
+  when none is connected; the remaining headless modes (print/rpc/acp)
+  auto-decline; URL mode (server-specified browser flow) is always
+  declined. The decision logic (mode × switch → prompt/decline) lives in
   `mcp_elicitation::elicitation_decision` and has unit tests.
 
 ### Tool schema lazy loading (tool search)

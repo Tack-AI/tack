@@ -938,7 +938,9 @@ impl TuiApp {
                         &sampling_llm,
                         super::sampling_usage_sink(tx_work.clone()),
                         crate::mcp_elicitation::InteractionMode::Tui,
-                        Some(tx_work.clone()),
+                        Some(crate::mcp_elicitation::ElicitationChannel::Tui(
+                            tx_work.clone(),
+                        )),
                     );
                     crate::mcp_oauth::connect_all_oauth(specs, &agent_dir, true, callbacks).await
                 };

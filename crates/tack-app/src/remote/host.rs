@@ -442,7 +442,11 @@ pub struct SessionHost {
     /// before the permission layer, rpc/ACP parity), plugin tools join
     /// every session's tool set, and the approval chain gets first crack
     /// at would-prompt decisions.
-    extensions: crate::extension_host::ExtensionManager,
+    pub(crate) extensions: crate::extension_host::ExtensionManager,
+    /// Plugin-initiated UI routed to clients (widgets, dialogs, MCP
+    /// elicitation): shared with the plugin host services and the
+    /// elicitation handler (see remote/ext_bridge.rs).
+    pub(crate) ext_bridge: Arc<super::ext_bridge::RemoteExtBridge>,
     /// Late-bound LLM for MCP sampling (plugin MCP servers connect at
     /// serve startup, before any session exists; the executor resolves
     /// this cell per request). Each session run publishes its own stack —
@@ -682,6 +686,13 @@ impl SessionHost {
 
     fn broadcast(&self, event: ServerEvent) {
         let _ = self.events.send(event);
+    }
+
+    /// Test seam for the ext-surface integration tests (widget
+    /// registration goes straight into the shared manager).
+    #[doc(hidden)]
+    pub fn extensions_for_testing(&mut self) -> &mut crate::extension_host::ExtensionManager {
+        &mut self.extensions
     }
 
     async fn run_prompt(host: SharedHost, session_id: String, text: String, steer: bool) {
@@ -1387,6 +1398,124 @@ impl SessionHost {
                 let models = list_model_metadata(&tack_session::default_agent_dir());
                 Ok(CommandResult::ListModels { models })
             }
+            Command::ListExtCommands => {
+                let host_guard = host.lock().await;
+                Ok(CommandResult::ListExtCommands {
+                    commands: host_guard.extensions.command_specs(),
+                })
+            }
+            Command::InvokeExtCommand { name, args } => {
+                // Resolve the invoker under the lock, then invoke
+                // OFF-lock: the plugin may itself call back into the
+                // host (ui/select → ext_dialog_request) while the
+                // invocation runs (the connection loop spawned this
+                // handler off-loop for exactly that reason).
+                let invoker = {
+                    let host_guard = host.lock().await;
+                    host_guard.extensions.command_invoker(&name)
+                };
+                let Some(invoker) = invoker else {
+                    return Err(ProtocolError {
+                        code: ProtocolErrorCode::NotFound,
+                        message: format!("unknown extension command {name:?}"),
+                        details: None,
+                    });
+                };
+                let result = invoker
+                    .invoke(args.unwrap_or_default())
+                    .await
+                    .map_err(|e| ProtocolError {
+                        code: ProtocolErrorCode::InternalError,
+                        message: format!("extension command {name:?} failed: {e}"),
+                        details: None,
+                    })?;
+                Ok(CommandResult::InvokeExtCommand { result })
+            }
+            Command::ListExtWidgets => {
+                let host_guard = host.lock().await;
+                Ok(CommandResult::ListExtWidgets {
+                    widgets: host_guard
+                        .extensions
+                        .widgets()
+                        .iter()
+                        .map(|entry| entry.to_protocol())
+                        .collect(),
+                })
+            }
+            Command::ExtWidgetAction {
+                key,
+                action,
+                item_id,
+            } => {
+                let route = {
+                    let host_guard = host.lock().await;
+                    host_guard.extensions.widget_action_route(&key)
+                };
+                let Some(route) = route else {
+                    return Err(ProtocolError {
+                        code: ProtocolErrorCode::NotFound,
+                        message: format!("widget not found (or plugin not running): {key}"),
+                        details: None,
+                    });
+                };
+                route.notify(action, item_id).await;
+                Ok(CommandResult::ExtWidgetAction)
+            }
+            Command::ListExtAutocomplete => {
+                let host_guard = host.lock().await;
+                Ok(CommandResult::ListExtAutocomplete {
+                    providers: host_guard
+                        .extensions
+                        .autocomplete_providers()
+                        .iter()
+                        .map(|provider| provider.to_protocol())
+                        .collect(),
+                })
+            }
+            Command::ExtAutocomplete {
+                provider_key,
+                query,
+                cursor_offset,
+            } => {
+                // Owned provider clone resolved under the lock; the
+                // plugin round-trip itself runs off-lock (contract
+                // degradation: unknown key → empty suggestions).
+                let provider = {
+                    let host_guard = host.lock().await;
+                    host_guard
+                        .extensions
+                        .autocomplete_providers()
+                        .into_iter()
+                        .find(|p| p.key() == provider_key)
+                };
+                let suggestions = match &provider {
+                    Some(provider) => {
+                        provider
+                            .provide_protocol(&query, cursor_offset as usize)
+                            .await
+                    }
+                    None => Vec::new(),
+                };
+                Ok(CommandResult::ExtAutocomplete { suggestions })
+            }
+            Command::ExtDialogResponse {
+                request_id,
+                cancelled,
+                value,
+            } => {
+                let bridge = {
+                    let host_guard = host.lock().await;
+                    host_guard.ext_bridge.clone()
+                };
+                if !bridge.answer_dialog(&request_id, cancelled, value) {
+                    return Err(ProtocolError {
+                        code: ProtocolErrorCode::NotFound,
+                        message: format!("ext dialog request not found: {request_id}"),
+                        details: None,
+                    });
+                }
+                Ok(CommandResult::ExtDialogResponse)
+            }
             Command::Unknown => Err(ProtocolError {
                 code: ProtocolErrorCode::NotImplemented,
                 message: "unknown command (newer protocol extension?)".to_string(),
@@ -1481,9 +1610,11 @@ impl SessionHost {
     pub(crate) async fn connection_closed(
         host: &SharedHost,
         attached: &std::collections::HashMap<String, u32>,
+        dialog_capable: bool,
     ) {
         let mut host_guard = host.lock().await;
         host_guard.active_connections = host_guard.active_connections.saturating_sub(1);
+        host_guard.ext_bridge.client_disconnected(dialog_capable);
         for (session_id, count) in attached {
             if let Some(session) = host_guard.sessions.get_mut(session_id) {
                 session.attached = session.attached.saturating_sub(*count);
@@ -1533,6 +1664,10 @@ impl SessionHost {
 /// (WebSocket + embedded web client, see remote_ws.rs), `unix:/path/to.sock`
 /// (unix / named-pipe-on-Windows via tokio uds).
 /// Build a host (shared by `serve` and tests).
+/// `ext_bridge` is created by the caller (the plugin services and the
+/// elicitation handler are wired with it BEFORE the host exists) and
+/// shared here; `RemoteExtBridge::attach` finishes the wiring.
+#[allow(clippy::too_many_arguments)]
 pub fn build_host(
     provider: Arc<dyn Provider>,
     default_model: tack_ai::Model,
@@ -1541,6 +1676,7 @@ pub fn build_host(
     auth_token: Option<String>,
     extensions: crate::extension_host::ExtensionManager,
     sampling_llm: crate::mcp_sampling::SharedSamplingLlm,
+    ext_bridge: Arc<super::ext_bridge::RemoteExtBridge>,
 ) -> Arc<Mutex<SessionHost>> {
     let (events, _) = broadcast::channel(512);
     Arc::new(Mutex::new(SessionHost {
@@ -1559,6 +1695,7 @@ pub fn build_host(
         pending_permissions: HashMap::new(),
         active_connections: 0,
         extensions,
+        ext_bridge,
         sampling_llm,
     }))
 }
@@ -1850,6 +1987,7 @@ mod tests {
             ClientMessage::Hello {
                 version: PROTOCOL_VERSION,
                 token: None,
+                capabilities: Vec::new(),
             },
             ClientMessage::Request {
                 id: "a1".into(),
@@ -1901,6 +2039,7 @@ mod tests {
             ClientMessage::Hello {
                 version: PROTOCOL_VERSION,
                 token: None,
+                capabilities: Vec::new(),
             },
             ClientMessage::Request {
                 id: "a1".into(),
@@ -1914,7 +2053,7 @@ mod tests {
         assert_eq!(guard.active_connections, 0);
         // The attach response was an error, and teardown was a no-op.
         assert!(
-            io.written
+            io.written()
                 .iter()
                 .any(|m| matches!(m, ServerMessage::Response { ok: false, .. }))
         );
@@ -1938,7 +2077,7 @@ mod tests {
                 },
             );
         }
-        SessionHost::connection_closed(&host, &Default::default()).await;
+        SessionHost::connection_closed(&host, &Default::default(), false).await;
         assert!(
             rx.await.is_err(),
             "the parked hook's sender must be dropped (deny)"
@@ -2023,6 +2162,7 @@ mod tests {
             None,
             crate::extension_host::ExtensionManager::default(),
             crate::mcp_sampling::SharedSamplingLlm::default(),
+            crate::remote::ext_bridge::RemoteExtBridge::new(),
         );
         let mut events = host.lock().await.events.subscribe();
 
@@ -2116,6 +2256,7 @@ mod tests {
             None,
             crate::extension_host::ExtensionManager::default(),
             crate::mcp_sampling::SharedSamplingLlm::default(),
+            crate::remote::ext_bridge::RemoteExtBridge::new(),
         )
     }
 
@@ -2610,6 +2751,193 @@ mod tests {
         assert!(
             matches!(event, ServerEvent::SessionRemoved { session_id } if session_id == stale_id),
             "clients must be told about the removal"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Extension surfaces (remote/ext_bridge.rs + the ext command arms)
+    // ------------------------------------------------------------------
+
+    /// Pull surfaces with no plugins loaded: empty lists, and every
+    /// plugin-backed command degrades to a clean error (never a panic,
+    /// never a hang).
+    #[tokio::test]
+    async fn ext_surfaces_degrade_without_plugins() {
+        let host = test_host(vec![]);
+        let result = SessionHost::handle_command(&host, Command::ListExtCommands)
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, CommandResult::ListExtCommands { commands } if commands.is_empty())
+        );
+        let result = SessionHost::handle_command(&host, Command::ListExtWidgets)
+            .await
+            .unwrap();
+        assert!(matches!(result, CommandResult::ListExtWidgets { widgets } if widgets.is_empty()));
+        let result = SessionHost::handle_command(&host, Command::ListExtAutocomplete)
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, CommandResult::ListExtAutocomplete { providers } if providers.is_empty())
+        );
+        let result = SessionHost::handle_command(
+            &host,
+            Command::ExtAutocomplete {
+                provider_key: "ghost:hash".into(),
+                query: "#a".into(),
+                cursor_offset: 2,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, CommandResult::ExtAutocomplete { suggestions } if suggestions.is_empty())
+        );
+        for command in [
+            Command::InvokeExtCommand {
+                name: "nope".into(),
+                args: None,
+            },
+            Command::ExtWidgetAction {
+                key: "ghost:w".into(),
+                action: "select".into(),
+                item_id: None,
+            },
+            Command::ExtDialogResponse {
+                request_id: "dlg-nope".into(),
+                cancelled: false,
+                value: None,
+            },
+        ] {
+            let error = SessionHost::handle_command(&host, command)
+                .await
+                .expect_err("unknown plugin resource must error");
+            assert_eq!(error.code, ProtocolErrorCode::NotFound, "{error:?}");
+        }
+    }
+
+    /// `invoke_ext_command` runs OFF the connection loop (a plugin
+    /// command may itself show a dialog only this connection can
+    /// answer): the loop must keep reading and answering later requests
+    /// while the invocation is in flight. Both responses arrive (the
+    /// inline one may overtake the spawned one — ids correlate).
+    #[tokio::test]
+    async fn invoke_ext_command_runs_off_loop() {
+        let host = test_host(vec![]);
+        let mut io = crate::remote::MockIo::open_ended(vec![
+            ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+                token: None,
+                capabilities: Vec::new(),
+            },
+            ClientMessage::Request {
+                id: "i1".into(),
+                request: Command::InvokeExtCommand {
+                    name: "nope".into(),
+                    args: None,
+                },
+            },
+            ClientMessage::Request {
+                id: "l1".into(),
+                request: Command::List,
+            },
+        ]);
+        let notify = io.written_notify();
+        let written = io.written_shared();
+        let connection = tokio::spawn(async move {
+            let _ = crate::remote::handle_frames(&mut io, &host).await;
+        });
+        // Wait for BOTH responses (bounded): the off-loop invoke must not
+        // block the inline List.
+        let both = async {
+            loop {
+                {
+                    let snapshot = written.lock().unwrap_or_else(|e| e.into_inner());
+                    let has = |id: &str| {
+                        snapshot.iter().any(
+                            |m| matches!(m, ServerMessage::Response { id: rid, .. } if rid == id),
+                        )
+                    };
+                    if has("i1") && has("l1") {
+                        return;
+                    }
+                }
+                notify.notified().await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), both)
+            .await
+            .expect("both responses must arrive (off-loop invoke must not block the loop)");
+        connection.abort();
+        let written = io_written(&written);
+        let response = |id: &str| {
+            written.iter().find_map(|message| {
+                let ServerMessage::Response {
+                    id: response_id,
+                    ok,
+                    error,
+                    ..
+                } = message
+                else {
+                    return None;
+                };
+                (response_id == id).then(|| (*ok, error.clone()))
+            })
+        };
+        let (ok, error) = response("i1").expect("invoke answered");
+        assert!(!ok, "unknown command errors: {error:?}");
+        assert_eq!(error.map(|e| e.code), Some(ProtocolErrorCode::NotFound));
+        let (ok, _) = response("l1").expect("list answered");
+        assert!(ok, "the loop kept reading while the invoke ran");
+    }
+
+    fn io_written(
+        written: &std::sync::Arc<std::sync::Mutex<Vec<ServerMessage>>>,
+    ) -> Vec<ServerMessage> {
+        written.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The dialog-capable connection count tracks the connection
+    /// lifetime: incremented after a `CAP_EXT_DIALOGS` handshake,
+    /// decremented on teardown (so a dialog never parks on thin air).
+    #[tokio::test]
+    async fn dialog_capability_tracks_connection_lifetime() {
+        let host = test_host(vec![]);
+        let bridge = host.lock().await.ext_bridge.clone();
+        let mut io = crate::remote::MockIo::new(vec![ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            token: None,
+            capabilities: vec![CAP_EXT_DIALOGS.to_string()],
+        }]);
+        crate::remote::handle_frames(&mut io, &host).await.unwrap();
+        assert_eq!(
+            bridge.dialog_answerers(),
+            0,
+            "EOF must release the dialog-capable registration"
+        );
+    }
+
+    /// The server hello advertises the extension surfaces so clients
+    /// can feature-detect them.
+    #[tokio::test]
+    async fn server_hello_advertises_ext_capabilities() {
+        let host = test_host(vec![]);
+        let mut io = crate::remote::MockIo::new(vec![ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            token: None,
+            capabilities: Vec::new(),
+        }]);
+        crate::remote::handle_frames(&mut io, &host).await.unwrap();
+        let written = io.written();
+        let Some(ServerMessage::Hello { capabilities, .. }) = written.first() else {
+            panic!("expected server hello, got {:?}", written.first())
+        };
+        assert_eq!(
+            capabilities,
+            &SERVER_CAPABILITIES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
         );
     }
 }

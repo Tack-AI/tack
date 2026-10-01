@@ -18,4 +18,16 @@ impl HeadlessExtServices {
     ) -> Arc<Self> {
         Arc::new(HeadlessExtServices { _private: () })
     }
+
+    /// Remote-mode constructor (real impl routes plugin UI to clients).
+    /// Without extensions no plugin exists to serve, so the bridge is
+    /// accepted and dropped.
+    pub fn new_with_remote(
+        _mode: &'static str,
+        _trusted: bool,
+        _bridge_state: Arc<crate::ext_provider_bridge::ProviderBridgeState>,
+        _remote: Arc<crate::remote::ext_bridge::RemoteExtBridge>,
+    ) -> Arc<Self> {
+        Arc::new(HeadlessExtServices { _private: () })
+    }
 }

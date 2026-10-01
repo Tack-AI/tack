@@ -391,12 +391,14 @@ fn golden_client_hello() {
     let value = ClientMessage::Hello {
         version: PROTOCOL_VERSION,
         token: None,
+        capabilities: Vec::new(),
     };
     assert_golden(&value, CLIENT_HELLO_NO_TOKEN);
 
     let value = ClientMessage::Hello {
         version: PROTOCOL_VERSION,
         token: Some("s3cret".to_string()),
+        capabilities: Vec::new(),
     };
     assert_golden(&value, CLIENT_HELLO_WITH_TOKEN);
 }
@@ -530,6 +532,7 @@ fn golden_server_hello() {
         version: PROTOCOL_VERSION,
         connection_id: "conn-1".to_string(),
         snapshot: server_snapshot_min(),
+        capabilities: Vec::new(),
     };
     assert_golden(&value, SERVER_HELLO);
 }
@@ -679,6 +682,100 @@ fn golden_protocol_error_without_details() {
 }
 
 // ---------------------------------------------------------------------------
+// Extension surfaces (additive v1 extension)
+// ---------------------------------------------------------------------------
+
+const CLIENT_HELLO_WITH_CAPABILITIES: &str = "a364747970656568656c6c6f6776657273696f6e016c6361706162696c6974696573826b6578745f776964676574736b6578745f6469616c6f6773";
+const COMMAND_INVOKE_EXT_COMMAND: &str = "a364747970656772657175657374626964657265712d316772657175657374a367636f6d6d616e6472696e766f6b655f6578745f636f6d6d616e64646e616d656568656c6c6f6461726773692d2d766572626f7365";
+const COMMAND_EXT_DIALOG_RESPONSE: &str = "a364747970656772657175657374626964657265712d326772657175657374a467636f6d6d616e64736578745f6469616c6f675f726573706f6e73656972657175657374496465646c672d316963616e63656c6c6564f46576616c75656162";
+const SERVER_EVENT_EXT_DIALOG_REQUEST: &str = "a26474797065656576656e74656576656e74a66474797065726578745f6469616c6f675f726571756573746972657175657374496465646c672d3166736f757263656964656d6f4075736572646b696e646673656c656374657469746c65685069636b206f6e65676f7074696f6e738261616162";
+const SERVER_EVENT_EXT_WIDGET_UPDATE: &str = "a26474797065656576656e74656576656e74a26474797065716578745f7769646765745f75706461746566776964676574a7636b65796c64656d6f40757365723a773166706c7567696e6964656d6f4075736572646b696e646d6d61726b646f776e50616e656c657469746c656570616e656c657374617465a1626d646268696776697369626c65f56372657601";
+const COMMAND_RESULT_LIST_EXT_COMMANDS: &str = "a4647479706568726573706f6e7365626964657265712d31626f6bf566726573756c74a267636f6d6d616e64716c6973745f6578745f636f6d6d616e647368636f6d6d616e647381a2646e616d656568656c6c6f6b6465736372697074696f6e695361792068656c6c6f";
+
+/// The additive ext surfaces stay byte-stable (field names, renames and
+/// skip-if-empty behavior are part of the wire contract).
+#[test]
+fn golden_ext_surface_wire_shapes() {
+    let value = ClientMessage::Hello {
+        version: PROTOCOL_VERSION,
+        token: None,
+        capabilities: vec![CAP_EXT_WIDGETS.to_string(), CAP_EXT_DIALOGS.to_string()],
+    };
+    assert_golden(&value, CLIENT_HELLO_WITH_CAPABILITIES);
+
+    let value = ClientMessage::Request {
+        id: "req-1".to_string(),
+        request: Command::InvokeExtCommand {
+            name: "hello".to_string(),
+            args: Some("--verbose".to_string()),
+        },
+    };
+    assert_golden(&value, COMMAND_INVOKE_EXT_COMMAND);
+
+    let value = ClientMessage::Request {
+        id: "req-2".to_string(),
+        request: Command::ExtDialogResponse {
+            request_id: "dlg-1".to_string(),
+            cancelled: false,
+            value: Some(serde_json::json!("b")),
+        },
+    };
+    assert_golden(&value, COMMAND_EXT_DIALOG_RESPONSE);
+
+    let value = ServerMessage::Event {
+        event: ServerEvent::ExtDialogRequest {
+            request_id: "dlg-1".to_string(),
+            source: "demo@user".to_string(),
+            kind: ExtDialogKind::Select,
+            title: "Pick one".to_string(),
+            message: None,
+            options: vec!["a".to_string(), "b".to_string()],
+            placeholder: None,
+            fields: Vec::new(),
+        },
+    };
+    assert_golden(&value, SERVER_EVENT_EXT_DIALOG_REQUEST);
+
+    let value = ServerMessage::Event {
+        event: ServerEvent::ExtWidgetUpdate {
+            widget: ExtWidgetState {
+                key: "demo@user:w1".to_string(),
+                plugin: "demo@user".to_string(),
+                kind: "markdownPanel".to_string(),
+                title: Some("panel".to_string()),
+                state: Some(serde_json::json!({"md": "hi"})),
+                visible: true,
+                rev: 1,
+            },
+        },
+    };
+    assert_golden(&value, SERVER_EVENT_EXT_WIDGET_UPDATE);
+
+    let value = ServerMessage::ok(
+        "req-1",
+        CommandResult::ListExtCommands {
+            commands: vec![ExtCommandSpec {
+                name: "hello".to_string(),
+                description: Some("Say hello".to_string()),
+            }],
+        },
+    );
+    assert_golden(&value, COMMAND_RESULT_LIST_EXT_COMMANDS);
+}
+
+/// Empty capabilities serialize EXACTLY like a pre-extension hello (the
+/// field is skipped) — the wire shape old peers already tolerate.
+#[test]
+fn empty_capabilities_are_wire_invisible() {
+    let with_empty = ClientMessage::Hello {
+        version: PROTOCOL_VERSION,
+        token: None,
+        capabilities: Vec::new(),
+    };
+    assert_golden(&with_empty, CLIENT_HELLO_NO_TOKEN);
+}
+
+// ---------------------------------------------------------------------------
 // Golden regeneration (ignored; see header). Uses the SAME builders as the
 // tests, so the printed consts always match what the tests assert.
 // ---------------------------------------------------------------------------
@@ -772,6 +869,7 @@ fn generate_goldens() {
             encode_payload(&ClientMessage::Hello {
                 version: PROTOCOL_VERSION,
                 token: None,
+                capabilities: Vec::new(),
             })
             .unwrap(),
         ),
@@ -780,6 +878,7 @@ fn generate_goldens() {
             encode_payload(&ClientMessage::Hello {
                 version: PROTOCOL_VERSION,
                 token: Some("s3cret".to_string()),
+                capabilities: Vec::new(),
             })
             .unwrap(),
         ),
@@ -906,6 +1005,7 @@ fn generate_goldens() {
                 version: PROTOCOL_VERSION,
                 connection_id: "conn-1".to_string(),
                 snapshot: server_snapshot_min(),
+                capabilities: Vec::new(),
             })
             .unwrap(),
         ),
@@ -1043,6 +1143,84 @@ fn generate_goldens() {
                 message: "unsupported protocol".to_string(),
                 details: None,
             })
+            .unwrap(),
+        ),
+        (
+            "CLIENT_HELLO_WITH_CAPABILITIES",
+            encode_payload(&ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+                token: None,
+                capabilities: vec![CAP_EXT_WIDGETS.to_string(), CAP_EXT_DIALOGS.to_string()],
+            })
+            .unwrap(),
+        ),
+        (
+            "COMMAND_INVOKE_EXT_COMMAND",
+            encode_payload(&ClientMessage::Request {
+                id: "req-1".to_string(),
+                request: Command::InvokeExtCommand {
+                    name: "hello".to_string(),
+                    args: Some("--verbose".to_string()),
+                },
+            })
+            .unwrap(),
+        ),
+        (
+            "COMMAND_EXT_DIALOG_RESPONSE",
+            encode_payload(&ClientMessage::Request {
+                id: "req-2".to_string(),
+                request: Command::ExtDialogResponse {
+                    request_id: "dlg-1".to_string(),
+                    cancelled: false,
+                    value: Some(serde_json::json!("b")),
+                },
+            })
+            .unwrap(),
+        ),
+        (
+            "SERVER_EVENT_EXT_DIALOG_REQUEST",
+            encode_payload(&ServerMessage::Event {
+                event: ServerEvent::ExtDialogRequest {
+                    request_id: "dlg-1".to_string(),
+                    source: "demo@user".to_string(),
+                    kind: ExtDialogKind::Select,
+                    title: "Pick one".to_string(),
+                    message: None,
+                    options: vec!["a".to_string(), "b".to_string()],
+                    placeholder: None,
+                    fields: Vec::new(),
+                },
+            })
+            .unwrap(),
+        ),
+        (
+            "SERVER_EVENT_EXT_WIDGET_UPDATE",
+            encode_payload(&ServerMessage::Event {
+                event: ServerEvent::ExtWidgetUpdate {
+                    widget: ExtWidgetState {
+                        key: "demo@user:w1".to_string(),
+                        plugin: "demo@user".to_string(),
+                        kind: "markdownPanel".to_string(),
+                        title: Some("panel".to_string()),
+                        state: Some(serde_json::json!({"md": "hi"})),
+                        visible: true,
+                        rev: 1,
+                    },
+                },
+            })
+            .unwrap(),
+        ),
+        (
+            "COMMAND_RESULT_LIST_EXT_COMMANDS",
+            encode_payload(&ServerMessage::ok(
+                "req-1",
+                CommandResult::ListExtCommands {
+                    commands: vec![ExtCommandSpec {
+                        name: "hello".to_string(),
+                        description: Some("Say hello".to_string()),
+                    }],
+                },
+            ))
             .unwrap(),
         ),
     ];

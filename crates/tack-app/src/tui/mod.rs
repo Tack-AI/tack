@@ -998,7 +998,9 @@ impl TuiApp {
             crate::mcp_config::plugin_mcp_callbacks(
                 settings,
                 crate::mcp_elicitation::InteractionMode::Tui,
-                Some(event_tx.clone()),
+                Some(crate::mcp_elicitation::ElicitationChannel::Tui(
+                    event_tx.clone(),
+                )),
                 sampling_llm,
                 sampling_usage_sink(event_tx.clone()),
             ),

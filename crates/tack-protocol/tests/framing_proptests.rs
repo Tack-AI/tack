@@ -23,7 +23,7 @@ proptest! {
     fn frame_roundtrip(id in "[a-z0-9]{1,16}", text in ".*") {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
-            let message = ClientMessage::Hello { version: PROTOCOL_VERSION, token: None };
+            let message = ClientMessage::Hello { version: PROTOCOL_VERSION, token: None, capabilities: Vec::new() };
             let mut buf: Vec<u8> = Vec::new();
             write_frame(&mut buf, &message).await.unwrap();
             let mut cursor = std::io::Cursor::new(buf);

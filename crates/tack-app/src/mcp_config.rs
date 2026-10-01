@@ -151,7 +151,7 @@ pub fn spec_from_entry(
 pub fn plugin_mcp_callbacks(
     settings: &crate::settings::Settings,
     mode: crate::mcp_elicitation::InteractionMode,
-    tui_events: Option<crate::tui::AppEventTx>,
+    elicitation_channel: Option<crate::mcp_elicitation::ElicitationChannel>,
     llm: &crate::mcp_sampling::SharedSamplingLlm,
     usage_sink: crate::mcp_sampling::SamplingUsageSink,
 ) -> tack_tools::mcp::McpClientCallbacks {
@@ -161,9 +161,11 @@ pub fn plugin_mcp_callbacks(
             crate::mcp_sampling::SamplingExecutor::shared(llm.clone(), usage_sink),
         ));
     }
-    if let Some(handler) =
-        crate::mcp_elicitation::elicitation_callback(mode, settings.mcp_elicitation, tui_events)
-    {
+    if let Some(handler) = crate::mcp_elicitation::elicitation_callback(
+        mode,
+        settings.mcp_elicitation,
+        elicitation_channel,
+    ) {
         callbacks = callbacks.with_elicitation(handler);
     }
     callbacks
@@ -190,14 +192,15 @@ impl std::fmt::Debug for SamplingLlm {
 ///   (resolved per request through the shared `llm` cell, so model changes
 ///   after connect are picked up) in an isolated untrusted context; usage
 ///   flows to `usage_sink`;
-/// - elicitation (`mcpElicitation`, default on) prompts in the TUI and
-///   auto-declines in headless modes.
+/// - elicitation (`mcpElicitation`, default on) prompts in the TUI,
+///   crosses to dialog-capable clients in remote mode, and auto-declines
+///   in headless modes.
 pub fn client_callbacks(
     settings: &crate::settings::Settings,
     llm: &crate::mcp_sampling::SharedSamplingLlm,
     usage_sink: crate::mcp_sampling::SamplingUsageSink,
     mode: crate::mcp_elicitation::InteractionMode,
-    tui_events: Option<crate::tui::AppEventTx>,
+    elicitation_channel: Option<crate::mcp_elicitation::ElicitationChannel>,
 ) -> tack_tools::mcp::McpClientCallbacks {
     let mut callbacks = tack_tools::mcp::McpClientCallbacks::default();
     if settings.mcp_sampling {
@@ -205,9 +208,11 @@ pub fn client_callbacks(
             crate::mcp_sampling::SamplingExecutor::shared(llm.clone(), usage_sink),
         ));
     }
-    if let Some(handler) =
-        crate::mcp_elicitation::elicitation_callback(mode, settings.mcp_elicitation, tui_events)
-    {
+    if let Some(handler) = crate::mcp_elicitation::elicitation_callback(
+        mode,
+        settings.mcp_elicitation,
+        elicitation_channel,
+    ) {
         callbacks = callbacks.with_elicitation(handler);
     }
     callbacks

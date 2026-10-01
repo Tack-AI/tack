@@ -360,6 +360,8 @@ tack serve --listen tcp:0.0.0.0:7749 --auth-token $(openssl rand -hex 32) --tls
 
 Web 客户端支持：权限弹窗（allow once/always/deny，并行工具调用排队逐个弹）、权限模式切换（ask/acceptEdits/plan/bypass，经新增的 `set_mode` 命令）、模型与 thinking 级别选择、会话 list/create/attach/switch。协议扩展全部增量（新 optional 字段 + `serde(other)` 未知消息兑底），且远程会话默认 bypass 模式——不会应答的旧客户端永远收不到新的 `permission_request` 事件，保持与 TS `@earendil-works/pi-protocol` v1 线兼容。
 
+插件面以同样方式暴露（`ext_*` 命令 + 受门控事件，经 hello `capabilities` 选择加入：`ext_widgets`、`ext_dialogs`）：远程客户端可以列出/调用插件 slash 命令、列出 widget 并上报 widget 交互、查询自动补全提供者，以及回答插件 `ui/select`/`ui/confirm`/`ui/input` 对话框与 MCP elicitation（广播，首答胜出）。`tack client` 两个能力都加入，并提供 `/ext`、`/widgets`、`/complete`、`/answer`、`/cancel`。
+
 ### Managed settings（组织强制）
 
 组织级策略文件（路径见 configuration.md）可以：强制 sandbox 开、强制开关 features、禁用 bypass 模式、锁定 provider/模型、追加不可移除的 deny 规则，以及管控插件（`pluginPolicy`：仅托管加载、来源白名单、按插件收窄能力——见下文"扩展系统"）。配合项目信任机制，企业内部署时用户侧和仓库侧都无法绕过组织策略。
@@ -480,7 +482,7 @@ mcp.json 的远程（HTTP）server 加 `"oauth": true` 或 `{"clientId": "…", 
 除工具/资源/提示外，MCP server 还可以反向请求客户端：
 
 - **Sampling**（`sampling/createMessage`）：server 请求一次 LLM 补全。settings.json 设 `"mcpSampling": true` 开启（**默认关闭**，不声明能力）。开启后按请求解析当前会话的 provider/model——模型切换对每个连接即时生效，包括 Level-2 插件 MCP server（它们在扩展加载时连接，早于任何会话）——安全防线与 MCP 工具结果一致：server 提供的 system prompt/messages 全部包裹 `<untrusted_content>` 并加防护前缀，只在隔离的子调用上下文中使用，绝不进主会话；拒绝 tools/toolChoice（不给 server 驱动本地工具的旁路）与 audio；`modelPreferences.hints` 忽略（始终用当前模型）。每次调用写 tracing 日志，token usage 计入会话（TUI 底部统计 + 提示）。
-- **Elicitation**（`elicitation/create`）：server 向用户请求结构化输入。`"mcpElicitation": true`（**默认开启**）。TUI 按 server 给的 JSON schema 逐字段弹输入框（string/number/integer/boolean/enum 自动类型转换，必填为空会重问，Esc = cancel）；print/rpc/acp/serve 等 headless 模式自动 decline；URL 模式（server 指定的浏览器流程）一律 decline。决策逻辑（模式 × 开关 → 弹窗/拒绝）在 `mcp_elicitation::elicitation_decision`，有单测。
+- **Elicitation**（`elicitation/create`）：server 向用户请求结构化输入。`"mcpElicitation": true`（**默认开启**）。TUI 按 server 给的 JSON schema 逐字段弹输入框（string/number/integer/boolean/enum 自动类型转换，必填为空会重问，Esc = cancel）；`tack serve` 会把表单转发给具备 dialog 能力的远程客户端（`ext_dialog_request`，首答胜出），无可用客户端时 decline；其余 headless 模式（print/rpc/acp）自动 decline；URL 模式（server 指定的浏览器流程）一律 decline。决策逻辑（模式 × 开关 → 弹窗/拒绝）在 `mcp_elicitation::elicitation_decision`，有单测。
 
 ### 工具 schema 懒加载（tool search）
 

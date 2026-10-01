@@ -2,6 +2,11 @@
 //! v1). `tack serve --listen 127.0.0.1:7749` (TCP) or `--listen unix:/path`
 //! (unix socket / Windows named pipe via tokio uds).
 
+/// Plugin-initiated UI bridged to remote clients (widgets, dialogs, MCP
+/// elicitation). Public for the crate's integration tests; not part of
+/// the supported API surface.
+#[doc(hidden)]
+pub mod ext_bridge;
 mod frames;
 mod host;
 
@@ -108,32 +113,54 @@ pub async fn serve(
     });
 
     // tack-ext plugins in headless mode (rpc parity): hook bridges,
-    // plugin tools, the approval chain and trust-gated exec stay live;
-    // UI dialogs degrade (ext_headless). Loaded once for the server and
-    // shared by every session in-process.
+    // plugin tools, the approval chain and trust-gated exec stay live.
+    // Remote mode additionally routes plugin-initiated UI (widgets,
+    // ui/* dialogs, MCP elicitation) to connected clients through the
+    // ext bridge (see remote/ext_bridge.rs) instead of degrading.
+    // Loaded once for the server and shared by every session in-process.
     let agent_dir = tack_session::default_agent_dir();
     let bridge_state = crate::ext_provider_bridge::ProviderBridgeState::shared();
     let sampling_llm = crate::mcp_sampling::SharedSamplingLlm::default();
+    let ext_bridge = ext_bridge::RemoteExtBridge::new();
     let extensions = crate::extension_host::ExtensionManager::load(
         &cwd,
         &agent_dir,
         "remote",
-        crate::ext_headless::HeadlessExtServices::new(
+        crate::ext_headless::HeadlessExtServices::new_with_remote(
             "remote",
             crate::project_trust::is_trusted(&cwd, &agent_dir),
             bridge_state.clone(),
+            ext_bridge.clone(),
         ),
         settings.extension_lock_required,
         crate::mcp_config::plugin_mcp_callbacks(
             &settings,
-            crate::mcp_elicitation::InteractionMode::Headless,
-            None,
+            crate::mcp_elicitation::InteractionMode::Remote,
+            Some(crate::mcp_elicitation::ElicitationChannel::Remote(
+                ext_bridge.clone(),
+            )),
             &sampling_llm,
             crate::mcp_sampling::log_usage_sink(),
         ),
         bridge_state,
     )
     .await;
+    // A dead plugin's widgets vanish with it (no UI residue): watch each
+    // plugin connection for EOF and tell widget-capable clients.
+    #[cfg(feature = "ext")]
+    for plugin in &extensions.plugins {
+        let Some(handle) = &plugin.handle else {
+            continue;
+        };
+        let conn = handle.client();
+        let name = plugin.id.to_string();
+        let bridge = ext_bridge.clone();
+        crate::extension_host::watch_plugin_death(conn, move || {
+            tokio::spawn(async move {
+                bridge.remove_plugin_widgets(&name).await;
+            });
+        });
+    }
     // Provider-boundary lifecycle events for subscribed plugins.
     let provider: Arc<dyn Provider> = Arc::new(crate::extension_host::ExtNotifyProvider::new(
         provider,
@@ -197,7 +224,10 @@ pub async fn serve(
         auth_token,
         extensions,
         sampling_llm,
+        ext_bridge.clone(),
     );
+    // Widget updates pushed while plugins were loading flush now.
+    ext_bridge.attach(&host).await;
     // Idle detached sessions would otherwise accumulate forever.
     let _reaper = spawn_session_reaper(&host);
     let acceptor = match &tls {
@@ -382,6 +412,7 @@ pub(crate) mod testutil {
             None,
             crate::extension_host::ExtensionManager::default(),
             crate::mcp_sampling::SharedSamplingLlm::default(),
+            super::ext_bridge::RemoteExtBridge::new(),
         )
     }
 }
@@ -449,6 +480,7 @@ mod tests {
                 &ClientMessage::Hello {
                     version: PROTOCOL_VERSION,
                     token: token.map(str::to_string),
+                    capabilities: Vec::new(),
                 },
             )
             .await;
@@ -555,6 +587,7 @@ mod tests {
                 Some("secret".to_string()),
                 crate::extension_host::ExtensionManager::default(),
                 crate::mcp_sampling::SharedSamplingLlm::default(),
+                ext_bridge::RemoteExtBridge::new(),
             );
             let addr = start_ws_server(host).await;
             let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))

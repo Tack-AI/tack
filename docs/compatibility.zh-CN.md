@@ -103,6 +103,24 @@ Rust workspace 的各个 crate **不发布到 crates.io**，也不提供 semver
 - **版本**：`crates/tack-protocol/src/schemas.rs` 中的
   `PROTOCOL_VERSION: u32 = 1`。schema 与上游
   `packages/protocol/src/schemas.ts` 逐字段对齐。
+- **扩展面（只增加扩展）**：插件 slash 命令、声明式 widget、
+  自动补全提供者、`ui/select`/`ui/confirm`/`ui/input` 对话框以及
+  MCP elicitation 作为 v1 的只增加扩展暴露在远程协议上。新增命令
+  （`list_ext_commands`、`invoke_ext_command`、`list_ext_widgets`、
+  `ext_widget_action`、`list_ext_autocomplete`、`ext_autocomplete`、
+  `ext_dialog_response`）—— 扩展前的服务端对它们回保留错误
+  `unknown command (newer protocol extension?)`。新增事件
+  （`ext_widget_update`、`ext_widgets_removed`、`ext_dialog_request`、
+  `ext_dialog_closed`）在扩展前的客户端上解码为 `Unknown` 兑底。
+  服务端推送的事件还额外受 hello 能力协商门控：客户端 hello 携带
+  可选的 `capabilities` 列表（`ext_widgets`、`ext_dialogs`；服务端
+  hello 回显其支持的集合），连接只会收到它选择加入的受门控事件
+  —— 扩展前的客户端看到的就是原样 v1 事件流。插件对话框没有会话
+  归属（插件连接是 host 级单例），因此 —— 与多客户端 attach 时的
+  `PermissionRequest` 相同 —— 它们广播给每个 dialog-capable 连接，
+  首个 `ext_dialog_response` 胜出；没有任何 dialog-capable 连接时，
+  插件对话框立即失败（capability-not-granted / elicitation 拒绝），
+  而不是空等。
 - **已存在版本协商**：`RemoteClient::connect`
   （`crates/tack-protocol/src/client.rs`）发送 `Hello { version }` 并
   检查服务端的 hello。说**更新**协议的服务端会被保留错误码

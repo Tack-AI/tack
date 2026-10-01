@@ -1,5 +1,5 @@
-//! Headless host services for non-TUI run modes (print / rpc / acp),
-//! implementing the v3 [`PeerHandler`] surface.
+//! Headless host services for non-TUI run modes (print / rpc / acp /
+//! remote), implementing the v3 [`PeerHandler`] surface.
 //!
 //! Plugins keep working in headless modes — tools, interception,
 //! lifecycle events, `exec/run` (trust-gated) — but anything that needs a
@@ -8,7 +8,12 @@
 //! - `ui/notify`: accepted, forwarded to the tracing log;
 //! - `ui/select` / `ui/confirm` / `ui/input`: `ERR_CAPABILITY_NOT_GRANTED`
 //!   — there is no user to ask (the initialize payload's `mode` and
-//!   `capabilities` tell the plugin);
+//!   `capabilities` tell the plugin). EXCEPTION: in "remote" mode (built
+//!   via [`HeadlessExtServices::new_with_remote`]) these cross to
+//!   dialog-capable clients over the protocol (`ext_dialog_request`,
+//!   first answer wins; none connected → capability-not-granted), and
+//!   `widgets/update` applies + broadcasts (`ext_widget_update`) instead
+//!   of being ignored;
 //! - `host/registerProvider`: honored — provider registration is
 //!   mode-independent (it writes the process-global runtime registry that
 //!   every mode's model resolution reads); `bridge: true` additionally
@@ -113,6 +118,10 @@ pub struct HeadlessExtServices {
     trusted: bool,
     /// Provider bridge state (connections, stream sinks, registrations).
     bridge_state: Arc<crate::ext_provider_bridge::ProviderBridgeState>,
+    /// "remote" mode only: plugin-initiated UI (widgets, dialogs) is
+    /// routed to connected clients through this bridge instead of
+    /// degrading (see remote/ext_bridge.rs).
+    remote: Option<Arc<crate::remote::ext_bridge::RemoteExtBridge>>,
 }
 
 impl std::fmt::Debug for HeadlessExtServices {
@@ -134,6 +143,106 @@ impl HeadlessExtServices {
             mode,
             trusted,
             bridge_state,
+            remote: None,
+        })
+    }
+
+    /// "remote" mode: plugin UI crosses to connected clients over the
+    /// protocol (`ext_dialog_request` / `ext_widget_update` events).
+    pub fn new_with_remote(
+        mode: &'static str,
+        trusted: bool,
+        bridge_state: Arc<crate::ext_provider_bridge::ProviderBridgeState>,
+        remote: Arc<crate::remote::ext_bridge::RemoteExtBridge>,
+    ) -> Arc<Self> {
+        Arc::new(HeadlessExtServices {
+            mode,
+            trusted,
+            bridge_state,
+            remote: Some(remote),
+        })
+    }
+
+    /// Plugin `ui/select`/`ui/confirm`/`ui/input` in remote mode:
+    /// broadcast the dialog to dialog-capable clients and park on the
+    /// first answer. Answer mapping matches the TUI dialogs (tui/ext.rs):
+    /// cancel → null (confirm → false).
+    async fn remote_ui_dialog(
+        &self,
+        bridge: &crate::remote::ext_bridge::RemoteExtBridge,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, ErrorObject> {
+        use crate::remote::ext_bridge::ExtDialogSpec;
+        use tack_protocol::schemas::ExtDialogKind;
+        // TaggedServices injected the originating plugin id.
+        let source = params
+            .get("plugin")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let spec = match method {
+            "ui/select" => {
+                match serde_json::from_value::<tack_ext::rpc3::UiSelectParams>(params) {
+                    Ok(parsed) if !parsed.options.is_empty() => ExtDialogSpec {
+                        source,
+                        kind: ExtDialogKind::Select,
+                        title: parsed.title,
+                        message: None,
+                        options: parsed.options,
+                        placeholder: None,
+                        fields: Vec::new(),
+                    },
+                    // Bad params degrade exactly like the TUI dialog.
+                    _ => return Ok(Value::Null),
+                }
+            }
+            "ui/confirm" => {
+                match serde_json::from_value::<tack_ext::rpc3::UiConfirmParams>(params) {
+                    Ok(parsed) => ExtDialogSpec {
+                        source,
+                        kind: ExtDialogKind::Confirm,
+                        title: parsed.title,
+                        message: Some(parsed.message),
+                        options: Vec::new(),
+                        placeholder: None,
+                        fields: Vec::new(),
+                    },
+                    _ => return Ok(Value::Bool(false)),
+                }
+            }
+            _ => match serde_json::from_value::<tack_ext::rpc3::UiInputParams>(params) {
+                Ok(parsed) => ExtDialogSpec {
+                    source,
+                    kind: ExtDialogKind::Input,
+                    title: parsed.title,
+                    message: None,
+                    options: Vec::new(),
+                    placeholder: parsed.placeholder,
+                    fields: Vec::new(),
+                },
+                _ => return Ok(Value::Null),
+            },
+        };
+        let answer = bridge
+            .ask_dialog(spec)
+            .await
+            .map_err(|e| service_error(ERR_CAPABILITY_NOT_GRANTED, e))?;
+        Ok(match method {
+            "ui/confirm" => {
+                if answer.cancelled {
+                    Value::Bool(false)
+                } else {
+                    answer.value.unwrap_or(Value::Bool(false))
+                }
+            }
+            _ => {
+                if answer.cancelled {
+                    Value::Null
+                } else {
+                    answer.value.unwrap_or(Value::Null)
+                }
+            }
         })
     }
 }
@@ -148,13 +257,16 @@ impl PeerHandler for HeadlessExtServices {
                 tracing::info!(target: "tack_ext::plugin", "notify: {message}");
                 Ok(Value::Null)
             }
-            "ui/select" | "ui/confirm" | "ui/input" => Err(service_error(
-                ERR_CAPABILITY_NOT_GRANTED,
-                format!(
-                    "{method} needs an interactive terminal; not available in {} mode",
-                    self.mode
-                ),
-            )),
+            "ui/select" | "ui/confirm" | "ui/input" => match &self.remote {
+                Some(bridge) => self.remote_ui_dialog(bridge, method, params).await,
+                None => Err(service_error(
+                    ERR_CAPABILITY_NOT_GRANTED,
+                    format!(
+                        "{method} needs an interactive terminal; not available in {} mode",
+                        self.mode
+                    ),
+                )),
+            },
             "exec/run" => {
                 if !self.trusted {
                     return Err(service_error(
@@ -204,8 +316,34 @@ impl PeerHandler for HeadlessExtServices {
                 let message = payload.get("message").and_then(Value::as_str).unwrap_or("");
                 tracing::warn!(target: "tack_ext::plugin", "plugin warning: {message}");
             }
-            // widgets/update: headless modes accept and ignore widget
-            // state (widgets are best-effort UI, never load-bearing).
+            // widgets/update: plain headless modes accept and ignore
+            // widget state (widgets are best-effort UI, never
+            // load-bearing). Remote mode applies it to the shared manager
+            // and broadcasts `ext_widget_update` to widget-capable
+            // clients. The `plugin` field was injected by TaggedServices
+            // (widget ids are only unique per plugin).
+            "widgets/update" => {
+                if let Some(bridge) = &self.remote {
+                    let plugin = payload
+                        .get("plugin")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    match serde_json::from_value::<tack_ext::rpc3::WidgetUpdateParams>(payload) {
+                        Ok(update) => {
+                            bridge
+                                .apply_widget_update(
+                                    &plugin,
+                                    &update.id,
+                                    update.state,
+                                    update.visible,
+                                )
+                                .await;
+                        }
+                        Err(e) => tracing::warn!("bad widgets/update payload: {e}"),
+                    }
+                }
+            }
             "provider/streamEvent" => {
                 let plugin = payload
                     .get("plugin")

@@ -115,6 +115,38 @@ fn next_connection_id() -> String {
     )
 }
 
+/// Per-connection extension-surface opt-ins, negotiated in the hello.
+/// Pre-extension clients (no capabilities field) get `false`/`false` and
+/// see exactly the v1 event stream.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ConnectionCaps {
+    pub widgets: bool,
+    pub dialogs: bool,
+}
+
+impl ConnectionCaps {
+    fn from_hello(capabilities: &[String]) -> Self {
+        ConnectionCaps {
+            widgets: capabilities.iter().any(|c| c == CAP_EXT_WIDGETS),
+            dialogs: capabilities.iter().any(|c| c == CAP_EXT_DIALOGS),
+        }
+    }
+
+    /// Event gating: ext-surface events are only written to connections
+    /// that opted into their capability in the hello.
+    fn allows(&self, event: &ServerEvent) -> bool {
+        match event {
+            ServerEvent::ExtWidgetUpdate { .. } | ServerEvent::ExtWidgetsRemoved { .. } => {
+                self.widgets
+            }
+            ServerEvent::ExtDialogRequest { .. } | ServerEvent::ExtDialogClosed { .. } => {
+                self.dialogs
+            }
+            _ => true,
+        }
+    }
+}
+
 /// Per-connection protocol loop, shared by all transports (TCP/unix/TLS via
 /// `StreamIo`, WebSocket via `remote_ws::WsIo`).
 pub(crate) async fn handle_frames(
@@ -137,8 +169,12 @@ pub(crate) async fn handle_frames(
                 return Ok(());
             }
         };
-    match first {
-        Some(ClientMessage::Hello { version, token }) if version == PROTOCOL_VERSION => {
+    let caps = match first {
+        Some(ClientMessage::Hello {
+            version,
+            token,
+            capabilities,
+        }) if version == PROTOCOL_VERSION => {
             // Shared-token auth (TS pi's --auth-token semantics).
             let expected = host.lock().await.auth_token.clone();
             if let Some(expected) = expected
@@ -154,6 +190,7 @@ pub(crate) async fn handle_frames(
                 .await?;
                 return Ok(());
             }
+            ConnectionCaps::from_hello(&capabilities)
         }
         Some(ClientMessage::Hello { .. }) => {
             io.write_message(&ServerMessage::HelloError {
@@ -177,7 +214,7 @@ pub(crate) async fn handle_frames(
             .await?;
             return Ok(());
         }
-    }
+    };
 
     let connection_id = next_connection_id();
     let snapshot = host.lock().await.server_snapshot();
@@ -185,21 +222,28 @@ pub(crate) async fn handle_frames(
         version: PROTOCOL_VERSION,
         connection_id,
         snapshot,
+        capabilities: SERVER_CAPABILITIES.iter().map(|s| s.to_string()).collect(),
     })
     .await?;
 
     // Registered only after a successful handshake (failed handshakes
     // never count): active_connections drives permission-prompt liveness.
-    host.lock().await.active_connections += 1;
+    // The ext bridge tracks dialog-capable connections the same way (a
+    // plugin dialog with zero answerers fails fast instead of parking).
+    {
+        let mut host_guard = host.lock().await;
+        host_guard.active_connections += 1;
+        host_guard.ext_bridge.client_connected(caps.dialogs);
+    }
     // This connection's session attachments, refcounted (attach +1 /
     // detach -1); whatever is still held when the loop ends is released
     // by connection_closed.
     let mut attached: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    let loop_result = connection_loop(io, host, &mut attached).await;
+    let loop_result = connection_loop(io, host, &mut attached, caps).await;
     // Teardown on EVERY exit path — clean EOF, io error and event-pump
     // shutdown alike (F07: release attachments; F17: last client gone
-    // denies parked permission prompts).
-    SessionHost::connection_closed(host, &attached).await;
+    // denies parked permission prompts and plugin dialogs).
+    SessionHost::connection_closed(host, &attached, caps.dialogs).await;
     loop_result
 }
 
@@ -210,9 +254,13 @@ async fn connection_loop(
     io: &mut impl FrameIo,
     host: &Arc<Mutex<SessionHost>>,
     attached: &mut std::collections::HashMap<String, u32>,
+    caps: ConnectionCaps,
 ) -> Result<()> {
     // Events → this connection.
     let mut event_rx = spawn_event_pump(host.lock().await.events.subscribe());
+    // Responses of off-loop requests (see below): merged back into the
+    // single writer.
+    let (response_tx, mut response_rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
 
     loop {
         tokio::select! {
@@ -220,6 +268,35 @@ async fn connection_loop(
                 let Some(message) = frame? else { break };
                 match message {
                     ClientMessage::Request { id, request } => {
+                        // Potentially long, RE-ENTRANT requests run
+                        // off-loop: a plugin command/autocomplete handler
+                        // may call back into the host (ui/select →
+                        // ext_dialog_request) that only THIS connection
+                        // can answer — awaiting it inline would deadlock
+                        // the dialog until the timeout. The response
+                        // re-enters via response_rx; ordering vs other
+                        // responses is irrelevant (ids correlate).
+                        if matches!(
+                            &request,
+                            Command::InvokeExtCommand { .. } | Command::ExtAutocomplete { .. }
+                        ) {
+                            let host = host.clone();
+                            let tx = response_tx.clone();
+                            tokio::spawn(async move {
+                                let response = match SessionHost::handle_command(&host, request).await
+                                {
+                                    Ok(result) => ServerMessage::ok(id, result),
+                                    Err(error) => ServerMessage::Response {
+                                        id,
+                                        ok: false,
+                                        result: None,
+                                        error: Some(error),
+                                    },
+                                };
+                                let _ = tx.send(response);
+                            });
+                            continue;
+                        }
                         // Per-connection attachment tracking (F07): only
                         // SUCCESSFUL attach/detach commands move the
                         // refcount, mirroring the host's `attached` count.
@@ -261,10 +338,17 @@ async fn connection_loop(
                     }
                 }
             }
+            Some(response) = response_rx.recv() => {
+                io.write_message(&response).await?;
+            }
             event = event_rx.recv() => {
                 match event {
                     Some(event) => {
-                        io.write_message( &ServerMessage::Event { event }).await?;
+                        // Ext-surface events only reach connections that
+                        // opted into their capability in the hello.
+                        if caps.allows(&event) {
+                            io.write_message( &ServerMessage::Event { event }).await?;
+                        }
                     }
                     None => break,
                 }
@@ -275,9 +359,73 @@ async fn connection_loop(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod caps_tests {
+    use super::*;
+
+    fn widget_event() -> ServerEvent {
+        ServerEvent::ExtWidgetsRemoved {
+            plugin: "p".into(),
+            keys: vec!["p:w".into()],
+        }
+    }
+
+    fn dialog_event() -> ServerEvent {
+        ServerEvent::ExtDialogClosed {
+            request_id: "dlg-1".into(),
+        }
+    }
+
+    /// Ext-surface events only pass with their capability; permission
+    /// prompts stay mode-driven (never capability-gated) and regular
+    /// events always pass.
+    #[test]
+    fn ext_events_require_their_capability() {
+        // Pre-extension client (no capabilities field): nothing gated passes.
+        let none = ConnectionCaps::from_hello(&[]);
+        assert!(!none.allows(&widget_event()));
+        assert!(!none.allows(&dialog_event()));
+        // Regular events are never gated.
+        assert!(none.allows(&ServerEvent::SessionRemoved {
+            session_id: "s".into()
+        }));
+        assert!(none.allows(&ServerEvent::PermissionRequest {
+            session_id: "s".into(),
+            request_id: "r".into(),
+            tool_call_id: "t".into(),
+            tool_name: "bash".into(),
+            title: "bash: ls".into(),
+            input: serde_json::json!({}),
+        }));
+
+        // Per-surface granularity: widgets ≠ dialogs.
+        let widgets_only = ConnectionCaps::from_hello(&[CAP_EXT_WIDGETS.to_string()]);
+        assert!(widgets_only.allows(&widget_event()));
+        assert!(!widgets_only.allows(&dialog_event()));
+        let dialogs_only = ConnectionCaps::from_hello(&[CAP_EXT_DIALOGS.to_string()]);
+        assert!(!dialogs_only.allows(&widget_event()));
+        assert!(dialogs_only.allows(&dialog_event()));
+        // Unknown capability strings are ignored; both bits work together.
+        let both = ConnectionCaps::from_hello(&[
+            CAP_EXT_WIDGETS.to_string(),
+            CAP_EXT_DIALOGS.to_string(),
+            "future_thing".to_string(),
+        ]);
+        assert!(both.allows(&widget_event()));
+        assert!(both.allows(&dialog_event()));
+    }
+}
+
+#[cfg(test)]
 pub(crate) struct MockIo {
     incoming: std::collections::VecDeque<ClientMessage>,
-    pub(crate) written: Vec<ServerMessage>,
+    written: std::sync::Arc<std::sync::Mutex<Vec<ServerMessage>>>,
+    /// Signalled on every write (tests awaiting off-loop responses).
+    written_notify: std::sync::Arc<tokio::sync::Notify>,
+    /// When the script runs out: park instead of EOF, so the test (not
+    /// the script length) controls the connection lifetime — required
+    /// when off-loop responses are still in flight at script end.
+    park_on_empty: bool,
 }
 
 #[cfg(test)]
@@ -287,8 +435,38 @@ impl MockIo {
     pub(crate) fn new(messages: Vec<ClientMessage>) -> Self {
         Self {
             incoming: messages.into_iter().collect(),
-            written: Vec::new(),
+            written: Default::default(),
+            written_notify: Default::default(),
+            park_on_empty: false,
         }
+    }
+
+    /// Like [`Self::new`], but reads PARK once the script runs out (the
+    /// test ends the connection by aborting the handle_frames task).
+    pub(crate) fn open_ended(messages: Vec<ClientMessage>) -> Self {
+        Self {
+            park_on_empty: true,
+            ..Self::new(messages)
+        }
+    }
+
+    /// Snapshot of everything written so far.
+    pub(crate) fn written(&self) -> Vec<ServerMessage> {
+        self.written
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Shared handle to the written log (open-ended tests outlive the
+    /// `MockIo`, which moves into the connection task).
+    pub(crate) fn written_shared(&self) -> std::sync::Arc<std::sync::Mutex<Vec<ServerMessage>>> {
+        self.written.clone()
+    }
+
+    /// Fires on every written message (re-check `written` on wake).
+    pub(crate) fn written_notify(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.written_notify.clone()
     }
 }
 
@@ -296,6 +474,9 @@ impl MockIo {
 impl FrameIo for MockIo {
     async fn read_message<T: serde::de::DeserializeOwned>(&mut self) -> Result<Option<T>> {
         let Some(message) = self.incoming.pop_front() else {
+            if self.park_on_empty {
+                std::future::pending::<()>().await;
+            }
             return Ok(None);
         };
         let value = serde_json::to_value(message)?;
@@ -303,7 +484,11 @@ impl FrameIo for MockIo {
     }
     async fn write_message<T: serde::Serialize + Sync>(&mut self, value: &T) -> Result<()> {
         let value = serde_json::to_value(value)?;
-        self.written.push(serde_json::from_value(value)?);
+        self.written
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(serde_json::from_value(value)?);
+        self.written_notify.notify_waiters();
         Ok(())
     }
 }

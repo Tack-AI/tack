@@ -56,8 +56,29 @@ pub enum ElicitationOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InteractionMode {
     Tui,
-    /// print / rpc / acp / serve.
+    /// print / rpc / acp.
     Headless,
+    /// `tack serve`: dialogs cross to connected clients over the
+    /// protocol (`ext_dialog_request`); with no dialog-capable client
+    /// they decline like Headless.
+    Remote,
+}
+
+/// The channel an elicitation dialog is forwarded over.
+pub enum ElicitationChannel {
+    /// TUI main loop (per-field InputDialogs).
+    Tui(crate::tui::AppEventTx),
+    /// Remote clients via the extension UI bridge.
+    Remote(Arc<crate::remote::ext_bridge::RemoteExtBridge>),
+}
+
+impl std::fmt::Debug for ElicitationChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ElicitationChannel::Tui(_) => f.debug_struct("Tui").finish_non_exhaustive(),
+            ElicitationChannel::Remote(_) => f.debug_struct("Remote").finish_non_exhaustive(),
+        }
+    }
 }
 
 /// The handling decision for one elicitation request.
@@ -69,11 +90,13 @@ pub enum ElicitationDecision {
     Decline,
 }
 
-/// Pure policy: mode × setting → decision (unit-tested; the TUI dialog and
-/// the headless decline are both driven by this).
+/// Pure policy: mode × setting → decision (unit-tested; the TUI dialog,
+/// the remote broadcast and the headless decline are all driven by this).
 pub fn elicitation_decision(mode: InteractionMode, enabled: bool) -> ElicitationDecision {
     match (mode, enabled) {
-        (InteractionMode::Tui, true) => ElicitationDecision::Prompt,
+        (InteractionMode::Tui, true) | (InteractionMode::Remote, true) => {
+            ElicitationDecision::Prompt
+        }
         _ => ElicitationDecision::Decline,
     }
 }
@@ -251,6 +274,87 @@ impl tack_tools::mcp::ElicitationHandler for TuiElicitationHandler {
     }
 }
 
+/// Elicitation handler for `tack serve`: the form crosses to
+/// dialog-capable clients as one `ext_dialog_request` (kind
+/// `elicitation`); the answer maps back to MCP actions (cancel → Cancel,
+/// content object → Accept, no answerer/timeout → Decline).
+pub struct RemoteElicitationHandler {
+    bridge: Arc<crate::remote::ext_bridge::RemoteExtBridge>,
+}
+
+impl std::fmt::Debug for RemoteElicitationHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteElicitationHandler").finish()
+    }
+}
+
+impl RemoteElicitationHandler {
+    pub fn new(bridge: Arc<crate::remote::ext_bridge::RemoteExtBridge>) -> Self {
+        RemoteElicitationHandler { bridge }
+    }
+}
+
+#[async_trait]
+impl tack_tools::mcp::ElicitationHandler for RemoteElicitationHandler {
+    async fn elicit(
+        &self,
+        server: &str,
+        params: ElicitRequestParams,
+    ) -> Result<ElicitResult, String> {
+        match params {
+            ElicitRequestParams::FormElicitationParams {
+                message,
+                requested_schema,
+                ..
+            } => {
+                let fields = fields_from_schema(&schema_to_json(&requested_schema));
+                let spec = crate::remote::ext_bridge::ExtDialogSpec {
+                    source: server.to_string(),
+                    kind: tack_protocol::schemas::ExtDialogKind::Elicitation,
+                    title: server.to_string(),
+                    message: Some(message),
+                    options: Vec::new(),
+                    placeholder: None,
+                    fields: fields
+                        .into_iter()
+                        .map(|f| tack_protocol::schemas::ExtElicitField {
+                            name: f.name,
+                            kind: f.kind,
+                            description: f.description,
+                            required: f.required,
+                            choices: f.choices,
+                        })
+                        .collect(),
+                };
+                match self.bridge.ask_dialog(spec).await {
+                    Ok(answer) if answer.cancelled => {
+                        Ok(ElicitResult::new(ElicitationAction::Cancel))
+                    }
+                    Ok(answer) => {
+                        let result = ElicitResult::new(ElicitationAction::Accept);
+                        Ok(match answer.value {
+                            Some(content) => result.with_content(content),
+                            None => result,
+                        })
+                    }
+                    // No dialog-capable client / timeout: decline but let
+                    // the server continue.
+                    Err(_) => Ok(ElicitResult::new(ElicitationAction::Decline)),
+                }
+            }
+            // URL-mode would send the user to a server-chosen browser flow;
+            // we don't follow those.
+            ElicitRequestParams::UrlElicitationParams { .. } => {
+                Ok(ElicitResult::new(ElicitationAction::Decline))
+            }
+            other => {
+                let _ = other;
+                Ok(ElicitResult::new(ElicitationAction::Decline))
+            }
+        }
+    }
+}
+
 /// Dialog-side state for one in-flight elicitation (owned by the TUI while
 /// it walks the fields one InputDialog at a time).
 #[derive(Debug)]
@@ -311,10 +415,17 @@ impl PendingElicitation {
 pub fn elicitation_callback(
     mode: InteractionMode,
     enabled: bool,
-    tx: Option<crate::tui::AppEventTx>,
+    channel: Option<ElicitationChannel>,
 ) -> Option<Arc<dyn tack_tools::mcp::ElicitationHandler>> {
-    match (elicitation_decision(mode, enabled), tx) {
-        (ElicitationDecision::Prompt, Some(tx)) => Some(Arc::new(TuiElicitationHandler::new(tx))),
+    match (mode, elicitation_decision(mode, enabled), channel) {
+        (InteractionMode::Tui, ElicitationDecision::Prompt, Some(ElicitationChannel::Tui(tx))) => {
+            Some(Arc::new(TuiElicitationHandler::new(tx)))
+        }
+        (
+            InteractionMode::Remote,
+            ElicitationDecision::Prompt,
+            Some(ElicitationChannel::Remote(bridge)),
+        ) => Some(Arc::new(RemoteElicitationHandler::new(bridge))),
         _ => None,
     }
 }
@@ -343,14 +454,148 @@ mod tests {
             elicitation_decision(InteractionMode::Headless, false),
             ElicitationDecision::Decline
         );
+        assert_eq!(
+            elicitation_decision(InteractionMode::Remote, true),
+            ElicitationDecision::Prompt
+        );
+        assert_eq!(
+            elicitation_decision(InteractionMode::Remote, false),
+            ElicitationDecision::Decline
+        );
     }
 
     #[test]
-    fn callback_only_in_tui_with_channel() {
+    fn callback_only_with_a_matching_channel() {
         let (tx, _rx) = crate::tui::app_event_bus();
-        assert!(elicitation_callback(InteractionMode::Tui, true, Some(tx)).is_some());
+        assert!(
+            elicitation_callback(
+                InteractionMode::Tui,
+                true,
+                Some(super::ElicitationChannel::Tui(tx))
+            )
+            .is_some()
+        );
         assert!(elicitation_callback(InteractionMode::Tui, false, None).is_none());
         assert!(elicitation_callback(InteractionMode::Headless, true, None).is_none());
+        // A channel for the WRONG mode yields nothing (mode decides).
+        let bridge = crate::remote::ext_bridge::RemoteExtBridge::new();
+        assert!(
+            elicitation_callback(
+                InteractionMode::Tui,
+                true,
+                Some(super::ElicitationChannel::Remote(bridge.clone()))
+            )
+            .is_none()
+        );
+        // Remote + bridge → advertised; remote without → not.
+        assert!(
+            elicitation_callback(
+                InteractionMode::Remote,
+                true,
+                Some(super::ElicitationChannel::Remote(bridge))
+            )
+            .is_some()
+        );
+        assert!(elicitation_callback(InteractionMode::Remote, false, None).is_none());
+    }
+
+    /// Remote elicitation: the form crosses the bridge as one dialog;
+    /// answers map to MCP actions.
+    #[tokio::test]
+    async fn remote_elicitation_accept_and_cancel() {
+        use rmcp::model::ElicitationSchema;
+        let bridge = crate::remote::ext_bridge::RemoteExtBridge::new();
+        let host = crate::remote::testutil::test_host(vec![]);
+        bridge.attach(&host).await;
+        bridge.client_connected(true);
+        let handler = super::RemoteElicitationHandler::new(bridge.clone());
+        let mut events = host.lock().await.events.subscribe();
+
+        let call = tokio::spawn(async move {
+            handler
+                .elicit(
+                    "srv",
+                    ElicitRequestParams::FormElicitationParams {
+                        meta: None,
+                        message: "who?".into(),
+                        requested_schema: ElicitationSchema::builder()
+                            .required_string("name")
+                            .build()
+                            .unwrap(),
+                    },
+                )
+                .await
+        });
+        // The dialog request went out with the flattened fields.
+        let request_id = loop {
+            if let Ok(tack_protocol::schemas::ServerEvent::ExtDialogRequest {
+                request_id,
+                kind,
+                fields,
+                ..
+            }) = events.recv().await
+            {
+                assert_eq!(kind, tack_protocol::schemas::ExtDialogKind::Elicitation);
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].name, "name");
+                break request_id;
+            }
+        };
+        assert!(bridge.answer_dialog(&request_id, false, Some(serde_json::json!({"name": "ada"}))));
+        let result = call.await.unwrap().unwrap();
+        assert_eq!(result.action, ElicitationAction::Accept);
+        assert_eq!(
+            result.content.as_ref().and_then(|c| c.get("name")),
+            Some(&serde_json::json!("ada"))
+        );
+
+        // Cancel maps to the MCP cancel action.
+        let handler = super::RemoteElicitationHandler::new(bridge.clone());
+        let call = tokio::spawn(async move {
+            handler
+                .elicit(
+                    "srv",
+                    ElicitRequestParams::FormElicitationParams {
+                        meta: None,
+                        message: "again?".into(),
+                        requested_schema: ElicitationSchema::builder()
+                            .required_string("name")
+                            .build()
+                            .unwrap(),
+                    },
+                )
+                .await
+        });
+        let request_id = loop {
+            if let Ok(tack_protocol::schemas::ServerEvent::ExtDialogRequest {
+                request_id, ..
+            }) = events.recv().await
+            {
+                break request_id;
+            }
+        };
+        assert!(bridge.answer_dialog(&request_id, true, None));
+        let result = call.await.unwrap().unwrap();
+        assert_eq!(result.action, ElicitationAction::Cancel);
+
+        // No answerers left → Decline (never parks).
+        bridge.client_disconnected(true);
+        let handler = super::RemoteElicitationHandler::new(bridge.clone());
+        let result = handler
+            .elicit(
+                "srv",
+                ElicitRequestParams::FormElicitationParams {
+                    meta: None,
+                    message: "anyone?".into(),
+                    requested_schema: ElicitationSchema::builder()
+                        .required_string("name")
+                        .build()
+                        .unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.action, ElicitationAction::Decline);
     }
 
     #[test]

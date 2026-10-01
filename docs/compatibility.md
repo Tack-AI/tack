@@ -112,6 +112,27 @@ binary and its externally observable behavior.
 - **Version**: `PROTOCOL_VERSION: u32 = 1` in
   `crates/tack-protocol/src/schemas.rs`. Schemas match upstream
   `packages/protocol/src/schemas.ts` field-for-field.
+- **Extension surfaces (additive)**: plugin slash commands, declarative
+  widgets, autocomplete providers, `ui/select`/`ui/confirm`/`ui/input`
+  dialogs and MCP elicitation are exposed over the remote protocol as an
+  additive v1 extension. New commands (`list_ext_commands`,
+  `invoke_ext_command`, `list_ext_widgets`, `ext_widget_action`,
+  `list_ext_autocomplete`, `ext_autocomplete`, `ext_dialog_response`) —
+  pre-extension servers answer them with the reserved
+  `unknown command (newer protocol extension?)` error. New events
+  (`ext_widget_update`, `ext_widgets_removed`, `ext_dialog_request`,
+  `ext_dialog_closed`) decode as the `Unknown` catch-all on
+  pre-extension clients. Server-push events are additionally gated on
+  hello capability negotiation: the client hello carries an optional
+  `capabilities` list (`ext_widgets`, `ext_dialogs`; the server hello
+  echoes its supported set), and a connection only receives the gated
+  events it opted into — a pre-extension client sees exactly the
+  original v1 event stream. Plugin dialogs have no session attribution
+  (plugin connections are host-global), so — like `PermissionRequest`
+  with several attached clients — they are broadcast to every
+  dialog-capable connection and the first `ext_dialog_response` wins;
+  with no dialog-capable connection a plugin dialog fails fast
+  (capability-not-granted / elicitation-decline) instead of parking.
 - **Version negotiation exists**: `RemoteClient::connect`
   (`crates/tack-protocol/src/client.rs`) sends `Hello { version }` and
   inspects the server hello. A server speaking a **newer** protocol is

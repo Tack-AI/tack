@@ -26,8 +26,8 @@ use tack_ext::hooks::{ExtHooks, FailMode};
 use tack_ext::plugin_id::PluginId;
 use tack_ext::rpc3::{
     ApprovalDecisionAction, ApprovalReviewParams, ErrorObject, HostCapabilities, HostInfo,
-    InitializeParams, InitializeResult, MetricsHostCapability, RunMode, ToolCall, WidgetSpec,
-    WidgetUpdateParams,
+    InitializeParams, InitializeResult, MetricsHostCapability, RunMode, ToolCall,
+    WidgetActionParams, WidgetKind, WidgetSpec, WidgetUpdateParams,
 };
 use tack_ext::tool::ExtTool;
 use tack_ext::v3::{PeerHandler, PluginConnection, V3Process};
@@ -1012,6 +1012,57 @@ pub struct WidgetEntry {
     pub rev: u64,
 }
 
+impl WidgetEntry {
+    /// Protocol snapshot for the remote surface (`list_ext_widgets`,
+    /// `ext_widget_update`).
+    pub fn to_protocol(&self) -> tack_protocol::schemas::ExtWidgetState {
+        tack_protocol::schemas::ExtWidgetState {
+            key: self.key.clone(),
+            plugin: self.plugin.clone(),
+            kind: match self.spec.r#type {
+                WidgetKind::StatusLineSegment => "statusLineSegment",
+                WidgetKind::MarkdownPanel => "markdownPanel",
+                WidgetKind::ListPanel => "listPanel",
+            }
+            .to_string(),
+            title: self.spec.title.clone(),
+            state: self.state.clone(),
+            visible: self.visible,
+            rev: self.rev,
+        }
+    }
+}
+
+/// Everything needed to report a widget interaction back to the owning
+/// plugin, resolved from the widget key off-lock (the JsonRpcPeer
+/// multiplexes; `widgets/action` is a fire-and-forget notification).
+pub struct WidgetActionRoute {
+    client: Arc<dyn PluginConnection>,
+    widget_id: String,
+}
+
+impl std::fmt::Debug for WidgetActionRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WidgetActionRoute")
+            .field("widget_id", &self.widget_id)
+            .finish()
+    }
+}
+
+impl WidgetActionRoute {
+    /// Send the `widgets/action` notification (owning plugin only).
+    pub async fn notify(self, action: String, item_id: Option<String>) {
+        let _ = self
+            .client
+            .widget_action(&WidgetActionParams {
+                id: self.widget_id,
+                action,
+                item_id,
+            })
+            .await;
+    }
+}
+
 /// Host-side widget registry. A dead plugin's widgets are removed (no UI
 /// residue).
 #[derive(Default, Debug)]
@@ -1089,6 +1140,42 @@ impl std::fmt::Debug for ExtAutocompleteProvider {
 }
 
 impl ExtAutocompleteProvider {
+    /// Host key `<plugin>:<provider-id>`.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Protocol descriptor for the remote surface
+    /// (`list_ext_autocomplete`).
+    pub fn to_protocol(&self) -> tack_protocol::schemas::ExtAutocompleteProviderInfo {
+        tack_protocol::schemas::ExtAutocompleteProviderInfo {
+            key: self.key.clone(),
+            plugin: self.plugin.clone(),
+            id: self.spec.id.clone(),
+            description: self.spec.description.clone(),
+            trigger: self.spec.trigger.clone(),
+        }
+    }
+
+    /// Query the plugin, converted to the protocol suggestion shape
+    /// (remote `ext_autocomplete`).
+    pub async fn provide_protocol(
+        &self,
+        query: &str,
+        cursor_offset: usize,
+    ) -> Vec<tack_protocol::schemas::ExtAutocompleteSuggestion> {
+        self.provide(query, cursor_offset)
+            .await
+            .into_iter()
+            .map(|s| tack_protocol::schemas::ExtAutocompleteSuggestion {
+                label: s.label,
+                value: s.value,
+                insert_text: s.insert_text,
+                detail: s.detail,
+            })
+            .collect()
+    }
+
     /// Query the plugin's `autocomplete/provide`. Contract degradation:
     /// dead plugins, error responses, and malformed results all yield no
     /// suggestions.
@@ -1185,8 +1272,8 @@ pub struct ExtensionManager {
     /// Capability-level load warnings (a bad hooks file, one malformed
     /// MCP entry, an invalid tool schema…).
     pub load_warnings: Vec<String>,
-    /// command name → plugin index.
-    commands: HashMap<String, usize>,
+    /// command name → (plugin index, contributed description).
+    commands: HashMap<String, (usize, Option<String>)>,
     /// Declarative widget registry, keyed `<plugin-id>:<widget-id>`.
     widgets: WidgetRegistry,
     /// Bundle contributions from installed extensions (merged by callers).
@@ -2211,9 +2298,10 @@ impl ExtensionManager {
                     );
                     if let Some(commands) = &register.capabilities.commands {
                         for command in commands {
-                            manager
-                                .commands
-                                .insert(command.name.clone(), manager.plugins.len());
+                            manager.commands.insert(
+                                command.name.clone(),
+                                (manager.plugins.len(), command.description.clone()),
+                            );
                         }
                     }
                     if let Some(widgets) = &register.capabilities.widgets {
@@ -2496,11 +2584,29 @@ impl ExtensionManager {
         self.commands.keys().cloned().collect()
     }
 
+    /// Registered extension slash commands with their contributed
+    /// descriptions (remote `list_ext_commands`; sorted for a stable
+    /// wire shape).
+    pub fn command_specs(&self) -> Vec<tack_protocol::schemas::ExtCommandSpec> {
+        let mut specs: Vec<tack_protocol::schemas::ExtCommandSpec> = self
+            .commands
+            .iter()
+            .map(
+                |(name, (_, description))| tack_protocol::schemas::ExtCommandSpec {
+                    name: name.clone(),
+                    description: description.clone(),
+                },
+            )
+            .collect();
+        specs.sort_by(|a, b| a.name.cmp(&b.name));
+        specs
+    }
+
     /// Invoke an extension command. Direct caller-side await — used by
     /// tests and headless paths where no UI loop pumps plugin→host
     /// callbacks. The TUI uses [`Self::command_invoker`] instead.
     pub async fn invoke_command(&self, name: &str, args: &str) -> Result<Value, String> {
-        let Some(index) = self.commands.get(name) else {
+        let Some((index, _)) = self.commands.get(name) else {
             return Err(format!("unknown extension command {name:?}"));
         };
         let plugin = &self.plugins[*index];
@@ -2524,7 +2630,7 @@ impl ExtensionManager {
     /// inline await deadlocks until the 30s request timeout. Cloning
     /// the connection is cheap (Arc inside).
     pub fn command_invoker(&self, name: &str) -> Option<CommandInvoker> {
-        let index = *self.commands.get(name)?;
+        let (index, _) = *self.commands.get(name)?;
         let handle = self.plugins.get(index)?.handle.as_ref()?;
         Some(CommandInvoker {
             client: handle.client(),
@@ -2541,6 +2647,48 @@ impl ExtensionManager {
     /// unknown widget id.
     pub fn apply_widget_update(&mut self, plugin: &str, update: &WidgetUpdateParams) -> bool {
         self.widgets.apply_update(plugin, update)
+    }
+
+    /// Remote `widgets/update` application: values-shaped (the remote
+    /// bridge cannot name rpc3 types), returning the updated entry's
+    /// protocol snapshot for the `ext_widget_update` broadcast. None =
+    /// unknown widget id.
+    pub fn apply_widget_update_remote(
+        &mut self,
+        plugin: &str,
+        id: &str,
+        state: Value,
+        visible: Option<bool>,
+    ) -> Option<tack_protocol::schemas::ExtWidgetState> {
+        let update = WidgetUpdateParams {
+            id: id.to_string(),
+            state,
+            visible,
+        };
+        if !self.apply_widget_update(plugin, &update) {
+            return None;
+        }
+        self.widgets
+            .entries()
+            .iter()
+            .find(|e| e.plugin == plugin && e.spec.id == id)
+            .map(WidgetEntry::to_protocol)
+    }
+
+    /// Resolve a widget key to an off-lock action route (remote
+    /// `ext_widget_action`). None = unknown key or the owning plugin is
+    /// not running.
+    pub fn widget_action_route(&self, key: &str) -> Option<WidgetActionRoute> {
+        let entry = self.widgets.entries().iter().find(|e| e.key == key)?;
+        let plugin = self
+            .plugins
+            .iter()
+            .find(|p| p.id.to_string() == entry.plugin)?;
+        let handle = plugin.handle.as_ref()?;
+        Some(WidgetActionRoute {
+            client: handle.client(),
+            widget_id: entry.spec.id.clone(),
+        })
     }
 
     /// A plugin died (peer EOF): its widgets vanish with it.
