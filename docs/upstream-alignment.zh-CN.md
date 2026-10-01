@@ -111,7 +111,12 @@
   完全失效、cacheRead 折扣吃不到。修复：`AnthropicCompat.top_level_cache_control`
   开启时顶层发 `cache_control`（Short→5m / Long→`ttl:1h`，复用 CacheRetention
   映射）、消息体内不再打点；catalog kimi-coding 4 个模型已标记。验证方式：
-  连跑两轮会话看响应 `usage.cache_read_input_tokens` 转为非零。
+  连跑两轮会话看响应 `usage.cache_read_input_tokens` 转为非零。**后续
+  （2026-10，Moonshot 计费拆分）**：Moonshot 上下文缓存升级把 Cache Write
+  单独计费（5m 写入价 = 输入价，1h = 2 倍，命中 = 1/10）。第一方 k3 模型
+  （`kimi-coding`/`moonshotai`/`moonshotai-cn`）catalog 补 `cacheWrite` =
+  输入价（原为 0）；顶层 Short 标记显式钉 `"ttl":"5m"`——Moonshot
+  Messages 契约只文档化了带 ttl 的标记。
 - `4635473`：extension_tests 三个 demo-plugin 测试共享 `TACK_AGENT_DIR` 环境变量、并行下互踩（预先存在的 flake，基线可复现），加 ENV_LOCK 串行化。
 
 ## 2026-09-08 对齐批次（基线 → 4a6ed0194）

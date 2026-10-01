@@ -44,7 +44,9 @@ pub struct AnthropicCompat {
     /// Moonshot/Kimi-style caching: the server only honors a request-level
     /// `cache_control` field and ignores message-body markers. When set, the
     /// marker is emitted at the top level instead of on system/message/tool
-    /// blocks (without it, prefixes are read-only — never written).
+    /// blocks (without it, prefixes are read-only — never written). The
+    /// top-level marker always carries an explicit `ttl` (`"5m"`/`"1h"`),
+    /// matching Kimi's documented Messages contract.
     pub top_level_cache_control: Option<bool>,
 }
 
@@ -557,8 +559,16 @@ fn build_params(
     }
 
     // Moonshot/Kimi top-level cache_control (body markers were skipped).
+    // Kimi's documented Messages contract always carries an explicit ttl
+    // ("5m"/"1h") at the top level; pin "5m" on the bare Short marker
+    // instead of relying on the server's undocumented no-ttl default.
+    // Anthropic-native body markers keep the bare form for TS parity.
     if top_level_cc && let Some(cc) = &cc {
-        params["cache_control"] = cc.clone();
+        let mut cc = cc.clone();
+        if cc.get("ttl").is_none() {
+            cc["ttl"] = json!("5m");
+        }
+        params["cache_control"] = cc;
     }
 
     Ok(params)
@@ -1267,7 +1277,9 @@ mod tests {
         };
         let options = StreamOptions::default();
 
-        // Short retention: top-level ephemeral marker, no body markers.
+        // Short retention: top-level ephemeral marker with an explicit 5m
+        // ttl (Kimi's contract documents no ttl-less default), no body
+        // markers.
         let params = build_params(
             &m,
             &context,
@@ -1277,7 +1289,10 @@ mod tests {
             CacheRetention::Short,
         )
         .unwrap();
-        assert_eq!(params["cache_control"], json!({ "type": "ephemeral" }));
+        assert_eq!(
+            params["cache_control"],
+            json!({ "type": "ephemeral", "ttl": "5m" })
+        );
         assert!(params["system"][0].get("cache_control").is_none());
         if let Value::Array(blocks) = &params["messages"][0]["content"] {
             assert!(blocks.iter().all(|b| b.get("cache_control").is_none()));

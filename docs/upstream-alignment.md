@@ -124,7 +124,13 @@ upstream sync.
   at the top level (Short→5m / Long→`ttl:1h`, reusing the CacheRetention
   mapping) and no longer mark inside message bodies; the 4 catalog kimi-coding
   models are flagged. Verification: run two sessions back to back and watch
-  the response `usage.cache_read_input_tokens` turn non-zero.
+  the response `usage.cache_read_input_tokens` turn non-zero. **Follow-up
+  (2026-10, Moonshot billing split)**: Moonshot's context-caching upgrade
+  bills Cache Write separately (5m write = input price, 1h = 2×, hits =
+  1/10). First-party k3 models (`kimi-coding`/`moonshotai`/`moonshotai-cn`)
+  gained `cacheWrite` = input price in the catalog (was 0), and the
+  top-level Short marker now pins an explicit `"ttl":"5m"` — Moonshot's
+  Messages contract only documents ttl-bearing markers.
 - `4635473`: three extension_tests demo-plugin tests share the
   `TACK_AGENT_DIR` environment variable and interfere with each other in
   parallel (a pre-existing flake, reproducible at baseline); serialized with

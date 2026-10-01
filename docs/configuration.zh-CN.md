@@ -192,7 +192,7 @@ Tack 从四级读取配置，**后加载的层级覆盖先加载的**（部分�
 | `collapseChangelog` | bool | `false` | 启动 changelog 只显示一行 |
 | `quietStartup` | bool | `false` | 跳过 banner + changelog |
 | `showCacheMissNotices` | bool | `false` | 提示词缓存未命中通知 |
-| `cacheRetention` | `"short"` \| `"long"` \| `"off"` | `"short"` | 提示词缓存保留时长：`short`=5 分钟写入（提供商默认）；`long`=1 小时写入（OpenAI 为 24h，写入费更高；Kimi/Anthropic 协议发 `ttl:"1h"`，Moonshot OpenAI 协议发 `prompt_cache_options`）；`off`=不发缓存标记（支持处只读）。未设置时回退 `TACK_CACHE_RETENTION` 环境变量（`long` 生效），再回退 `short`。注意 Kimi 的缓存 TTL 首次写入后锁定，中途切换需等旧条目过期才生效 |
+| `cacheRetention` | `"short"` \| `"long"` \| `"off"` | `"short"` | 提示词缓存保留时长：`short`=5 分钟写入（提供商默认；Kimi Messages 显式发送 `ttl:"5m"`）；`long`=1 小时写入（OpenAI 为 24h，写入费更高；Kimi/Anthropic 协议发 `ttl:"1h"`，Moonshot OpenAI 协议发 `prompt_cache_options`）；`off`=不发缓存标记（支持处只读）。未设置时回退 `TACK_CACHE_RETENTION` 环境变量（`long` 生效），再回退 `short`。注意 Kimi 的缓存 TTL 首次写入后锁定，中途切换需等旧条目过期才生效 |
 | `enableSkillCommands` | bool | `true` | `/skill:<name>` 补全 |
 | `defaultTools` | string[] | `[]`（全部） | 内置工具 allowlist（与 features.* 取交集）。可选的 `powershell` 工具（Windows）默认关闭，仅在此显式列出时注册——如 `["read", "powershell", "edit", "write"]` 替换 bash，或同时列出两者。优先 `pwsh.exe`，回退 `powershell.exe`，启动参数 `-NoProfile -NonInteractive -ExecutionPolicy Bypass`；非 Windows 平台注册后执行会报错。权限规则写法 `PowerShell(...)`，通配语义同 `Bash(...)` |
 | `updateRepo` | string | `"Tack-AI/tack"` | 自更新 GitHub 仓库 |

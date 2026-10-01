@@ -26,6 +26,14 @@ notice can parse entries (same convention as TS pi).
 
 ### Fixed
 
+- **Kimi caching aligned with Moonshot's context-caching billing split**:
+  first-party `kimi-k3` models (`moonshotai` / `moonshotai-cn` /
+  `kimi-coding`) now carry `cacheWrite` equal to the input price, matching
+  Moonshot's separately billed 5-minute Cache Write (previously priced at
+  0, under-reporting request cost; 1-hour writes were and are 2× input).
+  The Kimi Messages top-level `cache_control` now also pins an explicit
+  `"ttl":"5m"` on short retention instead of relying on the server's
+  undocumented no-ttl default.
 - **Remote permission gate honors the prompt-injection defense**: once
   untrusted web/MCP/plugin content entered a remote session's context,
   mutating tools now always prompt the client — declarative allow rules,
