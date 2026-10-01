@@ -61,6 +61,11 @@ cargo deny check                               # dependency policy (CI-enforced)
   is parsed by the TUI `/changelog` command. Record every user-notable change.
 - **Comments / rustdoc**: explain *why*, not *what*. Doc-comments are checked
   with `RUSTDOCFLAGS="-D warnings"`.
+  - **Context-efficient exploration**: prefer targeted search (`rg`, grep with
+    context lines) over whole-file reads, and slice large files with `read`
+    offset/limit instead of pulling them in whole. Small-context providers 
+    burn their window fast when every file is
+    dumped into context; re-reading a file you already have is wasted tokens.
 
 ## Testing rules
 
