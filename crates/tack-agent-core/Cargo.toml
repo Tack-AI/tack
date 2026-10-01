@@ -20,7 +20,7 @@ futures-util.workspace = true
 tracing.workspace = true
 # default-features off: defaults pull reqwest for remote-$ref resolution;
 # tool schemas are validated locally via validator_for only.
-jsonschema = { version = "0.33", default-features = false }
+jsonschema = { version = "0.57", default-features = false }
 
 [lints]
 workspace = true
