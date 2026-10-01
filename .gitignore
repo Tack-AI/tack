@@ -27,4 +27,5 @@ fuzz/corpus/
 fuzz/artifacts/
 .pnpm-store/
 TackCode/
+Tack-Desktop/
 __pycache__/
