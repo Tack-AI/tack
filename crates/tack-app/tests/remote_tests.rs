@@ -113,6 +113,8 @@ async fn remote_session_over_tcp() {
         ))),
         Settings::default(),
         None,
+        tack_app::extension_host::ExtensionManager::default(),
+        tack_app::mcp_sampling::SharedSamplingLlm::default(),
     );
     let server_task = tokio::spawn(tack_app::remote::serve_tcp_listener(listener, host));
 
@@ -249,6 +251,8 @@ async fn serve_requires_auth_token_when_configured() {
         ))),
         Settings::default(),
         Some("s3cret".to_string()),
+        tack_app::extension_host::ExtensionManager::default(),
+        tack_app::mcp_sampling::SharedSamplingLlm::default(),
     );
     let server_task = tokio::spawn(tack_app::remote::serve_tcp_listener(listener, host));
 

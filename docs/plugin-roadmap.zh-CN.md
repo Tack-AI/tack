@@ -440,5 +440,4 @@ P4 落地时对上面的草图做了两处有意偏离，记录在
    加载顺序，first-claim-wins）→ PermissionRequest hooks → 用户
    提示。认领的 `allow`/`reviewed` 一次性放行（审计可区分），
    `askUser` 交回内置提示，审查者错误降级为跳过（fail-open）。已
-   接线 TUI 与 rpc 两个 surface；acp/remote-host 的提示是文档化的
-   后续项。
+   接线全部可提示 surface：TUI、rpc、ACP 与 remote 宿主。

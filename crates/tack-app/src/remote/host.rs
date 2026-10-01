@@ -111,6 +111,15 @@ struct RemotePermissionHooks {
     session_id: String,
     rules: crate::permissions::PermissionRules,
     agent_dir: PathBuf,
+    /// Prompt-injection defense: when untrusted external content (web/MCP/
+    /// plugin tool output) entered the context this run, mutating tools
+    /// always prompt — allow rules, the allow-always cache AND the plugin
+    /// approval chain are bypassed (rpc/TUI parity).
+    untrusted_seen: Arc<std::sync::atomic::AtomicBool>,
+    /// Plugin approval chain (tack-RPC `approval/review`): reviewers get
+    /// first crack at a decision that would otherwise be broadcast as a
+    /// `ServerEvent::PermissionRequest` (see `crate::approval`).
+    approval_chain: crate::approval::ApprovalChain,
 }
 
 impl std::fmt::Debug for RemotePermissionHooks {
@@ -170,22 +179,59 @@ impl AgentHooks for RemotePermissionHooks {
                 }
             }
         }
-        // Declarative allow rules and the session allow-always cache skip
-        // the prompt.
-        if self.rules.allow_match(ctx.tool_name, ctx.args).is_some() {
-            return Outcome::Allow;
-        }
+        // Prompt-injection defense (rpc/TUI parity): once untrusted
+        // external content entered this run's context, cached "always
+        // allow" decisions and allow rules no longer auto-approve
+        // mutating tools — the chain "untrusted page → allow-always
+        // bash" is the attack. The client is asked instead.
+        let untrusted = self
+            .untrusted_seen
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && !read_only;
         // Shared keying (permissions::allow_always_key) so ext__* tools
         // bind the loaded plugin version here too — a plugin upgrade must
         // invalidate stale allow-always entries on every surface.
         let key = crate::permissions::allow_always_key(&self.agent_dir, ctx.tool_name, ctx.args);
-        {
-            let host_guard = self.host.lock().await;
-            let cached = host_guard
-                .sessions
-                .get(&self.session_id)
-                .is_some_and(|s| s.allow_always.contains(&key));
+        // Declarative allow rules and the session allow-always cache skip
+        // the prompt — but not in an untrusted run.
+        if !untrusted {
+            if self.rules.allow_match(ctx.tool_name, ctx.args).is_some() {
+                return Outcome::Allow;
+            }
+            let cached = {
+                let host_guard = self.host.lock().await;
+                host_guard
+                    .sessions
+                    .get(&self.session_id)
+                    .is_some_and(|s| s.allow_always.contains(&key))
+            };
             if cached {
+                return Outcome::Allow;
+            }
+            // Plugin approval chain: reviewers get first crack at the
+            // decision that would otherwise be broadcast to clients —
+            // EXCEPT in an untrusted run, where a chain claim must not
+            // silently approve a call the human has to see.
+            let policy = match mode {
+                SessionMode::Ask => "ask",
+                SessionMode::AcceptEdits => "acceptEdits",
+                SessionMode::Plan => "plan",
+                SessionMode::Bypass => "bypass",
+            };
+            if self
+                .approval_chain
+                .claims_approval(
+                    "remote",
+                    ctx.tool_call_id,
+                    ctx.tool_name,
+                    ctx.args,
+                    policy,
+                    self.untrusted_seen
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    read_only,
+                )
+                .await
+            {
                 return Outcome::Allow;
             }
         }
@@ -391,6 +437,19 @@ pub struct SessionHost {
     /// liveness: with no connection there is nobody to answer a prompt,
     /// so parked prompts are denied instead of parking the run forever.
     pub(crate) active_connections: u32,
+    /// tack-ext plugins (loaded once at serve startup, headless services):
+    /// hook bridges join every session's chain (plugin rewrites land
+    /// before the permission layer, rpc/ACP parity), plugin tools join
+    /// every session's tool set, and the approval chain gets first crack
+    /// at would-prompt decisions.
+    extensions: crate::extension_host::ExtensionManager,
+    /// Late-bound LLM for MCP sampling (plugin MCP servers connect at
+    /// serve startup, before any session exists; the executor resolves
+    /// this cell per request). Each session run publishes its own stack —
+    /// with concurrent sessions the LAST started run wins (the plugin
+    /// connection is host-global; a sampling request cannot be
+    /// attributed to a session).
+    sampling_llm: crate::mcp_sampling::SharedSamplingLlm,
 }
 
 impl std::fmt::Debug for SessionHost {
@@ -686,6 +745,15 @@ impl SessionHost {
             } else {
                 crate::model::resolve_auth(&model.provider, None, &agent_dir)
             };
+            // Late-bound MCP sampling (plugin MCP servers) resolves the
+            // shared cell per request — publish this run's stack (last
+            // writer wins across concurrent sessions, documented on the
+            // SessionHost field).
+            host_guard.sampling_llm.set(crate::mcp_config::SamplingLlm {
+                provider: provider.clone(),
+                model: model.clone(),
+                auth: auth.clone(),
+            });
             (
                 provider,
                 model,
@@ -696,16 +764,36 @@ impl SessionHost {
                 session.manager.cwd().to_path_buf(),
             )
         };
+        // tack-ext: plugin hook bridges + approval chain for this run.
+        // The manager is shared in-process across sessions (JsonRpcPeer
+        // multiplexes concurrent calls); hooks() re-collects per run so a
+        // disable/enable between runs takes effect, rpc/TUI parity.
+        let (ext_hooks, approval_chain) = {
+            let host_guard = host.lock().await;
+            (
+                host_guard.extensions.hooks(),
+                host_guard.extensions.approval_chain(),
+            )
+        };
         // Sandbox from settings (same wiring as rpc/print): without this a
         // remote client would bypass the configured sandbox entirely.
-        let tools = {
-            let mut services = tack_tools::default_services(cwd.clone())
-                .with_memory_dir(settings.memory_directory.clone());
-            if let Some(spec) = settings.sandbox_spec(&cwd) {
-                services = services.with_sandbox(spec);
-            }
-            tack_tools::create_coding_tools(&services)
-        };
+        let mut services = tack_tools::default_services(cwd.clone())
+            .with_memory_dir(settings.memory_directory.clone());
+        if let Some(spec) = settings.sandbox_spec(&cwd) {
+            services = services.with_sandbox(spec);
+        }
+        // Shared prompt-injection flag for this run: web/MCP/plugin tool
+        // output marks it, the permission gate below reads it (rpc parity).
+        let untrusted_seen = services.untrusted_seen.clone();
+        let mut tools = tack_tools::create_coding_tools(&services);
+        // tack-ext plugin tools (ext__<plugin>__<tool>); MCP-carrier plugins
+        // get the untrusted-content defense (rpc/print parity).
+        tools.extend({
+            let host_guard = host.lock().await;
+            host_guard
+                .extensions
+                .tools_with_untrusted(Some(untrusted_seen.clone()))
+        });
         let selected: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
         let system_prompt = crate::print_mode::assemble_system_prompt(
             &cwd,
@@ -856,22 +944,26 @@ impl SessionHost {
         }
 
         let hooks: Arc<dyn AgentHooks> = {
-            let mut hook_list: Vec<Arc<dyn AgentHooks>> = vec![
-                Arc::new(HostCompactionHooks {
-                    host: host.clone(),
-                    session_id: session_id.clone(),
-                    model: model.clone(),
-                    provider: provider.clone(),
-                    auth: auth.clone(),
-                    reasoning: thinking,
-                    settings: settings.compaction,
-                    cancel: cancel.clone(),
-                }),
-                Arc::new(SteerHooks {
-                    host: host.clone(),
-                    session_id: session_id.clone(),
-                }),
-            ];
+            // tack-ext plugin bridges run FIRST (rpc/ACP parity —
+            // SECURITY): a plugin `hooks/beforeToolCall` Rewrite lands
+            // before the permission layer, so deny rules, the mode gate,
+            // the approval chain and the client prompt all see the FINAL,
+            // post-rewrite arguments.
+            let mut hook_list: Vec<Arc<dyn AgentHooks>> = ext_hooks;
+            hook_list.push(Arc::new(HostCompactionHooks {
+                host: host.clone(),
+                session_id: session_id.clone(),
+                model: model.clone(),
+                provider: provider.clone(),
+                auth: auth.clone(),
+                reasoning: thinking,
+                settings: settings.compaction,
+                cancel: cancel.clone(),
+            }));
+            hook_list.push(Arc::new(SteerHooks {
+                host: host.clone(),
+                session_id: session_id.clone(),
+            }));
             // permissions.deny applies to remote runs too (same headless
             // safety net as rpc/print — a remote client must not bypass it).
             let permission_rules = crate::permissions::PermissionRules::load(&settings, &agent_dir);
@@ -888,6 +980,8 @@ impl SessionHost {
                 session_id: session_id.clone(),
                 rules: permission_rules,
                 agent_dir: agent_dir.clone(),
+                untrusted_seen,
+                approval_chain,
             }));
             Arc::new(HooksChain::new(hook_list))
         };
@@ -1445,6 +1539,8 @@ pub fn build_host(
     auth: Arc<dyn tack_ai::oauth::AuthResolver>,
     settings: Settings,
     auth_token: Option<String>,
+    extensions: crate::extension_host::ExtensionManager,
+    sampling_llm: crate::mcp_sampling::SharedSamplingLlm,
 ) -> Arc<Mutex<SessionHost>> {
     let (events, _) = broadcast::channel(512);
     Arc::new(Mutex::new(SessionHost {
@@ -1462,6 +1558,8 @@ pub fn build_host(
         conn_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
         pending_permissions: HashMap::new(),
         active_connections: 0,
+        extensions,
+        sampling_llm,
     }))
 }
 
@@ -1499,6 +1597,136 @@ pub fn spawn_session_reaper(host: &Arc<Mutex<SessionHost>>) -> tokio::task::Join
 mod tests {
     use super::*;
     use crate::remote::testutil::*;
+
+    /// Session in Ask mode (permission prompts active), created through
+    /// the real command path.
+    async fn ask_mode_session(host: &Arc<Mutex<SessionHost>>) -> String {
+        let cwd = tempfile::tempdir().unwrap();
+        let result = SessionHost::handle_command(
+            host,
+            Command::Create {
+                cwd: Some(cwd.path().to_string_lossy().to_string()),
+                name: None,
+                model: None,
+                thinking_level: None,
+            },
+        )
+        .await
+        .unwrap();
+        let CommandResult::Create { session } = result else {
+            panic!("expected create")
+        };
+        host.lock()
+            .await
+            .sessions
+            .get_mut(&session.id)
+            .expect("session stored")
+            .mode = SessionMode::Ask;
+        session.id
+    }
+
+    fn perm_ctx<'a>(
+        message: &'a tack_ai::AssistantMessage,
+        args: &'a serde_json::Value,
+    ) -> tack_agent_core::hooks::BeforeToolCallContext<'a> {
+        tack_agent_core::hooks::BeforeToolCallContext {
+            assistant_message: message,
+            tool_call_id: "call-1",
+            tool_name: "bash",
+            args,
+            context: &[],
+        }
+    }
+
+    #[derive(Debug)]
+    struct ClaimReviewer(crate::approval::ChainAction);
+
+    #[async_trait::async_trait]
+    impl crate::approval::ApprovalReviewer for ClaimReviewer {
+        async fn review(
+            &self,
+            request: &crate::approval::ApprovalRequest,
+        ) -> Option<crate::approval::ChainDecision> {
+            assert_eq!(request.approval_policy, "ask");
+            assert_eq!(request.tool_name, "bash");
+            assert_eq!(request.evidence["surface"], "remote");
+            Some(crate::approval::ChainDecision {
+                action: self.0,
+                reason: None,
+            })
+        }
+    }
+
+    fn permission_hooks(
+        host: &Arc<Mutex<SessionHost>>,
+        session_id: &str,
+        untrusted: bool,
+        approval_chain: crate::approval::ApprovalChain,
+    ) -> RemotePermissionHooks {
+        RemotePermissionHooks {
+            host: host.clone(),
+            session_id: session_id.to_string(),
+            rules: crate::permissions::PermissionRules {
+                allow: vec![crate::permissions::Rule::parse("Bash(cargo test)").unwrap()],
+                deny: vec![],
+            },
+            agent_dir: std::path::PathBuf::new(),
+            untrusted_seen: Arc::new(std::sync::atomic::AtomicBool::new(untrusted)),
+            approval_chain,
+        }
+    }
+
+    /// Plugin approval chain in remote sessions: a claim approves the
+    /// call WITHOUT broadcasting a PermissionRequest to clients (rpc/TUI
+    /// parity).
+    #[tokio::test]
+    async fn approval_chain_claim_skips_permission_broadcast() {
+        let host = test_host(vec![]);
+        let session_id = ask_mode_session(&host).await;
+        let mut events = host.lock().await.events.subscribe();
+        let mut chain = crate::approval::ApprovalChain::empty();
+        chain.push(
+            "fake@user".into(),
+            Arc::new(ClaimReviewer(crate::approval::ChainAction::Allow)),
+        );
+        let hooks = permission_hooks(&host, &session_id, false, chain);
+        let message = tack_ai::AssistantMessage::pending(&test_model());
+        // Matches neither the allow rule nor the cache: the built-in
+        // flow WOULD broadcast a prompt.
+        let args = serde_json::json!({"command": "rm -rf build"});
+        let outcome = hooks.before_tool_call(&perm_ctx(&message, &args)).await;
+        assert!(matches!(
+            outcome,
+            tack_agent_core::hooks::BeforeToolCallOutcome::Allow
+        ));
+        assert!(
+            events.try_recv().is_err(),
+            "no PermissionRequest broadcast expected"
+        );
+    }
+
+    /// Prompt-injection defense: in an untrusted run, allow rules AND the
+    /// plugin approval chain are both bypassed — with no client
+    /// connected to answer, the would-be prompt denies immediately.
+    #[tokio::test]
+    async fn untrusted_run_skips_allow_rules_and_chain() {
+        let host = test_host(vec![]);
+        let session_id = ask_mode_session(&host).await;
+        let mut chain = crate::approval::ApprovalChain::empty();
+        chain.push(
+            "fake@user".into(),
+            Arc::new(ClaimReviewer(crate::approval::ChainAction::Allow)),
+        );
+        let hooks = permission_hooks(&host, &session_id, true, chain);
+        let message = tack_ai::AssistantMessage::pending(&test_model());
+        // "cargo test" matches the allow rule — trusted runs would allow.
+        let args = serde_json::json!({"command": "cargo test"});
+        let outcome = hooks.before_tool_call(&perm_ctx(&message, &args)).await;
+        assert!(matches!(
+            outcome,
+            tack_agent_core::hooks::BeforeToolCallOutcome::Block { .. }
+        ));
+    }
 
     /// Regression: the session name used to be applied via
     /// `sessions.get_mut(&id)` BEFORE the session was inserted — always a
@@ -1793,6 +2021,8 @@ mod tests {
             Arc::new(tack_ai::oauth::StaticAuth::from(Some("key".to_string()))),
             settings,
             None,
+            crate::extension_host::ExtensionManager::default(),
+            crate::mcp_sampling::SharedSamplingLlm::default(),
         );
         let mut events = host.lock().await.events.subscribe();
 
@@ -1884,6 +2114,8 @@ mod tests {
             Arc::new(tack_ai::oauth::StaticAuth::from(Some("key".to_string()))),
             settings,
             None,
+            crate::extension_host::ExtensionManager::default(),
+            crate::mcp_sampling::SharedSamplingLlm::default(),
         )
     }
 

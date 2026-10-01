@@ -427,8 +427,8 @@ verdict 拒绝启动（工具返回错误、零 token 消耗，后台子代理�
 - **审批链**（`capabilities.hooks.approvalReview`）：当权限流程即将弹出人工
   提示时，声明了审批能力的插件按加载顺序先审——首个认领生效，pass/`askUser`
   顺延，出错失败开放（fail-open）。认领仅单次批准（不写入 allow-always），
-  审计在 `plugin_approval` target 下；已接入 TUI 与 rpc 表面（acp/remote-host
-  提示为后续跟进）。插件的 `beforeToolCall` 桥在每个表面都先于权限层运行，
+  审计在 `plugin_approval` target 下；已接入全部可提示表面（TUI、rpc、
+  ACP、remote 宿主）。插件的 `beforeToolCall` 桥在每个表面都先于权限层运行，
   因此审批者（和弹窗）看到的是改写后的最终参数。进入过不可信 web/MCP 内容
   的上下文跳过审批链——必须问人。
 - **Extension bundle（Level 1）**：`extension.json` 可声明 `hooks`（Claude
@@ -479,7 +479,7 @@ mcp.json 的远程（HTTP）server 加 `"oauth": true` 或 `{"clientId": "…", 
 
 除工具/资源/提示外，MCP server 还可以反向请求客户端：
 
-- **Sampling**（`sampling/createMessage`）：server 请求一次 LLM 补全。settings.json 设 `"mcpSampling": true` 开启（**默认关闭**，不声明能力）。开启后用当前会话的 provider/model 执行，安全防线与 MCP 工具结果一致：server 提供的 system prompt/messages 全部包裹 `<untrusted_content>` 并加防护前缀，只在隔离的子调用上下文中使用，绝不进主会话；拒绝 tools/toolChoice（不给 server 驱动本地工具的旁路）与 audio；`modelPreferences.hints` 忽略（始终用当前模型）。每次调用写 tracing 日志，token usage 计入会话（TUI 底部统计 + 提示）。
+- **Sampling**（`sampling/createMessage`）：server 请求一次 LLM 补全。settings.json 设 `"mcpSampling": true` 开启（**默认关闭**，不声明能力）。开启后按请求解析当前会话的 provider/model——模型切换对每个连接即时生效，包括 Level-2 插件 MCP server（它们在扩展加载时连接，早于任何会话）——安全防线与 MCP 工具结果一致：server 提供的 system prompt/messages 全部包裹 `<untrusted_content>` 并加防护前缀，只在隔离的子调用上下文中使用，绝不进主会话；拒绝 tools/toolChoice（不给 server 驱动本地工具的旁路）与 audio；`modelPreferences.hints` 忽略（始终用当前模型）。每次调用写 tracing 日志，token usage 计入会话（TUI 底部统计 + 提示）。
 - **Elicitation**（`elicitation/create`）：server 向用户请求结构化输入。`"mcpElicitation": true`（**默认开启**）。TUI 按 server 给的 JSON schema 逐字段弹输入框（string/number/integer/boolean/enum 自动类型转换，必填为空会重问，Esc = cancel）；print/rpc/acp/serve 等 headless 模式自动 decline；URL 模式（server 指定的浏览器流程）一律 decline。决策逻辑（模式 × 开关 → 弹窗/拒绝）在 `mcp_elicitation::elicitation_decision`，有单测。
 
 ### 工具 schema 懒加载（tool search）

@@ -647,8 +647,8 @@ managed hooks only. See [hooks.md](hooks.md) for details.
   permission flow is about to prompt a human, reviewer plugins get first
   crack in load order — first claim wins, pass/`askUser` defers, errors
   fail open. Claims approve one-shot (nothing persists into allow-always),
-  audited under `plugin_approval`; wired in the TUI and rpc surfaces
-  (acp/remote-host prompts are a follow-up). Plugin `beforeToolCall` bridges
+  audited under `plugin_approval`; wired on every prompt-capable surface
+  (TUI, rpc, ACP, remote host). Plugin `beforeToolCall` bridges
   run BEFORE the permission layer on every surface, so reviewers (and the
   dialog) see the final post-rewrite arguments. Calls that entered untrusted
   web/MCP content skip the chain — the human must be asked.
@@ -718,7 +718,10 @@ requests to the client:
 - **Sampling** (`sampling/createMessage`): the server requests an LLM
   completion. Enable with `"mcpSampling": true` in settings.json (**off by
   default**, capability not declared). When enabled it runs with the current
-  session's provider/model, with the same defenses as MCP tool results: the
+  session's provider/model — resolved per request, so model changes are
+  picked up by every connection, including Level-2 plugin MCP servers
+  (which connect at extension-load time, before any session exists) — with
+  the same defenses as MCP tool results: the
   server-provided system prompt/messages are all wrapped in
   `<untrusted_content>` with a guard prefix, used only in an isolated
   sub-call context, never entering the main session; tools/toolChoice are

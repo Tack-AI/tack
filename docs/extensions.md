@@ -84,10 +84,13 @@ adapts the probe into the plugin model:
   `.`) resolves against it. Arguments are never rewritten (npm package
   names like `@scope/pkg` contain `/` but are not paths).
 - **Sampling / elicitation**: elicitation follows the run mode (TUI
-  prompts, headless modes decline). Sampling is **not** wired for plugin
-  connections — the session model does not exist at load time — so a
-  server's sampling request gets method-not-found (documented Level-2
-  limitation).
+  prompts, headless modes decline). Sampling (`mcpSampling`, default
+  off) resolves the session model **late**: plugin connections outlive
+  any session, so the executor reads a shared per-surface cell that
+  sessions publish as they start and as the model changes — a sampling
+  request always runs against the current model, and one arriving
+  before any session started gets a clean error instead of
+  method-not-found.
 - **Failure as data**: a server that fails to connect or probe lands in
   `ext list` with its error (`LoadedPlugin.error`), like any other
   plugin. Shutdown cancels the connection (server child killed).

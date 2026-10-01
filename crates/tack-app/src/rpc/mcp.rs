@@ -8,7 +8,6 @@ use std::sync::Arc;
 use tack_tools::mcp::{McpConnection, McpServerSpec, McpTransport};
 use tokio::sync::Mutex;
 
-use crate::mcp_config::SamplingLlm;
 use crate::settings::Settings;
 
 use super::RpcState;
@@ -79,7 +78,8 @@ async fn oauth_fingerprint_suffix(specs: &[McpServerSpec], agent_dir: &std::path
 pub(crate) async fn ensure_mcp_pool(
     state: &Arc<Mutex<RpcState>>,
     settings: &Settings,
-    llm: &SamplingLlm,
+    sampling: &crate::mcp_sampling::SharedSamplingLlm,
+    model: &tack_ai::Model,
     cwd: &std::path::Path,
     agent_dir: &std::path::Path,
     ext_specs: Vec<McpServerSpec>,
@@ -96,7 +96,7 @@ pub(crate) async fn ensure_mcp_pool(
             specs,
         };
     }
-    let mut fingerprint = super::mcp_cache_fingerprint(cwd, agent_dir, &specs, &llm.model);
+    let mut fingerprint = super::mcp_cache_fingerprint(cwd, agent_dir, &specs, model);
     fingerprint.push_str(&oauth_fingerprint_suffix(&specs, agent_dir).await);
     let spec_count = specs.len();
     let cached = {
@@ -122,7 +122,7 @@ pub(crate) async fn ensure_mcp_pool(
         None => {
             let callbacks = crate::mcp_config::client_callbacks(
                 settings,
-                Some(llm),
+                sampling,
                 crate::mcp_sampling::log_usage_sink(),
                 crate::mcp_elicitation::InteractionMode::Headless,
                 None,
@@ -180,7 +180,8 @@ fn transport_name(spec: &McpServerSpec) -> &'static str {
 pub(crate) async fn mcp_status(
     state: &Arc<Mutex<RpcState>>,
     settings: &Settings,
-    llm: &SamplingLlm,
+    sampling: &crate::mcp_sampling::SharedSamplingLlm,
+    model: &tack_ai::Model,
     cwd: &std::path::Path,
     agent_dir: &std::path::Path,
     connect: bool,
@@ -230,7 +231,8 @@ pub(crate) async fn mcp_status(
             })
             .collect();
     }
-    let outcome = ensure_mcp_pool(state, settings, llm, cwd, agent_dir, ext_specs).await;
+    let outcome =
+        ensure_mcp_pool(state, settings, sampling, model, cwd, agent_dir, ext_specs).await;
     outcome
         .specs
         .iter()

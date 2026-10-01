@@ -56,36 +56,76 @@ pub fn log_usage_sink() -> SamplingUsageSink {
     })
 }
 
+/// Shared, late-bound LLM for MCP sampling. Level-2 plugin MCP servers
+/// connect at extension-load time — before any session model exists — so
+/// their sampling executor cannot capture provider/model/auth at
+/// construction. Instead every surface owns one cell, updates it as
+/// sessions start and models change, and the executor resolves it per
+/// request. A cell that was never set answers sampling requests with an
+/// error (the server asked before any session model was known).
+///
+/// One cell per surface: with multiple concurrent sessions (remote host)
+/// the LAST started/updated session wins — a plugin connection is
+/// host-global, so a sampling request cannot be attributed to a session
+/// anyway (documented limitation).
+#[derive(Clone, Debug, Default)]
+pub struct SharedSamplingLlm {
+    inner: Arc<std::sync::RwLock<Option<crate::mcp_config::SamplingLlm>>>,
+}
+
+impl SharedSamplingLlm {
+    /// Publish the session's current LLM (call at session start and after
+    /// every model/provider rebind).
+    pub fn set(&self, llm: crate::mcp_config::SamplingLlm) {
+        *self.inner.write().unwrap_or_else(|e| e.into_inner()) = Some(llm);
+    }
+
+    /// The most recently published LLM, if any.
+    pub fn get(&self) -> Option<crate::mcp_config::SamplingLlm> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
 /// Executes MCP sampling requests against the session's provider/model.
 #[derive(Clone)]
 pub struct SamplingExecutor {
-    provider: Arc<dyn Provider>,
-    model: Model,
-    auth: Arc<dyn AuthResolver>,
+    llm: SharedSamplingLlm,
     usage_sink: SamplingUsageSink,
 }
 
 impl std::fmt::Debug for SamplingExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SamplingExecutor")
-            .field("model", &self.model.id)
-            .finish()
+        let mut d = f.debug_struct("SamplingExecutor");
+        if let Some(llm) = self.llm.get() {
+            d.field("model", &llm.model.id);
+        }
+        d.finish()
     }
 }
 
 impl SamplingExecutor {
+    /// Fixed LLM (tests and call sites that connect a server with the
+    /// session model already in hand): the cell is pre-set and never
+    /// updated through this executor.
     pub fn new(
         provider: Arc<dyn Provider>,
         model: Model,
         auth: Arc<dyn AuthResolver>,
         usage_sink: SamplingUsageSink,
     ) -> Self {
-        SamplingExecutor {
+        let llm = SharedSamplingLlm::default();
+        llm.set(crate::mcp_config::SamplingLlm {
             provider,
             model,
             auth,
-            usage_sink,
-        }
+        });
+        SamplingExecutor { llm, usage_sink }
+    }
+
+    /// Late-bound LLM: resolves the surface's shared cell per request, so
+    /// model changes after the connection was made are picked up.
+    pub fn shared(llm: SharedSamplingLlm, usage_sink: SamplingUsageSink) -> Self {
+        SamplingExecutor { llm, usage_sink }
     }
 
     /// Wrap server-provided text so the model treats it as data (same
@@ -184,9 +224,16 @@ impl tack_tools::mcp::SamplingHandler for SamplingExecutor {
         server: &str,
         params: CreateMessageRequestParams,
     ) -> Result<CreateMessageResult, String> {
+        let Some(llm) = self.llm.get() else {
+            return Err(
+                "MCP sampling unavailable: no session model published yet (the server \
+                 asked before any session started)"
+                    .to_string(),
+            );
+        };
         let context = Self::build_context(server, &params)?;
-        let resolved = self.auth.resolve().await?;
-        let mut model = self.model.clone();
+        let resolved = llm.auth.resolve().await?;
+        let mut model = llm.model.clone();
         if let Some(base_url) = resolved.base_url {
             model.base_url = base_url;
         }
@@ -207,7 +254,7 @@ impl tack_tools::mcp::SamplingHandler for SamplingExecutor {
         );
         // modelPreferences.hints are advisory; we always serve with the
         // session's current model (documented behavior).
-        let message = self.provider.complete(&model, &context, options).await;
+        let message = llm.provider.complete(&model, &context, options).await;
         match message.stop_reason {
             tack_ai::StopReason::Error => {
                 return Err(message
@@ -451,5 +498,76 @@ mod tests {
         let params = CreateMessageRequestParams::new(vec![SamplingMessage::user_text("x")], 16);
         let err = executor.create_message("srv", params).await.unwrap_err();
         assert_eq!(err, "boom");
+    }
+
+    fn scripted_provider(scripts: Vec<AssistantMessage>) -> Arc<ScriptedProvider> {
+        Arc::new(ScriptedProvider {
+            scripts: std::sync::Mutex::new(scripts),
+            seen: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn static_auth() -> Arc<dyn tack_ai::oauth::AuthResolver> {
+        Arc::new(tack_ai::oauth::StaticAuth::from(Some("key".to_string())))
+    }
+
+    /// Late-bound executor (plugin MCP servers): an unset cell answers
+    /// with a clean error; publishing/re-publishing the cell is picked up
+    /// by the SAME executor — connections outlive model changes.
+    #[tokio::test]
+    async fn shared_executor_resolves_cell_per_request() {
+        let cell = SharedSamplingLlm::default();
+        let executor = SamplingExecutor::shared(cell.clone(), Arc::new(|_| {}));
+        let params = || CreateMessageRequestParams::new(vec![SamplingMessage::user_text("hi")], 16);
+
+        // No session model published yet (server asked too early).
+        let err = executor.create_message("srv", params()).await.unwrap_err();
+        assert!(err.contains("no session model"), "{err}");
+
+        let provider_a = scripted_provider(vec![assistant_text("A")]);
+        cell.set(crate::mcp_config::SamplingLlm {
+            provider: provider_a.clone(),
+            model: test_model(),
+            auth: static_auth(),
+        });
+        let result = executor.create_message("srv", params()).await.unwrap();
+        assert_eq!(
+            result
+                .message
+                .content
+                .first()
+                .unwrap()
+                .as_text()
+                .unwrap()
+                .text,
+            "A"
+        );
+        assert_eq!(provider_a.seen.lock().unwrap().len(), 1);
+
+        // Model switch after the connection: re-publish, same executor.
+        let mut model_b = test_model();
+        model_b.id = "model-b".into();
+        let provider_b = scripted_provider(vec![assistant_text("B")]);
+        cell.set(crate::mcp_config::SamplingLlm {
+            provider: provider_b.clone(),
+            model: model_b,
+            auth: static_auth(),
+        });
+        let result = executor.create_message("srv", params()).await.unwrap();
+        assert_eq!(result.model, "model-b");
+        assert_eq!(
+            result
+                .message
+                .content
+                .first()
+                .unwrap()
+                .as_text()
+                .unwrap()
+                .text,
+            "B"
+        );
+        // The stale provider was not consulted again.
+        assert_eq!(provider_a.seen.lock().unwrap().len(), 1);
+        assert_eq!(provider_b.seen.lock().unwrap().len(), 1);
     }
 }

@@ -474,5 +474,5 @@ recorded in [compatibility.md](compatibility.md):
    PermissionRequest hooks → user prompt. Claimed `allow`/`reviewed`
    approve one-shot (audit-distinguished), `askUser` defers to the
    built-in prompt, and reviewer errors degrade to pass (fail-open).
-   Wired in the TUI and rpc surfaces; acp/remote-host prompts are a
-   documented follow-up.
+   Wired on every prompt-capable surface: TUI, rpc, ACP, and the
+   remote host.

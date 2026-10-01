@@ -206,30 +206,26 @@ impl TuiPermissionHooks {
         ctx: &BeforeToolCallContext<'_>,
         force_human: bool,
     ) -> BeforeToolCallOutcome {
-        if !force_human && !self.approval_chain.is_empty() {
-            let request = crate::approval::ApprovalRequest {
-                approval_id: ctx.tool_call_id.to_string(),
-                tool_call_id: ctx.tool_call_id.to_string(),
-                tool_name: ctx.tool_name.to_string(),
-                arguments: ctx.args.clone(),
-                approval_policy: lock_recover(&self.mode).as_str().to_string(),
-                evidence: serde_json::json!({
-                    "surface": "tui",
-                    "untrustedSeen": self
-                        .untrusted_seen
+        if !force_human {
+            let policy = lock_recover(&self.mode).as_str().to_string();
+            if self
+                .approval_chain
+                .claims_approval(
+                    "tui",
+                    ctx.tool_call_id,
+                    ctx.tool_name,
+                    ctx.args,
+                    &policy,
+                    self.untrusted_seen
                         .load(std::sync::atomic::Ordering::Relaxed),
-                    "readOnly": is_read_only_tool(ctx.tool_name, ctx.args),
-                }),
-            };
-            // allow/reviewed both approve one-shot (nothing persists
-            // into the allow-always cache or permissions.json); askUser
-            // (explicit defer) and all-pass both reach the built-in
-            // prompt below.
-            if let Some(crate::approval::ChainDecision {
-                action: crate::approval::ChainAction::Allow | crate::approval::ChainAction::Reviewed,
-                ..
-            }) = self.approval_chain.review(&request).await
+                    is_read_only_tool(ctx.tool_name, ctx.args),
+                )
+                .await
             {
+                // allow/reviewed both approve one-shot (nothing persists
+                // into the allow-always cache or permissions.json); askUser
+                // (explicit defer) and all-pass both reach the built-in
+                // prompt below.
                 return BeforeToolCallOutcome::Allow;
             }
         }
