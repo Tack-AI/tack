@@ -161,8 +161,11 @@ deny 规则 → PreToolUse hook 裁决 → 模式门（plan/acceptEdits/bypass�
   超时。认领、跳过与审查者失败都是结构化 tracing 事件（target
   `plugin_approval`），managed `auditSink` 部署会像看到策略决策一样
   看到它们。
-- 已接线 surface：**TUI 与 rpc**（本仓库拥有的两个可提示 surface）；
-  acp 与 remote-host 的提示是文档化的后续项。
+- 已接线 surface：**TUI、rpc、ACP 与 remote 宿主**——每个可提示
+  surface 都在自己的“将要提示人工”点上咨询审批链（TUI 对话框、
+  rpc 的 `permission_request` 事件、ACP 的
+  `session/request_permission`、remote 的 `PermissionRequest`
+  广播）。
 - managed 策略可以用 `pluginPolicy.plugins."<id>".hooks: false`
   整体剥离一个插件的 hook 桥：插件的工具/命令照常加载，但它不再
   贡献任何 `beforeToolCall`/`transformContext`/`afterToolCall`/

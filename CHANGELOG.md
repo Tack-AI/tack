@@ -4,6 +4,34 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [Unreleased]
+
+### Added
+
+- **Plugin approval chain wired on every prompt-capable surface**: ACP
+  (`session/request_permission`) and remote-host sessions now consult
+  reviewer plugins (`capabilities.hooks.approvalReview`) at the
+  would-prompt point, joining the TUI and rpc surfaces. `tack serve`
+  loads the extension host for the first time: plugin hook bridges run
+  before the permission layer in remote sessions (a guardrail plugin can
+  no longer be bypassed by driving a remote session), plugin tools are
+  available, and provider lifecycle events fire.
+- **MCP sampling for plugin (Level-2) connections**: MCP servers that
+  ARE plugins can now request LLM completions (`sampling/createMessage`)
+  when `mcpSampling` is on. The session model is resolved per request
+  through a shared cell published as sessions start and models change,
+  so every connection — config-file or plugin — samples against the
+  current model (previously config-file connections captured the
+  connect-time model, and plugin connections got method-not-found).
+
+### Fixed
+
+- **Remote permission gate honors the prompt-injection defense**: once
+  untrusted web/MCP/plugin content entered a remote session's context,
+  mutating tools now always prompt the client — declarative allow rules,
+  the allow-always cache and the plugin approval chain are bypassed,
+  matching the TUI/rpc/ACP surfaces.
+
 ## [1.0.8] - 2026-10-01
 
 ### Changed

@@ -196,34 +196,29 @@ impl AgentHooks for RpcPermissionHooks {
         // that would otherwise be parked on a client answer — EXCEPT in an
         // untrusted run or on a hook "ask" verdict, where a chain claim
         // must not silently approve a call the human has to see.
-        if !untrusted && !force_human && !self.approval_chain.is_empty() {
-            let policy = match mode {
-                SessionMode::Ask => "ask",
-                SessionMode::AcceptEdits => "acceptEdits",
-                SessionMode::Plan => "plan",
-                SessionMode::Bypass => "bypass",
-            };
-            let request = crate::approval::ApprovalRequest {
-                approval_id: ctx.tool_call_id.to_string(),
-                tool_call_id: ctx.tool_call_id.to_string(),
-                tool_name: ctx.tool_name.to_string(),
-                arguments: ctx.args.clone(),
-                approval_policy: policy.to_string(),
-                evidence: json!({
-                    "surface": "rpc",
-                    "untrustedSeen": self
-                        .untrusted_seen
+        let policy = match mode {
+            SessionMode::Ask => "ask",
+            SessionMode::AcceptEdits => "acceptEdits",
+            SessionMode::Plan => "plan",
+            SessionMode::Bypass => "bypass",
+        };
+        if !untrusted
+            && !force_human
+            && self
+                .approval_chain
+                .claims_approval(
+                    "rpc",
+                    ctx.tool_call_id,
+                    ctx.tool_name,
+                    ctx.args,
+                    policy,
+                    self.untrusted_seen
                         .load(std::sync::atomic::Ordering::Relaxed),
-                    "readOnly": read_only,
-                }),
-            };
-            if let Some(crate::approval::ChainDecision {
-                action: crate::approval::ChainAction::Allow | crate::approval::ChainAction::Reviewed,
-                ..
-            }) = self.approval_chain.review(&request).await
-            {
-                return Outcome::Allow;
-            }
+                    read_only,
+                )
+                .await
+        {
+            return Outcome::Allow;
         }
 
         // Prompt the client: park until answered, cancelled, or timed out.

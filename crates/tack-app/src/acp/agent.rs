@@ -2,7 +2,6 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -132,15 +131,15 @@ impl TackAcpAgent {
     }
 
     /// MCP client callbacks for server-initiated requests: sampling (opt-in)
-    /// runs against the current model; elicitation auto-declines (headless).
-    fn mcp_client_callbacks(&self, _cwd: &Path) -> tack_tools::mcp::McpClientCallbacks {
+    /// resolves the session model late through the shared cell; elicitation
+    /// auto-declines (headless).
+    fn mcp_client_callbacks(
+        &self,
+        sampling_llm: &crate::mcp_sampling::SharedSamplingLlm,
+    ) -> tack_tools::mcp::McpClientCallbacks {
         crate::mcp_config::client_callbacks(
             &self.settings,
-            Some(&crate::mcp_config::SamplingLlm {
-                provider: self.provider.clone(),
-                model: self.model.clone(),
-                auth: self.auth.clone(),
-            }),
+            sampling_llm,
             crate::mcp_sampling::log_usage_sink(),
             crate::mcp_elicitation::InteractionMode::Headless,
             None,
@@ -447,6 +446,10 @@ struct AcpHooks {
     /// Session-shared prompt-injection flag: set when untrusted external
     /// content (web/MCP/plugin tool output) entered the context.
     untrusted_seen: Arc<std::sync::atomic::AtomicBool>,
+    /// Plugin approval chain (tack-RPC `approval/review`): reviewers get
+    /// first crack at a decision that would otherwise be bridged to the
+    /// client's `session/request_permission` (TUI/rpc parity).
+    approval_chain: crate::approval::ApprovalChain,
 }
 
 #[async_trait::async_trait]
@@ -518,6 +521,28 @@ impl AgentHooks for AcpHooks {
             if res {
                 return BeforeToolCallOutcome::Allow;
             }
+        }
+
+        // Plugin approval chain: reviewers get first crack at the decision
+        // that would otherwise be bridged to the client — EXCEPT in an
+        // untrusted run, where a chain claim must not silently approve a
+        // call the human has to see (TUI/rpc parity).
+        if !untrusted
+            && self
+                .approval_chain
+                .claims_approval(
+                    "acp",
+                    ctx.tool_call_id,
+                    ctx.tool_name,
+                    ctx.args,
+                    &mode,
+                    self.untrusted_seen
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    TackAcpAgent::is_read_only_tool(ctx.tool_name, ctx.args),
+                )
+                .await
+        {
+            return BeforeToolCallOutcome::Allow;
         }
 
         let (respond, response) = tokio::sync::oneshot::channel::<PermissionChoice>();
@@ -662,6 +687,7 @@ impl Agent for TackAcpAgent {
         // into the connection specs below.
         let agent_dir = tack_session::default_agent_dir();
         let bridge_state = crate::ext_provider_bridge::ProviderBridgeState::shared();
+        let sampling_llm = crate::mcp_sampling::SharedSamplingLlm::default();
         let extensions = crate::extension_host::ExtensionManager::load(
             &cwd,
             &agent_dir,
@@ -676,6 +702,8 @@ impl Agent for TackAcpAgent {
                 &self.settings,
                 crate::mcp_elicitation::InteractionMode::Headless,
                 None,
+                &sampling_llm,
+                crate::mcp_sampling::log_usage_sink(),
             ),
             bridge_state,
         )
@@ -694,7 +722,7 @@ impl Agent for TackAcpAgent {
             specs,
             &tack_session::default_agent_dir(),
             false,
-            self.mcp_client_callbacks(&cwd),
+            self.mcp_client_callbacks(&sampling_llm),
         )
         .await;
 
@@ -710,6 +738,7 @@ impl Agent for TackAcpAgent {
             self.model.clone(),
             self.thinking,
             extensions,
+            sampling_llm,
         );
         self.sessions
             .borrow_mut()
@@ -774,6 +803,7 @@ impl Agent for TackAcpAgent {
                 // Reloaded sessions get config-file MCP servers only.
                 let agent_dir = tack_session::default_agent_dir();
                 let bridge_state = crate::ext_provider_bridge::ProviderBridgeState::shared();
+                let sampling_llm = crate::mcp_sampling::SharedSamplingLlm::default();
                 let extensions = crate::extension_host::ExtensionManager::load(
                     &cwd,
                     &agent_dir,
@@ -788,6 +818,8 @@ impl Agent for TackAcpAgent {
                         &self.settings,
                         crate::mcp_elicitation::InteractionMode::Headless,
                         None,
+                        &sampling_llm,
+                        crate::mcp_sampling::log_usage_sink(),
                     ),
                     bridge_state,
                 )
@@ -799,7 +831,7 @@ impl Agent for TackAcpAgent {
                     specs,
                     &tack_session::default_agent_dir(),
                     false,
-                    self.mcp_client_callbacks(&cwd),
+                    self.mcp_client_callbacks(&sampling_llm),
                 )
                 .await;
 
@@ -811,6 +843,7 @@ impl Agent for TackAcpAgent {
                     self.model.clone(),
                     self.thinking,
                     extensions,
+                    sampling_llm,
                 );
                 self.sessions
                     .borrow_mut()
@@ -939,9 +972,13 @@ impl Agent for TackAcpAgent {
         };
 
         // tack-ext: plugin hooks + provider-boundary event sink for this turn.
-        let (ext_hooks, ext_sink) = {
+        let (ext_hooks, ext_sink, approval_chain) = {
             let extensions = state.extensions.lock().await;
-            (extensions.hooks(), extensions.clone_sink())
+            (
+                extensions.hooks(),
+                extensions.clone_sink(),
+                extensions.approval_chain(),
+            )
         };
         let provider: Arc<dyn Provider> = Arc::new(crate::extension_host::ExtNotifyProvider::new(
             self.provider.clone(),
@@ -956,6 +993,14 @@ impl Agent for TackAcpAgent {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let turn_thinking = *state.thinking.lock().unwrap_or_else(|e| e.into_inner());
+        // Late-bound MCP sampling (plugin MCP servers) resolves the shared
+        // cell per request — publish this turn's stack so a set_model
+        // since the last turn is picked up.
+        state.sampling_llm.set(crate::mcp_config::SamplingLlm {
+            provider: provider.clone(),
+            model: turn_model.clone(),
+            auth: self.auth.clone(),
+        });
 
         let acp_hooks: Arc<dyn AgentHooks> = Arc::new(AcpHooks {
             inner: crate::hooks::SessionHooks {
@@ -982,6 +1027,7 @@ impl Agent for TackAcpAgent {
             allow_always: state.allow_always.clone(),
             mode: state.mode.clone(),
             untrusted_seen: state.untrusted_seen.clone(),
+            approval_chain,
         });
         // Hook ordering (rpc/prompt.rs / print_mode.rs parity — SECURITY):
         // tack-ext plugin `hooks/beforeToolCall` bridges run BEFORE the
@@ -1322,6 +1368,7 @@ impl Agent for TackAcpAgent {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use std::path::Path;
 
     #[derive(Debug)]
     struct StubProvider;
@@ -1357,34 +1404,47 @@ mod tests {
     }
 
     fn test_hooks(mode: &str) -> AcpHooks {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<BridgeRequest>();
+        test_hooks_with_bridge(mode).0
+    }
+
+    fn test_hooks_with_bridge(
+        mode: &str,
+    ) -> (
+        AcpHooks,
+        tokio::sync::mpsc::UnboundedReceiver<BridgeRequest>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<BridgeRequest>();
         let settings = Settings::default();
-        AcpHooks {
-            inner: crate::hooks::SessionHooks {
-                session: Arc::new(tokio::sync::Mutex::new(
-                    tack_session::SessionManager::in_memory(std::path::Path::new("")),
-                )),
-                model: test_model(),
-                provider: Arc::new(StubProvider),
-                auth: Arc::new(tack_ai::oauth::StaticAuth::from(Some("key".to_string()))),
-                reasoning: None,
-                settings: settings.compaction,
-                cancel: tokio_util::sync::CancellationToken::new(),
-                on_compaction: None,
-                history: None,
-                hook_engine: crate::shell_hooks::HookEngine::new(
-                    None,
-                    Path::new(".").to_path_buf(),
-                ),
-                pre_compact: Vec::new(),
-                post_compact: Vec::new(),
-                hook_session_id: "test".to_string(),
+        (
+            AcpHooks {
+                inner: crate::hooks::SessionHooks {
+                    session: Arc::new(tokio::sync::Mutex::new(
+                        tack_session::SessionManager::in_memory(std::path::Path::new("")),
+                    )),
+                    model: test_model(),
+                    provider: Arc::new(StubProvider),
+                    auth: Arc::new(tack_ai::oauth::StaticAuth::from(Some("key".to_string()))),
+                    reasoning: None,
+                    settings: settings.compaction,
+                    cancel: tokio_util::sync::CancellationToken::new(),
+                    on_compaction: None,
+                    history: None,
+                    hook_engine: crate::shell_hooks::HookEngine::new(
+                        None,
+                        Path::new(".").to_path_buf(),
+                    ),
+                    pre_compact: Vec::new(),
+                    post_compact: Vec::new(),
+                    hook_session_id: "test".to_string(),
+                },
+                bridge: tx,
+                allow_always: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+                mode: Arc::new(std::sync::Mutex::new(mode.to_string())),
+                untrusted_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                approval_chain: crate::approval::ApprovalChain::empty(),
             },
-            bridge: tx,
-            allow_always: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            mode: Arc::new(std::sync::Mutex::new(mode.to_string())),
-            untrusted_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
+            rx,
+        )
     }
 
     fn call_ctx<'a>(
@@ -1461,6 +1521,7 @@ mod tests {
                     test_model(),
                     None,
                     crate::extension_host::ExtensionManager::default(),
+                    crate::mcp_sampling::SharedSamplingLlm::default(),
                 );
                 agent
                     .sessions
@@ -1525,5 +1586,77 @@ mod tests {
             .before_tool_call(&call_ctx(&message, "read", &args))
             .await;
         assert!(matches!(outcome, BeforeToolCallOutcome::Allow));
+    }
+
+    #[derive(Debug)]
+    struct ClaimReviewer(crate::approval::ChainAction);
+
+    #[async_trait::async_trait]
+    impl crate::approval::ApprovalReviewer for ClaimReviewer {
+        async fn review(
+            &self,
+            request: &crate::approval::ApprovalRequest,
+        ) -> Option<crate::approval::ChainDecision> {
+            assert_eq!(request.approval_policy, "ask");
+            assert_eq!(request.tool_name, "bash");
+            assert_eq!(request.evidence["surface"], "acp");
+            Some(crate::approval::ChainDecision {
+                action: self.0,
+                reason: None,
+            })
+        }
+    }
+
+    /// A plugin approval-chain claim approves the call WITHOUT bridging a
+    /// `session/request_permission` to the client (TUI/rpc parity).
+    #[tokio::test]
+    async fn approval_chain_claim_skips_client_prompt() {
+        let (mut hooks, mut rx) = test_hooks_with_bridge("ask");
+        hooks.approval_chain.push(
+            "fake@user".into(),
+            Arc::new(ClaimReviewer(crate::approval::ChainAction::Allow)),
+        );
+        let model = test_model();
+        let message = tack_ai::AssistantMessage::pending(&model);
+        let args = serde_json::json!({"command": "rm -rf build"});
+        let outcome = hooks
+            .before_tool_call(&call_ctx(&message, "bash", &args))
+            .await;
+        assert!(matches!(outcome, BeforeToolCallOutcome::Allow));
+        assert!(rx.try_recv().is_err(), "no client prompt expected");
+        // One-shot approve: nothing persisted into allow-always.
+        assert!(hooks.allow_always.lock().unwrap().is_empty());
+    }
+
+    /// Prompt-injection defense: in an untrusted run a chain claim must
+    /// NOT silently approve a mutating call — the client is asked.
+    #[tokio::test]
+    async fn approval_chain_skipped_in_untrusted_run() {
+        let (mut hooks, mut rx) = test_hooks_with_bridge("ask");
+        hooks.approval_chain.push(
+            "fake@user".into(),
+            Arc::new(ClaimReviewer(crate::approval::ChainAction::Allow)),
+        );
+        hooks
+            .untrusted_seen
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let model = test_model();
+        let message = tack_ai::AssistantMessage::pending(&model);
+        let args = serde_json::json!({"command": "rm -rf build"});
+        // The chain is bypassed, so the flow parks on the client answer;
+        // answer it from the bridge receiver.
+        let answer = tokio::spawn(async move {
+            match rx.recv().await {
+                Some(BridgeRequest::Permission(query)) => {
+                    let _ = query.respond.send(PermissionChoice::AllowOnce);
+                }
+                other => panic!("expected permission query, got {other:?}"),
+            }
+        });
+        let outcome = hooks
+            .before_tool_call(&call_ctx(&message, "bash", &args))
+            .await;
+        assert!(matches!(outcome, BeforeToolCallOutcome::Allow));
+        answer.await.unwrap();
     }
 }

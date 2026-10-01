@@ -104,6 +104,10 @@ pub struct AcpSessionState {
     /// session/close handshake, so plugins are shut down when the client
     /// connection ends (`shutdown_all_sessions` in `acp::serve`).
     pub extensions: Arc<Mutex<crate::extension_host::ExtensionManager>>,
+    /// Late-bound LLM for MCP sampling (plugin MCP servers connect at
+    /// extension-load time, before any session model exists; the executor
+    /// resolves this cell per request). Updated at every prompt turn.
+    pub sampling_llm: crate::mcp_sampling::SharedSamplingLlm,
     /// Set when untrusted external content (web fetch, MCP/plugin tool
     /// output) entered this session's context. The permission gate reads
     /// it to re-prompt for mutating tools instead of honoring cached
@@ -158,6 +162,7 @@ const TERMINAL_OUTPUT_BYTE_LIMIT: u64 = 8 * 1024 * 1024;
 
 /// Create the session state and spawn the bridge dispatcher (must be called
 /// from within the LocalSet).
+#[allow(clippy::too_many_arguments)]
 pub fn create_session_state(
     session: SessionManager,
     shared_conn: SharedConn,
@@ -166,6 +171,7 @@ pub fn create_session_state(
     model: tack_ai::Model,
     thinking: Option<tack_ai::ThinkingLevel>,
     extensions: crate::extension_host::ExtensionManager,
+    sampling_llm: crate::mcp_sampling::SharedSamplingLlm,
 ) -> Rc<AcpSessionState> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<BridgeRequest>();
 
@@ -200,6 +206,7 @@ pub fn create_session_state(
         model: Arc::new(std::sync::Mutex::new(model)),
         thinking: Arc::new(std::sync::Mutex::new(thinking)),
         extensions: Arc::new(Mutex::new(extensions)),
+        sampling_llm,
         untrusted_seen,
         in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })

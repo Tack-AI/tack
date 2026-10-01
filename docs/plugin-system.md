@@ -195,8 +195,11 @@ deny rules → PreToolUse hook decisions → mode gate (plan/acceptEdits/bypass)
   the standard 30s request timeout. Claims, passes, and reviewer
   failures are structured tracing events (target `plugin_approval`), so
   managed `auditSink` deployments see them like policy decisions.
-- Wired surfaces: **TUI and rpc** (the prompt-capable surfaces this
-  repo owns); acp and remote-host prompts are a documented follow-up.
+- Wired surfaces: **TUI, rpc, ACP, and the remote host** — every
+  prompt-capable surface consults the chain at its would-prompt point
+  (the TUI dialog, the rpc `permission_request` event, ACP
+  `session/request_permission`, the remote `PermissionRequest`
+  broadcast).
 - Managed policy can strip a plugin's hook bridges wholesale with
   `pluginPolicy.plugins."<id>".hooks: false`: the plugin's
   tools/commands still load, but it contributes no

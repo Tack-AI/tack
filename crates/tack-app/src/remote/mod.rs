@@ -107,6 +107,39 @@ pub async fn serve(
         on_retry_scheduled: None,
     });
 
+    // tack-ext plugins in headless mode (rpc parity): hook bridges,
+    // plugin tools, the approval chain and trust-gated exec stay live;
+    // UI dialogs degrade (ext_headless). Loaded once for the server and
+    // shared by every session in-process.
+    let agent_dir = tack_session::default_agent_dir();
+    let bridge_state = crate::ext_provider_bridge::ProviderBridgeState::shared();
+    let sampling_llm = crate::mcp_sampling::SharedSamplingLlm::default();
+    let extensions = crate::extension_host::ExtensionManager::load(
+        &cwd,
+        &agent_dir,
+        "remote",
+        crate::ext_headless::HeadlessExtServices::new(
+            "remote",
+            crate::project_trust::is_trusted(&cwd, &agent_dir),
+            bridge_state.clone(),
+        ),
+        settings.extension_lock_required,
+        crate::mcp_config::plugin_mcp_callbacks(
+            &settings,
+            crate::mcp_elicitation::InteractionMode::Headless,
+            None,
+            &sampling_llm,
+            crate::mcp_sampling::log_usage_sink(),
+        ),
+        bridge_state,
+    )
+    .await;
+    // Provider-boundary lifecycle events for subscribed plugins.
+    let provider: Arc<dyn Provider> = Arc::new(crate::extension_host::ExtNotifyProvider::new(
+        provider,
+        extensions.clone_sink(),
+    ));
+
     // Security posture: a remote client can run bash on this machine.
     let is_unix = listen.starts_with("unix:");
     let addr = listen
@@ -156,7 +189,15 @@ pub async fn serve(
         auth_token
     };
 
-    let host = build_host(provider, model, auth, settings, auth_token);
+    let host = build_host(
+        provider,
+        model,
+        auth,
+        settings,
+        auth_token,
+        extensions,
+        sampling_llm,
+    );
     // Idle detached sessions would otherwise accumulate forever.
     let _reaper = spawn_session_reaper(&host);
     let acceptor = match &tls {
@@ -339,6 +380,8 @@ pub(crate) mod testutil {
             Arc::new(tack_ai::oauth::StaticAuth::from(Some("key".to_string()))),
             Settings::default(),
             None,
+            crate::extension_host::ExtensionManager::default(),
+            crate::mcp_sampling::SharedSamplingLlm::default(),
         )
     }
 }
@@ -510,6 +553,8 @@ mod tests {
                 Arc::new(tack_ai::oauth::StaticAuth::from(Some("key".to_string()))),
                 Settings::default(),
                 Some("secret".to_string()),
+                crate::extension_host::ExtensionManager::default(),
+                crate::mcp_sampling::SharedSamplingLlm::default(),
             );
             let addr = start_ws_server(host).await;
             let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))

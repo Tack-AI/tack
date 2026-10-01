@@ -1998,7 +1998,10 @@ impl ExtensionManager {
             let run_mode = match mode {
                 "tui" => RunMode::Tui,
                 "print" => RunMode::Print,
-                "rpc" => RunMode::Rpc,
+                // The remote host is client-driven, multi-turn and
+                // permission-prompt-capable like rpc (the rpc3 RunMode
+                // enum has no remote variant).
+                "rpc" | "remote" => RunMode::Rpc,
                 "acp" => RunMode::Acp,
                 _ => RunMode::Print,
             };

@@ -376,6 +376,19 @@ pub(crate) fn app_event_bus() -> (AppEventTx, AppEventRx) {
     )
 }
 
+/// MCP sampling usage sink: fold every sampling call's usage into the
+/// footer stats (headless modes log instead — see
+/// `mcp_sampling::log_usage_sink`). Shared by config-file and plugin MCP
+/// connections.
+pub(crate) fn sampling_usage_sink(event_tx: AppEventTx) -> crate::mcp_sampling::SamplingUsageSink {
+    Arc::new(move |m| {
+        let _ = event_tx.send(AppEvent::McpSamplingDone {
+            usage: m.usage.clone(),
+            model: m.model.clone(),
+        });
+    })
+}
+
 /// Shared session state (mutated by commands and the run hooks).
 struct AppState {
     session: SessionManager,
@@ -497,6 +510,11 @@ pub struct TuiApp {
     flags: crate::cli_flags::CliFlags,
     /// Running tack-ext plugins (empty when none are installed).
     extensions: crate::extension_host::ExtensionManager,
+    /// Late-bound LLM for MCP sampling (plugin MCP servers connect at
+    /// extension-load time, before any session model exists — the
+    /// executor resolves this cell per request). Updated at every run
+    /// start and in rebind_provider after a model switch.
+    sampling_llm: crate::mcp_sampling::SharedSamplingLlm,
     /// An extension UI dialog awaiting an answer (method, responder).
     pending_ext_ui: Option<(
         String,
@@ -683,9 +701,16 @@ impl TuiApp {
         let (compaction_tx, compaction_rx) = mpsc::unbounded_channel();
         let (budget_tx, budget_rx) = mpsc::unbounded_channel::<String>();
 
-        let (provider, extensions) =
-            Self::init_provider_stack(provider, &settings, &event_tx, &options.cwd, &agent_dir)
-                .await;
+        let sampling_llm = crate::mcp_sampling::SharedSamplingLlm::default();
+        let (provider, extensions) = Self::init_provider_stack(
+            provider,
+            &settings,
+            &event_tx,
+            &options.cwd,
+            &agent_dir,
+            &sampling_llm,
+        )
+        .await;
         #[cfg(feature = "ext")]
         let ext_ac_providers = extensions.autocomplete_providers();
 
@@ -791,6 +816,7 @@ impl TuiApp {
             mcp_connections: Vec::new(),
             flags: flags.clone(),
             extensions,
+            sampling_llm,
             pending_ext_ui: None,
             pending_elicitation: None,
             pending_ask_user: None,
@@ -955,6 +981,7 @@ impl TuiApp {
         event_tx: &AppEventTx,
         cwd: &Path,
         agent_dir: &Path,
+        sampling_llm: &crate::mcp_sampling::SharedSamplingLlm,
     ) -> (Arc<dyn Provider>, crate::extension_host::ExtensionManager) {
         let bridge_state = crate::ext_provider_bridge::ProviderBridgeState::shared();
         let ext_services = Arc::new(crate::extension_host::TuiExtServices::new(
@@ -972,6 +999,8 @@ impl TuiApp {
                 settings,
                 crate::mcp_elicitation::InteractionMode::Tui,
                 Some(event_tx.clone()),
+                sampling_llm,
+                sampling_usage_sink(event_tx.clone()),
             ),
             bridge_state,
         )
@@ -1037,6 +1066,14 @@ impl TuiApp {
             self.auth =
                 crate::model::resolve_auth(&self.state.model.provider, None, &self.agent_dir);
         }
+        // Plugin MCP sampling resolves the session model late through the
+        // shared cell — publish the rebound stack so a sampling request
+        // arriving between runs does not see the previous model.
+        self.sampling_llm.set(crate::mcp_config::SamplingLlm {
+            provider: self.provider.clone(),
+            model: self.state.model.clone(),
+            auth: self.auth.clone(),
+        });
     }
 
     /// Theme + terminal capability setup: theme resolution, fullscreen /

@@ -144,15 +144,23 @@ pub fn spec_from_entry(
 
 /// Client callbacks for Level-2 MCP server plugins (connected at
 /// extension-load time): elicitation follows the mode's usual rule (TUI
-/// prompts, headless auto-declines). Sampling is NOT wired: the session
-/// model does not exist yet at load time, so a plugin server's sampling
-/// request gets method-not-found (documented Level-2 limitation).
+/// prompts, headless auto-declines). Sampling (`mcpSampling`, default off)
+/// resolves the session model LATE through `llm` — plugin connections
+/// outlive any session, so the executor reads the shared cell per request
+/// (see `crate::mcp_sampling::SharedSamplingLlm`).
 pub fn plugin_mcp_callbacks(
     settings: &crate::settings::Settings,
     mode: crate::mcp_elicitation::InteractionMode,
     tui_events: Option<crate::tui::AppEventTx>,
+    llm: &crate::mcp_sampling::SharedSamplingLlm,
+    usage_sink: crate::mcp_sampling::SamplingUsageSink,
 ) -> tack_tools::mcp::McpClientCallbacks {
     let mut callbacks = tack_tools::mcp::McpClientCallbacks::default();
+    if settings.mcp_sampling {
+        callbacks = callbacks.with_sampling(Arc::new(
+            crate::mcp_sampling::SamplingExecutor::shared(llm.clone(), usage_sink),
+        ));
+    }
     if let Some(handler) =
         crate::mcp_elicitation::elicitation_callback(mode, settings.mcp_elicitation, tui_events)
     {
@@ -162,6 +170,7 @@ pub fn plugin_mcp_callbacks(
 }
 
 /// LLM access for MCP sampling: the session's current provider/model/auth.
+#[derive(Clone)]
 pub struct SamplingLlm {
     pub provider: Arc<dyn tack_ai::Provider>,
     pub model: tack_ai::Model,
@@ -177,27 +186,24 @@ impl std::fmt::Debug for SamplingLlm {
 }
 
 /// Assemble the client-side callbacks for MCP connections:
-/// - sampling (`mcpSampling`, default off) runs against the session model in
-///   an isolated untrusted context; usage flows to `usage_sink`;
+/// - sampling (`mcpSampling`, default off) runs against the session model
+///   (resolved per request through the shared `llm` cell, so model changes
+///   after connect are picked up) in an isolated untrusted context; usage
+///   flows to `usage_sink`;
 /// - elicitation (`mcpElicitation`, default on) prompts in the TUI and
 ///   auto-declines in headless modes.
 pub fn client_callbacks(
     settings: &crate::settings::Settings,
-    llm: Option<&SamplingLlm>,
+    llm: &crate::mcp_sampling::SharedSamplingLlm,
     usage_sink: crate::mcp_sampling::SamplingUsageSink,
     mode: crate::mcp_elicitation::InteractionMode,
     tui_events: Option<crate::tui::AppEventTx>,
 ) -> tack_tools::mcp::McpClientCallbacks {
     let mut callbacks = tack_tools::mcp::McpClientCallbacks::default();
-    if settings.mcp_sampling
-        && let Some(llm) = llm
-    {
-        callbacks = callbacks.with_sampling(Arc::new(crate::mcp_sampling::SamplingExecutor::new(
-            llm.provider.clone(),
-            llm.model.clone(),
-            llm.auth.clone(),
-            usage_sink,
-        )));
+    if settings.mcp_sampling {
+        callbacks = callbacks.with_sampling(Arc::new(
+            crate::mcp_sampling::SamplingExecutor::shared(llm.clone(), usage_sink),
+        ));
     }
     if let Some(handler) =
         crate::mcp_elicitation::elicitation_callback(mode, settings.mcp_elicitation, tui_events)
@@ -375,5 +381,29 @@ mod tests {
         let merged = merge_session_servers(configured, Vec::new());
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].name, "a");
+    }
+
+    /// MCP sampling is opt-in (`mcpSampling`, default off) for BOTH
+    /// config-file and Level-2 plugin connections: no capability is
+    /// advertised unless the setting is on.
+    #[test]
+    #[allow(deprecated)]
+    fn sampling_follows_setting_for_both_connection_kinds() {
+        let cell = crate::mcp_sampling::SharedSamplingLlm::default();
+        let sink = crate::mcp_sampling::log_usage_sink();
+        let mode = crate::mcp_elicitation::InteractionMode::Headless;
+        let mut settings = crate::settings::Settings::default();
+        assert!(!settings.mcp_sampling, "default must be off");
+
+        let client = client_callbacks(&settings, &cell, sink.clone(), mode, None);
+        assert!(client.sampling.is_none());
+        let plugin = plugin_mcp_callbacks(&settings, mode, None, &cell, sink.clone());
+        assert!(plugin.sampling.is_none());
+
+        settings.mcp_sampling = true;
+        let client = client_callbacks(&settings, &cell, sink.clone(), mode, None);
+        assert!(client.sampling.is_some());
+        let plugin = plugin_mcp_callbacks(&settings, mode, None, &cell, sink);
+        assert!(plugin.sampling.is_some());
     }
 }

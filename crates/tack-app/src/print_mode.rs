@@ -420,6 +420,7 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
     // intercepts, lifecycle events and trust-gated exec stay live; UI
     // dialogs degrade (see ext_headless). Bundle resources merge below.
     let bridge_state = crate::ext_provider_bridge::ProviderBridgeState::shared();
+    let sampling_llm = crate::mcp_sampling::SharedSamplingLlm::default();
     let mut extensions = crate::extension_host::ExtensionManager::load(
         &options.cwd,
         &agent_dir,
@@ -434,6 +435,8 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
             &settings,
             crate::mcp_elicitation::InteractionMode::Headless,
             None,
+            &sampling_llm,
+            crate::mcp_sampling::log_usage_sink(),
         ),
         bridge_state,
     )
@@ -444,6 +447,13 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
         provider,
         extensions.clone_sink(),
     ));
+    // Late-bound MCP sampling resolves this cell per request (plugin MCP
+    // servers connected at extension-load time, before the session model).
+    sampling_llm.set(crate::mcp_config::SamplingLlm {
+        provider: provider.clone(),
+        model: options.model.clone(),
+        auth: options.auth.clone(),
+    });
     let hook_engine =
         crate::shell_hooks::HookEngine::new(services.shell.clone(), options.cwd.clone())
             .with_evaluator(Arc::new(crate::shell_hooks::LlmEvaluator {
@@ -511,11 +521,7 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
         } else {
             let callbacks = crate::mcp_config::client_callbacks(
                 &settings,
-                Some(&crate::mcp_config::SamplingLlm {
-                    provider: provider.clone(),
-                    model: options.model.clone(),
-                    auth: options.auth.clone(),
-                }),
+                &sampling_llm,
                 crate::mcp_sampling::log_usage_sink(),
                 crate::mcp_elicitation::InteractionMode::Headless,
                 None,

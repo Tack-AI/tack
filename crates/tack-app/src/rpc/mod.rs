@@ -59,6 +59,10 @@ pub(crate) struct RpcState {
     /// tack-ext plugins (process + wasm carriers): one manager per RPC
     /// process, tools/hooks are re-collected per prompt run.
     pub(crate) extensions: Arc<Mutex<crate::extension_host::ExtensionManager>>,
+    /// Late-bound LLM for MCP sampling (plugin MCP servers connect at
+    /// extension-load time; the executor resolves this cell per request).
+    /// Updated at every prompt run and after set_model rebinds.
+    pub(crate) sampling_llm: crate::mcp_sampling::SharedSamplingLlm,
     /// Active provider adapter (startup wrapping: Retrying inside ExtNotify).
     /// Rebound by set_model when the api kind changes — otherwise a
     /// cross-api switch streams the new model through the startup adapter,
@@ -243,6 +247,7 @@ pub async fn run_rpc(
     // tack-ext plugins in headless mode: tools, intercepts, lifecycle events
     // and trust-gated exec stay live; UI dialogs degrade (ext_headless).
     let bridge_state = crate::ext_provider_bridge::ProviderBridgeState::shared();
+    let sampling_llm = crate::mcp_sampling::SharedSamplingLlm::default();
     let extensions = crate::extension_host::ExtensionManager::load(
         &cwd,
         &agent_dir,
@@ -257,6 +262,8 @@ pub async fn run_rpc(
             &settings,
             crate::mcp_elicitation::InteractionMode::Headless,
             None,
+            &sampling_llm,
+            crate::mcp_sampling::log_usage_sink(),
         ),
         bridge_state,
     )
@@ -332,6 +339,7 @@ pub async fn run_rpc(
         },
         lsp: settings.lsp_manager(&cwd),
         extensions: Arc::new(Mutex::new(extensions)),
+        sampling_llm: sampling_llm.clone(),
         provider: provider.clone(),
         auth: auth.clone(),
         mcp_connections: None,
@@ -693,6 +701,13 @@ async fn handle_command(
                     let mut state = state.lock().await;
                     let previous = std::mem::replace(&mut state.model, model.clone());
                     rebind_provider_after_model_change(&mut state, &previous, settings).await;
+                    // Late-bound MCP sampling resolves this cell per
+                    // request — publish the rebound stack.
+                    state.sampling_llm.set(crate::mcp_config::SamplingLlm {
+                        provider: state.provider.clone(),
+                        model: state.model.clone(),
+                        auth: state.auth.clone(),
+                    });
                     if let Err(e) = state.session.append_model_change(provider_name, model_id) {
                         tracing::warn!("model_change persist failed: {e}");
                     }
@@ -1215,22 +1230,34 @@ async fn handle_command(
                 .get("connect")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            let (provider, model, auth, cwd) = {
+            let (provider, model, auth, cwd, sampling_llm) = {
                 let state = state.lock().await;
                 (
                     state.provider.clone(),
                     state.model.clone(),
                     state.auth.clone(),
                     state.session.cwd().to_path_buf(),
+                    state.sampling_llm.clone(),
                 )
             };
             let agent_dir = tack_session::default_agent_dir();
-            let llm = crate::mcp_config::SamplingLlm {
+            // Fresh connection (re)builds resolve sampling against the
+            // current stack — publish before connecting.
+            sampling_llm.set(crate::mcp_config::SamplingLlm {
                 provider,
-                model,
+                model: model.clone(),
                 auth,
-            };
-            let statuses = mcp::mcp_status(state, settings, &llm, &cwd, &agent_dir, connect).await;
+            });
+            let statuses = mcp::mcp_status(
+                state,
+                settings,
+                &sampling_llm,
+                &model,
+                &cwd,
+                &agent_dir,
+                connect,
+            )
+            .await;
             let servers: Vec<Value> = statuses
                 .iter()
                 .map(|s| {
@@ -1440,6 +1467,7 @@ mod tests {
             extensions: Arc::new(Mutex::new(
                 crate::extension_host::ExtensionManager::default(),
             )),
+            sampling_llm: crate::mcp_sampling::SharedSamplingLlm::default(),
             provider: test_provider(vec![]),
             auth: test_auth(),
             mcp_connections: None,

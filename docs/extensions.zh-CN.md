@@ -77,9 +77,11 @@ Level-2 插件的 `extension.json` 恰好声明一个 MCP 服务器——服务�
   `command`（包含 `/` 或以 `.` 开头）相对该目录解析。参数从不
   被重写（npm 包名如 `@scope/pkg` 含 `/` 但不是路径）。
 - **Sampling / elicitation**：elicitation 跟随运行模式（TUI 弹窗，
-  headless 模式拒绝）。Sampling **不**为插件连接接线——加载时不
-  存在会话模型——所以服务器的 sampling 请求会得到 method-not-found
-  （文档化的 Level-2 限制）。
+  headless 模式拒绝）。Sampling（`mcpSampling`，默认关）**延迟**
+  解析会话模型：插件连接比任何会话都长寿，所以 executor 按请求
+  读取一个各面共享的 cell——会话启动与模型切换时发布——sampling
+  请求永远跑在当前模型上；在任何会话开始前到达的请求得到一个
+  干净的错误而不是 method-not-found。
 - **失败即数据**：连接或探测失败的服务器以错误落入 `ext list`
   （`LoadedPlugin.error`），与其他插件一样。shutdown 取消连接
   （服务器子进程被杀）。

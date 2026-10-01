@@ -155,14 +155,19 @@ pub(crate) async fn spawn_prompt(
         // rpc::mcp::ensure_mcp_pool (session-scoped specs from
         // set_mcp_servers are merged in there; fingerprint-keyed cache,
         // rebuild on config/model/token change, dead-connection eviction).
+        // Publish this run's LLM for late-bound MCP sampling (plugin MCP
+        // servers resolve the shared cell per request).
+        let sampling_llm = state.lock().await.sampling_llm.clone();
+        sampling_llm.set(crate::mcp_config::SamplingLlm {
+            provider: provider.clone(),
+            model: model.clone(),
+            auth: auth.clone(),
+        });
         let connections = super::mcp::ensure_mcp_pool(
             state,
             settings,
-            &crate::mcp_config::SamplingLlm {
-                provider: provider.clone(),
-                model: model.clone(),
-                auth: auth.clone(),
-            },
+            &sampling_llm,
+            &model,
             &cwd,
             &agent_dir,
             ext_mcp_servers,

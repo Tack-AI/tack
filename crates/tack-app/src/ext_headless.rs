@@ -105,7 +105,8 @@ pub(crate) async fn run_ext_exec(
 }
 
 /// Headless host services: no terminal, no session owner. `mode` is the
-/// run-mode label ("print" | "rpc" | "acp") used in error messages.
+/// run-mode label ("print" | "rpc" | "acp" | "remote") used in error
+/// messages.
 pub struct HeadlessExtServices {
     mode: &'static str,
     /// Project trust: `exec/run` is only honored for trusted contexts.

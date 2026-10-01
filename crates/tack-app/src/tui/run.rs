@@ -910,6 +910,14 @@ impl TuiApp {
         let plan_permission_tx = self.permission_tx.clone();
         let provider = self.provider.clone();
         let auth = self.auth.clone();
+        // Publish the run's LLM for late-bound MCP sampling (plugin MCP
+        // servers resolve the shared cell per request).
+        self.sampling_llm.set(crate::mcp_config::SamplingLlm {
+            provider: provider.clone(),
+            model: model.clone(),
+            auth: auth.clone(),
+        });
+        let sampling_llm = self.sampling_llm.clone();
         let agent_dir = self.agent_dir.clone();
         let cwd = self.cwd.clone();
         let cancel = self.cancel.clone();
@@ -925,21 +933,10 @@ impl TuiApp {
                 let connections = if specs.is_empty() {
                     Vec::new()
                 } else {
-                    let event_tx = tx_work.clone();
-                    let usage_sink: crate::mcp_sampling::SamplingUsageSink = Arc::new(move |m| {
-                        let _ = event_tx.send(AppEvent::McpSamplingDone {
-                            usage: m.usage.clone(),
-                            model: m.model.clone(),
-                        });
-                    });
                     let callbacks = crate::mcp_config::client_callbacks(
                         &settings,
-                        Some(&crate::mcp_config::SamplingLlm {
-                            provider: provider.clone(),
-                            model: model.clone(),
-                            auth: auth.clone(),
-                        }),
-                        usage_sink,
+                        &sampling_llm,
+                        super::sampling_usage_sink(tx_work.clone()),
                         crate::mcp_elicitation::InteractionMode::Tui,
                         Some(tx_work.clone()),
                     );
