@@ -52,6 +52,7 @@ pub mod i18n;
 pub mod logs;
 #[cfg(feature = "ext")]
 pub mod marketplace_sync;
+pub mod mcp_cli;
 pub mod mcp_config;
 pub mod mcp_elicitation;
 pub mod mcp_oauth;

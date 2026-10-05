@@ -82,6 +82,13 @@ pub trait AgentTool: Send + Sync {
         true
     }
 
+    /// Whether this tool starts in the deferred `tool_search` pool instead
+    /// of the model's declarations (MCP `exposure: "deferred"`). The loop
+    /// activates pool tools via `AgentToolResult.added_tool_names`.
+    fn starts_deferred(&self) -> bool {
+        false
+    }
+
     /// Validate raw arguments. Default: validate against the JSON schema.
     fn validate_arguments(&self, args: &Value) -> Result<(), String> {
         let schema = self.parameters_schema();

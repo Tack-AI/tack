@@ -8,6 +8,42 @@ notice can parse entries (same convention as TS pi).
 
 ### Added
 
+- **MCP management CLI**: `tack mcp list` (connects every enabled server,
+  prints state/tools/errors, exits 1 when an entry is invalid or an
+  enabled server is not connected), `tack mcp add` / `tack mcp remove`
+  (user-level by default, `--local` for the project file; edits preserve
+  unrelated mcp.json content), `tack mcp login` / `tack mcp logout`
+  (interactive OAuth sign-in / token-cache removal) — session-free,
+  mirroring `pi mcp`.
+- **MCP config: `enabled`, `timeout`, `${VAR}` interpolation**: mcp.json
+  entries accept `"enabled": false` (listed as disabled, never connected),
+  `"timeout": <seconds>` per tool/resource/prompt request (default 60, `0`
+  disables; progress notifications reset the clock), and `${VAR}`
+  environment interpolation in `env`/`headers`/`oauth.clientSecret`
+  values. OAuth entries also accept `clientSecret`, `callbackPort` and
+  `callbackUrl` (loopback-validated) for pre-registered clients and fixed
+  redirect URIs.
+- **MCP connection resilience**: a tool call that finds its connection
+  closed reconnects (re-spawning stdio children / re-dialing HTTP) before
+  failing, and `tools|resources|prompts/list_changed` notifications
+  refresh the cached capability lists in place.
+- **MCP tool annotations reach the permission system**: server-declared
+  `readOnlyHint` classifies MCP tools as read-only for permission
+  auto-allow (a contradictory `destructiveHint` wins), and approval-chain
+  plugins receive all four hints as `mcpAnnotations` evidence.
+- **MCP `exposure` / `toolExposure` (search-based tool loading, pi-style)**:
+  mcp.json entries accept `"exposure": "deferred"` (tools are NOT declared
+  to the model; `tool_search` loads matches on demand — the big win when a
+  server offers hundreds of tools) and `"hidden"` (unreachable), plus
+  per-tool `toolExposure` overrides with exact names or `*` patterns
+  (exact wins, then longest/most-specific pattern). pi's `"codemode"`
+  values map to `"deferred"` (tack has no codemode tool). Deferred servers
+  are named in a "Deferred MCP tools" system-prompt section so the model
+  knows `tool_search` reaches them; activated tools stay declared on the
+  session branch via the existing transcript mechanism. Configuring any
+  `exposure` opts out of the `mcpDeferThreshold` blanket rule. `tack mcp
+  list` shows effective exposures.
+
 - **Plugin surfaces over the remote protocol**: `tack serve` now exposes
   plugin slash commands, declarative widgets, autocomplete providers,
   `ui/select`/`ui/confirm`/`ui/input` dialogs and MCP elicitation to

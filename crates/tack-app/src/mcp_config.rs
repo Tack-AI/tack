@@ -35,30 +35,112 @@ struct McpServerEntry {
     url: Option<String>,
     #[serde(default)]
     headers: BTreeMap<String, String>,
-    /// OAuth 2.1 for remote servers: {"clientId": "…", "scopes": ["…"]}.
+    /// OAuth 2.1 for remote servers: {"clientId": "…", "clientSecret": "…",
+    /// "scopes": ["…"], "callbackPort": 8765, "callbackUrl": "…"}.
     /// `true` means "authorize with dynamic registration on 401".
     #[serde(default)]
     oauth: Option<serde_json::Value>,
+    /// `false` keeps the entry without ever connecting to it.
+    #[serde(default)]
+    enabled: Option<bool>,
+    /// Per-request timeout in seconds (default 60; `0` disables). Progress
+    /// notifications reset the clock.
+    #[serde(default)]
+    timeout: Option<f64>,
+    /// How the server's tools reach the model: "direct" (default),
+    /// "deferred" (loaded on demand via tool_search), "hidden" (never).
+    /// pi's "codemode"/"codemode-deferred" map to "deferred".
+    #[serde(default)]
+    exposure: Option<String>,
+    /// Per-tool exposure overrides: exact server tool names or `*`
+    /// patterns → exposure. Exact names win; among patterns the longest
+    /// (most specific) wins.
+    #[serde(default, rename = "toolExposure")]
+    tool_exposure: std::collections::BTreeMap<String, String>,
 }
 
-fn parse_oauth(value: Option<serde_json::Value>) -> Option<tack_tools::mcp::McpOAuthConfig> {
+/// Expand `${VAR}` references against the process environment (mcp.json
+/// `env`/`headers`/`clientSecret` values — the interpolation syntax other
+/// MCP clients share). Undefined variables expand to empty with a warning:
+/// a literal `${VAR}` reaching the server would be a silent
+/// misconfiguration. An unterminated `${` stays literal.
+fn expand_env_vars(value: &str, name: &str, origin: &str) -> String {
+    if !value.contains("${") {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) if !after[..end].is_empty() => {
+                let var = &after[..end];
+                match std::env::var(var) {
+                    Ok(v) => out.push_str(&v),
+                    Err(_) => {
+                        tracing::warn!(
+                            "MCP server {name:?} in {origin}: environment variable {var:?} is not set; expanding to empty"
+                        );
+                    }
+                }
+                rest = &after[end + 1..];
+            }
+            // Unterminated or empty `${}`: keep the remainder literal.
+            _ => {
+                out.push_str(&rest[start..]);
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn parse_oauth(
+    value: Option<serde_json::Value>,
+    name: &str,
+    origin: &str,
+) -> Option<tack_tools::mcp::McpOAuthConfig> {
     match value {
         Some(serde_json::Value::Bool(true)) => Some(tack_tools::mcp::McpOAuthConfig::default()),
-        Some(serde_json::Value::Object(map)) => Some(tack_tools::mcp::McpOAuthConfig {
-            client_id: map
-                .get("clientId")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            scopes: map
-                .get("scopes")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default(),
-        }),
+        Some(serde_json::Value::Object(map)) => {
+            let callback_port = match map.get("callbackPort").and_then(|v| v.as_u64()) {
+                Some(port) if port <= u16::MAX as u64 => Some(port as u16),
+                Some(port) => {
+                    tracing::warn!(
+                        "MCP server {name:?} in {origin}: callbackPort {port} out of range; ignoring"
+                    );
+                    None
+                }
+                None => None,
+            };
+            Some(tack_tools::mcp::McpOAuthConfig {
+                client_id: map
+                    .get("clientId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                client_secret: map
+                    .get("clientSecret")
+                    .and_then(|v| v.as_str())
+                    .map(|s| expand_env_vars(s, name, origin)),
+                scopes: map
+                    .get("scopes")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                callback_port,
+                callback_url: map
+                    .get("callbackUrl")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            })
+        }
         _ => None,
     }
 }
@@ -116,29 +198,111 @@ pub fn spec_from_entry(
         }
     };
     let name = name.to_string();
-    let oauth = parse_oauth(entry.oauth);
+    let oauth = parse_oauth(entry.oauth, &name, origin);
+    let enabled = entry.enabled.unwrap_or(true);
+    let exposure = entry
+        .exposure
+        .as_deref()
+        .and_then(|e| parse_exposure(e, &name, origin));
+    let tool_exposure: Vec<(String, tack_tools::mcp::McpExposure)> = entry
+        .tool_exposure
+        .iter()
+        .filter_map(|(pattern, value)| {
+            parse_exposure(value, &name, origin).map(|e| (pattern.clone(), e))
+        })
+        .collect();
+    let timeout = match entry.timeout {
+        Some(secs) if secs < 0.0 => {
+            tracing::warn!("mcp.json entry {name:?} has a negative timeout; using the default");
+            None
+        }
+        // 0 disables the limit (spec encodes that as Duration::ZERO).
+        Some(secs) => Some(Some(std::time::Duration::from_secs_f64(secs))),
+        None => None,
+    };
     if let Some(url) = entry.url {
-        let headers: Vec<(String, String)> = entry.headers.into_iter().collect();
+        let headers: Vec<(String, String)> = entry
+            .headers
+            .into_iter()
+            .map(|(k, v)| (k, expand_env_vars(&v, &name, origin)))
+            .collect();
         let spec = if entry.transport_type.as_deref() == Some("sse") {
             McpServerSpec::sse(name, url, headers)
         } else {
             McpServerSpec::http(name, url, headers)
         };
-        Some(match oauth {
+        let spec = match oauth {
             Some(oauth) => spec.with_oauth(oauth),
             None => spec,
-        })
+        };
+        Some(apply_entry_flags(
+            spec,
+            enabled,
+            timeout,
+            exposure,
+            tool_exposure,
+        ))
     } else if let Some(command) = entry.command {
-        Some(McpServerSpec::stdio(
-            name,
-            command,
-            entry.args,
-            entry.env.into_iter().collect(),
-            None,
+        let env = entry
+            .env
+            .into_iter()
+            .map(|(k, v)| (k, expand_env_vars(&v, &name, origin)))
+            .collect();
+        Some(apply_entry_flags(
+            McpServerSpec::stdio(name, command, entry.args, env, None),
+            enabled,
+            timeout,
+            exposure,
+            tool_exposure,
         ))
     } else {
         tracing::warn!("mcp.json entry {name:?} has neither command nor url; skipped");
         None
+    }
+}
+
+/// Apply the transport-independent entry flags (`enabled`, `timeout`,
+/// `exposure`, `toolExposure`).
+fn apply_entry_flags(
+    spec: McpServerSpec,
+    enabled: bool,
+    timeout: Option<Option<std::time::Duration>>,
+    exposure: Option<tack_tools::mcp::McpExposure>,
+    tool_exposure: Vec<(String, tack_tools::mcp::McpExposure)>,
+) -> McpServerSpec {
+    let spec = spec.with_enabled(enabled);
+    let spec = match timeout {
+        Some(t) => spec.with_request_timeout(t),
+        None => spec,
+    };
+    let spec = match exposure {
+        Some(e) => spec.with_exposure(e),
+        None => spec,
+    };
+    if !tool_exposure.is_empty() {
+        return spec.with_tool_exposure(tool_exposure);
+    }
+    spec
+}
+
+/// Parse one exposure value (mcp.json `exposure` / `toolExposure` values).
+/// Unknown values warn and fall back to None (entry default: `direct`).
+fn parse_exposure(value: &str, name: &str, origin: &str) -> Option<tack_tools::mcp::McpExposure> {
+    match tack_tools::mcp::McpExposure::from_config(value) {
+        Some((exposure, codemode_alias)) => {
+            if codemode_alias {
+                tracing::warn!(
+                    "MCP server {name:?} in {origin}: exposure {value:?} needs the codemode tool, which tack does not have; using \"deferred\" (tools reachable via tool_search)"
+                );
+            }
+            Some(exposure)
+        }
+        None => {
+            tracing::warn!(
+                "MCP server {name:?} in {origin}: unknown exposure {value:?} (expected direct/deferred/hidden); using \"direct\""
+            );
+            None
+        }
     }
 }
 
@@ -307,6 +471,7 @@ pub fn specs_from_acp(servers: &[agent_client_protocol::McpServer]) -> Vec<McpSe
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    #![allow(unsafe_code)] // std::env::set_var in tests (unique var names)
     use super::*;
 
     #[test]
@@ -386,6 +551,148 @@ mod tests {
         let merged = merge_session_servers(configured, Vec::new());
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].name, "a");
+    }
+
+    #[test]
+    fn enabled_timeout_and_expansion_are_parsed() {
+        // Unique var name: env mutation is process-global, tests run in
+        // parallel.
+        unsafe { std::env::set_var("TACK_TEST_MCP_EXPANSION", "expanded!") };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mcp.json"),
+            r#"{
+  "mcpServers": {
+    "off": { "command": "npx", "enabled": false },
+    "slow": { "command": "npx", "timeout": 120 },
+    "unlimited": { "command": "npx", "timeout": 0 },
+    "expanded": { "type": "http", "url": "http://localhost:1/mcp",
+      "headers": { "authorization": "Bearer ${TACK_TEST_MCP_EXPANSION}" } }
+  }
+}"#,
+        )
+        .unwrap();
+        let specs = load_mcp_json(&dir.path().join("mcp.json"));
+        assert_eq!(specs.len(), 4);
+
+        let off = specs.iter().find(|s| s.name == "off").unwrap();
+        assert!(!off.enabled, "enabled: false must parse");
+        assert!(
+            specs.iter().all(|s| s.name == "off" || s.enabled),
+            "enabled defaults to true"
+        );
+
+        let slow = specs.iter().find(|s| s.name == "slow").unwrap();
+        assert_eq!(
+            slow.effective_request_timeout(),
+            Some(std::time::Duration::from_secs(120))
+        );
+        let unlimited = specs.iter().find(|s| s.name == "unlimited").unwrap();
+        assert_eq!(
+            unlimited.effective_request_timeout(),
+            None,
+            "timeout 0 disables the limit"
+        );
+        let default_timeout = specs.iter().find(|s| s.name == "off").unwrap();
+        assert_eq!(
+            default_timeout.effective_request_timeout(),
+            Some(tack_tools::mcp::DEFAULT_REQUEST_TIMEOUT),
+            "absent timeout uses the 60s default"
+        );
+
+        let expanded = specs.iter().find(|s| s.name == "expanded").unwrap();
+        let tack_tools::mcp::McpTransport::Http { headers, .. } = &expanded.transport else {
+            panic!("expected http transport");
+        };
+        assert_eq!(
+            headers[0].1, "Bearer expanded!",
+            "${{VAR}} expands against the process env"
+        );
+    }
+
+    #[test]
+    fn oauth_extended_fields_are_parsed() {
+        unsafe { std::env::set_var("TACK_TEST_MCP_SECRET", "s3cret") };
+        let value = serde_json::json!({
+            "mcpServers": {
+                "sentry": {
+                    "url": "https://mcp.sentry.dev/mcp",
+                    "oauth": {
+                        "clientId": "my-client",
+                        "clientSecret": "${TACK_TEST_MCP_SECRET}",
+                        "scopes": ["read", "write"],
+                        "callbackPort": 8765,
+                        "callbackUrl": "http://127.0.0.1:8765/callback"
+                    }
+                }
+            }
+        });
+        let specs = specs_from_value(&value, "test");
+        let oauth = specs[0].oauth.as_ref().expect("oauth config");
+        assert_eq!(oauth.client_id.as_deref(), Some("my-client"));
+        assert_eq!(
+            oauth.client_secret.as_deref(),
+            Some("s3cret"),
+            "clientSecret gets env expansion too"
+        );
+        assert_eq!(oauth.scopes, ["read", "write"]);
+        assert_eq!(oauth.callback_port, Some(8765));
+        assert_eq!(
+            oauth.callback_url.as_deref(),
+            Some("http://127.0.0.1:8765/callback")
+        );
+
+        // Out-of-range callbackPort is dropped, not wrapped.
+        let value = serde_json::json!({
+            "mcpServers": {
+                "bad": { "url": "https://x/mcp", "oauth": { "callbackPort": 70000 } }
+            }
+        });
+        let specs = specs_from_value(&value, "test");
+        assert_eq!(specs[0].oauth.as_ref().unwrap().callback_port, None);
+    }
+
+    #[test]
+    fn exposure_and_tool_exposure_are_parsed() {
+        let value = serde_json::json!({
+            "mcpServers": {
+                "github": {
+                    "url": "https://api.githubcopilot.com/mcp/",
+                    "exposure": "deferred",
+                    "toolExposure": {
+                        "search_code": "direct",
+                        "get_*": "deferred",
+                        "delete_*": "hidden"
+                    }
+                },
+                "off": { "command": "npx", "exposure": "hidden" },
+                "legacy": { "command": "npx", "exposure": "codemode" }
+            }
+        });
+        let specs = specs_from_value(&value, "test");
+        let github = specs.iter().find(|s| s.name == "github").unwrap();
+        assert_eq!(github.exposure, tack_tools::mcp::McpExposure::Deferred);
+        use tack_tools::mcp::McpExposure;
+        assert_eq!(
+            github.effective_exposure("search_code"),
+            McpExposure::Direct,
+            "exact toolExposure key wins over server exposure"
+        );
+        assert_eq!(github.effective_exposure("get_pr"), McpExposure::Deferred);
+        assert_eq!(
+            github.effective_exposure("delete_repo"),
+            McpExposure::Hidden
+        );
+        assert_eq!(github.effective_exposure("anything"), McpExposure::Deferred);
+
+        let off = specs.iter().find(|s| s.name == "off").unwrap();
+        assert_eq!(off.exposure, McpExposure::Hidden);
+        let legacy = specs.iter().find(|s| s.name == "legacy").unwrap();
+        assert_eq!(
+            legacy.exposure,
+            McpExposure::Deferred,
+            "pi's codemode maps to deferred"
+        );
     }
 
     /// MCP sampling is opt-in (`mcpSampling`, default off) for BOTH

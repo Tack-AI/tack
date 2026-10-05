@@ -990,6 +990,9 @@ impl TuiApp {
                     &selected,
                     &flags,
                 );
+                // Deferred MCP servers must be discoverable: name them and
+                // point at tool_search (pi's mcp_servers prompt section).
+                system_prompt.push_str(&crate::cli_flags::deferred_mcp_prompt_section(&tool_pool));
                 if in_plan_mode {
                     system_prompt.push_str(plan_mode::PLAN_MODE_PROMPT);
                 }

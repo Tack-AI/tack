@@ -295,11 +295,38 @@ Each server entry, besides `command`/`args`/`env` (stdio) or
 
 | Key | Notes |
 |---|---|
-| `oauth` | `true` or `{"clientId": "…", "scopes": ["…"]}` — OAuth 2.1 authorization for remote servers (PKCE + dynamic registration, tokens cached in `mcp-tokens.json` and auto-renewed) |
+| `enabled` | `false` keeps the entry listed (status surfaces show "disabled") but never connects to it. Default `true` |
+| `timeout` | Per-request timeout in seconds for tool/resource/prompt calls (default 60; `0` disables). Progress notifications reset the clock — a long call that streams progress is not stuck |
+| `exposure` | How the server's tools reach the model: `"direct"` (default — declared like built-ins), `"deferred"` (NOT declared; `tool_search` loads matches on demand, the system prompt's "Deferred MCP tools" section names these servers), `"hidden"` (registered nowhere). pi's `"codemode"`/`"codemode-deferred"` are accepted and map to `"deferred"` (tack has no codemode tool) |
+| `toolExposure` | Per-tool overrides of `exposure`: keys are exact server tool names or `*` patterns (e.g. `{"search_code": "direct", "delete_*": "hidden"}`). Exact names win; among patterns the longest (most specific) wins — a deliberate upgrade of pi's first-match rule (JSON object order is not preserved) |
+| `oauth` | `true` or an object — OAuth 2.1 authorization for remote servers (PKCE + dynamic registration, tokens cached in `mcp-tokens.json` and auto-renewed). Object keys: `clientId`, `clientSecret` (for pre-registered clients), `scopes` (array), `callbackPort` (fixed loopback port for providers with a fixed redirect URI), `callbackUrl` (full redirect URI override; must be plain HTTP on `localhost`/`127.0.0.1`/`[::1]`) |
+
+`env` and `headers` values (and `oauth.clientSecret`) interpolate
+`${VAR}` from the process environment — the syntax other MCP clients
+share; an unset variable expands to empty with a warning.
+
+Servers are managed from the shell without a session: `tack mcp list`
+(connects every enabled server, prints state/tools/errors, exits 1 when
+an entry is invalid or an enabled server is not connected), `tack mcp
+add <name> [--local] [--env K=V]... [--header K=V]... [--url URL
+[--transport sse] [--bearer-token-env-var VAR]] [-- command args...]`,
+`tack mcp remove <name> [--local]`, `tack mcp login <name>` (interactive
+OAuth) and `tack mcp logout <name>` (drops the cached token).
+
+Connection resilience: a tool call that finds its connection closed
+reconnects (re-spawning stdio children / re-dialing HTTP) before
+failing, and `tools|resources|prompts/list_changed` notifications
+refresh the cached capability lists in place. Server-declared tool
+annotations (`readOnlyHint` etc.) feed the permission system — a
+read-only MCP tool skips prompts like the built-in read tools (a
+contradictory `destructiveHint` wins) — and are passed to approval-chain
+plugins as evidence.
 
 settings.json also has `mcpDeferThreshold` (number, default 0=off): when the
 total tool count exceeds the threshold, MCP tools are lazily loaded and the
 agent activates them on demand via `tool_search` (see the features doc).
+Configuring `exposure` on ANY server opts out of that blanket rule so
+per-server choices stay predictable.
 
 Two more MCP switches in settings.json:
 
@@ -363,6 +390,7 @@ Subcommands:
 |---|---|
 | `tack acp` | ACP server (Zed and other editors) |
 | `tack rpc` | JSONL RPC (stdin commands / stdout events) |
+| `tack mcp list` / `tack mcp add` / `tack mcp remove` / `tack mcp login` / `tack mcp logout` | Session-free MCP server management (see MCP (mcp.json) above) |
 | `tack mcp-serve` | MCP server (exposes the agent to other MCP clients) |
 | `tack serve` | Remote session host (CBOR; `--listen`, `--auth-token`/`--auth-token-file`, `--tls`/`--tls-cert`/`--tls-key`, `--allow-no-auth`). `--tls` applies to both `tcp:` and `ws:` listeners (the latter becoming wss). `--allow-no-auth` allows starting a non-loopback listener without a token (dangerous: anyone who can reach the port can execute commands on your machine; not needed for loopback/unix listeners) |
 | `tack client` | Connect to serve (`--addr`, `--auth-token`, `--tls`/`--tls-ca`/`--tls-insecure`; `--addr ws:`/`wss:` uses WebSocket, `wss:` implies `--tls`) |

@@ -548,7 +548,7 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
         crate::cli_flags::split_for_tool_search(tools, settings.mcp_defer_threshold);
     let selected_tools: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
 
-    let system_prompt = assemble_system_prompt(
+    let mut system_prompt = assemble_system_prompt(
         &options.cwd,
         &agent_dir,
         &settings,
@@ -556,6 +556,8 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
         &selected_tools,
         flags,
     );
+    // Deferred MCP servers must be discoverable (see deferred_mcp_prompt_section).
+    system_prompt.push_str(&crate::cli_flags::deferred_mcp_prompt_section(&tool_pool));
 
     let existing = session.build_session_context().messages;
     // Transcript-declared tool state (upstream #9548): re-activate pool

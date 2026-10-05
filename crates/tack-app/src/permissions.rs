@@ -19,6 +19,11 @@ use serde_json::{Value, json};
 
 /// Tools that never need a prompt (read-only builtins). The `git` tool is
 /// classified by subcommand: only pure-read invocations are read-only.
+/// MCP tools (`mcp__*`) are classified by the SERVER-DECLARED
+/// `readOnlyHint` annotation (published to `tack_tools::mcp`'s registry
+/// when the tool set is built): a hint is honored only when the server
+/// did not also mark the tool destructive — contradictory hints resolve
+/// to the safe side.
 pub fn is_read_only_tool(name: &str, args: &Value) -> bool {
     match name {
         "read" | "grep" | "find" | "ls" => true,
@@ -37,6 +42,9 @@ pub fn is_read_only_tool(name: &str, args: &Value) -> bool {
             }
             false
         }
+        _ if name.starts_with("mcp__") => tack_tools::mcp::mcp_tool_annotations(name)
+            .map(|a| a.read_only && !a.destructive)
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -681,6 +689,52 @@ mod tests {
         assert!(wildcard_match("push --force*", "push\t--force origin main"));
         assert!(wildcard_match("git push *", "git  push   origin main"));
         assert!(!wildcard_match("push --force*", "push origin main"));
+    }
+
+    /// MCP read-only gating honors the server-declared `readOnlyHint`
+    /// (registry published when the tool set is built), but a
+    /// contradictory destructive hint resolves to the safe side.
+    #[test]
+    fn mcp_read_only_hint_gating() {
+        use tack_tools::mcp::{McpToolAnnotations, register_tool_annotations_for_test};
+        register_tool_annotations_for_test(
+            "mcp__t__search",
+            McpToolAnnotations {
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: true,
+            },
+        );
+        register_tool_annotations_for_test(
+            "mcp__t__confused",
+            McpToolAnnotations {
+                read_only: true,
+                destructive: true,
+                idempotent: false,
+                open_world: true,
+            },
+        );
+        register_tool_annotations_for_test(
+            "mcp__t__write",
+            McpToolAnnotations {
+                read_only: false,
+                destructive: true,
+                idempotent: false,
+                open_world: true,
+            },
+        );
+        let args = serde_json::json!({});
+        assert!(is_read_only_tool("mcp__t__search", &args));
+        assert!(
+            !is_read_only_tool("mcp__t__confused", &args),
+            "readOnly+destructive is contradictory: not read-only"
+        );
+        assert!(!is_read_only_tool("mcp__t__write", &args));
+        assert!(
+            !is_read_only_tool("mcp__t__unknown", &args),
+            "unregistered MCP tools are not read-only"
+        );
     }
 
     #[test]

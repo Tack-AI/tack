@@ -173,6 +173,11 @@ enum Command {
     Rpc,
     /// Expose the agent as an MCP server over stdio (callable by other agents/IDEs)
     McpServe,
+    /// Manage MCP servers without a session (list/add/remove/login/logout)
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
     /// Self-check the environment (shell, LSP servers, sandbox, browser, credentials, MCP)
     Doctor {
         /// Machine-readable JSON output
@@ -340,6 +345,61 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum McpCommand {
+    /// List configured MCP servers with connection status and tools
+    /// (exits non-zero when an entry is invalid or an enabled server is
+    /// not connected)
+    List,
+    /// Add an MCP server to the user-level (~/.tack/agent/mcp.json) or,
+    /// with --local, the project (.pi/mcp.json) configuration.
+    /// Examples:
+    ///   tack mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem .
+    ///   tack mcp add docs --url <https://example.com/mcp> --bearer-token-env-var DOCS_TOKEN
+    Add {
+        /// Server name (letters, digits, '_' and '-')
+        name: String,
+        /// Write the project configuration (.pi/mcp.json) instead of the
+        /// user-level one
+        #[arg(short = 'l', long)]
+        local: bool,
+        /// Remote server URL (streamable HTTP; --transport sse for legacy
+        /// SSE servers)
+        #[arg(long)]
+        url: Option<String>,
+        /// Transport for --url: http (default) or sse
+        #[arg(long, value_parser = ["http", "streamable-http", "sse"])]
+        transport: Option<String>,
+        /// Environment variable for a stdio server: KEY=VALUE (repeatable;
+        /// values may use ${VAR})
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// HTTP header for a remote server: KEY=VALUE (repeatable; values
+        /// may use ${VAR})
+        #[arg(long = "header", value_name = "KEY=VALUE")]
+        headers: Vec<String>,
+        /// Send "Authorization: Bearer ${VAR}" read from this environment
+        /// variable
+        #[arg(long, value_name = "VAR")]
+        bearer_token_env_var: Option<String>,
+        /// Stdio server command and arguments (after --)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Remove an MCP server from the configuration
+    Remove {
+        name: String,
+        /// Remove from the project configuration (.pi/mcp.json)
+        #[arg(short = 'l', long)]
+        local: bool,
+    },
+    /// Sign in to an OAuth-protected remote MCP server (browser flow with
+    /// manual-paste fallback)
+    Login { name: String },
+    /// Sign out of a remote MCP server (delete the cached OAuth token)
+    Logout { name: String },
 }
 
 #[derive(Subcommand)]
@@ -609,6 +669,9 @@ async fn async_main() -> Result<()> {
         }
         Some(Command::McpServe) => {
             return close_codebuddy_after(cmd_mcp_serve(&cli)).await;
+        }
+        Some(Command::Mcp { command }) => {
+            return cmd_mcp(command).await;
         }
         Some(Command::Doctor { json, bundle }) => {
             let code = if let Some(path) = bundle {
@@ -915,6 +978,42 @@ async fn run_rpc(cli: &Cli) -> Result<()> {
 async fn cmd_mcp_serve(cli: &Cli) -> Result<()> {
     let SubcommandContext { model, auth, .. } = subcommand_context(cli)?;
     tack_app::mcp_serve::run(model, auth).await
+}
+
+/// `tack mcp …`: session-free MCP server management (mirrors `pi mcp`).
+async fn cmd_mcp(command: &McpCommand) -> Result<()> {
+    let agent_dir = tack_session::default_agent_dir();
+    let cwd = std::env::current_dir()?;
+    match command {
+        McpCommand::List => tack_app::mcp_cli::list(&cwd, &agent_dir).await,
+        McpCommand::Add {
+            name,
+            local,
+            url,
+            transport,
+            env,
+            headers,
+            bearer_token_env_var,
+            command,
+        } => {
+            let args = tack_app::mcp_cli::AddArgs {
+                name: name.clone(),
+                local: *local,
+                url: url.clone(),
+                transport: transport.clone(),
+                env: env.clone(),
+                headers: headers.clone(),
+                bearer_token_env_var: bearer_token_env_var.clone(),
+                command: command.clone(),
+            };
+            tack_app::mcp_cli::add(&args, &cwd, &agent_dir)
+        }
+        McpCommand::Remove { name, local } => {
+            tack_app::mcp_cli::remove(name, *local, &cwd, &agent_dir)
+        }
+        McpCommand::Login { name } => tack_app::mcp_cli::login(name, &cwd, &agent_dir).await,
+        McpCommand::Logout { name } => tack_app::mcp_cli::logout(name, &agent_dir),
+    }
 }
 
 /// `tack eval`: run eval tasks headlessly and score pass rates.

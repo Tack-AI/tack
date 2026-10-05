@@ -6,9 +6,17 @@
 //! Scope: stdio + Streamable HTTP + legacy SSE (2024-11-05, via the hand-rolled
 //! transport in `mcp_sse`) transports, tool proxying, resources (list/read
 //! meta-tools), prompts (exposed as tools).
+//!
+//! Resilience: connections heal themselves — a tool call that finds its
+//! connection closed reconnects (re-spawn/re-dial) before failing, per-server
+//! request timeouts reset while the server reports progress, and
+//! `tools|resources|prompts/list_changed` notifications refresh the cached
+//! capability lists in place.
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use rmcp::RoleClient;
@@ -23,17 +31,28 @@ use rmcp::model::{
     ElicitResult, Prompt, ReadResourceRequestParams, Resource, ResourceTemplate,
     Tool as McpToolInfo,
 };
-use rmcp::service::{Peer, RequestContext, RunningService};
+use rmcp::service::{NotificationContext, Peer, RequestContext, RunningService};
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 /// OAuth 2.1 config for a remote server (mcp.json `"oauth": {clientId,
-/// scopes}`; both optional — dynamic registration fills the rest).
+/// clientSecret, scopes, callbackPort, callbackUrl}` — everything optional;
+/// dynamic registration + an ephemeral loopback callback fill the rest).
 #[derive(Clone, Debug, Default)]
 pub struct McpOAuthConfig {
     pub client_id: Option<String>,
+    /// Confidential-client secret (registered clients that do not support
+    /// dynamic registration). Env-var expansion (`${VAR}`) happens at
+    /// config-parse time, never here.
+    pub client_secret: Option<String>,
     pub scopes: Vec<String>,
+    /// Fixed loopback callback port (`http://127.0.0.1:<port>/callback`) for
+    /// providers whose registered redirect URI is fixed. Default: ephemeral.
+    pub callback_port: Option<u16>,
+    /// Full redirect URI override; must be HTTP on a loopback host
+    /// (`localhost`, `127.0.0.1`, `[::1]`) — validated at flow start.
+    pub callback_url: Option<String>,
 }
 
 /// How to reach an MCP server.
@@ -47,6 +66,93 @@ pub struct McpServerSpec {
     /// [`Self::with_credential_stripping`]). Off by default:
     /// user-configured servers keep the host's full environment.
     pub strip_credentials: bool,
+    /// `enabled: false` keeps the entry in config/status surfaces but never
+    /// connects (mcp.json `enabled`). On by default.
+    pub enabled: bool,
+    /// Per-request timeout for tool/resource/prompt calls. `None` → the
+    /// default (60 s); `Some(Duration::ZERO)` disables the limit. Progress
+    /// notifications reset the clock (see [`Self::effective_request_timeout`]).
+    pub request_timeout: Option<Duration>,
+    /// How the server's tools reach the model (mcp.json `exposure`).
+    pub exposure: McpExposure,
+    /// Per-tool exposure overrides (mcp.json `toolExposure`): exact server
+    /// tool names or `*` patterns. Exact names win over patterns; among
+    /// patterns the LONGEST (most specific) wins — serde_json drops file
+    /// order, so pi's first-match rule is upgraded to a deterministic
+    /// specificity rule.
+    pub tool_exposure: Vec<(String, McpExposure)>,
+}
+
+/// Default per-request timeout when the spec does not set one (matches TS
+/// pi's 60 s). `"timeout": 0` in mcp.json disables the limit.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How a server's tools reach the model (mcp.json `exposure`; TS pi calls
+/// the middle tier `deferred`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum McpExposure {
+    /// Declared to the model like a built-in tool (tack's behavior so far).
+    #[default]
+    Direct,
+    /// Not declared until `tool_search` loads a match; the tool then stays
+    /// declared on that session branch (transcript-recorded).
+    Deferred,
+    /// Registered nowhere — unreachable.
+    Hidden,
+}
+
+impl McpExposure {
+    /// Parse an mcp.json exposure value. pi's `codemode` /
+    /// `codemode-deferred` map to `Deferred` (tack has no codemode tool;
+    /// tool_search is the closest indirect reach) with a warning from the
+    /// caller.
+    pub fn from_config(value: &str) -> Option<(Self, bool)> {
+        match value {
+            "direct" => Some((McpExposure::Direct, false)),
+            "deferred" => Some((McpExposure::Deferred, false)),
+            "hidden" => Some((McpExposure::Hidden, false)),
+            "codemode" | "codemode-deferred" => Some((McpExposure::Deferred, true)),
+            _ => None,
+        }
+    }
+}
+
+/// `*` glob for `toolExposure` patterns: `*` matches any character run
+/// (including empty); every other character matches literally.
+pub fn star_match(pattern: &str, name: &str) -> bool {
+    if !pattern.contains('*') {
+        // A pattern without `*` is an exact match (the first/last anchor
+        // branches alone would accept it as a prefix).
+        return pattern == name;
+    }
+    let segments: Vec<&str> = pattern.split('*').collect();
+    let mut rest = name;
+    for (index, segment) in segments.iter().enumerate() {
+        if segment.is_empty() {
+            continue;
+        }
+        let first = index == 0;
+        let last = index == segments.len() - 1;
+        if first && !pattern.starts_with('*') {
+            let Some(stripped) = rest.strip_prefix(segment) else {
+                return false;
+            };
+            rest = stripped;
+        } else if last && !pattern.ends_with('*') {
+            let Some(pos) = rest.rfind(segment) else {
+                return false;
+            };
+            if pos + segment.len() != rest.len() {
+                return false;
+            }
+        } else {
+            let Some(pos) = rest.find(segment) else {
+                return false;
+            };
+            rest = &rest[pos + segment.len()..];
+        }
+    }
+    true
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +193,10 @@ impl McpServerSpec {
             },
             oauth: None,
             strip_credentials: false,
+            enabled: true,
+            request_timeout: None,
+            exposure: McpExposure::default(),
+            tool_exposure: Vec::new(),
         }
     }
 
@@ -96,6 +206,10 @@ impl McpServerSpec {
             transport: McpTransport::Http { url, headers },
             oauth: None,
             strip_credentials: false,
+            enabled: true,
+            request_timeout: None,
+            exposure: McpExposure::default(),
+            tool_exposure: Vec::new(),
         }
     }
 
@@ -105,6 +219,10 @@ impl McpServerSpec {
             transport: McpTransport::Sse { url, headers },
             oauth: None,
             strip_credentials: false,
+            enabled: true,
+            request_timeout: None,
+            exposure: McpExposure::default(),
+            tool_exposure: Vec::new(),
         }
     }
 
@@ -124,6 +242,62 @@ impl McpServerSpec {
     pub fn with_credential_stripping(mut self) -> Self {
         self.strip_credentials = true;
         self
+    }
+
+    /// Opt out of connecting (`mcp.json `"enabled": false`): the entry
+    /// stays visible in config/status surfaces but is skipped at connect.
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Override the per-request timeout (mcp.json `timeout`, seconds).
+    /// `Some(Duration::ZERO)` disables the limit; `None` restores the
+    /// default (60 s).
+    pub fn with_request_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    /// Effective per-request timeout: the spec default (60 s) unless
+    /// overridden; `Some(0)` in config means no limit.
+    pub fn effective_request_timeout(&self) -> Option<Duration> {
+        match self.request_timeout {
+            None => Some(DEFAULT_REQUEST_TIMEOUT),
+            Some(d) if d.is_zero() => None,
+            Some(d) => Some(d),
+        }
+    }
+
+    /// Set the server-level tool exposure (mcp.json `exposure`).
+    pub fn with_exposure(mut self, exposure: McpExposure) -> Self {
+        self.exposure = exposure;
+        self
+    }
+
+    /// Set per-tool exposure overrides (mcp.json `toolExposure`).
+    pub fn with_tool_exposure(mut self, entries: Vec<(String, McpExposure)>) -> Self {
+        self.tool_exposure = entries;
+        self
+    }
+
+    /// Effective exposure for one SERVER tool name: exact `toolExposure`
+    /// keys win over `*` patterns; among patterns the longest (most
+    /// specific) wins; otherwise the server-level `exposure`.
+    pub fn effective_exposure(&self, server_tool_name: &str) -> McpExposure {
+        let mut best: Option<(usize, McpExposure)> = None;
+        for (pattern, exposure) in &self.tool_exposure {
+            if pattern == server_tool_name {
+                return *exposure;
+            }
+            if pattern.contains('*') && star_match(pattern, server_tool_name) {
+                let specificity = pattern.len();
+                if best.is_none_or(|(len, _)| specificity > len) {
+                    best = Some((specificity, *exposure));
+                }
+            }
+        }
+        best.map(|(_, exposure)| exposure).unwrap_or(self.exposure)
     }
 
     /// Extra headers merged in at connect time (e.g. a cached OAuth token).
@@ -203,20 +377,139 @@ impl McpClientCallbacks {
     }
 }
 
+/// Discovered server capabilities, refreshed in place when the server
+/// announces a `list_changed` notification.
+#[derive(Debug, Default)]
+struct DiscoveredLists {
+    tools: Vec<McpToolInfo>,
+    resources: Vec<Resource>,
+    resource_templates: Vec<ResourceTemplate>,
+    prompts: Vec<Prompt>,
+}
+
+/// State shared between the client handler (server-initiated requests AND
+/// notifications) and the [`McpConnection`] that owns the session. The
+/// handler is created before the transport handshake, so the peer arrives
+/// late via [`HandlerShared::peer`].
+#[derive(Debug)]
+struct HandlerShared {
+    server_name: String,
+    /// Set once `initialize` completes; list-refresh tasks use it to
+    /// re-query the server after a `list_changed` notification.
+    peer: std::sync::OnceLock<Peer<RoleClient>>,
+    lists: std::sync::RwLock<DiscoveredLists>,
+    /// Bumped on every progress notification: request timeouts reset while
+    /// progress flows (a long call that reports progress is not stuck).
+    progress: AtomicU64,
+    /// Bumped whenever a `list_changed` refresh lands, so status surfaces
+    /// notice a changed tool set under a cached connection.
+    generation: AtomicU64,
+}
+
+impl HandlerShared {
+    fn new(server_name: String) -> Self {
+        HandlerShared {
+            server_name,
+            peer: std::sync::OnceLock::new(),
+            lists: std::sync::RwLock::new(DiscoveredLists::default()),
+            progress: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    fn lists_read(&self) -> std::sync::RwLockReadGuard<'_, DiscoveredLists> {
+        self.lists.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lists_write(&self) -> std::sync::RwLockWriteGuard<'_, DiscoveredLists> {
+        self.lists.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Re-query one capability list after a `list_changed` notification.
+    /// Runs in a spawned task: the notification path must not block on a
+    /// request round-trip with the same session.
+    fn refresh(self: &Arc<Self>, kind: ListKind) {
+        let Some(peer) = self.peer.get().cloned() else {
+            return;
+        };
+        let shared = self.clone();
+        tokio::spawn(async move {
+            let result = match kind {
+                ListKind::Tools => peer.list_all_tools().await.map(|tools| {
+                    shared.lists_write().tools = tools;
+                }),
+                ListKind::Resources => {
+                    let resources = peer.list_all_resources().await;
+                    let templates = peer.list_all_resource_templates().await;
+                    match (resources, templates) {
+                        (Ok(resources), Ok(templates)) => {
+                            let mut lists = shared.lists_write();
+                            lists.resources = resources;
+                            lists.resource_templates = templates;
+                            Ok(())
+                        }
+                        (Err(e), _) | (_, Err(e)) => Err(e),
+                    }
+                }
+                ListKind::Prompts => peer.list_all_prompts().await.map(|prompts| {
+                    shared.lists_write().prompts = prompts;
+                }),
+            };
+            match result {
+                Ok(()) => {
+                    shared.generation.fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(
+                        "MCP {}: {:?} list changed; refreshed",
+                        shared.server_name,
+                        kind
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    "MCP {}: {:?} refresh after list_changed failed: {e}",
+                    shared.server_name,
+                    kind
+                ),
+            }
+        });
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ListKind {
+    Tools,
+    Resources,
+    Prompts,
+}
+
 /// rmcp `ClientHandler` bridging server-initiated requests to the configured
-/// callbacks. Also used (with empty callbacks) for plain connections so
-/// `McpConnection` has one concrete service type.
+/// callbacks and `list_changed`/progress notifications to the shared
+/// connection state. Also used (with empty callbacks) for plain connections
+/// so `McpConnection` has one concrete service type.
 #[derive(Clone, Debug)]
 pub struct TackClientHandler {
     server_name: String,
     callbacks: McpClientCallbacks,
+    shared: Arc<HandlerShared>,
 }
 
 impl TackClientHandler {
     pub fn new(server_name: String, callbacks: McpClientCallbacks) -> Self {
         TackClientHandler {
+            shared: Arc::new(HandlerShared::new(server_name.clone())),
             server_name,
             callbacks,
+        }
+    }
+
+    fn with_shared(
+        server_name: String,
+        callbacks: McpClientCallbacks,
+        shared: Arc<HandlerShared>,
+    ) -> Self {
+        TackClientHandler {
+            server_name,
+            callbacks,
+            shared,
         }
     }
 }
@@ -255,6 +548,43 @@ impl rmcp::ClientHandler for TackClientHandler {
             .map_err(|e| McpError::internal_error(e, None))
     }
 
+    async fn on_progress(
+        &self,
+        _params: rmcp::model::ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        self.shared.progress.fetch_add(1, Ordering::Relaxed);
+    }
+
+    async fn on_logging_message(
+        &self,
+        params: rmcp::model::LoggingMessageNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        // Server log notifications go to the session trace (there is no
+        // mcp.log file like TS pi's); the target makes them filterable.
+        tracing::info!(
+            target: "mcp_server_log",
+            server = self.server_name.as_str(),
+            level = ?params.level,
+            logger = params.logger.as_deref().unwrap_or(""),
+            "{}",
+            params.data
+        );
+    }
+
+    async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        self.shared.refresh(ListKind::Tools);
+    }
+
+    async fn on_resource_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        self.shared.refresh(ListKind::Resources);
+    }
+
+    async fn on_prompt_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        self.shared.refresh(ListKind::Prompts);
+    }
+
     fn get_info(&self) -> rmcp::model::ClientInfo {
         let mut info = rmcp::model::ClientInfo::default();
         if self.callbacks.sampling.is_some() {
@@ -270,44 +600,159 @@ impl rmcp::ClientHandler for TackClientHandler {
     }
 }
 
+/// The swappable live parts of a connection: replaced wholesale on
+/// reconnect (new process/session, new capability lists).
+struct ConnParts {
+    service: RunningService<RoleClient, TackClientHandler>,
+    shared: Arc<HandlerShared>,
+}
+
+/// Rebuilds a connection from scratch (re-spawn the child / re-dial the
+/// HTTP session) — the reconnect path. `None` for in-memory test
+/// transports, which cannot reconnect.
+#[doc(hidden)]
+pub type McpConnector = Arc<
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<McpConnection, String>> + Send>,
+        > + Send
+        + Sync,
+>;
+
 /// A live MCP server connection plus its discovered capabilities.
+///
+/// Self-healing: [`McpConnection::ensure_connected`] reconnects a closed
+/// session before the next call (re-spawning stdio children), and
+/// `list_changed` notifications refresh the capability lists in place —
+/// both invisible to holders of the `Arc`.
 pub struct McpConnection {
     pub name: String,
-    service: RunningService<RoleClient, TackClientHandler>,
-    pub tools: Vec<McpToolInfo>,
-    pub resources: Vec<Resource>,
-    pub resource_templates: Vec<ResourceTemplate>,
-    pub prompts: Vec<Prompt>,
+    /// The spec this connection was built from (with any connect-time
+    /// headers, e.g. OAuth bearer tokens, already merged). Drives
+    /// reconnects.
+    spec: Option<McpServerSpec>,
+    /// Resolved per-request timeout (from the spec, the 60 s default, or a
+    /// test override); `None` = no limit.
+    request_timeout: Option<Duration>,
+    parts: std::sync::RwLock<ConnParts>,
+    reconnect_lock: tokio::sync::Mutex<()>,
+    connector: Option<McpConnector>,
 }
 
 impl std::fmt::Debug for McpConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let shared = self.shared();
+        let lists = shared.lists_read();
         f.debug_struct("McpConnection")
             .field("name", &self.name)
-            .field("tools", &self.tools.len())
+            .field("tools", &lists.tools.len())
             .field(
                 "resources",
-                &(self.resources.len() + self.resource_templates.len()),
+                &(lists.resources.len() + lists.resource_templates.len()),
             )
-            .field("prompts", &self.prompts.len())
+            .field("prompts", &lists.prompts.len())
             .finish()
     }
 }
 
 impl McpConnection {
-    pub fn peer(&self) -> &Peer<RoleClient> {
-        self.service.peer()
+    fn new(
+        name: String,
+        spec: Option<McpServerSpec>,
+        service: RunningService<RoleClient, TackClientHandler>,
+        shared: Arc<HandlerShared>,
+        connector: Option<McpConnector>,
+    ) -> Self {
+        let request_timeout = spec
+            .as_ref()
+            .map(McpServerSpec::effective_request_timeout)
+            .unwrap_or(Some(DEFAULT_REQUEST_TIMEOUT));
+        McpConnection {
+            name,
+            spec,
+            request_timeout,
+            parts: std::sync::RwLock::new(ConnParts { service, shared }),
+            reconnect_lock: tokio::sync::Mutex::new(()),
+            connector,
+        }
+    }
+
+    fn parts_read(&self) -> std::sync::RwLockReadGuard<'_, ConnParts> {
+        self.parts.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn parts_write(&self) -> std::sync::RwLockWriteGuard<'_, ConnParts> {
+        self.parts.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn shared(&self) -> Arc<HandlerShared> {
+        self.parts_read().shared.clone()
+    }
+
+    /// Current session peer. Cloned per call so a reconnect swap never
+    /// leaves a tool holding a stale session.
+    pub fn peer(&self) -> Peer<RoleClient> {
+        self.parts_read().service.peer().clone()
+    }
+
+    /// The spec this connection was built from (connect-time headers
+    /// included), when reconnectable.
+    pub fn spec(&self) -> Option<&McpServerSpec> {
+        self.spec.as_ref()
+    }
+
+    pub fn tools(&self) -> Vec<McpToolInfo> {
+        self.shared().lists_read().tools.clone()
+    }
+
+    pub fn resources(&self) -> Vec<Resource> {
+        self.shared().lists_read().resources.clone()
+    }
+
+    pub fn resource_templates(&self) -> Vec<ResourceTemplate> {
+        self.shared().lists_read().resource_templates.clone()
+    }
+
+    pub fn prompts(&self) -> Vec<Prompt> {
+        self.shared().lists_read().prompts.clone()
+    }
+
+    /// Generation counter bumped on every `list_changed` refresh — status
+    /// surfaces can cheaply notice a tool set changing under a cached pool.
+    pub fn generation(&self) -> u64 {
+        self.shared().generation.load(Ordering::Relaxed)
+    }
+
+    /// Current progress-notification count: bumped by the client handler
+    /// on every progress notification; request timeouts reset while it moves.
+    fn progress_value(&self) -> u64 {
+        self.shared().progress.load(Ordering::Relaxed)
+    }
+
+    /// Per-request timeout (spec default 60 s; `Some(0)` = no limit).
+    pub fn request_timeout(&self) -> Option<Duration> {
+        self.request_timeout
+    }
+
+    /// Override the request timeout (test seam; production timeouts come
+    /// from the spec's mcp.json `timeout`).
+    #[doc(hidden)]
+    pub fn with_request_timeout_override(mut self, timeout: Option<Duration>) -> Self {
+        self.request_timeout = timeout;
+        self
     }
 
     /// True when the underlying service/transport is gone (server child
-    /// died, transport closed or cancelled) — a pooled connection in this
-    /// state must be rebuilt, not reused.
+    /// died, transport closed or cancelled). A call on a closed connection
+    /// first tries [`McpConnection::ensure_connected`].
     pub fn is_closed(&self) -> bool {
-        self.service.is_closed() || self.peer().is_transport_closed()
+        let parts = self.parts_read();
+        parts.service.is_closed() || parts.service.peer().is_transport_closed()
     }
 
     pub fn has_resources(&self) -> bool {
-        !self.resources.is_empty() || !self.resource_templates.is_empty()
+        let shared = self.shared();
+        let lists = shared.lists_read();
+        !lists.resources.is_empty() || !lists.resource_templates.is_empty()
     }
 
     /// Cancel the service (server child killed / HTTP session closed).
@@ -315,7 +760,41 @@ impl McpConnection {
     /// Dropping the last `Arc<McpConnection>` cancels too — this is the
     /// explicit, prompt version for plugin shutdown.
     pub fn cancel(&self) {
-        self.service.cancellation_token().cancel();
+        self.parts_read().service.cancellation_token().cancel();
+    }
+
+    /// Reconnect a closed session before the next call: re-runs the
+    /// original connect (re-spawn/re-dial + handshake + capability probe)
+    /// and swaps the live parts. Concurrent callers serialize; the second
+    /// one finds a healthy connection and returns immediately. No-op when
+    /// the connection is still alive.
+    pub async fn ensure_connected(&self) -> Result<(), String> {
+        if !self.is_closed() {
+            return Ok(());
+        }
+        let _guard = self.reconnect_lock.lock().await;
+        if !self.is_closed() {
+            // A concurrent caller already healed the connection.
+            return Ok(());
+        }
+        let Some(connector) = &self.connector else {
+            return Err(format!(
+                "MCP {}: connection lost (this transport cannot reconnect)",
+                self.name
+            ));
+        };
+        tracing::info!("MCP {}: connection closed; reconnecting", self.name);
+        let fresh = connector().await?;
+        let fresh_parts = fresh.into_parts();
+        let old = std::mem::replace(&mut *self.parts_write(), fresh_parts);
+        // Reap the half-dead child/session explicitly instead of relying
+        // on drop order.
+        old.service.cancellation_token().cancel();
+        Ok(())
+    }
+
+    fn into_parts(self) -> ConnParts {
+        self.parts.into_inner().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -369,13 +848,40 @@ fn strip_credential_env(
 }
 
 /// `connect` with client-side callbacks for server-initiated requests
-/// (sampling / elicitation).
+/// (sampling / elicitation). The returned connection is reconnectable:
+/// [`McpConnection::ensure_connected`] re-runs this exact connect when the
+/// session dies.
 pub async fn connect_with(
     spec: &McpServerSpec,
     callbacks: McpClientCallbacks,
 ) -> Result<McpConnection, String> {
+    let spec_for_reconnect = spec.clone();
+    let callbacks_for_reconnect = callbacks.clone();
+    let connector: McpConnector = Arc::new(move || {
+        reconnect_boxed(spec_for_reconnect.clone(), callbacks_for_reconnect.clone())
+    });
+    connect_spec_transport(spec, callbacks, Some(connector)).await
+}
+
+/// Boxed re-connect behind the reconnect connector. The concrete `Send`
+/// return type breaks the auto-trait inference cycle: `connect_with`'s
+/// future holds the connector across awaits, so an async block INSIDE the
+/// closure would make the future's Send-ness depend on itself.
+fn reconnect_boxed(
+    spec: McpServerSpec,
+    callbacks: McpClientCallbacks,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<McpConnection, String>> + Send>> {
+    Box::pin(async move { connect_with(&spec, callbacks).await })
+}
+
+async fn connect_spec_transport(
+    spec: &McpServerSpec,
+    callbacks: McpClientCallbacks,
+    connector: Option<McpConnector>,
+) -> Result<McpConnection, String> {
     use rmcp::ServiceExt;
-    let handler = TackClientHandler::new(spec.name.clone(), callbacks);
+    let shared = Arc::new(HandlerShared::new(spec.name.clone()));
+    let handler = TackClientHandler::with_shared(spec.name.clone(), callbacks, shared.clone());
     let service = match &spec.transport {
         McpTransport::Stdio {
             command,
@@ -449,12 +955,14 @@ pub async fn connect_with(
                 .map_err(|e| format!("MCP initialize failed for {} (SSE): {e}", spec.name))?
         }
     };
-    finish_connection(spec.name.clone(), service).await
+    finish_connection(Some(spec.clone()), service, shared, connector).await
 }
 
 /// Test seam (also used by tack-app's plugin tests): connect over an
 /// arbitrary in-memory transport instead of spawning a child or dialing
 /// HTTP — a fixture server answers on the other end of the duplex.
+/// In-memory transports cannot reconnect (`ensure_connected` reports the
+/// connection as unrecoverable once the stream dies).
 #[doc(hidden)]
 pub async fn connect_transport<S>(
     name: &str,
@@ -464,22 +972,46 @@ pub async fn connect_transport<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
 {
+    connect_transport_with(name, stream, callbacks, None).await
+}
+
+/// [`connect_transport`] with a reconnect connector (test-only: the
+/// connector re-establishes a fresh transport + fixture server).
+#[doc(hidden)]
+pub async fn connect_transport_with<S>(
+    name: &str,
+    stream: S,
+    callbacks: McpClientCallbacks,
+    connector: Option<McpConnector>,
+) -> Result<McpConnection, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+{
     use rmcp::ServiceExt;
-    let handler = TackClientHandler::new(name.to_string(), callbacks);
+    let shared = Arc::new(HandlerShared::new(name.to_string()));
+    let handler = TackClientHandler::with_shared(name.to_string(), callbacks, shared.clone());
     let service = handler
         .serve(stream)
         .await
         .map_err(|e| format!("MCP initialize failed for {name}: {e}"))?;
-    finish_connection(name.to_string(), service).await
+    finish_connection(None, service, shared, connector).await
 }
 
-/// Shared post-handshake tail of `connect_with` / `connect_transport`:
-/// probe the server's tools/resources/prompts (unsupported capability
-/// probes degrade to empty lists).
+/// Shared post-handshake tail of the connect paths: publish the peer (so
+/// `list_changed` refreshes can fire), probe the server's
+/// tools/resources/prompts (unsupported capability probes degrade to empty
+/// lists), and assemble the connection.
 async fn finish_connection(
-    name: String,
+    spec: Option<McpServerSpec>,
     service: RunningService<RoleClient, TackClientHandler>,
+    shared: Arc<HandlerShared>,
+    connector: Option<McpConnector>,
 ) -> Result<McpConnection, String> {
+    let name = spec
+        .as_ref()
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| shared.server_name.clone());
+    let _ = shared.peer.set(service.peer().clone());
     let tools = service
         .list_all_tools()
         .await
@@ -494,14 +1026,13 @@ async fn finish_connection(
         .unwrap_or_default();
     let prompts = service.list_all_prompts().await.unwrap_or_default();
 
-    Ok(McpConnection {
-        name,
-        service,
+    *shared.lists_write() = DiscoveredLists {
         tools,
         resources,
         resource_templates,
         prompts,
-    })
+    };
+    Ok(McpConnection::new(name, spec, service, shared, connector))
 }
 
 /// Connect to several servers concurrently; failures are logged and skipped
@@ -511,12 +1042,20 @@ pub async fn connect_all(specs: Vec<McpServerSpec>) -> Vec<Arc<McpConnection>> {
 }
 
 /// `connect_all` with client-side callbacks applied to every server.
+/// Disabled specs (`enabled: false`) are skipped up front — they stay in
+/// config/status surfaces but never spawn processes.
 pub async fn connect_all_with(
     specs: Vec<McpServerSpec>,
     callbacks: McpClientCallbacks,
 ) -> Vec<Arc<McpConnection>> {
     let tasks: Vec<_> = specs
         .into_iter()
+        .filter(|spec| {
+            if !spec.enabled {
+                tracing::info!("MCP {}: disabled in config; skipping connect", spec.name);
+            }
+            spec.enabled
+        })
         .map(|spec| {
             let callbacks = callbacks.clone();
             tokio::spawn(async move {
@@ -543,19 +1082,138 @@ pub async fn connect_all_with(
 // Tools
 // ---------------------------------------------------------------------------
 
+/// Run one MCP request with the connection's per-server timeout: the clock
+/// resets whenever the server reports progress (a long call that streams
+/// progress is not stuck); `None` disables the limit. Cancellation (user
+/// abort) always wins.
+async fn call_with_timeout<F, T>(
+    conn: &McpConnection,
+    what: &str,
+    call: F,
+    cancel: CancellationToken,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, rmcp::service::ServiceError>>,
+{
+    let Some(limit) = conn.request_timeout() else {
+        return match tokio::select! {
+            _ = cancel.cancelled() => return Err("Operation aborted".to_string()),
+            r = call => r,
+        } {
+            Ok(value) => Ok(value),
+            Err(e) => Err(format!("{what} failed: {e}")),
+        };
+    };
+    let mut call = std::pin::pin!(call);
+    let mut seen_progress = conn.progress_value();
+    let timer = tokio::time::sleep(limit);
+    tokio::pin!(timer);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return Err("Operation aborted".to_string()),
+            r = &mut call => {
+                return r.map_err(|e| format!("{what} failed: {e}"));
+            }
+            _ = &mut timer => {
+                let now = conn.progress_value();
+                if now != seen_progress {
+                    // Progress flowed: the server is working, reset the clock.
+                    seen_progress = now;
+                    timer.as_mut().reset(tokio::time::Instant::now() + limit);
+                    continue;
+                }
+                return Err(format!(
+                    "{what} failed: timed out after {}s (no progress)",
+                    limit.as_secs()
+                ));
+            }
+        }
+    }
+}
+
+/// Server-declared tool annotations (MCP `ToolAnnotations`), surfaced to
+/// the permission layer so read-only MCP tools can skip prompts the same
+/// way built-in read tools do.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct McpToolAnnotations {
+    pub read_only: bool,
+    pub destructive: bool,
+    pub idempotent: bool,
+    pub open_world: bool,
+}
+
+fn annotations_of(info: &McpToolInfo) -> Option<McpToolAnnotations> {
+    let a = info.annotations.as_ref()?;
+    Some(McpToolAnnotations {
+        // MCP spec defaults when a hint is absent: readOnly=false,
+        // destructive=true, idempotent=false, openWorld=true.
+        read_only: a.read_only_hint.unwrap_or(false),
+        destructive: a.destructive_hint.unwrap_or(true),
+        idempotent: a.idempotent_hint.unwrap_or(false),
+        open_world: a.open_world_hint.unwrap_or(true),
+    })
+}
+
+/// Full-name → annotations registry: the permission layer's read-only
+/// classification is a sync name→bool lookup, so `mcp_tools_with`
+/// publishes each tool's hints here when the tool set is built.
+static ANNOTATION_REGISTRY: std::sync::OnceLock<
+    std::sync::RwLock<std::collections::HashMap<&'static str, McpToolAnnotations>>,
+> = std::sync::OnceLock::new();
+
+fn register_tool_annotations(full_name: &'static str, info: &McpToolInfo) {
+    let Some(annotations) = annotations_of(info) else {
+        return;
+    };
+    let registry = ANNOTATION_REGISTRY
+        .get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+    registry
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(full_name, annotations);
+}
+
+/// Insert annotations directly (permission-layer tests; production
+/// registration happens in `mcp_tools_with`).
+#[doc(hidden)]
+pub fn register_tool_annotations_for_test(
+    full_name: &'static str,
+    annotations: McpToolAnnotations,
+) {
+    let registry = ANNOTATION_REGISTRY
+        .get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+    registry
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(full_name, annotations);
+}
+
+/// Annotations an MCP server declared for the tool behind `full_name`
+/// (`mcp__<server>__<tool>`), if any. Read-only gating
+/// (`tack_app::permissions::is_read_only_tool`) consults this; approval
+/// chains receive the same hints as evidence.
+pub fn mcp_tool_annotations(full_name: &str) -> Option<McpToolAnnotations> {
+    let registry = ANNOTATION_REGISTRY.get()?;
+    registry
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(full_name)
+        .copied()
+}
+
 /// AgentTool proxy for one MCP tool.
 pub struct McpTool {
     server_name: String,
     info: McpToolInfo,
-    peer: Peer<RoleClient>,
-    /// Keeps the connection (and its RunningService) alive for servers whose
-    /// tool list is the ONLY exposed capability — otherwise dropping the
-    /// caller's Arc would cancel the service while tools still exist.
-    keepalive: Option<Arc<McpConnection>>,
+    /// The owning connection: holds the session (and its re-spawned
+    /// successor after a reconnect) alive and provides the per-call peer.
+    conn: Arc<McpConnection>,
     /// Interned prefixed name (see intern_tool_name).
     full_name: &'static str,
     /// Prompt-injection defense: set when a result enters the context.
     untrusted: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// mcp.json `exposure: "deferred"`: start in the tool_search pool.
+    starts_deferred: bool,
 }
 
 /// Mark the untrusted flag and wrap text so the model treats MCP output as
@@ -732,7 +1390,7 @@ fn unique_tool_name(raw: &str, taken: &mut std::collections::HashSet<String>) ->
 }
 
 impl McpTool {
-    pub fn new(server_name: &str, info: McpToolInfo, peer: Peer<RoleClient>) -> Self {
+    pub fn new(server_name: &str, info: McpToolInfo, conn: Arc<McpConnection>) -> Self {
         let full_name = intern_tool_name(sanitize_tool_name(&format!(
             "mcp__{server_name}__{}",
             info.name
@@ -740,10 +1398,10 @@ impl McpTool {
         McpTool {
             server_name: server_name.to_string(),
             info,
-            peer,
-            keepalive: None,
+            conn,
             full_name,
             untrusted: None,
+            starts_deferred: false,
         }
     }
 
@@ -769,6 +1427,10 @@ impl AgentTool for McpTool {
         Value::Object((*self.info.input_schema).clone())
     }
 
+    fn starts_deferred(&self) -> bool {
+        self.starts_deferred
+    }
+
     async fn execute(
         &self,
         _tool_call_id: &str,
@@ -776,23 +1438,25 @@ impl AgentTool for McpTool {
         cancel: CancellationToken,
         _on_update: &(dyn Fn(AgentToolResult) + Send + Sync),
     ) -> Result<AgentToolResult, String> {
+        // Heal a dropped session before failing the call (reconnects a
+        // dead stdio child / re-dials HTTP; no-op when healthy).
+        self.conn
+            .ensure_connected()
+            .await
+            .map_err(|e| format!("MCP {} reconnect failed: {e}", self.server_name))?;
         let arguments = params.as_object().cloned();
         let mut request = CallToolRequestParams::new(self.info.name.clone());
         if let Some(arguments) = arguments {
             request = request.with_arguments(arguments);
         }
-        let call = self.peer.call_tool(request);
-
-        let result = tokio::select! {
-            _ = cancel.cancelled() => return Err("Operation aborted".to_string()),
-            r = call => r,
-        };
-        let result = result.map_err(|e| {
-            format!(
-                "MCP tool {} on {} failed: {e}",
-                self.info.name, self.server_name
-            )
-        })?;
+        let what = format!("MCP tool {} on {}", self.info.name, self.server_name);
+        let result = call_with_timeout(
+            &self.conn,
+            &what,
+            self.conn.peer().call_tool(request),
+            cancel,
+        )
+        .await?;
 
         let mut content: Vec<tack_ai::InputContentBlock> = Vec::new();
         for block in &result.content {
@@ -851,6 +1515,8 @@ pub struct McpListResourcesTool {
     full_name: &'static str,
     /// Prompt-injection defense: set when a result enters the context.
     untrusted: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// mcp.json `exposure: "deferred"`: start in the tool_search pool.
+    starts_deferred: bool,
 }
 
 #[async_trait]
@@ -867,6 +1533,9 @@ impl AgentTool for McpListResourcesTool {
     fn parameters_schema(&self) -> Value {
         json!({ "type": "object", "properties": {} })
     }
+    fn starts_deferred(&self) -> bool {
+        self.starts_deferred
+    }
 
     async fn execute(
         &self,
@@ -876,11 +1545,13 @@ impl AgentTool for McpListResourcesTool {
         _on_update: &(dyn Fn(AgentToolResult) + Send + Sync),
     ) -> Result<AgentToolResult, String> {
         let mut text = String::new();
-        for resource in &self.conn.resources {
+        // Cached capability lists (refreshed on list_changed); no network
+        // round-trip here, so no reconnect/timeout handling.
+        for resource in &self.conn.resources() {
             let desc = resource.description.as_deref().unwrap_or("");
             text.push_str(&format!("{} — {}\n", resource.uri, desc));
         }
-        for template in &self.conn.resource_templates {
+        for template in &self.conn.resource_templates() {
             let desc = template.description.as_deref().unwrap_or("");
             text.push_str(&format!(
                 "{} (template) — {}\n",
@@ -910,6 +1581,8 @@ pub struct McpReadResourceTool {
     full_name: &'static str,
     /// Prompt-injection defense: set when a result enters the context.
     untrusted: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// mcp.json `exposure: "deferred"`: start in the tool_search pool.
+    starts_deferred: bool,
 }
 
 #[async_trait]
@@ -932,6 +1605,9 @@ impl AgentTool for McpReadResourceTool {
             "required": ["uri"]
         })
     }
+    fn starts_deferred(&self) -> bool {
+        self.starts_deferred
+    }
 
     async fn execute(
         &self,
@@ -944,15 +1620,19 @@ impl AgentTool for McpReadResourceTool {
             .get("uri")
             .and_then(Value::as_str)
             .ok_or_else(|| "missing required parameter: uri".to_string())?;
-        let mut request = ReadResourceRequestParams::new(uri);
-        let call = self.conn.peer().read_resource(request.clone());
-        let result = tokio::select! {
-            _ = cancel.cancelled() => return Err("Operation aborted".to_string()),
-            r = call => r,
-        };
-        let result = result
-            .map_err(|e| format!("MCP resources/read {uri} on {} failed: {e}", self.conn.name))?;
-        let _ = &mut request;
+        self.conn
+            .ensure_connected()
+            .await
+            .map_err(|e| format!("MCP {} reconnect failed: {e}", self.conn.name))?;
+        let request = ReadResourceRequestParams::new(uri);
+        let what = format!("MCP resources/read {uri} on {}", self.conn.name);
+        let result = call_with_timeout(
+            &self.conn,
+            &what,
+            self.conn.peer().read_resource(request),
+            cancel,
+        )
+        .await?;
         let text = result
             .contents
             .iter()
@@ -981,28 +1661,29 @@ impl AgentTool for McpReadResourceTool {
 pub struct McpPromptTool {
     server_name: String,
     prompt: Prompt,
-    peer: Peer<RoleClient>,
-    /// See [`McpTool::keepalive`].
-    keepalive: Option<Arc<McpConnection>>,
+    /// See [`McpTool::conn`].
+    conn: Arc<McpConnection>,
     full_name: &'static str,
     /// Prompt-injection defense: set when a result enters the context.
     untrusted: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// mcp.json `exposure: "deferred"`: start in the tool_search pool.
+    starts_deferred: bool,
 }
 
 impl McpPromptTool {
     fn new(
         server_name: &str,
         prompt: Prompt,
-        peer: Peer<RoleClient>,
+        conn: Arc<McpConnection>,
         full_name: &'static str,
     ) -> Self {
         McpPromptTool {
             server_name: server_name.to_string(),
             prompt,
-            peer,
-            keepalive: None,
+            conn,
             full_name,
             untrusted: None,
+            starts_deferred: false,
         }
     }
 }
@@ -1049,6 +1730,9 @@ impl AgentTool for McpPromptTool {
         }
         json!({ "type": "object", "properties": properties, "required": required })
     }
+    fn starts_deferred(&self) -> bool {
+        self.starts_deferred
+    }
 
     async fn execute(
         &self,
@@ -1061,17 +1745,21 @@ impl AgentTool for McpPromptTool {
         if let Some(args) = prompt_arguments(&params) {
             request = request.with_arguments(args);
         }
-        let call = self.peer.get_prompt(request);
-        let result = tokio::select! {
-            _ = cancel.cancelled() => return Err("Operation aborted".to_string()),
-            r = call => r,
-        };
-        let result = result.map_err(|e| {
-            format!(
-                "MCP prompts/get {} on {} failed: {e}",
-                self.prompt.name, self.server_name
-            )
-        })?;
+        self.conn
+            .ensure_connected()
+            .await
+            .map_err(|e| format!("MCP {} reconnect failed: {e}", self.server_name))?;
+        let what = format!(
+            "MCP prompts/get {} on {}",
+            self.prompt.name, self.server_name
+        );
+        let result = call_with_timeout(
+            &self.conn,
+            &what,
+            self.conn.peer().get_prompt(request),
+            cancel,
+        )
+        .await?;
         // Flatten the prompt's messages to text for the model to continue.
         let mut text = String::new();
         for message in &result.messages {
@@ -1125,20 +1813,36 @@ pub fn mcp_tools_with(
     // full set is deduplicated across all connections up front.
     let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
     for conn in connections {
-        for info in &conn.tools {
+        // mcp.json `exposure` / `toolExposure`: per-tool resolution (exact
+        // names > longest `*` pattern > server default). `hidden` tools
+        // are never built; `deferred` tools carry the marker the
+        // tool_search split reads. In-memory connections (plugin/test
+        // transports) have no spec and default to `direct`.
+        let spec = conn.spec();
+        let server_exposure = spec.map(|s| s.exposure).unwrap_or_default();
+        for info in &conn.tools() {
+            let exposure = spec
+                .map(|s| s.effective_exposure(&info.name))
+                .unwrap_or_default();
+            if exposure == McpExposure::Hidden {
+                continue;
+            }
             let full_name = intern_tool_name(unique_tool_name(
                 &format!("mcp__{}__{}", conn.name, info.name),
                 &mut taken,
             ));
-            let mut tool = McpTool::new(&conn.name, info.clone(), conn.peer().clone());
+            // Publish the server-declared hints for the permission layer.
+            register_tool_annotations(full_name, info);
+            let mut tool = McpTool::new(&conn.name, info.clone(), conn.clone());
             tool.full_name = full_name;
-            tool.keepalive = Some(conn.clone());
+            tool.starts_deferred = exposure == McpExposure::Deferred;
             if let Some(flag) = &untrusted {
                 tool = tool.with_untrusted(flag.clone());
             }
             tools.push(Arc::new(tool));
         }
-        if conn.has_resources() {
+        if conn.has_resources() && server_exposure != McpExposure::Hidden {
+            let starts_deferred = server_exposure == McpExposure::Deferred;
             let list_name = intern_tool_name(unique_tool_name(
                 &format!("mcp__{}__list_resources", conn.name),
                 &mut taken,
@@ -1147,6 +1851,7 @@ pub fn mcp_tools_with(
                 conn: conn.clone(),
                 full_name: list_name,
                 untrusted: untrusted.clone(),
+                starts_deferred,
             }));
             let read_name = intern_tool_name(unique_tool_name(
                 &format!("mcp__{}__read_resource", conn.name),
@@ -1156,18 +1861,21 @@ pub fn mcp_tools_with(
                 conn: conn.clone(),
                 full_name: read_name,
                 untrusted: untrusted.clone(),
+                starts_deferred,
             }));
         }
-        for prompt in &conn.prompts {
-            let full_name = intern_tool_name(unique_tool_name(
-                &format!("mcp__{}__prompt__{}", conn.name, prompt.name),
-                &mut taken,
-            ));
-            let mut tool =
-                McpPromptTool::new(&conn.name, prompt.clone(), conn.peer().clone(), full_name);
-            tool.keepalive = Some(conn.clone());
-            tool.untrusted = untrusted.clone();
-            tools.push(Arc::new(tool));
+        if server_exposure != McpExposure::Hidden {
+            for prompt in &conn.prompts() {
+                let full_name = intern_tool_name(unique_tool_name(
+                    &format!("mcp__{}__prompt__{}", conn.name, prompt.name),
+                    &mut taken,
+                ));
+                let mut tool =
+                    McpPromptTool::new(&conn.name, prompt.clone(), conn.clone(), full_name);
+                tool.untrusted = untrusted.clone();
+                tool.starts_deferred = server_exposure == McpExposure::Deferred;
+                tools.push(Arc::new(tool));
+            }
         }
     }
     tools
@@ -1242,14 +1950,13 @@ pub fn plugin_capabilities(conn: &Arc<McpConnection>) -> Vec<McpPluginTool> {
     let mut out = Vec::new();
     let mut spec_taken = std::collections::HashSet::new();
     let mut engine_taken = std::collections::HashSet::new();
-    for info in &conn.tools {
+    for info in &conn.tools() {
         let full_name = intern_tool_name(unique_tool_name(
             &format!("mcp__{}__{}", conn.name, info.name),
             &mut engine_taken,
         ));
-        let mut tool = McpTool::new(&conn.name, info.clone(), conn.peer().clone());
+        let mut tool = McpTool::new(&conn.name, info.clone(), conn.clone());
         tool.full_name = full_name;
-        tool.keepalive = Some(conn.clone());
         push_plugin_tool(&mut out, &mut spec_taken, &info.name, Arc::new(tool));
     }
     if conn.has_resources() {
@@ -1265,6 +1972,9 @@ pub fn plugin_capabilities(conn: &Arc<McpConnection>) -> Vec<McpPluginTool> {
                 conn: conn.clone(),
                 full_name: list_name,
                 untrusted: None,
+                // Plugin-attributed tools never defer (the plugin host
+                // owns their registration; the pool is mcp__-shaped).
+                starts_deferred: false,
             }),
         );
         let read_name = intern_tool_name(unique_tool_name(
@@ -1279,17 +1989,16 @@ pub fn plugin_capabilities(conn: &Arc<McpConnection>) -> Vec<McpPluginTool> {
                 conn: conn.clone(),
                 full_name: read_name,
                 untrusted: None,
+                starts_deferred: false,
             }),
         );
     }
-    for prompt in &conn.prompts {
+    for prompt in &conn.prompts() {
         let full_name = intern_tool_name(unique_tool_name(
             &format!("mcp__{}__prompt__{}", conn.name, prompt.name),
             &mut engine_taken,
         ));
-        let mut tool =
-            McpPromptTool::new(&conn.name, prompt.clone(), conn.peer().clone(), full_name);
-        tool.keepalive = Some(conn.clone());
+        let tool = McpPromptTool::new(&conn.name, prompt.clone(), conn.clone(), full_name);
         push_plugin_tool(
             &mut out,
             &mut spec_taken,
@@ -1346,6 +2055,69 @@ mod tests {
         let http =
             super::McpServerSpec::http("srv".to_string(), "https://x/mcp".to_string(), vec![]);
         assert!(!http.strip_credentials);
+    }
+
+    #[test]
+    fn star_match_semantics() {
+        assert!(super::star_match("get_*", "get_user"));
+        assert!(!super::star_match("get_*", "set_user"));
+        assert!(super::star_match("*_admin", "user_admin"));
+        assert!(!super::star_match("*_admin", "admin_panel"));
+        assert!(super::star_match("get_*_json", "get_user_json"));
+        assert!(!super::star_match("get_*_json", "get_user_xml"));
+        assert!(super::star_match("*", "anything"));
+        assert!(super::star_match("search", "search"));
+        assert!(!super::star_match("search", "search_code"));
+        assert!(super::star_match("a*b*c", "aXbYc"));
+        assert!(!super::star_match("a*b*c", "aXbY"));
+    }
+
+    #[test]
+    fn effective_exposure_precedence() {
+        use super::{McpExposure, McpServerSpec};
+        let spec = McpServerSpec::stdio("s".into(), "c".into(), vec![], vec![], None)
+            .with_exposure(McpExposure::Deferred)
+            .with_tool_exposure(vec![
+                ("delete_*".to_string(), McpExposure::Hidden),
+                ("get_*".to_string(), McpExposure::Direct),
+                ("get_user_admin".to_string(), McpExposure::Hidden),
+                ("get_user_*".to_string(), McpExposure::Deferred),
+            ]);
+        // Exact name beats every pattern.
+        assert_eq!(
+            spec.effective_exposure("get_user_admin"),
+            McpExposure::Hidden
+        );
+        // Longest pattern beats shorter ones (get_user_* > get_*).
+        assert_eq!(
+            spec.effective_exposure("get_user_repo"),
+            McpExposure::Deferred
+        );
+        assert_eq!(spec.effective_exposure("get_teams"), McpExposure::Direct);
+        assert_eq!(spec.effective_exposure("delete_repo"), McpExposure::Hidden);
+        // No override: the server-level exposure.
+        assert_eq!(
+            spec.effective_exposure("anything_else"),
+            McpExposure::Deferred
+        );
+        // Default spec: everything direct.
+        let plain = McpServerSpec::http("s".into(), "http://x/mcp".into(), vec![]);
+        assert_eq!(plain.effective_exposure("x"), McpExposure::Direct);
+    }
+
+    #[test]
+    fn exposure_config_values() {
+        use super::McpExposure;
+        assert_eq!(
+            McpExposure::from_config("deferred"),
+            Some((McpExposure::Deferred, false))
+        );
+        assert_eq!(
+            McpExposure::from_config("codemode"),
+            Some((McpExposure::Deferred, true)),
+            "pi's codemode maps to deferred with a warning flag"
+        );
+        assert!(McpExposure::from_config("bogus").is_none());
     }
 
     #[test]

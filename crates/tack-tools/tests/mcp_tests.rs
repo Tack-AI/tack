@@ -60,18 +60,21 @@ async fn mcp_tool_roundtrip_over_duplex() {
         running.waiting().await.unwrap();
     });
 
-    // Client side.
-    let client = ().serve(client_io).await.unwrap();
-    let infos = client.list_all_tools().await.unwrap();
+    // Client side (via the connection wrapper, so the McpTool path gets a
+    // reconnectable Arc<McpConnection>).
+    let conn = std::sync::Arc::new(
+        tack_tools::mcp::connect_transport("calc", client_io, Default::default())
+            .await
+            .unwrap(),
+    );
+    let infos = conn.tools();
     assert_eq!(infos.len(), 2);
     assert!(infos.iter().any(|t| t.name == "sum"));
 
     // Wrap as agent tools via the McpTool path.
     let tools: Vec<Arc<dyn AgentTool>> = infos
         .into_iter()
-        .map(|info| {
-            Arc::new(McpTool::new("calc", info, client.peer().clone())) as Arc<dyn AgentTool>
-        })
+        .map(|info| Arc::new(McpTool::new("calc", info, conn.clone())) as Arc<dyn AgentTool>)
         .collect();
     let sum = tools.iter().find(|t| t.name() == "mcp__calc__sum").unwrap();
 
@@ -95,7 +98,7 @@ async fn mcp_tool_roundtrip_over_duplex() {
     };
     assert_eq!(text, "42");
 
-    client.cancel().await.unwrap();
+    conn.cancel();
 }
 
 #[tokio::test]

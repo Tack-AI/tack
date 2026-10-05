@@ -475,7 +475,7 @@ verdict 拒绝启动（工具返回错误、零 token 消耗，后台子代理�
 
 ### MCP client OAuth 2.1
 
-mcp.json 的远程（HTTP）server 加 `"oauth": true` 或 `{"clientId": "…", "scopes": […]}` 即启用：元数据发现 → 动态客户端注册（或配置的 clientId）→ PKCE 浏览器授权（loopback 回调，支持手动粘贴）。令牌缓存 `~/.tack/agent/mcp-tokens.json`（0600），过期自动用 refresh_token 续期。缓存按 **server 名**（mcp.json 里的键名）索引——TUI 里授权过的 server，同名配置在 print/rpc/serve 等 headless 模式直接命中缓存。TUI 交互授权；print/rpc/serve 只用缓存/续期令牌，绝不弹浏览器。
+mcp.json 的远程（HTTP）server 加 `"oauth": true` 或 `{"clientId": "…", "scopes": […]}` 即启用：元数据发现 → 动态客户端注册（或配置的 clientId）→ PKCE 浏览器授权（loopback 回调，支持手动粘贴）。`clientSecret`、`callbackPort` 与 `callbackUrl`（回环校验）覆盖预注册客户端与固定重定向 URI。令牌缓存 `~/.tack/agent/mcp-tokens.json`（0600），过期自动用 refresh_token 续期。缓存按 **server 名**（mcp.json 里的键名）索引——TUI 里授权过的 server，同名配置在 print/rpc/serve 等 headless 模式直接命中缓存。TUI 交互授权；print/rpc/serve 只用缓存/续期令牌，绝不弹浏览器。
 
 ### MCP sampling 与 elicitation（server 反向请求）
 
@@ -487,6 +487,8 @@ mcp.json 的远程（HTTP）server 加 `"oauth": true` 或 `{"clientId": "…", 
 ### 工具 schema 懒加载（tool search）
 
 `mcpDeferThreshold: N`——工具总数超过 N 时，MCP 工具不直接进模型工具表（零 schema 开销），而是进一个 agent 不可见的延迟池；agent 用 `tool_search` 按能力检索，命中的工具从下一步起可调用。N=0（默认）关闭。
+
+mcp.json 里的按服务器控制（pi 风格）更精细：`"exposure": "deferred"` 把单个服务器的工具放入延迟池（与阈值无关），`"hidden"` 使其不可达，`"direct"`（默认）照常声明；`toolExposure` 按工具覆盖（精确名或 `*` 通配；精确名优先，通配取最长者）。兼容 pi 的 `"codemode"`，映射为 `"deferred"`（tack 没有 codemode 工具）。延迟服务器会在系统提示的 "Deferred MCP tools" 段中列名，让模型知道可用 `tool_search` 触达；任一服务器配置 `exposure` 后阈值兜底规则失效。
 
 ### Eval 回归评测
 

@@ -234,9 +234,19 @@ Tack 从四级读取配置，**后加载的层级覆盖先加载的**（部分�
 
 | 键 | 说明 |
 |---|---|
-| `oauth` | `true` 或 `{"clientId": "…", "scopes": ["…"]}`——远程 server 的 OAuth 2.1 授权（PKCE + 动态注册，令牌缓存 `mcp-tokens.json` 并自动续期） |
+| `enabled` | `false` 时条目保留（状态界面显示 “disabled”）但永不连接。默认 `true` |
+| `timeout` | 工具/资源/prompt 调用的单次请求超时（秒，默认 60；`0` 表示不限）。progress 通知会重置计时——持续上报进度的长调用不算卡死 |
+| `exposure` | 服务器工具到达模型的方式：`"direct"`（默认——像内置工具一样声明）、`"deferred"`（不声明；`tool_search` 按需加载，系统提示的 “Deferred MCP tools” 段会列出这些服务器）、`"hidden"`（完全不可达）。兼容 pi 的 `"codemode"`/`"codemode-deferred"`，映射为 `"deferred"`（tack 没有 codemode 工具） |
+| `toolExposure` | 按工具覆盖 `exposure`：键为精确工具名或 `*` 通配（如 `{"search_code": "direct", "delete_*": "hidden"}`）。精确名优先；多个通配匹配时最长（最具体）者胜——这是对 pi “首个匹配”规则的有意改进（JSON 对象不保序） |
+| `oauth` | `true` 或对象——远程 server 的 OAuth 2.1 授权（PKCE + 动态注册，令牌缓存 `mcp-tokens.json` 并自动续期）。对象键：`clientId`、`clientSecret`（预注册客户端）、`scopes`（数组）、`callbackPort`（固定回环端口，用于重定向 URI 固定的提供商）、`callbackUrl`（完整重定向 URI 覆盖；必须是 `localhost`/`127.0.0.1`/`[::1]` 上的纯 HTTP） |
 
-settings.json 另有 `mcpDeferThreshold`（number，默认 0=关闭）：工具总数超阈值时 MCP 工具延迟加载，agent 通过 `tool_search` 按需激活（见 features 文档）。
+`env`、`headers` 的值（以及 `oauth.clientSecret`）支持 `${VAR}` 环境变量插值——与其他 MCP 客户端相同的语法；未设置的变量展开为空并给出警告。
+
+无需会话即可从 shell 管理服务器：`tack mcp list`（连接每个 enabled 服务器并打印状态/工具/错误；条目无效或 enabled 服务器未连上时退出码为 1）、`tack mcp add <name> [--local] [--env K=V]... [--header K=V]... [--url URL [--transport sse] [--bearer-token-env-var VAR]] [-- command args...]`、`tack mcp remove <name> [--local]`、`tack mcp login <name>`（交互式 OAuth）、`tack mcp logout <name>`（删除缓存令牌）。
+
+连接韧性：工具调用发现连接已断开时先重连（stdio 子进程重启 / HTTP 重拨）再报错；`tools|resources|prompts/list_changed` 通知会就地刷新缓存的能力列表。服务器声明的工具注解（`readOnlyHint` 等）进入权限系统——声明只读的 MCP 工具像内置读工具一样免提示（与 `destructiveHint` 矛盾时按不安全处理）——并作为证据传给审批链插件。
+
+settings.json 另有 `mcpDeferThreshold`（number，默认 0=关闭）：工具总数超阈值时 MCP 工具延迟加载，agent 通过 `tool_search` 按需激活（见 features 文档）。只要任一服务器配置了 `exposure`，该兜底规则即失效，以保证按服务器配置的行为可预期。
 
 settings.json 的另外两个 MCP 开关：
 
@@ -300,6 +310,7 @@ settings.json 的另外两个 MCP 开关：
 |---|---|
 | `tack acp` | ACP server（Zed 等编辑器） |
 | `tack rpc` | JSONL RPC（stdin 命令 / stdout 事件） |
+| `tack mcp list` / `tack mcp add` / `tack mcp remove` / `tack mcp login` / `tack mcp logout` | 无会话的 MCP 服务器管理（见上文 MCP（mcp.json）） |
 | `tack mcp-serve` | MCP server（把 agent 暴露给其他 MCP 客户端） |
 | `tack serve` | 远程会话宿主（CBOR；`--listen`、`--auth-token`/`--auth-token-file`、`--tls`/`--tls-cert`/`--tls-key`、`--allow-no-auth`）。`--tls` 对 `tcp:` 与 `ws:` 监听都生效（后者即 wss）。`--allow-no-auth` 允许非 loopback 监听不带 token 启动（危险：能连到端口的人即可在你机器上执行命令；loopback/unix 监听不需要） |
 | `tack client` | 连接 serve（`--addr`、`--auth-token`、`--tls`/`--tls-ca`/`--tls-insecure`；`--addr ws:`/`wss:` 走 WebSocket，`wss:` 隐含 `--tls`） |

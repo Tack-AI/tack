@@ -18,11 +18,16 @@ use rmcp::transport::auth::{AuthorizationManager, OAuthClientConfig};
 use serde_json::Value;
 
 /// Per-server OAuth config from mcp.json: `"oauth": {"clientId": "…",
-/// "scopes": ["…"]}` (both optional — dynamic registration fills the rest).
+/// "clientSecret": "…", "scopes": ["…"], "callbackPort": 8765,
+/// "callbackUrl": "http://127.0.0.1:8765/callback"}` (all optional —
+/// dynamic registration and an ephemeral loopback callback fill the rest).
 #[derive(Clone, Debug, Default)]
 pub struct McpOAuthSpec {
     pub client_id: Option<String>,
+    pub client_secret: Option<String>,
     pub scopes: Vec<String>,
+    pub callback_port: Option<u16>,
+    pub callback_url: Option<String>,
 }
 
 /// Cached token set for one server.
@@ -67,6 +72,19 @@ fn save_token(agent_dir: &Path, server: &str, token: &McpToken) -> std::io::Resu
     // Windows relies on the profile ACL. Atomic: a crash mid-write keeps
     // the previous token cache instead of a truncated file.
     crate::atomic_write::atomic_write_private(&tokens_path(agent_dir), &content, 0o600)
+}
+
+/// Remove a server's cached token (`tack mcp logout`). Returns true when
+/// an entry was actually removed.
+pub fn delete_token(agent_dir: &Path, server: &str) -> std::io::Result<bool> {
+    let _guard = TOKENS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut tokens = load_tokens(agent_dir);
+    if tokens.remove(server).is_none() {
+        return Ok(false);
+    }
+    let content = serde_json::to_string_pretty(&tokens)?;
+    crate::atomic_write::atomic_write_private(&tokens_path(agent_dir), &content, 0o600)?;
+    Ok(true)
 }
 
 /// Fresh cached token, if any.
@@ -120,6 +138,9 @@ pub async fn refresh_token(
     if let Some(client_id) = &client_id {
         form.push(("client_id", client_id.clone()));
     }
+    if let Some(secret) = &spec.client_secret {
+        form.push(("client_secret", secret.clone()));
+    }
     let response = reqwest::Client::new()
         .post(&token_endpoint)
         .form(&form)
@@ -154,6 +175,74 @@ pub async fn refresh_token(
     Ok(Some(new_token.access))
 }
 
+/// Loopback callback target derived from the OAuth config. `{port}` in
+/// `uri` is substituted with the bound port after the listener is up.
+struct CallbackTarget {
+    bind: std::net::SocketAddr,
+    path: String,
+    uri: String,
+}
+
+/// Resolve the redirect target: an explicit `callbackUrl` (must be plain
+/// HTTP on a loopback host — the redirect carries the authorization code,
+/// anything else would be a code-exfiltration footgun), else
+/// `http://127.0.0.1:<callbackPort>/callback` with an ephemeral port when
+/// no port is configured either.
+fn callback_target(spec: &McpOAuthSpec) -> Result<CallbackTarget> {
+    if let Some(raw) = &spec.callback_url {
+        let url = reqwest::Url::parse(raw).context("oauth.callbackUrl parse")?;
+        anyhow::ensure!(
+            url.scheme() == "http",
+            "oauth.callbackUrl must use http (loopback only), got {raw:?}"
+        );
+        let host = url.host_str().unwrap_or("");
+        anyhow::ensure!(
+            host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "[::1]",
+            "oauth.callbackUrl must be on a loopback host (localhost, 127.0.0.1, [::1]), got {raw:?}"
+        );
+        anyhow::ensure!(
+            url.query().is_none() && url.fragment().is_none(),
+            "oauth.callbackUrl must not carry a query or fragment, got {raw:?}"
+        );
+        let port = url.port().or(spec.callback_port).unwrap_or(0);
+        let path = match url.path() {
+            "" | "/" => "/callback".to_string(),
+            path => path.to_string(),
+        };
+        let bind_ip: std::net::IpAddr = if host == "[::1]" {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        };
+        return Ok(CallbackTarget {
+            bind: std::net::SocketAddr::new(bind_ip, port),
+            path: path.clone(),
+            uri: format!("http://{host}:{{port}}{path}"),
+        });
+    }
+    Ok(CallbackTarget {
+        bind: std::net::SocketAddr::new(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            spec.callback_port.unwrap_or(0),
+        ),
+        path: "/callback".to_string(),
+        uri: "http://127.0.0.1:{port}/callback".to_string(),
+    })
+}
+
+/// Read a manually pasted redirect URL / `?code=…` from stdin (the
+/// fallback when the browser runs on another machine, e.g. over SSH).
+async fn read_pasted_code() -> Result<String> {
+    tokio::task::spawn_blocking(|| {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut line);
+        line
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("stdin reader: {e}"))
+}
+
 /// Full interactive flow. Returns the fresh access token.
 pub async fn authorize(
     agent_dir: &Path,
@@ -169,19 +258,38 @@ pub async fn authorize(
         .await
         .context("authorization server metadata discovery")?;
 
-    // Bind the loopback listener first: the redirect URI must carry the port.
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .context("loopback bind")?;
-    let port = listener.local_addr()?.port();
-    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+    // Bind the loopback listener first: the redirect URI must carry the
+    // port. A configured (fixed) port/URL that fails to bind degrades to
+    // manual-paste-only — the registered redirect URI cannot move to a
+    // free port.
+    let target = callback_target(spec)?;
+    let fixed = target.bind.port() != 0;
+    let listener = match tokio::net::TcpListener::bind(target.bind).await {
+        Ok(listener) => Some(listener),
+        Err(e) if fixed => {
+            eprintln!(
+                "warning: cannot bind {} ({e}); paste the redirected URL when prompted",
+                target.bind
+            );
+            None
+        }
+        Err(e) => return Err(e).context("loopback bind"),
+    };
+    let port = match &listener {
+        Some(listener) => listener.local_addr()?.port(),
+        None => target.bind.port(),
+    };
+    let redirect_uri = target.uri.replace("{port}", &port.to_string());
 
-    // Client: configured id, else dynamic registration.
+    // Client: configured id (+ optional secret), else dynamic registration.
     let mut client_id = spec.client_id.clone();
-    let config = OAuthClientConfig::new(
+    let mut config = OAuthClientConfig::new(
         client_id.clone().unwrap_or_else(|| "tack".to_string()),
         &redirect_uri,
     );
+    if let Some(secret) = &spec.client_secret {
+        config = config.with_client_secret(secret.clone());
+    }
     manager
         .configure_client(config)
         .context("oauth client config")?;
@@ -206,23 +314,22 @@ pub async fn authorize(
 
     // Loopback callback raced against manual paste. The state value is the
     // csrf key into rmcp's state store — the code exchange requires it.
-    let (code, state) = tokio::select! {
-        callback = crate::oauth_login::await_callback_pair(listener, "/callback") => {
-            callback.context("callback")?
+    let (code, state) = match listener {
+        Some(listener) => {
+            let path = target.path.clone();
+            tokio::select! {
+                callback = crate::oauth_login::await_callback_pair(listener, &path) => {
+                    callback.context("callback")?
+                }
+                pasted = read_pasted_code() => {
+                    crate::oauth_login::parse_manual_input(&pasted?)
+                        .context("no code in pasted input")?
+                }
+            }
         }
-        pasted = async move {
-            let mut line = String::new();
-            tokio::task::spawn_blocking(move || {
-                use std::io::BufRead as _;
-                let _ = std::io::stdin().lock().read_line(&mut line);
-                line
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("stdin reader: {e}"))
-        } => {
-            let pasted = pasted?;
-            crate::oauth_login::parse_manual_input(&pasted)
-                .context("no code in pasted input")?
+        None => {
+            let pasted = read_pasted_code().await?;
+            crate::oauth_login::parse_manual_input(&pasted).context("no code in pasted input")?
         }
     };
 
@@ -277,7 +384,10 @@ pub(crate) fn spec_oauth(spec: &tack_tools::mcp::McpServerSpec) -> McpOAuthSpec 
         .as_ref()
         .map(|o| McpOAuthSpec {
             client_id: o.client_id.clone(),
+            client_secret: o.client_secret.clone(),
             scopes: o.scopes.clone(),
+            callback_port: o.callback_port,
+            callback_url: o.callback_url.clone(),
         })
         .unwrap_or_default()
 }
@@ -320,6 +430,12 @@ pub async fn connect_all_oauth_reporting(
 ) -> Vec<McpConnectOutcome> {
     let mut out = Vec::new();
     for spec in specs {
+        if !spec.enabled {
+            // `enabled: false`: listed in config/status surfaces but never
+            // connected (defense in depth — the plain connect paths filter
+            // the same way in tack-tools).
+            continue;
+        }
         let name = spec.name.clone();
         let result = connect_one_oauth(&spec, agent_dir, interactive, &callbacks).await;
         out.push(McpConnectOutcome { name, result });
@@ -409,6 +525,92 @@ async fn connect_one_oauth(
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn callback_target_validates_loopback() {
+        // Default: ephemeral 127.0.0.1 port, /callback path.
+        let target = callback_target(&McpOAuthSpec::default()).unwrap();
+        assert_eq!(target.bind.port(), 0, "ephemeral by default");
+        assert_eq!(target.path, "/callback");
+
+        // Fixed port.
+        let target = callback_target(&McpOAuthSpec {
+            callback_port: Some(8765),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(target.bind.port(), 8765);
+        assert!(target.uri.contains("{port}"), "port substituted post-bind");
+
+        // Full callback URL: loopback hosts accepted, path honored.
+        for url in [
+            "http://localhost:9000/auth/done",
+            "http://127.0.0.1/cb",
+            "http://[::1]:8080/callback",
+        ] {
+            let target = callback_target(&McpOAuthSpec {
+                callback_url: Some(url.to_string()),
+                ..Default::default()
+            })
+            .unwrap_or_else(|e| panic!("{url} must be accepted: {e}"));
+            assert!(!target.path.is_empty());
+        }
+
+        // Rejected: https, non-loopback host, query string.
+        for url in [
+            "https://127.0.0.1:9000/callback",
+            "http://example.com/callback",
+            "http://127.0.0.1:9000/callback?x=1",
+        ] {
+            assert!(
+                callback_target(&McpOAuthSpec {
+                    callback_url: Some(url.to_string()),
+                    ..Default::default()
+                })
+                .is_err(),
+                "{url} must be rejected"
+            );
+        }
+
+        // A URL port wins over callbackPort; callbackPort fills a missing
+        // URL port.
+        let target = callback_target(&McpOAuthSpec {
+            callback_url: Some("http://127.0.0.1:1111/callback".to_string()),
+            callback_port: Some(2222),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(target.bind.port(), 1111);
+        let target = callback_target(&McpOAuthSpec {
+            callback_url: Some("http://127.0.0.1/callback".to_string()),
+            callback_port: Some(2222),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(target.bind.port(), 2222);
+    }
+
+    #[test]
+    fn delete_token_removes_only_the_named_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let token = McpToken {
+            access: "a".into(),
+            refresh: None,
+            expires_at: 0,
+            client_id: None,
+        };
+        save_token(tmp.path(), "one", &token).unwrap();
+        save_token(tmp.path(), "two", &token).unwrap();
+        assert!(delete_token(tmp.path(), "one").unwrap());
+        assert!(
+            !delete_token(tmp.path(), "one").unwrap(),
+            "second delete is a no-op"
+        );
+        assert!(
+            cached_token(tmp.path(), "two").is_some(),
+            "other entry kept"
+        );
+    }
 
     #[cfg(unix)]
     #[test]

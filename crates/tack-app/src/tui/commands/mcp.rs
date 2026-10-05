@@ -35,7 +35,7 @@ impl TuiApp {
         }
         let mut items = Vec::new();
         for (index, conn) in self.mcp_connections.iter().enumerate() {
-            for resource in &conn.resources {
+            for resource in &conn.resources() {
                 items.push(
                     SelectItem::new(
                         format!("📄 {}: {}", conn.name, resource.name),
@@ -44,7 +44,7 @@ impl TuiApp {
                     .with_description(resource.description.clone().unwrap_or_default()),
                 );
             }
-            for prompt in &conn.prompts {
+            for prompt in &conn.prompts() {
                 items.push(
                     SelectItem::new(
                         format!("💬 {}: {}", conn.name, prompt.name),

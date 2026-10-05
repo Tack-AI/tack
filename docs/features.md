@@ -710,7 +710,9 @@ See [plugin-system.md](plugin-system.md), [extensions.md](extensions.md),
 Add `"oauth": true` or `{"clientId": "…", "scopes": […]}` to a remote (HTTP)
 server in mcp.json to enable: metadata discovery → dynamic client
 registration (or the configured clientId) → PKCE browser authorization
-(loopback callback, manual paste supported). Tokens are cached in
+(loopback callback, manual paste supported). `clientSecret`, `callbackPort`
+and `callbackUrl` (loopback-validated) cover pre-registered clients and
+fixed redirect URIs. Tokens are cached in
 `~/.tack/agent/mcp-tokens.json` (0600), auto-renewed with refresh_token when
 expired. The cache is indexed by **server name** (the key in mcp.json) — a
 server authorized in the TUI hits the cache directly under the same-name
@@ -755,6 +757,15 @@ enter the model's tool table directly (zero schema overhead); they go into a
 deferred pool invisible to the agent; the agent retrieves by capability with
 `tool_search`, and matched tools become callable from the next step on.
 N=0 (default) disables this.
+
+Per-server control (mcp.json, pi-style) refines this: `"exposure": "deferred"`
+pools one server's tools regardless of the threshold, `"hidden"` makes them
+unreachable, `"direct"` (default) declares them like built-ins, and
+`toolExposure` overrides per tool by exact name or `*` pattern (exact names
+win, then the longest pattern). pi's `"codemode"` values map to `"deferred"`
+(tack has no codemode tool). Deferred servers are named in a "Deferred MCP
+tools" system-prompt section so the model knows `tool_search` reaches them;
+configuring any `exposure` opts out of the blanket threshold rule.
 
 ### Eval regression testing
 

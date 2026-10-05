@@ -214,7 +214,14 @@ fn check_mcp(cwd: &Path, agent_dir: &Path) -> Check {
         return ok("mcp servers", "none configured");
     }
     let mut problems = Vec::new();
+    let mut disabled = 0usize;
     for spec in &specs {
+        if !spec.enabled {
+            // Disabled servers never connect: a missing binary is not a
+            // problem to report.
+            disabled += 1;
+            continue;
+        }
         if let tack_tools::mcp::McpTransport::Stdio { command, .. } = &spec.transport
             && command_exists(command).is_none()
         {
@@ -222,9 +229,14 @@ fn check_mcp(cwd: &Path, agent_dir: &Path) -> Check {
         }
     }
     if problems.is_empty() {
+        let suffix = if disabled > 0 {
+            format!(", {disabled} disabled")
+        } else {
+            String::new()
+        };
         ok(
             "mcp servers",
-            format!("{} configured, all commands found", specs.len()),
+            format!("{} configured, all commands found{suffix}", specs.len()),
         )
     } else {
         warn(

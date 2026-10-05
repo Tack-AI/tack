@@ -291,6 +291,8 @@ pub(crate) async fn spawn_prompt(
         &selected_tools,
         &crate::cli_flags::CliFlags::default(),
     );
+    // Deferred MCP servers must be discoverable (see deferred_mcp_prompt_section).
+    system_prompt.push_str(&crate::cli_flags::deferred_mcp_prompt_section(&tool_pool));
     {
         let st = state.lock().await;
         if let Some(context) = &st.session_hook_context

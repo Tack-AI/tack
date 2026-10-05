@@ -135,15 +135,46 @@ async fn start_server() -> String {
     format!("http://{addr}/mcp")
 }
 
+/// mcp.json `exposure` / `toolExposure` reach the built AgentTools:
+/// deferred tools carry the pool marker (server-level for meta/prompt
+/// tools), hidden tools are never built.
+#[tokio::test]
+async fn exposure_marks_deferred_and_drops_hidden() {
+    use tack_tools::mcp::McpExposure;
+
+    let spec = McpServerSpec::http("test".into(), start_server().await, vec![])
+        .with_exposure(McpExposure::Deferred)
+        .with_tool_exposure(vec![("echo_tool".to_string(), McpExposure::Hidden)]);
+    let conn = connect(&spec).await.unwrap();
+    let tools = mcp_tools(&[Arc::new(conn)]);
+    let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+    assert!(
+        !names.contains(&"mcp__test__echo_tool"),
+        "hidden tool is never built: {names:?}"
+    );
+    assert!(names.contains(&"mcp__test__list_resources"));
+    assert!(names.contains(&"mcp__test__prompt__greet"));
+    assert!(
+        tools.iter().all(|t| t.starts_deferred()),
+        "server-level deferred marks everything built"
+    );
+
+    // A fully hidden server exposes nothing.
+    let spec = McpServerSpec::http("test2".into(), start_server().await, vec![])
+        .with_exposure(McpExposure::Hidden);
+    let conn = connect(&spec).await.unwrap();
+    assert!(mcp_tools(&[Arc::new(conn)]).is_empty());
+}
+
 #[tokio::test]
 async fn http_connect_discovers_capabilities() {
     let url = start_server().await;
     let conn = connect(&McpServerSpec::http("test".into(), url, vec![]))
         .await
         .unwrap();
-    assert_eq!(conn.tools.len(), 1);
+    assert_eq!(conn.tools().len(), 1);
     assert!(conn.has_resources());
-    assert_eq!(conn.prompts.len(), 1);
+    assert_eq!(conn.prompts().len(), 1);
 
     let tools = mcp_tools(&[Arc::new(conn)]);
     let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();

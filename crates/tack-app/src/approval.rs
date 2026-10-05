@@ -161,6 +161,17 @@ impl ApprovalChain {
         if self.is_empty() {
             return false;
         }
+        // MCP server-declared hints ride along as evidence so reviewers
+        // can apply their own policy (e.g. auto-approve read-only+
+        // idempotent search tools, always ask on destructive ones).
+        let mcp_annotations = tack_tools::mcp::mcp_tool_annotations(tool_name).map(|a| {
+            serde_json::json!({
+                "readOnlyHint": a.read_only,
+                "destructiveHint": a.destructive,
+                "idempotentHint": a.idempotent,
+                "openWorldHint": a.open_world,
+            })
+        });
         let request = ApprovalRequest {
             approval_id: tool_call_id.to_string(),
             tool_call_id: tool_call_id.to_string(),
@@ -171,6 +182,7 @@ impl ApprovalChain {
                 "surface": surface,
                 "untrustedSeen": untrusted_seen,
                 "readOnly": read_only,
+                "mcpAnnotations": mcp_annotations,
             }),
         };
         matches!(
@@ -452,6 +464,55 @@ mod tests {
                 "surface": "remote",
                 "untrustedSeen": true,
                 "readOnly": false,
+                "mcpAnnotations": null,
+            })
+        );
+    }
+
+    /// MCP tool annotations ride along as evidence so reviewers can apply
+    /// their own policy to server-declared hints.
+    #[tokio::test]
+    async fn claims_approval_includes_mcp_annotations_evidence() {
+        #[derive(Debug)]
+        struct Recording(Mutex<Vec<ApprovalRequest>>);
+        #[async_trait::async_trait]
+        impl ApprovalReviewer for Recording {
+            async fn review(&self, request: &ApprovalRequest) -> Option<ChainDecision> {
+                self.0.lock().unwrap().push(request.clone());
+                None
+            }
+        }
+        tack_tools::mcp::register_tool_annotations_for_test(
+            "mcp__gh__search",
+            tack_tools::mcp::McpToolAnnotations {
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: true,
+            },
+        );
+        let recording = Arc::new(Recording(Mutex::new(Vec::new())));
+        let mut chain = ApprovalChain::empty();
+        chain.push("rec".into(), recording.clone());
+        chain
+            .claims_approval(
+                "rpc",
+                "call-10",
+                "mcp__gh__search",
+                &serde_json::json!({"q": "x"}),
+                "ask",
+                false,
+                true,
+            )
+            .await;
+        let seen = recording.0.lock().unwrap();
+        assert_eq!(
+            seen[0].evidence["mcpAnnotations"],
+            serde_json::json!({
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true,
             })
         );
     }

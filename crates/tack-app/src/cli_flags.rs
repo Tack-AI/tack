@@ -171,18 +171,29 @@ fn open_session_for_flags_inner(
 /// (active, deferred-pool) pair from split_for_tool_search.
 pub type ToolSplit = (Vec<Arc<dyn AgentTool>>, Vec<Arc<dyn AgentTool>>);
 
-/// Split tools for client-side tool search (settings `mcpDeferThreshold`):
-/// when the total tool count exceeds the threshold, MCP tools defer to a
-/// pool that is invisible to the model until `tool_search` activates them
-/// (the loadout change is recorded as a transcript system message).
+/// Split tools for client-side tool search. Two routes into the deferred
+/// pool (invisible to the model until `tool_search` activates them — the
+/// loadout change is recorded as a transcript system message):
+///
+/// 1. Explicit: tools whose mcp.json entry sets `exposure: "deferred"`
+///    (or `toolExposure` selects it) carry `starts_deferred`. These defer
+///    regardless of the threshold.
+/// 2. Legacy threshold (settings `mcpDeferThreshold`, 0 = off): with NO
+///    explicit deferrals and the total tool count over the threshold,
+///    every `mcp__*` tool defers. Configuring any exposure opts out of
+///    the blanket rule so per-server choices stay predictable.
+///
 /// Returns (active_tools, deferred_pool).
 pub fn split_for_tool_search(tools: Vec<Arc<dyn AgentTool>>, threshold: usize) -> ToolSplit {
-    if threshold == 0 || tools.len() <= threshold {
-        return (tools, Vec::new());
+    let (mut deferred, mut active): (Vec<_>, Vec<_>) =
+        tools.into_iter().partition(|t| t.starts_deferred());
+    if deferred.is_empty() && threshold > 0 && active.len() > threshold {
+        let (mcp_tools, rest): (Vec<_>, Vec<_>) = active
+            .into_iter()
+            .partition(|t| t.name().starts_with("mcp__"));
+        deferred = mcp_tools;
+        active = rest;
     }
-    let (deferred, mut active): (Vec<_>, Vec<_>) = tools
-        .into_iter()
-        .partition(|t| t.name().starts_with("mcp__"));
     if deferred.is_empty() {
         return (active, Vec::new());
     }
@@ -197,6 +208,40 @@ pub fn split_for_tool_search(tools: Vec<Arc<dyn AgentTool>>, threshold: usize) -
         pool_entries,
     )));
     (active, deferred)
+}
+
+/// System-prompt section listing deferred MCP servers (pi's `mcp_servers`
+/// section): the model must know these servers exist and that
+/// `tool_search` reaches their tools, or deferred tools are
+/// undiscoverable. Appended to the system prompt whenever the pool is
+/// non-empty.
+pub fn deferred_mcp_prompt_section(tool_pool: &[Arc<dyn AgentTool>]) -> String {
+    if tool_pool.is_empty() {
+        return String::new();
+    }
+    let mut by_server: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for tool in tool_pool {
+        // Pool tools are mcp__<server>__<tool> by construction (plugin
+        // tools never defer); anything else groups under a generic label.
+        let server = tool
+            .name()
+            .strip_prefix("mcp__")
+            .and_then(|rest| rest.split_once("__").map(|(server, _)| server))
+            .unwrap_or("other");
+        *by_server.entry(server.to_string()).or_default() += 1;
+    }
+    let mut section = String::from(
+        "\n\n# Deferred MCP tools\n\
+         The MCP servers below are connected, but their tools are NOT declared in your \
+         tool set. When a task needs them, call the `tool_search` tool with what you \
+         want to do (e.g. \"create an issue\"); matching tools become callable \
+         immediately after it returns.\n",
+    );
+    for (server, count) in by_server {
+        section.push_str(&format!("- {server} ({count} tools)\n"));
+    }
+    section
 }
 
 /// Remove tools owned by disabled features (settings `features.*`). A
@@ -428,5 +473,123 @@ mod tests {
         )
         .unwrap();
         assert!(session.session_file().is_none());
+    }
+
+    /// Minimal AgentTool stub with a configurable deferred marker.
+    struct StubTool {
+        name: &'static str,
+        deferred: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTool for StubTool {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn label(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "stub"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn starts_deferred(&self) -> bool {
+            self.deferred
+        }
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _params: serde_json::Value,
+            _cancel: tokio_util::sync::CancellationToken,
+            _on_update: &(dyn Fn(tack_agent_core::AgentToolResult) + Send + Sync),
+        ) -> Result<tack_agent_core::AgentToolResult, String> {
+            unimplemented!("stub")
+        }
+    }
+
+    fn stub(name: &'static str, deferred: bool) -> Arc<dyn AgentTool> {
+        Arc::new(StubTool { name, deferred })
+    }
+
+    /// mcp.json `exposure: "deferred"` tools pool even with the threshold
+    /// off, and the pool activates tool_search.
+    #[test]
+    fn explicit_deferred_pools_regardless_of_threshold() {
+        let tools = vec![
+            stub("read", false),
+            stub("mcp__github__create_issue", true),
+            stub("mcp__github__search_code", true),
+        ];
+        let (active, pool) = split_for_tool_search(tools, 0);
+        assert_eq!(
+            names(&pool),
+            ["mcp__github__create_issue", "mcp__github__search_code"]
+        );
+        let active_names = names(&active);
+        assert!(active_names.contains(&"read"));
+        assert!(
+            active_names.contains(&"tool_search"),
+            "pool activates tool_search: {active_names:?}"
+        );
+    }
+
+    /// Legacy behavior: no explicit markers and the total over
+    /// `mcpDeferThreshold` → every mcp__* tool defers.
+    #[test]
+    fn threshold_still_defers_all_mcp_when_unmarked() {
+        let tools = vec![
+            stub("read", false),
+            stub("mcp__a__t1", false),
+            stub("mcp__b__t2", false),
+        ];
+        let (active, pool) = split_for_tool_search(tools, 1);
+        assert_eq!(names(&pool), ["mcp__a__t1", "mcp__b__t2"]);
+        assert!(names(&active).contains(&"tool_search"));
+        // Under/at the threshold nothing defers (0 = off).
+        let tools = vec![stub("read", false), stub("mcp__a__t1", false)];
+        let (active, pool) = split_for_tool_search(tools, 5);
+        assert!(pool.is_empty());
+        assert!(!names(&active).contains(&"tool_search"));
+    }
+
+    /// Configuring ANY exposure opts out of the blanket threshold rule:
+    /// unmarked mcp tools stay direct.
+    #[test]
+    fn explicit_exposure_opts_out_of_threshold() {
+        let tools = vec![
+            stub("read", false),
+            stub("mcp__big__t1", false),
+            stub("mcp__big__t2", false),
+            stub("mcp__sel__t3", true),
+        ];
+        let (active, pool) = split_for_tool_search(tools, 1);
+        assert_eq!(
+            names(&pool),
+            ["mcp__sel__t3"],
+            "only the marked tool defers"
+        );
+        let active_names = names(&active);
+        assert!(active_names.contains(&"mcp__big__t1"));
+        assert!(active_names.contains(&"mcp__big__t2"));
+        assert!(active_names.contains(&"tool_search"));
+    }
+
+    /// The system-prompt section names deferred servers with tool counts
+    /// (discoverability, pi's mcp_servers section).
+    #[test]
+    fn deferred_prompt_section_lists_servers() {
+        assert!(deferred_mcp_prompt_section(&[]).is_empty());
+        let pool = vec![
+            stub("mcp__github__a", true),
+            stub("mcp__github__b", true),
+            stub("mcp__linear__c", true),
+        ];
+        let section = deferred_mcp_prompt_section(&pool);
+        assert!(section.contains("# Deferred MCP tools"), "{section}");
+        assert!(section.contains("tool_search"), "{section}");
+        assert!(section.contains("- github (2 tools)"), "{section}");
+        assert!(section.contains("- linear (1 tools)"), "{section}");
     }
 }

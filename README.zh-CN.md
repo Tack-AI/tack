@@ -139,6 +139,7 @@ tack client --addr tcp:127.0.0.1:7749   # 或从另一个终端接入
 
 ```bash
 tack rpc          # stdio 上的 JSONL RPC（与 pi --mode rpc 线上兼容）
+tack mcp list     # 查看 MCP 服务器（add/remove/login/logout 管理）
 tack mcp-serve    # 把 tack 自身作为 MCP server 暴露在 stdio 上
 tack stats        # 跨会话 token/费用报告（--since 7d --json）
 tack fork <session.jsonl>   # 把会话 fork 进此目录
@@ -203,9 +204,13 @@ RPC 命令面与 TS 完全对齐（34 个命令，`prompt`/`steer`/`follow_up`/`
 
 stdio / Streamable HTTP / 旧版 SSE 传输；工具以 `mcp__<server>__<tool>` 走
 正常权限管线；资源和提示可经 `/mcp` 浏览；远程服务器支持 OAuth 2.1
-（`"oauth": true`）；惰性工具 schema（`mcpDeferThreshold`）、server 反向
-sampling（`mcpSampling`，默认关）和 elicitation（`mcpElicitation`）均有
-加固默认值。细节：[docs/features.zh-CN.md](docs/features.zh-CN.md) §生态互操作 与
+（`"oauth": true`，或 `clientId`/`clientSecret`/`scopes`/`callbackPort`/
+`callbackUrl` 对象形式）；条目支持 `enabled`、单请求 `timeout`（进度重置）
+与 `${VAR}` 插值；连接断开后自动重连并跟随 `list_changed`。无会话管理：
+`tack mcp list/add/remove/login/logout`。惰性工具 schema
+（`mcpDeferThreshold`）、server 反向 sampling（`mcpSampling`，默认关）和
+elicitation（`mcpElicitation`）均有加固默认值。细节：
+[docs/features.zh-CN.md](docs/features.zh-CN.md) §生态互操作 与
 [docs/configuration.zh-CN.md](docs/configuration.zh-CN.md)。
 
 ## 扩展

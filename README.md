@@ -146,6 +146,7 @@ create/attach/switch sessions, stream replies, answer permission prompts.
 
 ```bash
 tack rpc          # JSONL RPC on stdio (wire-compatible with pi --mode rpc)
+tack mcp list     # inspect MCP servers (add/remove/login/logout manage them)
 tack mcp-serve    # expose tack itself as an MCP server over stdio
 tack stats        # cross-session token/cost report (--since 7d --json)
 tack fork <session.jsonl>   # fork a session into this directory
@@ -215,9 +216,14 @@ extensions:
 Stdio / Streamable HTTP / legacy SSE transports; tools appear as
 `mcp__<server>__<tool>` through the normal permission pipeline; resources and
 prompts are browsable via `/mcp`; remote servers support OAuth 2.1
-(`"oauth": true`); lazy tool schemas (`mcpDeferThreshold`), server-initiated
-sampling (`mcpSampling`, default off) and elicitation (`mcpElicitation`) are
-available with hardened defaults. Details:
+(`"oauth": true`, or an object with `clientId`/`clientSecret`/`scopes`/
+`callbackPort`/`callbackUrl`); entries support `enabled`, per-request
+`timeout` (progress-resetting) and `${VAR}` interpolation; connections
+reconnect on drop and follow `list_changed`. Manage servers without a
+session via `tack mcp list/add/remove/login/logout`. Lazy tool schemas
+(`mcpDeferThreshold`), server-initiated sampling (`mcpSampling`, default
+off) and elicitation (`mcpElicitation`) are available with hardened
+defaults. Details:
 [docs/features.md](docs/features.md) §生态互操作 and
 [docs/configuration.md](docs/configuration.md).
 

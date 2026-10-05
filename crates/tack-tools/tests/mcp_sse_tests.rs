@@ -110,8 +110,8 @@ async fn legacy_sse_initialize_list_and_call() {
     let spec = McpServerSpec::sse("legacy".into(), url, Vec::new());
     let connection = connect(&spec).await.expect("connect over legacy SSE");
 
-    assert_eq!(connection.tools.len(), 1);
-    assert_eq!(connection.tools[0].name, "echo_tool");
+    assert_eq!(connection.tools().len(), 1);
+    assert_eq!(connection.tools()[0].name, "echo_tool");
 
     let tools = mcp_tools(&[std::sync::Arc::new(connection)]);
     let echo = tools

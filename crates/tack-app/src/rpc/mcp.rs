@@ -98,7 +98,9 @@ pub(crate) async fn ensure_mcp_pool(
     }
     let mut fingerprint = super::mcp_cache_fingerprint(cwd, agent_dir, &specs, model);
     fingerprint.push_str(&oauth_fingerprint_suffix(&specs, agent_dir).await);
-    let spec_count = specs.len();
+    // Disabled specs never connect: completeness is measured against the
+    // ENABLED set, or a disabled entry would keep the pool uncacheable.
+    let enabled_count = specs.iter().filter(|s| s.enabled).count();
     let cached = {
         let state_guard = state.lock().await;
         state_guard
@@ -143,7 +145,7 @@ pub(crate) async fn ensure_mcp_pool(
                 }
             }
             state.lock().await.mcp_connections =
-                (connections.len() == spec_count).then(|| super::McpConnectionCache {
+                (connections.len() == enabled_count).then(|| super::McpConnectionCache {
                     fingerprint,
                     connections: connections.clone(),
                 });
@@ -207,6 +209,15 @@ pub(crate) async fn mcp_status(
         return specs
             .iter()
             .map(|spec| {
+                if !spec.enabled {
+                    return McpServerStatus {
+                        name: spec.name.clone(),
+                        transport: transport_name(spec),
+                        status: "disabled",
+                        tool_count: 0,
+                        error: None,
+                    };
+                }
                 let live = cached.as_ref().and_then(|connections| {
                     connections
                         .iter()
@@ -217,7 +228,7 @@ pub(crate) async fn mcp_status(
                         name: spec.name.clone(),
                         transport: transport_name(spec),
                         status: "connected",
-                        tool_count: conn.tools.len(),
+                        tool_count: conn.tools().len(),
                         error: None,
                     },
                     None => McpServerStatus {
@@ -237,12 +248,21 @@ pub(crate) async fn mcp_status(
         .specs
         .iter()
         .map(|spec| {
+            if !spec.enabled {
+                return McpServerStatus {
+                    name: spec.name.clone(),
+                    transport: transport_name(spec),
+                    status: "disabled",
+                    tool_count: 0,
+                    error: None,
+                };
+            }
             if let Some(conn) = outcome.connections.iter().find(|c| c.name == spec.name) {
                 return McpServerStatus {
                     name: spec.name.clone(),
                     transport: transport_name(spec),
                     status: "connected",
-                    tool_count: conn.tools.len(),
+                    tool_count: conn.tools().len(),
                     error: None,
                 };
             }
