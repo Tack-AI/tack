@@ -4,6 +4,18 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [Unreleased]
+
+### Security
+
+- **wasmtime 49.0.1 → 49.0.2**: fixes seven upstream Wasmtime advisories
+  affecting the WASM extension sandbox (GC heap corruption via mis-typed
+  tag imports / `try_call` rooting, stack buffer overflow in async-lifted
+  component callbacks, `poll_oneoff` fuel bypass, host memory exhaustion
+  without guest stdio, uninitialized padding leak in `fd_readdir`, host
+  panic via pre-epoch filesystem timestamps) — RUSTSEC-2026-0321
+  through RUSTSEC-2026-0327.
+
 ## [1.0.9] - 2026-10-05
 
 ### Added

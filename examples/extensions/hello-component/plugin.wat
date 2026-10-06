@@ -43,7 +43,7 @@
     (data (i32.const 256) "hello-component executed a tool")
   )
   (core instance $abi_i (instantiate $abi))
-  (core func $log_lowered (canon lower (func $host "log") (memory $abi_i "memory") (realloc (func $abi_i "realloc"))))
+  (core func $log_lowered (canon lower (func $host "log") (memory (core memory $abi_i "memory")) (realloc (core func $abi_i "realloc"))))
 
   (core module $m
     (import "tack" "log" (func $log (param i32 i32 i32 i32)))
@@ -91,15 +91,15 @@
 
   (func $list
     (result string)
-    (canon lift (core func $i "list") (memory $i "memory") (realloc (func $i "realloc"))))
+    (canon lift (core func $i "list") (memory (core memory $i "memory")) (realloc (core func $i "realloc"))))
   (func $execute
     (param "call" string)
     (result (result string (error string)))
-    (canon lift (core func $i "execute") (memory $i "memory") (realloc (func $i "realloc"))))
+    (canon lift (core func $i "execute") (memory (core memory $i "memory")) (realloc (core func $i "realloc"))))
   (func $before_tool_call
     (param "call" string)
     (result (result string (error string)))
-    (canon lift (core func $i "before-tool-call") (memory $i "memory") (realloc (func $i "realloc"))))
+    (canon lift (core func $i "before-tool-call") (memory (core memory $i "memory")) (realloc (core func $i "realloc"))))
 
   (instance $tools
     (export "list" (func $list))

@@ -29,11 +29,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
-      - name: Install cargo-fuzz
-        uses: taiki-e/install-action@cargo-fuzz
       - uses: Swatinem/rust-cache@v2
         with:
           key: fuzz-${{ matrix.target }}
+      # cargo-fuzz ships no prebuilt binaries (and is not in install-action's
+      # manifest), so compile it; rust-cache above restores ~/.cargo/bin so the
+      # install is a no-op on cache hit.
+      - name: Install cargo-fuzz
+        run: cargo fuzz --version || cargo install cargo-fuzz --locked
       - name: Fuzz ${{ matrix.target }}
         run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300 -timeout=10 -rss_limit_mb=4096
       - name: Upload crash artifacts

@@ -1014,7 +1014,7 @@ mod tests {
   (func $execute
     (param "call" string)
     (result (result string (error string)))
-    (canon lift (core func $i "execute") (memory $i "memory") (realloc (func $i "realloc"))))
+    (canon lift (core func $i "execute") (memory (core memory $i "memory")) (realloc (core func $i "realloc"))))
   (instance $tools (export "execute" (func $execute)))
   (export "tack:plugin/tools" (instance $tools))
 )
@@ -1060,11 +1060,11 @@ mod tests {
   (core instance $i (instantiate $m))
   (func $list
     (result string)
-    (canon lift (core func $i "list") (memory $i "memory") (realloc (func $i "realloc"))))
+    (canon lift (core func $i "list") (memory (core memory $i "memory")) (realloc (core func $i "realloc"))))
   (func $execute
     (param "call" string)
     (result (result string (error string)))
-    (canon lift (core func $i "execute") (memory $i "memory") (realloc (func $i "realloc"))))
+    (canon lift (core func $i "execute") (memory (core memory $i "memory")) (realloc (core func $i "realloc"))))
   (instance $tools
     (export "list" (func $list))
     (export "execute" (func $execute)))
@@ -1124,11 +1124,11 @@ mod tests {
   (core instance $i (instantiate $m))
   (func $list
     (result string)
-    (canon lift (core func $i "list") (memory $i "memory") (realloc (func $i "realloc"))))
+    (canon lift (core func $i "list") (memory (core memory $i "memory")) (realloc (core func $i "realloc"))))
   (func $execute
     (param "call" string)
     (result (result string (error string)))
-    (canon lift (core func $i "execute") (memory $i "memory") (realloc (func $i "realloc"))))
+    (canon lift (core func $i "execute") (memory (core memory $i "memory")) (realloc (core func $i "realloc"))))
   (instance $tools
     (export "list" (func $list))
     (export "execute" (func $execute)))
@@ -1174,7 +1174,7 @@ mod tests {
   (func $before_tool_call
     (param "call" string)
     (result (result string (error string)))
-    (canon lift (core func $i "before-tool-call") (memory $i "memory") (realloc (func $i "realloc"))))
+    (canon lift (core func $i "before-tool-call") (memory (core memory $i "memory")) (realloc (core func $i "realloc"))))
   (instance $hooks
     (export "before-tool-call" (func $before_tool_call)))
   (export "tack:plugin/hooks" (instance $hooks))

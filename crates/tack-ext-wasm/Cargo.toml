@@ -31,8 +31,8 @@ wasmtime = { version = "49", default-features = false, features = [
     # MACH_RCV_INTERRUPTED — any caught signal (SIGCHLD from tokio::process
     # child spawns) delivered to that thread triggers it. This is the flaky
     # `cargo test -p tack-app --lib` SIGABRT on macOS. Fixed upstream by
-    # PR #14414 (issue #14393); bump to the first release containing it
-    # (50.0.0 or a 49.0.2 backport) as soon as it ships.
+    # PR #14414 (issue #14393); the fix missed 49.0.2 (still on
+    # MACH_RCV_INTERRUPT there), so bump to 50.0.0 as soon as it ships.
     # Store call hooks, used to replenish the guest's fuel budget on every
     # guest→host call (no transitive dependencies).
     "call-hook",

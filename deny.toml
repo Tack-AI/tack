@@ -70,11 +70,11 @@ skip = [
     { crate = "rand_chacha@0.3" },
     { crate = "getrandom@0.2" },
     { crate = "getrandom@0.4" },
-    # wasmtime 48 internal: the `wat` feature pins wat 1.258 (wast 258 /
-    # wasm-encoder 0.258) while wiggle (wasmtime-wasi) still uses wast 35
-    # and wasmtime-environ pins wasm-encoder 0.254.
+    # wasmtime 49 internal: the `wat` feature pins wat 1.261 (wast 261)
+    # while wiggle (wasmtime-wasi) still uses wast 35; the wit-bindgen
+    # chain (wit-component/wasm-metadata 0.258) keeps wasm-encoder 0.258.
     { crate = "wasm-encoder@0.258" },
-    { crate = "wast@258" },
+    { crate = "wast@261" },
     # wasmtime 48 (wit-bindgen) uses hashbrown 0.17; the rest of the tree is
     # on 0.16.
     { crate = "hashbrown@0.17" },
@@ -94,10 +94,8 @@ skip = [
     # 0.61 is canonical (tack-tools pins it directly; tokio/rustix/wasmtime
     # agree). Older versions are pinned by stacks we cannot move:
     #   0.52 <- ring 0.17 (rustls ring provider; ring has not moved)
-    #   0.59 <- fs-set-times/winx (wasmtime 48 WASI stack)
     #   0.60 <- arboard 3.6, keyring 3.6, io-extras 0.19 (cap-std 4 chain)
     { crate = "windows-sys@0.52" },
-    { crate = "windows-sys@0.59" },
     { crate = "windows-sys@0.60" },
     # windows-targets 0.52.6 (+ its per-arch import crates) only exists for
     # the windows-sys <0.61 chain above; 0.53 serves windows-sys 0.61.
