@@ -68,7 +68,7 @@ globset.workspace = true
 regex.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pemfile = "2"
-rcgen = "0.13"
+rcgen = "0.14"
 webpki-roots = "1"
 # default-features off: defaults pull oauth2's own reqwest 0.12 HTTP client;
 # only TokenResponse/types are used (rmcp's auth does its own transport).
