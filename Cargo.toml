@@ -92,7 +92,7 @@ uuid = { version = "1", features = ["v4"] }
 dirs = "7"
 
 # crypto (OAuth PKCE / AWS SigV4 / Vertex SA-JWT)
-sha2 = "0.10"
+sha2 = "0.11"
 # Keep on 0.11 to match tungstenite 0.30's sha1 (WebSocket handshake);
 # downgrading would only add a second sha1 without removing the digest 0.11
 # chain (sha2/hmac/aes-gcm still pin digest 0.10).
