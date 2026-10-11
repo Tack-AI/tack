@@ -8,6 +8,22 @@ notice can parse entries (same convention as TS pi).
 
 ### Fixed
 
+- **Inline-mode scrollback no longer shows duplicated content when a
+  thinking block collapses**: when a streaming thinking block folded into
+  its "Thought for a while" label (or history was compacted) with the cut
+  straddling the viewport top, bottom-aligning the shorter frame pulled
+  rows that had already scrolled into the terminal's append-only
+  scrollback back onto the screen — scrolling up showed those rows twice
+  (plus the stale expanded thinking). The main-screen renderer now
+  splices a band of phantom blank rows at the collapse point so the
+  visible window stays anchored (label and response keep their screen
+  rows; nothing old reappears). The blanks scroll out through the
+  scrollback naturally as new output appends and are garbage-collected
+  from the renderer's retained frame once safely above the window — no
+  full-screen clear, no scrollback wipe, no paired-reclaim repaint
+  storms. Wholesale transcript replacements (/new, tree jumps) are
+  detected by a realignment guard and keep the classic repaint.
+
 - **LSP post-edit feedback no longer reports ghost errors**: the edit/write
   diagnostics summary tracked each file's last `publishDiagnostics` against
   its last content sync — errors in files edited since their last publish

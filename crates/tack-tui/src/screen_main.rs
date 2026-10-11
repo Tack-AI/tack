@@ -93,6 +93,24 @@ pub struct MainScreenRenderer {
     /// tiny re-placement escape — re-sending megabytes of base64 per frame
     /// is what made streaming crawl with a mermaid diagram on screen.
     kitty_transmitted: std::collections::HashSet<u32>,
+    /// Phantom blank regions: `(logical_row, count)`, sorted by row.
+    ///
+    /// When content ABOVE the viewport shrinks with the cut straddling the
+    /// viewport top (a streaming thinking block folding into its label at
+    /// run end, compaction, ctrl+t), bottom-aligning the shorter frame
+    /// would pull rows that already scrolled into the terminal's
+    /// append-only scrollback back onto the screen — the "pullback
+    /// duplication" a user sees when scrolling up. Splicing `count` blank
+    /// rows at the collapse row keeps the retained frame long enough that
+    /// the visible window stays anchored: the collapse leaves a blank band
+    /// where the folded rows were, the label/summary renders right below
+    /// it, and no stale row reappears. The blanks scroll up through the
+    /// scrollback naturally as new output appends (no paired reclaim, no
+    /// full-viewport repaints); once a region lies entirely above the
+    /// window its blanks are safely in the scrollback and the region is
+    /// garbage-collected from the retained frame (pure bookkeeping — no
+    /// terminal output).
+    phantoms: Vec<(usize, usize)>,
 }
 
 /// Extract (id, cols, rows) from a Kitty transmit+place escape line
@@ -119,6 +137,185 @@ fn parse_kitty_transmission(line: &str) -> Option<(u32, &str, &str)> {
     Some((id?, cols?, rows?))
 }
 
+/// Materialize the candidate frame with phantom blank regions spliced in,
+/// so the diff stays index-aligned with the retained previous frame.
+/// Region positions are APP-row indices (each region anchors `count`
+/// blanks before app row `pos`); they do not count other regions' blanks.
+fn splice_phantom_rows(parts: &[&[Line]], phantoms: &[(usize, usize)]) -> Vec<Line> {
+    let extra: usize = phantoms.iter().map(|r| r.1).sum();
+    let base: usize = parts.iter().map(|p| p.len()).sum();
+    let mut out = Vec::with_capacity(base + extra);
+    let mut src = parts.iter().flat_map(|p| p.iter());
+    let mut consumed = 0usize;
+    for &(pos, count) in phantoms {
+        for line in src.by_ref().take(pos.saturating_sub(consumed)) {
+            out.push(line.clone());
+            consumed += 1;
+        }
+        out.extend((0..count).map(|_| Line::new()));
+    }
+    out.extend(src.cloned());
+    out
+}
+
+/// Build the renderable rows for a candidate frame: per-row ANSI strings
+/// (fingerprint-reused from the previous frame where possible), the
+/// fingerprints, the rebuilt-row retention list, and the hardware cursor
+/// marker position. Extracted so a collapse that re-anchors phantom
+/// regions can rebuild the candidate within the same frame.
+/// The renderable form of a candidate frame: per-row ANSI strings, their
+/// source fingerprints, the rebuilt-row retention list, and the hardware
+/// cursor marker position.
+type AnsiRows = (
+    Vec<std::sync::Arc<str>>,
+    Vec<u64>,
+    Vec<(usize, Line)>,
+    Option<CursorPosition>,
+);
+
+fn build_ansi_rows(
+    parts: &[&[Line]],
+    previous_fps: &[u64],
+    previous_lines: &[std::sync::Arc<str>],
+) -> AnsiRows {
+    let total_len: usize = parts.iter().map(|p| p.len()).sum();
+    let mut cursor_pos: Option<CursorPosition> = None;
+    let mut new_lines: Vec<std::sync::Arc<str>> = Vec::with_capacity(total_len);
+    let mut new_fps: Vec<u64> = Vec::with_capacity(total_len);
+    // Rows whose ANSI was rebuilt this frame, each with a clone of its
+    // source Line — `update_caches` retains exactly these.
+    let mut changed: Vec<(usize, Line)> = Vec::new();
+    for (row, line) in parts.iter().flat_map(|p| p.iter()).enumerate() {
+        let fp = line_fingerprint(line);
+        new_fps.push(fp);
+        // Cache hit FIRST: identical source (same span Arcs) renders to
+        // identical ANSI, so reuse it and skip both the ANSI build and the
+        // cursor-marker substring scan (an O(bytes) scan over every line
+        // per frame otherwise — the dominant per-keystroke cost at large
+        // transcripts). Marker lines move the marker with the cursor, so
+        // their fingerprint changes whenever the cursor does; a matched
+        // marker line keeps the cursor where the previous frame put it,
+        // which is still correct.
+        if previous_fps.get(row) == Some(&fp) && previous_lines.get(row).is_some() {
+            new_lines.push(previous_lines[row].clone());
+            continue;
+        }
+        let mut ansi = String::new();
+        let mut col = 0usize;
+        for span in &line.spans {
+            // Find marker inside the span text.
+            if let Some(pos) = span.text.find(CURSOR_MARKER) {
+                cursor_pos = Some(CursorPosition {
+                    row,
+                    col: col + crate::line::grapheme_width(&span.text[..pos]),
+                });
+                let cleaned = span.text.replace(CURSOR_MARKER, "");
+                ansi.push_str(&span.style.ansi_prefix());
+                // The marker itself rides in a zero-width raw span; any
+                // styled text around it still gets sanitized.
+                if span.zero_width {
+                    ansi.push_str(&cleaned);
+                } else {
+                    ansi.push_str(&crate::line::sanitize(&cleaned));
+                }
+                ansi.push_str(span.style.ansi_suffix());
+            } else {
+                ansi.push_str(&span.style.ansi_prefix());
+                ansi.push_str(&span.terminal_text());
+                ansi.push_str(span.style.ansi_suffix());
+            }
+            col += span.width();
+        }
+        changed.push((row, line.clone()));
+        new_lines.push(std::sync::Arc::from(ansi));
+    }
+    (new_lines, new_fps, changed, cursor_pos)
+}
+
+/// Convert a candidate (spliced) row index to an app-row index by
+/// subtracting the phantom blanks sitting before it.
+fn app_row_at(phantoms: &[(usize, usize)], spliced_row: usize) -> usize {
+    let mut app = spliced_row;
+    let mut offset = 0usize;
+    for &(pos, count) in phantoms {
+        let logical = pos + offset;
+        if logical >= spliced_row {
+            break;
+        }
+        app -= count.min(spliced_row - logical);
+        offset += count;
+    }
+    app
+}
+
+/// First/last index at which the two frames differ (index-aligned
+/// comparison; <0 first when identical). Pointer equality first:
+/// unchanged rows reuse the previous frame's Arc, so the common case
+/// skips the string compare (a full-transcript memcmp per frame
+/// otherwise).
+fn first_last_changed(
+    previous_lines: &[std::sync::Arc<str>],
+    new_lines: &[std::sync::Arc<str>],
+) -> (i64, i64) {
+    let mut first_changed: i64 = -1;
+    let mut last_changed: i64 = -1;
+    let max_lines = new_lines.len().max(previous_lines.len());
+    for i in 0..max_lines {
+        let equal = match (previous_lines.get(i), new_lines.get(i)) {
+            (Some(old), Some(new)) => std::sync::Arc::ptr_eq(old, new) || old == new,
+            (old, new) => {
+                old.map(|s| s.as_ref()).unwrap_or("") == new.map(|s| s.as_ref()).unwrap_or("")
+            }
+        };
+        if !equal {
+            if first_changed == -1 {
+                first_changed = i as i64;
+            }
+            last_changed = i as i64;
+        }
+    }
+    (first_changed, last_changed)
+}
+
+/// Post-collapse realignment check for the phantom splice: after removing
+/// `shrink` rows at `c`, the candidate must line back up with the
+/// previous frame within a few rows of replacement content (the collapse
+/// label, a compaction summary) — verified against at least one real row.
+/// Returns the replacement-row count on success. Without a verified
+/// realignment the shrink is a wholesale transcript replacement (/new,
+/// tree jump, session load), where splicing blanks would leave the fresh
+/// content floating above a phantom band instead of anchoring at the top
+/// of the screen, so the caller keeps the classic repaint.
+fn suffix_realigns(
+    new: &[std::sync::Arc<str>],
+    prev: &[std::sync::Arc<str>],
+    c: usize,
+    shrink: usize,
+) -> Option<usize> {
+    // A collapse at the very first row is indistinguishable from a
+    // wholesale replacement — refuse those (thinking blocks always sit
+    // below the banner/history in practice).
+    if c == 0 {
+        return None;
+    }
+    /// Replacement rows tolerated before the suffix must realign.
+    const MAX_REPLACEMENT_ROWS: usize = 80;
+    let scan_end = new.len().min(c + MAX_REPLACEMENT_ROWS + 1);
+    for a in c..scan_end {
+        let run = (new.len() - a).min(3);
+        if run == 0 {
+            break;
+        }
+        if a + shrink + run > prev.len() {
+            continue;
+        }
+        if new[a..a + run] == prev[a + shrink..a + shrink + run] {
+            return Some(a - c);
+        }
+    }
+    None
+}
+
 impl MainScreenRenderer {
     pub fn new() -> Self {
         MainScreenRenderer::default()
@@ -127,6 +324,70 @@ impl MainScreenRenderer {
     /// Forget all render state (next frame is a first render).
     pub fn reset(&mut self) {
         *self = MainScreenRenderer::default();
+    }
+
+    /// Drop phantom regions whose blanks have scrolled entirely above the
+    /// window (they live in the terminal's scrollback now). Pure
+    /// bookkeeping — the terminal shows the same rows before and after;
+    /// only the renderer's absolute row numbering shifts. Keeps the
+    /// steady-state frame on the zero-copy parts path and the retained
+    /// frame bounded by the real transcript length.
+    fn gc_phantoms(&mut self) {
+        // Regions anchor app rows; convert to retained-frame rows by
+        // counting the blanks of all earlier regions.
+        let mut logical = 0usize;
+        let mut i = 0;
+        while i < self.phantoms.len() {
+            let (pos, count) = self.phantoms[i];
+            logical += pos;
+            if logical + count <= self.previous_viewport_top {
+                self.previous_lines.drain(logical..logical + count);
+                self.previous_fps.drain(logical..logical + count);
+                self.previous_source.drain(logical..logical + count);
+                self.previous_viewport_top -= count;
+                self.cursor_row = self.cursor_row.saturating_sub(count);
+                self.hardware_cursor_row = self.hardware_cursor_row.saturating_sub(count);
+                self.max_lines_rendered = self.max_lines_rendered.saturating_sub(count);
+                self.phantoms.remove(i);
+            } else {
+                logical += count;
+                i += 1;
+            }
+        }
+    }
+
+    /// Strip every phantom region out of a freshly built candidate frame.
+    /// Used by the full-clear paths: the scrollback wipe makes anchoring
+    /// moot, and the rewritten frame must not carry the blanks forward.
+    fn strip_phantom_rows(
+        &mut self,
+        new_lines: &mut Vec<std::sync::Arc<str>>,
+        new_fps: &mut Vec<u64>,
+        changed: &mut Vec<(usize, Line)>,
+    ) {
+        let regions = std::mem::take(&mut self.phantoms);
+        // Candidate rows count earlier regions' blanks; strip in reverse
+        // so earlier positions stay valid.
+        let mut logical_positions: Vec<usize> = Vec::with_capacity(regions.len());
+        let mut blanks_before = 0usize;
+        for &(pos, count) in &regions {
+            logical_positions.push(pos + blanks_before);
+            blanks_before += count;
+        }
+        for (&logical, &(_, count)) in logical_positions.iter().zip(regions.iter()).rev() {
+            new_lines.drain(logical..(logical + count).min(new_lines.len()));
+            new_fps.drain(logical..(logical + count).min(new_fps.len()));
+            let mut kept: Vec<(usize, Line)> = Vec::with_capacity(changed.len());
+            for (row, line) in changed.drain(..) {
+                if row < logical {
+                    kept.push((row, line));
+                } else if row >= logical + count {
+                    kept.push((row - count, line));
+                }
+                // Rows inside the stripped region vanish with it.
+            }
+            *changed = kept;
+        }
     }
 
     /// Emit a Kitty image line: verbatim the first time (the terminal
@@ -231,6 +492,7 @@ impl MainScreenRenderer {
         if height == 0 {
             return Ok(None);
         }
+        self.gc_phantoms();
         // Lines wider than the viewport would auto-wrap in the terminal,
         // breaking the renderer's one-frame-line = one-terminal-row
         // accounting (misplaced cursor, stale/duplicated rows, blank bands).
@@ -261,6 +523,22 @@ impl MainScreenRenderer {
         } else {
             parts
         };
+        // Phantom blanks: splice the recorded regions into the candidate
+        // frame so it stays index-aligned with the retained previous frame.
+        // Only materializes while regions are pending (between a collapse
+        // and its blanks scrolling off into the terminal's scrollback);
+        // steady-state frames keep the zero-copy parts path. `base_parts`
+        // keeps the un-spliced frame for a region re-anchor rebuild.
+        let phantom_joined;
+        let phantom_slice;
+        let base_parts = parts;
+        let parts: &[&[Line]] = if self.phantoms.is_empty() {
+            base_parts
+        } else {
+            phantom_joined = splice_phantom_rows(base_parts, &self.phantoms);
+            phantom_slice = phantom_joined.as_slice();
+            std::slice::from_ref(&phantom_slice)
+        };
         let width_changed = self.previous_width != 0 && self.previous_width != width;
         let height_changed = self.previous_height != 0 && self.previous_height != height;
         let previous_buffer_length = if self.previous_height > 0 {
@@ -276,66 +554,18 @@ impl MainScreenRenderer {
 
         let mut hardware_cursor_row = self.hardware_cursor_row;
 
-        // Extract the cursor marker, then emit ANSI strings. Lines whose
-        // fingerprint matches the previous frame reuse the previous ANSI
-        // string (an Arc clone) — steady-state frames build ANSI only for
-        // changed lines instead of the full transcript.
-        let total_len: usize = parts.iter().map(|p| p.len()).sum();
-        let mut cursor_pos: Option<CursorPosition> = None;
-        let mut new_lines: Vec<std::sync::Arc<str>> = Vec::with_capacity(total_len);
-        let mut new_fps: Vec<u64> = Vec::with_capacity(total_len);
-        // Rows whose ANSI was rebuilt this frame, each with a clone of its
-        // source Line — `update_caches` retains exactly these.
-        let mut changed: Vec<(usize, Line)> = Vec::new();
-        for (row, line) in parts.iter().flat_map(|p| p.iter()).enumerate() {
-            let fp = line_fingerprint(line);
-            new_fps.push(fp);
-            // Cache hit FIRST: identical source (same span Arcs) renders to
-            // identical ANSI, so reuse it and skip both the ANSI build and
-            // the cursor-marker substring scan (an O(bytes) scan over every
-            // line per frame otherwise — the dominant per-keystroke cost at
-            // large transcripts). Marker lines move the marker with the
-            // cursor, so their fingerprint changes whenever the cursor does;
-            // a matched marker line keeps the cursor where the previous
-            // frame put it, which is still correct.
-            if self.previous_fps.get(row) == Some(&fp) && self.previous_lines.get(row).is_some() {
-                new_lines.push(self.previous_lines[row].clone());
-                continue;
-            }
-            let mut ansi = String::new();
-            let mut col = 0usize;
-            for span in &line.spans {
-                // Find marker inside the span text.
-                if let Some(pos) = span.text.find(CURSOR_MARKER) {
-                    cursor_pos = Some(CursorPosition {
-                        row,
-                        col: col + crate::line::grapheme_width(&span.text[..pos]),
-                    });
-                    let cleaned = span.text.replace(CURSOR_MARKER, "");
-                    ansi.push_str(&span.style.ansi_prefix());
-                    // The marker itself rides in a zero-width raw span; any
-                    // styled text around it still gets sanitized.
-                    if span.zero_width {
-                        ansi.push_str(&cleaned);
-                    } else {
-                        ansi.push_str(&crate::line::sanitize(&cleaned));
-                    }
-                    ansi.push_str(span.style.ansi_suffix());
-                } else {
-                    ansi.push_str(&span.style.ansi_prefix());
-                    ansi.push_str(&span.terminal_text());
-                    ansi.push_str(span.style.ansi_suffix());
-                }
-                col += span.width();
-            }
-            changed.push((row, line.clone()));
-            new_lines.push(std::sync::Arc::from(ansi));
-        }
+        // Extract the cursor marker, then emit ANSI strings (fingerprint
+        // reuse from the previous frame — see build_ansi_rows).
+        let (mut new_lines, mut new_fps, mut changed, mut cursor_pos) =
+            build_ansi_rows(parts, &self.previous_fps, &self.previous_lines);
 
         let new_len = new_lines.len();
         // Full re-render helper.
+        #[allow(clippy::too_many_arguments)]
         let full_render = |renderer: &mut Self,
-                           new_lines: &[std::sync::Arc<str>],
+                           new_lines: &mut Vec<std::sync::Arc<str>>,
+                           new_fps: &mut Vec<u64>,
+                           changed: &mut Vec<(usize, Line)>,
                            clear: bool,
                            out: &mut dyn Write,
                            viewport_top: usize,
@@ -344,6 +574,9 @@ impl MainScreenRenderer {
             let mut buffer = String::from("\x1b[?2026h");
             if clear {
                 buffer.push_str("\x1b[2J\x1b[H\x1b[3J"); // clear screen + scrollback
+                // Anchoring is moot once the scrollback is wiped; the
+                // rewritten frame must not carry the blanks forward.
+                renderer.strip_phantom_rows(new_lines, new_fps, changed);
             }
             for (i, line) in new_lines.iter().enumerate() {
                 if i > 0 {
@@ -373,7 +606,9 @@ impl MainScreenRenderer {
         if self.previous_lines.is_empty() && !width_changed && !height_changed {
             let (cr, hcr, vtop) = full_render(
                 self,
-                &new_lines,
+                &mut new_lines,
+                &mut new_fps,
+                &mut changed,
                 false,
                 out,
                 prev_viewport_top,
@@ -393,7 +628,9 @@ impl MainScreenRenderer {
         if width_changed {
             let (cr, hcr, vtop) = full_render(
                 self,
-                &new_lines,
+                &mut new_lines,
+                &mut new_fps,
+                &mut changed,
                 true,
                 out,
                 prev_viewport_top,
@@ -417,7 +654,9 @@ impl MainScreenRenderer {
             }
             let (cr, hcr, vtop) = full_render(
                 self,
-                &new_lines,
+                &mut new_lines,
+                &mut new_fps,
+                &mut changed,
                 true,
                 out,
                 prev_viewport_top,
@@ -434,26 +673,118 @@ impl MainScreenRenderer {
         }
 
         // Find first/last changed lines.
-        let mut first_changed: i64 = -1;
-        let mut last_changed: i64 = -1;
-        let max_lines = new_lines.len().max(self.previous_lines.len());
-        for i in 0..max_lines {
-            // Pointer equality first: unchanged rows reuse the previous
-            // frame's Arc, so the common case skips the string compare
-            // (a full-transcript memcmp per frame otherwise).
-            let equal = match (self.previous_lines.get(i), new_lines.get(i)) {
-                (Some(old), Some(new)) => std::sync::Arc::ptr_eq(old, new) || old == new,
-                (old, new) => {
-                    old.map(|s| s.as_ref()).unwrap_or("") == new.map(|s| s.as_ref()).unwrap_or("")
+        let (mut first_changed, mut last_changed) =
+            first_last_changed(&self.previous_lines, &new_lines);
+
+        // Shrink straddling the viewport top (a streaming thinking block
+        // folding into its label at run end, compaction, ctrl+t): splice
+        // phantom blank rows at the collapse point so the retained frame
+        // keeps its length and the on-screen window stays anchored. Rows
+        // that already scrolled into the terminal's append-only scrollback
+        // are never pulled back onto the screen (the "pullback
+        // duplication"); the blanks scroll out through the scrollback
+        // naturally as new output appends. Guarded by a suffix-realignment
+        // check so wholesale transcript replacements keep the classic
+        // repaint. Multi-site shrinks (ctrl+t collapsing several thinking
+        // blocks at once) splice one site per frame — later sites show up
+        // as a fresh shrink on the next frame.
+        if new_lines.len() < self.previous_lines.len()
+            && first_changed != -1
+            && (first_changed as usize) < prev_viewport_top
+        {
+            let shrink = self.previous_lines.len() - new_lines.len();
+            let mut c = first_changed as usize;
+            if let Some(replaced) = suffix_realigns(&new_lines, &self.previous_lines, c, shrink) {
+                // `c` is in candidate (spliced) coordinates; region
+                // bookkeeping anchors app rows. Convert by subtracting the
+                // phantom blanks sitting before `c`.
+                let app_c = app_row_at(&self.phantoms, c);
+                // Re-anchor existing regions to the new app frame: the
+                // collapse removed app rows [app_c, app_c + shrink +
+                // replaced). Regions anchoring inside the removed range
+                // merge into the new collapse point; regions below it
+                // shift up.
+                let removed_end = app_c + shrink + replaced;
+                let mut moved = false;
+                for region in &mut self.phantoms {
+                    if region.0 > app_c {
+                        moved = true;
+                        region.0 = if region.0 < removed_end {
+                            app_c
+                        } else {
+                            region.0 - shrink
+                        };
+                    }
                 }
-            };
-            if !equal {
-                if first_changed == -1 {
-                    first_changed = i as i64;
+                self.phantoms.sort_unstable();
+                // Blanks needed to keep the collapse label and everything
+                // below it at their current screen rows: the pullback
+                // amount.
+                let pad = (c + height as usize)
+                    .saturating_sub(new_lines.len())
+                    .min(shrink);
+                if moved {
+                    // The blanks in the already-built candidate sit at the
+                    // pre-collapse positions; rebuild it with the
+                    // re-anchored regions so this frame's repaint places
+                    // the bands correctly (collapse frames are rare — one
+                    // extra candidate build is fine).
+                    let rebuilt = splice_phantom_rows(base_parts, &self.phantoms);
+                    let (l, f, ch, cp) = build_ansi_rows(
+                        std::slice::from_ref(&rebuilt.as_slice()),
+                        &self.previous_fps,
+                        &self.previous_lines,
+                    );
+                    new_lines = l;
+                    new_fps = f;
+                    changed = ch;
+                    cursor_pos = cp;
+                    (first_changed, last_changed) =
+                        first_last_changed(&self.previous_lines, &new_lines);
+                    // The collapse's spliced coordinate moved with the
+                    // re-anchored bands; the app coordinate is unchanged.
+                    c = first_changed as usize;
                 }
-                last_changed = i as i64;
+                if pad > 0 {
+                    let blank_fp = line_fingerprint(&Line::new());
+                    let blank_ansi: std::sync::Arc<str> = std::sync::Arc::from("");
+                    new_lines.splice(c..c, (0..pad).map(|_| blank_ansi.clone()));
+                    new_fps.splice(c..c, std::iter::repeat_n(blank_fp, pad));
+                    let split = changed.partition_point(|(row, _)| *row < c);
+                    for (row, _) in &mut changed[split..] {
+                        *row += pad;
+                    }
+                    changed.splice(split..split, (0..pad).map(|j| (c + j, Line::new())));
+                    let at = self.phantoms.partition_point(|r| r.0 < app_c);
+                    self.phantoms.insert(at, (app_c, pad));
+                    // The suffix below the splice no longer index-aligns
+                    // with the previous frame (pad < shrink);
+                    // conservatively mark everything to the frame end as
+                    // changed. The above-viewport repaint path below only
+                    // reads `first_changed` — its stable-suffix scan
+                    // bounds the actual repaint to the blank band + label.
+                    last_changed = (self.previous_lines.len().max(new_lines.len()) - 1) as i64;
+                }
             }
+        } else if new_lines.len() > self.previous_lines.len()
+            && first_changed != -1
+            && (first_changed as usize) < prev_viewport_top
+        {
+            // Growth above the viewport (ctrl+o expanding old history):
+            // shift the regions below the insertion so they stay anchored
+            // to their app rows. The already-built candidate carries the
+            // blanks at the pre-growth positions — cosmetic only (the
+            // insertion is above the window, so is the misplacement).
+            let growth = new_lines.len() - self.previous_lines.len();
+            let app_c = app_row_at(&self.phantoms, first_changed as usize);
+            for region in &mut self.phantoms {
+                if region.0 > app_c {
+                    region.0 += growth;
+                }
+            }
+            self.phantoms.sort_unstable();
         }
+        let new_len = new_lines.len();
         let appended = new_lines.len() > self.previous_lines.len();
         if appended {
             if first_changed == -1 {
@@ -480,7 +811,9 @@ impl MainScreenRenderer {
                 if target_row < prev_viewport_top {
                     let (cr, hcr, vtop) = full_render(
                         self,
-                        &new_lines,
+                        &mut new_lines,
+                        &mut new_fps,
+                        &mut changed,
                         true,
                         out,
                         prev_viewport_top,
@@ -506,7 +839,9 @@ impl MainScreenRenderer {
                 if extra_lines > height as usize {
                     let (cr, hcr, vtop) = full_render(
                         self,
-                        &new_lines,
+                        &mut new_lines,
+                        &mut new_fps,
+                        &mut changed,
                         true,
                         out,
                         prev_viewport_top,
@@ -549,15 +884,21 @@ impl MainScreenRenderer {
         }
 
         // Changes above the viewport can't be edited in place — those rows
-        // live in the terminal's scrollback. But a collapse/expansion up
-        // there (a long streaming thought folding into its "Thought for a
-        // while" label when the run ends, or ctrl+t on old history) leaves
-        // every screen row BELOW the change showing the same content at the
-        // same screen row: only the top rows actually differ. Repaint just
-        // those, from the top of the screen, instead of the old full clear
-        // (\x1b[2J\x1b[H\x1b[3J) + whole-frame rewrite — that wiped the
-        // scrollback and visibly flashed the entire screen on terminals
-        // without synchronized output (Termux).
+        // live in the terminal's scrollback. Two shapes survive to here:
+        //
+        // - A collapse/expansion fully above the viewport (ctrl+t on old
+        //   history) leaves every screen row showing the same content at
+        //   the same screen row: only the top rows actually differ, so
+        //   repaint just those instead of the old full clear
+        //   (\x1b[2J\x1b[H\x1b[3J) + whole-frame rewrite — that wiped the
+        //   scrollback and visibly flashed the entire screen on terminals
+        //   without synchronized output (Termux).
+        // - A straddling shrink the phantom splice refused (wholesale
+        //   transcript replacement, or a guard mismatch): the window top
+        //   moves up and pulled-back rows reappear on screen. That trades
+        //   the scrollback/screen duplication for keeping a faithful
+        //   scrollback tape — collapses that DO match the guard never
+        //   reach here (see the phantom splice above).
         if (first_changed as usize) < prev_viewport_top {
             let h = height as usize;
             let new_viewport_top = new_len.saturating_sub(h);
@@ -633,7 +974,9 @@ impl MainScreenRenderer {
         if frame_has_kitty && move_target_row > prev_viewport_bottom {
             let (cr, hcr, vtop) = full_render(
                 self,
-                &new_lines,
+                &mut new_lines,
+                &mut new_fps,
+                &mut changed,
                 true,
                 out,
                 prev_viewport_top,
@@ -969,14 +1312,15 @@ mod tests {
     }
 
     #[test]
-    fn collapse_straddling_viewport_repaints_only_changed_rows() {
+    fn collapse_straddling_viewport_splices_phantoms_no_pullback() {
         // Termux scenario: a thinking block taller than the visible screen
-        // collapses to the one-row "Thought for a while" label. Old
-        // behavior: \x1b[2J\x1b[H\x1b[3J + a rewrite of every frame row — a
-        // visible full-screen flash (no synchronized output on Termux) that
-        // also wiped the scrollback. Only the screen rows whose content
-        // actually changed (revealed history + the label) need a repaint;
-        // the stable bottom suffix stays untouched.
+        // collapses to the one-row "Thought for a while" label. The cut
+        // straddles the viewport top, so bottom-aligning the shorter frame
+        // would pull rows that already live in the (append-only) scrollback
+        // back onto the screen — the pullback duplication. The phantom
+        // splice keeps the window anchored instead: the thinking tail on
+        // screen is replaced by a blank band + the label, the stable
+        // bottom suffix stays untouched, and no history row is rewritten.
         let mut renderer = MainScreenRenderer::new();
         let mut out = Vec::new();
         // Old frame: 100 rows; the expanded thinking occupies rows 60..90,
@@ -992,18 +1336,34 @@ mod tests {
         let s = String::from_utf8_lossy(&out);
         assert!(!s.contains("\x1b[2J"), "full screen clear: {s:?}");
         assert!(!s.contains("\x1b[3J"), "scrollback wipe: {s:?}");
-        // New viewport top = 71 - 30 = 41: revealed history rows 41..60 and
-        // the label are rewritten (20 rows); nothing else.
-        assert!(s.contains("row 41"), "revealed history row missing: {s:?}");
-        assert!(s.contains("row 59"), "revealed history row missing: {s:?}");
+        // Phantom splice: 19 blanks (rows 60..79 logical) + the label are
+        // rewritten (20 rows); the stable suffix (rows 90..99) is not, and
+        // no pulled-back history row (41..60) appears.
+        assert_eq!(renderer.phantoms, vec![(60, 19)], "phantom region");
         assert!(s.contains("Thought for a while"), "{s:?}");
+        assert!(!s.contains("row 41"), "pulled-back row rewritten: {s:?}");
+        assert!(!s.contains("row 59"), "pulled-back row rewritten: {s:?}");
         assert!(!s.contains("row 90"), "stable suffix rewritten: {s:?}");
-        assert!(!s.contains("row 40"), "above-viewport row rewritten: {s:?}");
         assert_eq!(
             s.matches("\x1b[2K").count(),
             20,
-            "expected exactly the 20 changed rows repainted: {s:?}"
+            "expected exactly the 19 blanks + label repainted: {s:?}"
         );
+
+        // The phantom region keeps later frames index-aligned: an append
+        // scrolls one blank into the scrollback (physical scroll path),
+        // the rest of the screen stays put.
+        let mut newer = numbered_rows(60);
+        newer.push(Line::plain("◦ Thought for a while (5400 chars)"));
+        newer.extend((90..100).map(|i| Line::plain(format!("row {i}"))));
+        newer.push(Line::plain("fresh output"));
+        out.clear();
+        renderer.render(&newer, 80, 30, false, &mut out).unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("fresh output"), "{s:?}");
+        assert!(!s.contains("\x1b[2J"), "{s:?}");
+        assert!(!s.contains("row 41"), "late pullback: {s:?}");
+        assert_eq!(renderer.phantoms, vec![(60, 19)], "region persists");
     }
 
     #[test]
@@ -1084,5 +1444,168 @@ mod tests {
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("tail"), "{s:?}");
         assert!(!s.contains("\x1b[2J"), "{s:?}");
+    }
+
+    #[test]
+    fn phantom_region_is_garbage_collected_once_scrolled_above_window() {
+        // After the collapse, each append scrolls one phantom blank into
+        // the scrollback. Once the whole region lies above the window it
+        // is dropped from the retained frame (pure bookkeeping), and the
+        // renderer returns to the zero-copy steady state.
+        let mut renderer = MainScreenRenderer::new();
+        let mut out = Vec::new();
+        let old = numbered_rows(100);
+        let mut collapsed = numbered_rows(60);
+        collapsed.push(Line::plain("◦ Thought for a while (5400 chars)"));
+        collapsed.extend((90..100).map(|i| Line::plain(format!("row {i}"))));
+        renderer.render(&old, 80, 30, false, &mut out).unwrap();
+        renderer
+            .render(&collapsed, 80, 30, false, &mut out)
+            .unwrap();
+        assert_eq!(renderer.phantoms, vec![(60, 19)]);
+        // 19 appends flush all 19 blanks above the window; the GC runs at
+        // the START of the frame once the region end reaches the window
+        // top, so it takes one more frame after the 19th append.
+        for k in 0..20usize {
+            let mut frame = collapsed.clone();
+            frame.extend((0..=k).map(|i| Line::plain(format!("append {i}"))));
+            out.clear();
+            renderer.render(&frame, 80, 30, false, &mut out).unwrap();
+        }
+        assert!(
+            renderer.phantoms.is_empty(),
+            "region not GC'd: {:?}",
+            renderer.phantoms
+        );
+        // Bookkeeping survived the GC: the next append diffs against the
+        // bottom instead of repainting the world.
+        let mut frame = collapsed.clone();
+        frame.extend((0..20).map(|i| Line::plain(format!("append {i}"))));
+        frame.push(Line::plain("append 20"));
+        out.clear();
+        renderer.render(&frame, 80, 30, false, &mut out).unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("append 20"), "{s:?}");
+        assert!(!s.contains("\x1b[2J"), "{s:?}");
+        assert!(
+            s.len() < 200,
+            "expected a small tail diff after GC, got {} bytes",
+            s.len()
+        );
+    }
+
+    #[test]
+    fn wholesale_replacement_rejects_phantom_splice() {
+        // /new-style replacement: the old transcript vanishes wholesale
+        // (nothing realigns) — the splice must NOT fire; the fresh frame
+        // anchors at the top of the screen via the classic repaint.
+        let mut renderer = MainScreenRenderer::new();
+        let mut out = Vec::new();
+        renderer
+            .render(&numbered_rows(100), 80, 30, false, &mut out)
+            .unwrap();
+        out.clear();
+        let fresh = vec![
+            Line::plain("welcome to a fresh session"),
+            Line::plain(""),
+            Line::plain("> "),
+        ];
+        renderer.render(&fresh, 80, 30, false, &mut out).unwrap();
+        assert!(
+            renderer.phantoms.is_empty(),
+            "splice misfired: {:?}",
+            renderer.phantoms
+        );
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("welcome to a fresh session"), "{s:?}");
+        assert!(!s.contains("\x1b[2J"), "{s:?}");
+    }
+
+    #[test]
+    fn expansion_above_viewport_shifts_pending_region() {
+        // A collapse left a phantom band pending; ctrl+o expanding old
+        // history above it must re-anchor the band to its app row.
+        let mut renderer = MainScreenRenderer::new();
+        let mut out = Vec::new();
+        let old = numbered_rows(100);
+        let mut collapsed = numbered_rows(60);
+        collapsed.push(Line::plain("◦ Thought for a while (5400 chars)"));
+        collapsed.extend((90..100).map(|i| Line::plain(format!("row {i}"))));
+        renderer.render(&old, 80, 30, false, &mut out).unwrap();
+        renderer
+            .render(&collapsed, 80, 30, false, &mut out)
+            .unwrap();
+        assert_eq!(renderer.phantoms, vec![(60, 19)]);
+        // Expand 20 rows at app row 10 (above the band's anchor).
+        let mut expanded = numbered_rows(10);
+        expanded.extend((0..20).map(|i| Line::plain(format!("thought {i}"))));
+        expanded.extend((10..60).map(|i| Line::plain(format!("row {i}"))));
+        expanded.push(Line::plain("◦ Thought for a while (5400 chars)"));
+        expanded.extend((90..100).map(|i| Line::plain(format!("row {i}"))));
+        out.clear();
+        renderer.render(&expanded, 80, 30, false, &mut out).unwrap();
+        assert_eq!(
+            renderer.phantoms,
+            vec![(80, 19)],
+            "region shifted by the insertion"
+        );
+        // Steady-state append afterwards still diffs cleanly.
+        let mut appended = expanded.clone();
+        appended.push(Line::plain("tail"));
+        out.clear();
+        renderer.render(&appended, 80, 30, false, &mut out).unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("tail"), "{s:?}");
+        assert!(!s.contains("\x1b[2J"), "{s:?}");
+    }
+
+    #[test]
+    fn sequential_collapses_splice_independently() {
+        // Two thinking blocks collapse in successive frames: each splice
+        // anchors its own region; both sets of blanks flow out cleanly.
+        let mut renderer = MainScreenRenderer::new();
+        let mut out = Vec::new();
+        let old = numbered_rows(100);
+        renderer.render(&old, 80, 30, false, &mut out).unwrap();
+        // First collapse: rows 60..90 → label (as in the straddle test).
+        let mut step1 = numbered_rows(60);
+        step1.push(Line::plain("◦ Thought A"));
+        step1.extend((90..100).map(|i| Line::plain(format!("row {i}"))));
+        renderer.render(&step1, 80, 30, false, &mut out).unwrap();
+        assert_eq!(renderer.phantoms, vec![(60, 19)]);
+        // Second collapse one frame later: rows 20..50 → another label.
+        // The cut is fully ABOVE the current window, so no new blank band
+        // is needed — the first region simply re-anchors to its label's
+        // new app row (60 → 31) and the screen stays exactly put.
+        let mut step2 = numbered_rows(20);
+        step2.push(Line::plain("◦ Thought B"));
+        step2.extend((50..60).map(|i| Line::plain(format!("row {i}"))));
+        step2.push(Line::plain("◦ Thought A"));
+        step2.extend((90..100).map(|i| Line::plain(format!("row {i}"))));
+        out.clear();
+        renderer.render(&step2, 80, 30, false, &mut out).unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert!(!s.contains("\x1b[2J"), "{s:?}");
+        assert!(
+            !s.contains("row ") && !s.contains("Thought"),
+            "fully-above-viewport collapse must not repaint rows: {s:?}"
+        );
+        assert_eq!(
+            renderer.phantoms,
+            vec![(31, 19)],
+            "first region re-anchored to the label's new app row"
+        );
+        // And both regions GC as output streams.
+        for k in 0..40usize {
+            let mut frame = step2.clone();
+            frame.extend((0..=k).map(|i| Line::plain(format!("append {i}"))));
+            out.clear();
+            renderer.render(&frame, 80, 30, false, &mut out).unwrap();
+        }
+        assert!(
+            renderer.phantoms.is_empty(),
+            "regions not GC'd: {:?}",
+            renderer.phantoms
+        );
     }
 }
