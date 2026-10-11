@@ -6,6 +6,16 @@ notice can parse entries (same convention as TS pi).
 
 ## [Unreleased]
 
+### Fixed
+
+- **LSP post-edit feedback no longer reports ghost errors**: the edit/write
+  diagnostics summary tracked each file's last `publishDiagnostics` against
+  its last content sync — errors in files edited since their last publish
+  (stale by construction, e.g. flycheck output computed against a
+  mid-refactor workspace) are omitted from the cross-file summary with a
+  disclosure, and a summary read before the server analyzed the edit is
+  marked as possibly predating it instead of claiming a clean file.
+
 ### Security
 
 - **wasmtime 49.0.1 → 49.0.2**: fixes seven upstream Wasmtime advisories

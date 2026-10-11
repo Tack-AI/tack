@@ -324,6 +324,20 @@ impl LspManager {
     /// Sync `path` and wait for the diagnostics burst to settle. Returns
     /// the live client.
     async fn sync_settled(&self, path: &Path, wait: std::time::Duration) -> Option<Arc<LspClient>> {
+        self.sync_settled_fresh(path, wait)
+            .await
+            .map(|(client, _)| client)
+    }
+
+    /// `sync_settled`, also reporting whether a publish for `path`
+    /// arrived within `wait` — when it did not, the cached diagnostics
+    /// may predate the synced content and the caller must say so rather
+    /// than present them as current.
+    async fn sync_settled_fresh(
+        &self,
+        path: &Path,
+        wait: std::time::Duration,
+    ) -> Option<(Arc<LspClient>, bool)> {
         let client = self.client_for(path).await?;
         let text = read_lsp_file_opt(path)?;
         let (uri, before) = client.sync_document(path, &text);
@@ -341,7 +355,8 @@ impl LspManager {
             }
             last = client.uri_version(&uri);
         }
-        Some(client)
+        let fresh = client.uri_version(&uri) > before;
+        Some((client, fresh))
     }
 
     /// Sync `path` and return its current diagnostics after settling, plus
@@ -435,8 +450,8 @@ pub async fn post_edit_summary(manager: &LspManager, path: &Path) -> Option<Stri
         }
     }
     let spec = manager.spec_for(path)?;
-    let client = manager
-        .sync_settled(path, std::time::Duration::from_millis(2500))
+    let (client, fresh) = manager
+        .sync_settled_fresh(path, std::time::Duration::from_millis(2500))
         .await?;
     // Background analysis (flycheck) lags the syntax pass; give it a short
     // bounded grace so type errors usually make it into the feedback.
@@ -465,13 +480,20 @@ pub async fn post_edit_summary(manager: &LspManager, path: &Path) -> Option<Stri
         text.push('\n');
         text.push_str(&note);
     }
+    if !fresh {
+        text.push_str("\n(the server has not analyzed this edit yet — diagnostics may predate it)");
+    }
     Some(text)
 }
 
 /// "N error(s) in M other file(s): a.rs (2), b.rs (1)" — cross-file errors
 /// cached on the same server, excluding `exclude_uri`. None when clean.
+/// Files synced since their cached diagnostics were published are
+/// omitted with a disclosure instead: those entries describe older text
+/// — presenting them as current is how ghost errors outlive their fix.
 fn cross_file_error_note(client: &LspClient, exclude_uri: &str) -> Option<String> {
     let mut files: Vec<(PathBuf, usize)> = Vec::new();
+    let mut stale: Vec<PathBuf> = Vec::new();
     for (uri, diags) in client.all_diagnostics() {
         if uri == normalize_uri(exclude_uri) {
             continue;
@@ -480,14 +502,13 @@ fn cross_file_error_note(client: &LspClient, exclude_uri: &str) -> Option<String
         if errors > 0
             && let Some(path) = uri_to_path(&uri)
         {
-            files.push((path, errors));
+            if client.stale_since_sync(&uri) {
+                stale.push(path);
+            } else {
+                files.push((path, errors));
+            }
         }
     }
-    if files.is_empty() {
-        return None;
-    }
-    files.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-    let total: usize = files.iter().map(|(_, n)| n).sum();
     let short = |path: &Path| {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         match path.parent().and_then(|p| p.file_name()) {
@@ -495,18 +516,38 @@ fn cross_file_error_note(client: &LspClient, exclude_uri: &str) -> Option<String
             None => name.to_string(),
         }
     };
+    let stale_note = |stale: &[PathBuf]| {
+        let shown: Vec<String> = stale.iter().take(3).map(|p| short(p)).collect();
+        let more = if stale.len() > 3 { ", …" } else { "" };
+        format!(
+            "{} stale file(s) omitted (edited since their last analysis): {}{}",
+            stale.len(),
+            shown.join(", "),
+            more
+        )
+    };
+    if files.is_empty() {
+        return (!stale.is_empty()).then(|| stale_note(&stale));
+    }
+    files.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    let total: usize = files.iter().map(|(_, n)| n).sum();
     let shown: Vec<String> = files
         .iter()
         .take(3)
         .map(|(path, n)| format!("{} ({n})", short(path)))
         .collect();
     let more = if files.len() > 3 { ", …" } else { "" };
-    Some(format!(
+    let mut note = format!(
         "{total} error(s) in {} other file(s): {}{}",
         files.len(),
         shown.join(", "),
         more
-    ))
+    );
+    if !stale.is_empty() {
+        note.push_str(" · ");
+        note.push_str(&stale_note(&stale));
+    }
+    Some(note)
 }
 
 impl LspManager {
@@ -997,6 +1038,92 @@ mod tests {
     async fn no_server_for_unknown_extension() {
         let manager = LspManager::new(std::env::current_dir().unwrap());
         assert!(manager.client_for(Path::new("foo.xyz123")).await.is_none());
+    }
+
+    /// Post-edit feedback must not present diagnostics published before a
+    /// file's latest sync as current — that is how ghost errors outlive
+    /// their fix (rust-analyzer republishes edited files and dependents
+    /// on its own cadence; flycheck trails by seconds).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cross_file_note_omits_files_synced_since_their_last_publish() {
+        use crate::lsp::client::dispatch;
+
+        fn fake_client() -> Arc<LspClient> {
+            let (writer, _sink) = tokio::sync::mpsc::unbounded_channel();
+            let child = tokio::process::Command::new("sleep")
+                .arg("30")
+                .kill_on_drop(true)
+                .spawn()
+                .expect("sleep spawns on unix");
+            Arc::new(LspClient {
+                shared: Arc::new(ReaderShared::new(writer)),
+                next_id: AtomicU64::new(1),
+                open_docs: Mutex::new(HashMap::new()),
+                sync_seq: AtomicU64::new(1),
+                warmed: std::sync::atomic::AtomicBool::new(false),
+                alive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                child: Mutex::new(child),
+            })
+        }
+        let publish = |client: &LspClient, path: &Path, errors: usize| {
+            let uri = path_to_uri(path);
+            let diags: Vec<Value> = (0..errors)
+                .map(|i| {
+                    json!({
+                        "range": {"start": {"line": i, "character": 0},
+                                  "end": {"line": i, "character": 1}},
+                        "severity": 1,
+                        "message": format!("err {i}"),
+                    })
+                })
+                .collect();
+            dispatch(
+                &json!({
+                    "method": "textDocument/publishDiagnostics",
+                    "params": { "uri": uri, "diagnostics": diags },
+                }),
+                &client.shared,
+            );
+        };
+
+        let client = fake_client();
+        let a = Path::new("/tmp/xf-a.rs");
+        let b = Path::new("/tmp/xf-b.rs");
+        let exclude = path_to_uri(Path::new("/tmp/xf-edited.rs"));
+
+        publish(&client, a, 1);
+        publish(&client, b, 2);
+
+        // Baseline: never synced, both count.
+        let note = cross_file_error_note(&client, &exclude).unwrap();
+        assert!(note.contains("3 error(s) in 2 other file(s)"), "{note}");
+
+        // Synced (edited) without a republish: the entry goes stale —
+        // omitted from the counts, disclosed by name.
+        client.sync_document(a, "fn a() {}");
+        let note = cross_file_error_note(&client, &exclude).unwrap();
+        assert!(
+            note.contains("2 error(s) in 1 other file(s): tmp/xf-b.rs (2)"),
+            "{note}"
+        );
+        assert!(note.contains("1 stale file(s) omitted"), "{note}");
+        assert!(note.contains("xf-a.rs"), "{note}");
+
+        // Everything stale: no error counts, only the disclosure.
+        client.sync_document(b, "fn b() {}");
+        let note = cross_file_error_note(&client, &exclude).unwrap();
+        assert!(!note.contains("error(s) in"), "{note}");
+        assert!(note.contains("2 stale file(s) omitted"), "{note}");
+
+        // A republish past the sync refreshes: errors count again.
+        publish(&client, a, 1);
+        let note = cross_file_error_note(&client, &exclude).unwrap();
+        assert!(
+            note.contains("1 error(s) in 1 other file(s): tmp/xf-a.rs (1)"),
+            "{note}"
+        );
+        assert!(note.contains("1 stale file(s) omitted"), "{note}");
     }
 
     /// Oversized files are rejected with a clear error BEFORE being read

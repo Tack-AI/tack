@@ -151,6 +151,13 @@ pub(crate) struct ReaderShared {
     /// Waits for a specific file must not be satisfied by an unrelated
     /// file's publish (the global counter alone allowed that).
     uri_versions: Mutex<HashMap<String, u64>>,
+    /// uri → the global diag-version observed at that uri's last
+    /// `sync_document`. A publish for the uri only refreshes the cache
+    /// past this mark, so a cached set published at or before it
+    /// describes older text — what the cross-file note must not present
+    /// as current (rust-analyzer republishes dependents on its own
+    /// cadence; flycheck trails a save by seconds).
+    sync_versions: Mutex<HashMap<String, u64>>,
     /// Bumped on every publishDiagnostics; receivers wait on it.
     diag_version: tokio::sync::watch::Sender<u64>,
     status: Mutex<ClientStatus>,
@@ -166,6 +173,7 @@ impl ReaderShared {
             diagnostics: Mutex::new(HashMap::new()),
             diagnostics_raw: Mutex::new(HashMap::new()),
             uri_versions: Mutex::new(HashMap::new()),
+            sync_versions: Mutex::new(HashMap::new()),
             diag_version: tokio::sync::watch::channel(0u64).0,
             status: Mutex::new(ClientStatus::default()),
             status_watch: tokio::sync::watch::channel(0u64).0,
@@ -391,6 +399,11 @@ impl LspClient {
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
         let before = *self.shared.diag_version.borrow();
+        self.shared
+            .sync_versions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(uri.clone(), before);
         let mut docs = self.open_docs.lock().unwrap_or_else(|e| e.into_inner());
         match docs.get_mut(&uri) {
             None => {
@@ -417,6 +430,11 @@ impl LspClient {
                         .remove(&evict);
                     self.shared
                         .uri_versions
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&evict);
+                    self.shared
+                        .sync_versions
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(&evict);
@@ -479,6 +497,22 @@ impl LspClient {
             .get(&normalize_uri(uri))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Whether `uri`'s cached diagnostics predate its last content sync:
+    /// no publish for the uri arrived since the most recent didOpen/
+    /// didChange, so the cache describes older text. A never-synced uri
+    /// is as fresh as the server's own cadence.
+    pub fn stale_since_sync(&self, uri: &str) -> bool {
+        let uri = normalize_uri(uri);
+        let synced_at = self
+            .shared
+            .sync_versions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&uri)
+            .copied();
+        synced_at.is_some_and(|v| self.uri_version(&uri) <= v)
     }
 
     /// Like [`Self::wait_fresh`], but only satisfied by a publish for
@@ -688,7 +722,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-fn dispatch(message: &Value, shared: &Arc<ReaderShared>) {
+pub(crate) fn dispatch(message: &Value, shared: &Arc<ReaderShared>) {
     let method = message.get("method").and_then(Value::as_str);
     match method {
         Some("textDocument/publishDiagnostics") => {

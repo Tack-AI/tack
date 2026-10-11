@@ -155,7 +155,7 @@ code_actions 的上下文诊断自动限定在光标位置的范围内；服务�
 
 多根会话：`--add-dir` 的额外目录（存在且不重复时）作为 workspaceFolders 一并发给语言 server，跨目录依赖可解析。每 server 最多同时打开 64 个文档，超限后最久未同步的文档自动 didClose（缓存诊断一并丢弃）。
 
-edit/write 的结果自动附该文件最新诊断（`lspEditFeedback: false` 可关），诊断行带来源与代码（如 `[rustc E0308]`），并汇总其他文件的错误计数（如 “3 error(s) in 2 other file(s): tui/mod.rs (2), chat.rs (1)”）——改 enum/签名导致的跨文件破坏不用等 build 就能看见。server 按需惰性启动并保持热连接；首次查询要等索引。语言 server 按扩展名自动识别，`lspServers` 可覆盖。
+edit/write 的结果自动附该文件最新诊断（`lspEditFeedback: false` 可关），诊断行带来源与代码（如 `[rustc E0308]`），并汇总其他文件的错误计数（如 “3 error(s) in 2 other file(s): tui/mod.rs (2), chat.rs (1)”）——改 enum/签名导致的跨文件破坏不用等 build 就能看见。若某文件在上次发布诊断之后又被编辑过，其错误会从汇总中省略并显式声明（那些诊断描述的是旧文本——幽灵错误不该比修复活得更久）；若汇总读自 server 尚未分析完本次编辑时，也会明说而非声称文件干净。server 按需惰性启动并保持热连接；首次查询要等索引。语言 server 按扩展名自动识别，`lspServers` 可覆盖。
 
 已知的 rust-analyzer 行为（已内建应对）：先发空诊断再发真诊断（客户端有 settle 循环，按文件维度等待）；首次分析完成前 definition 返回空（warmup 门）；分析进行中 rename 返回 ContentModified（自动重试）；类型诊断来自后台 flycheck（通过 serverStatus/progress 跟踪，诊断反馈据此区分“语法级干净”与“类型检查完成”）。
 

@@ -215,7 +215,11 @@ edit/write results automatically come with the file's latest diagnostics
 code (e.g. `[rustc E0308]`), plus a summary of error counts in other files
 (e.g. "3 error(s) in 2 other file(s): tui/mod.rs (2), chat.rs (1)") —
 cross-file breakage from changing an enum/signature is visible without
-waiting for a build. Servers start lazily on demand and stay warm; the first
+waiting for a build. Errors in files edited since their last published
+diagnostics are omitted from that summary with a disclosure (they describe
+older text — ghost errors must not outlive their fix), and a summary read
+before the server analyzed the edit says so instead of claiming a clean
+file. Servers start lazily on demand and stay warm; the first
 query waits for indexing. Language servers are auto-detected by extension;
 `lspServers` can override.
 
