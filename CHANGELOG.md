@@ -4,6 +4,29 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [Unreleased]
+
+### Fixed
+
+- **Inline-mode thinking blocks no longer leave blank bands or lose their
+  visible tail when a run ends**: 1.0.10 anchored the viewport with
+  phantom blank rows when a streamed thinking block folded into its
+  "Thought for a while" label above the viewport top. The blanks did keep
+  old scrollback rows off the screen, but they also erased the thinking
+  rows that were still visible (those never reached the scrollback) and
+  left a blank band between the thinking history and its label; a fold
+  that did not realign still fell back to the pull-back duplication it
+  was meant to stop. The main screen now keeps a thinking block that was
+  already printed expanded after the run: the committed entry renders
+  exactly the rows the streaming partial printed, so the frame does not
+  shrink above the viewport at all — nothing is blanked, pulled back, or
+  lost, and no blank band appears. Blocks that still fit on screen fold
+  in place as before. Above-viewport rewrites that cannot be avoided
+  (ctrl+t/compaction of printed history, `/new`, tree jumps) now reprint
+  the frame on a cleared screen + scrollback instead of padding blanks:
+  no duplicated rows and no blank band, at the cost of replacing the
+  superseded scrollback copy.
+
 ## [1.0.10] - 2026-10-11
 
 ### Fixed

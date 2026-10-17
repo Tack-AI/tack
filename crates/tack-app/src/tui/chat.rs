@@ -20,6 +20,11 @@ pub struct Media {
     /// ctrl+o expand-all: render completed thinking blocks in full instead
     /// of the "Thought for a while" collapsed label.
     pub expand_thinking: bool,
+    /// Main-screen (scrollback) mode. A thinking block that was already
+    /// printed cannot be folded there without rewriting history, so entries
+    /// marked `thinking_printed` stay expanded; the alt screen can repaint
+    /// freely and keeps the user's collapse setting.
+    pub main_screen: bool,
     /// terminal.imageWidthCells: cap for rendered image width.
     pub image_width_cells: Option<u16>,
 }
@@ -47,6 +52,16 @@ pub enum ChatEntry {
     Assistant {
         message: AssistantMessage,
         streaming: bool,
+        /// The thinking block was already printed expanded to the main
+        /// screen while streaming. Folding it now would shrink the frame
+        /// above the viewport — the terminal cannot unprint those rows, so
+        /// the renderer would either pull scrollback rows back on screen
+        /// (duplicates) or replace the visible thinking tail with a blank
+        /// band. Keep rendering it expanded: the streamed text is what the
+        /// terminal already shows. False for history replayed into a fresh
+        /// frame (nothing was printed for it yet), so resumed sessions keep
+        /// the compact "Thought for a while" label.
+        thinking_printed: bool,
     },
     Notice {
         text: String,
@@ -99,7 +114,17 @@ impl ChatEntry {
     pub fn render(&self, width: u16, theme: &Theme, media: Media) -> Vec<Line> {
         match self {
             ChatEntry::User { text } => render_user(text, width, theme),
-            ChatEntry::Assistant { message, streaming } => {
+            ChatEntry::Assistant {
+                message,
+                streaming,
+                thinking_printed,
+            } => {
+                let mut media = media;
+                // Main-screen only (see the field doc): keep the already
+                // printed thinking expanded instead of folding it.
+                if media.main_screen {
+                    media.expand_thinking |= *thinking_printed;
+                }
                 render_assistant(message, *streaming, width, theme, media)
             }
             ChatEntry::Notice { text, kind } => {
@@ -201,6 +226,25 @@ fn render_user(text: &str, width: u16, theme: &Theme) -> Vec<Line> {
     }
     lines.push(Line::new());
     lines
+}
+
+/// Would folding a message's thinking block shrink the main-screen frame
+/// above the viewport top?
+///
+/// The committed entry starts at the same row the streaming partial
+/// occupied; the rows below it are the entry itself plus the status/editor/
+/// footer tail. When those do not fit the screen, the entry's first row has
+/// already scrolled off the top: folding the thinking block would then
+/// rewrite rows that live in the terminal's append-only scrollback. The
+/// renderer can only pull those rows back on screen (visible duplicates) or
+/// blank the band (losing the visible thinking tail), so the caller keeps
+/// the block expanded instead. Fully-visible thinking blocks fold normally.
+pub fn thinking_fold_scrolls_past_viewport(
+    expanded_entry_rows: usize,
+    tail_rows: usize,
+    height: u16,
+) -> bool {
+    expanded_entry_rows + tail_rows > height as usize
 }
 
 /// Render an assistant message: thinking blocks (collapsed label when done),
@@ -353,5 +397,100 @@ mod tests {
         assert!(texts.iter().all(|t| !t.contains('\n')), "{texts:?}");
         assert!(texts.iter().any(|t| t.contains("one")));
         assert!(texts.iter().any(|t| t.contains("two")));
+    }
+
+    fn test_message(content: Vec<ContentBlock>) -> AssistantMessage {
+        AssistantMessage {
+            content,
+            api: "test".into(),
+            provider: "test".into(),
+            model: "test".into(),
+            response_model: None,
+            response_id: None,
+            provider_thinking_level: None,
+            diagnostics: None,
+            usage: Default::default(),
+            stop_reason: StopReason::Stop,
+            deferred: None,
+            error_message: None,
+            raw_stop_reason: None,
+            end_turn: None,
+            timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn printed_thinking_stays_expanded() {
+        let thinking = || ContentBlock::Thinking {
+            thinking: "step one\n\nstep two\n\nstep three".to_string(),
+            thinking_signature: None,
+            redacted: None,
+        };
+        let main_screen = Media {
+            main_screen: true,
+            ..Media::default()
+        };
+        let collapsed = ChatEntry::Assistant {
+            message: test_message(vec![thinking()]),
+            streaming: false,
+            thinking_printed: false,
+        }
+        .render(80, &Theme::dark(), main_screen);
+        let printed = ChatEntry::Assistant {
+            message: test_message(vec![thinking()]),
+            streaming: false,
+            thinking_printed: true,
+        }
+        .render(80, &Theme::dark(), main_screen);
+        // The alt screen (main_screen = false) can repaint: the collapse
+        // setting applies even to printed entries.
+        let alt = ChatEntry::Assistant {
+            message: test_message(vec![thinking()]),
+            streaming: false,
+            thinking_printed: true,
+        }
+        .render(80, &Theme::dark(), Media::default());
+        let alt_text: Vec<String> = alt.iter().map(|l| l.text()).collect();
+        assert!(
+            alt_text.iter().any(|t| t.contains("Thought")),
+            "alt screen ignored the collapse setting: {alt_text:?}"
+        );
+        let collapsed_text: Vec<String> = collapsed.iter().map(|l| l.text()).collect();
+        let printed_text: Vec<String> = printed.iter().map(|l| l.text()).collect();
+        assert!(
+            collapsed_text.iter().any(|t| t.contains("Thought")),
+            "collapsed label missing: {collapsed_text:?}"
+        );
+        assert!(
+            printed_text.iter().any(|t| t.contains("step one")),
+            "printed thinking folded away: {printed_text:?}"
+        );
+        assert!(printed.len() > collapsed.len());
+        // Hidden thinking still wins over the printed flag.
+        let hidden = ChatEntry::Assistant {
+            message: test_message(vec![thinking()]),
+            streaming: false,
+            thinking_printed: true,
+        }
+        .render(
+            80,
+            &Theme::dark(),
+            Media {
+                hide_thinking: true,
+                ..main_screen
+            },
+        );
+        assert!(!hidden.iter().any(|l| l.text().contains("step one")));
+    }
+
+    /// The fold is safe while the entry starts inside the visible window;
+    /// once its first row is above the viewport top, folding must be
+    /// skipped (a shrink there cannot be rendered faithfully).
+    #[test]
+    fn thinking_fold_viewport_boundary() {
+        assert!(!thinking_fold_scrolls_past_viewport(10, 3, 30));
+        assert!(!thinking_fold_scrolls_past_viewport(27, 3, 30));
+        assert!(thinking_fold_scrolls_past_viewport(28, 3, 30));
+        assert!(thinking_fold_scrolls_past_viewport(40, 3, 30));
     }
 }

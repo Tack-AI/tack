@@ -609,6 +609,11 @@ pub struct TuiApp {
     last_ctrl_c: Option<Instant>,
     /// Last-known footer stats (shown during runs while the session is parked).
     last_stats: footer::FooterStats,
+    /// Rows below the streaming partial (status, todo/ext panels, editor,
+    /// footer) at the last regular-mode render. Used at MessageEnd to decide
+    /// whether the committed thinking block starts above the viewport top
+    /// (see `keep_streamed_thinking_expanded`).
+    last_tail_bottom: usize,
     /// Session (id, revision) `last_stats` was computed from. The recompute
     /// deep-clones every session entry (O(context size)), so it must not run
     /// per frame: keystrokes/paste re-render and would each pay that cost.
@@ -803,6 +808,7 @@ impl TuiApp {
             fullscreen,
             scroll,
             last_frame: Vec::new(),
+            last_tail_bottom: 0,
             debug_capture: false,
             ac_sources: None,
             jump_pill: None,
@@ -1452,6 +1458,10 @@ impl TuiApp {
                         .push(chat::TranscriptItem::Chat(ChatEntry::Assistant {
                             message: a.clone(),
                             streaming: false,
+                            // History replayed into a fresh frame: nothing
+                            // was printed for it, the collapsed label is
+                            // the compact representation to use.
+                            thinking_printed: false,
                         }));
                     for block in &a.content {
                         if let tack_ai::ContentBlock::ToolCall {
@@ -1510,6 +1520,13 @@ impl TuiApp {
     #[doc(hidden)]
     pub fn test_editor_text(&self) -> String {
         self.editor.text()
+    }
+
+    /// Test helper: bypass the streaming markdown re-parse throttle so a
+    /// just-applied streaming delta renders on the next frame.
+    #[doc(hidden)]
+    pub fn test_flush_stream_render(&mut self) {
+        self.stream_render_mark = None;
     }
 
     /// Test helper: advance the spinner one frame.
@@ -1859,11 +1876,13 @@ impl TuiApp {
                     }
                 }
                 if let Some(partial) = self.streaming.take() {
+                    let thinking_printed = self.keep_streamed_thinking_expanded(&partial);
                     self.stream_rev += 1;
                     self.items
                         .push(chat::TranscriptItem::Chat(ChatEntry::Assistant {
                             message: partial,
                             streaming: false,
+                            thinking_printed,
                         }));
                 }
                 // Finalize any running tools (shouldn't happen, but stay robust).

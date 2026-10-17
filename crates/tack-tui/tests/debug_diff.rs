@@ -389,6 +389,9 @@ impl VirtualTerm {
                     }
                     self.cr = 0;
                     self.cc = 0;
+                } else if clean == "3" {
+                    // Clear scrollback, leaving the (already cleared) screen.
+                    self.scrollback.clear();
                 }
             }
             "K" => {
@@ -749,16 +752,18 @@ fn debug_diff_cursor_tracks_marker() {
     assert_eq!((term.cr, term.cc), (9, 2), "{}", term.dump());
 }
 
-/// The user-reported scenario: a long streaming thinking block collapses to
-/// the one-row label at MessageEnd while earlier content has already scrolled
-/// into the terminal scrollback. The phantom splice must keep the window
-/// anchored — the thinking tail on screen is replaced by a blank band + the
-/// label, and NO row that already lives in the append-only scrollback is
-/// pulled back onto the screen. As the next turn streams, the blanks scroll
-/// out naturally and every non-blank row exists exactly once across
-/// scrollback + screen.
+/// The user-reported scenario: a long streaming thinking block finishes
+/// while its tail is on screen. The app keeps the already-printed block
+/// expanded at MessageEnd (`thinking_printed`) because folding it would
+/// shrink the frame above the viewport — the terminal cannot unprint those
+/// rows, so a fold forces either a blank band (erasing the visible thinking
+/// tail) or pulled-back scrollback rows (visible duplicates).
+///
+/// The commit frame therefore matches the streaming frame: nothing is
+/// rewritten, no blank band appears, and no thinking row is lost. As the
+/// next turn streams, the rows scroll into the scrollback exactly once.
 #[test]
-fn debug_diff_thinking_collapse_no_pullback_duplication() {
+fn debug_diff_printed_thinking_commit_keeps_rows() {
     let width = 40u16;
     let height = 12u16;
     let mut renderer = MainScreenRenderer::new();
@@ -792,50 +797,70 @@ fn debug_diff_thinking_collapse_no_pullback_duplication() {
             .map(|r| r.iter().collect::<String>().trim_end().to_string())
             .collect()
     };
+    let assert_clean = |term: &VirtualTerm, tag: &str| {
+        let rows = screen_rows(term);
+        assert!(
+            !rows.iter().any(|r| r.is_empty()),
+            "blank band at {tag}: {rows:?}"
+        );
+        let mut seen: std::collections::HashMap<String, usize> = Default::default();
+        for r in term
+            .scrollback
+            .iter()
+            .cloned()
+            .chain(rows.iter().cloned())
+            .filter(|r| !r.is_empty())
+        {
+            *seen.entry(r).or_default() += 1;
+        }
+        let dups: Vec<(_, _)> = seen.iter().filter(|(_, n)| **n > 1).collect();
+        assert!(dups.is_empty(), "duplicated rows at {tag}: {dups:?}");
+    };
 
-    // Phase 1: stream the thinking block + text (frames grow past the
-    // viewport; rows scroll into scrollback).
+    // Phase 1: stream the thinking block + text (rows scroll into
+    // scrollback; the thinking tail is on screen).
     for k in 0..=25usize {
-        let f = frame(Some(k));
         out.clear();
-        renderer.render(&f, width, height, false, &mut out).unwrap();
+        renderer
+            .render(&frame(Some(k)), width, height, false, &mut out)
+            .unwrap();
         term.feed(&out);
     }
     assert!(term.scrolled > 0, "expected streaming to scroll");
+    let visible_thinking_before = screen_rows(&term)
+        .iter()
+        .filter(|r| r.starts_with("thinking row"))
+        .count();
+    assert!(visible_thinking_before > 0, "{}", term.dump());
 
-    // Phase 2: MessageEnd — the thinking block collapses to the label.
-    let collapsed = frame(None);
+    // Phase 2: MessageEnd with the printed thinking kept expanded — the
+    // committed entry renders exactly the streaming rows.
     out.clear();
     renderer
-        .render(&collapsed, width, height, false, &mut out)
+        .render(&frame(Some(25)), width, height, false, &mut out)
         .unwrap();
     term.feed(&out);
-    let dump = term.dump();
-    println!("=== screen after collapse ===\n{dump}");
+    assert!(
+        out.is_empty(),
+        "printed thinking commit repainted: {:?}",
+        String::from_utf8_lossy(&out)
+    );
     let vis = term.visible_text();
-    // The window stays anchored: a blank band replaces the thinking tail
-    // on screen, the label renders right below it, the text/status/editor
-    // rows keep their screen rows, and no stale thinking row survives.
-    assert_eq!(vis.matches("◦ Thought for a while").count(), 1, "{vis}");
-    assert_eq!(vis.matches("alpha text row").count(), 1, "{vis}");
-    assert!(!vis.contains("thinking row"), "stale thinking row: {vis}");
+    assert_eq!(
+        vis.matches("thinking row").count(),
+        visible_thinking_before,
+        "visible thinking rows lost: {}",
+        term.dump()
+    );
+    assert!(!vis.contains("Thought for a while"), "{vis}");
     let rows = screen_rows(&term);
-    let blank_band = rows.iter().take_while(|r| r.is_empty()).count();
-    assert_eq!(blank_band, 5, "phantom blank band: {rows:?}");
-    assert_eq!(rows[5], "◦ Thought for a while (999 chars)", "{rows:?}");
-    assert_eq!(rows[11], "footer", "editor/footer anchored: {rows:?}");
-    // Zero pullback: nothing on screen also exists in the scrollback.
-    let overlap: Vec<&String> = rows
-        .iter()
-        .filter(|r| !r.is_empty())
-        .filter(|r| term.scrollback.contains(r))
-        .collect();
-    assert!(overlap.is_empty(), "pullback duplication: {overlap:?}");
+    assert!(!rows.iter().any(|r| r.is_empty()), "blank band: {rows:?}");
+    assert_clean(&term, "commit");
 
-    // Phase 3: the next turn streams; the phantom blanks scroll out
-    // through the scrollback one by one.
+    // Phase 3: the next turn streams; the thinking rows scroll into the
+    // scrollback exactly once and nothing is lost or duplicated.
     for k in 0..10usize {
-        let mut f = collapsed.clone();
+        let mut f = frame(Some(25));
         for i in 0..k {
             f.insert(f.len() - 3, Line::plain(format!("turn2 row {i}")));
         }
@@ -843,183 +868,148 @@ fn debug_diff_thinking_collapse_no_pullback_duplication() {
         renderer.render(&f, width, height, false, &mut out).unwrap();
         term.feed(&out);
     }
-    let dump = term.dump();
-    let sb = term
+    let vis = term.visible_text();
+    let all_rows: Vec<String> = term
         .scrollback
         .iter()
-        .enumerate()
-        .map(|(i, r)| format!("{i:3}|{r}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    println!("=== final screen ===\n{dump}\n=== scrollback ===\n{sb}");
-    let vis = term.visible_text();
-    assert!(!vis.contains("thinking row"), "{vis}");
+        .cloned()
+        .chain(screen_rows(&term))
+        .collect();
+    for i in 0..25usize {
+        let want = format!("thinking row {i}");
+        assert_eq!(
+            all_rows.iter().filter(|r| *r == &want).count(),
+            1,
+            "thinking row {i} lost or duplicated:\n{}",
+            term.dump()
+        );
+    }
     for i in 0..9usize {
         assert!(
-            vis.contains(&format!("turn2 row {i}")),
+            vis.contains(&format!("turn2 row {i}"))
+                || term
+                    .scrollback
+                    .iter()
+                    .any(|r| r == &format!("turn2 row {i}")),
             "missing turn2 {i}: {vis}"
         );
     }
-    // Global invariant: every non-blank row appears exactly ONCE across
-    // scrollback + screen (the scrollback keeps the streamed thinking rows
-    // as faithful history — once).
-    let mut seen: std::collections::HashMap<String, usize> = Default::default();
-    for r in term
-        .scrollback
-        .iter()
-        .chain(screen_rows(&term).iter())
-        .map(|r| r.trim_end().to_string())
-        .filter(|r| !r.is_empty())
-    {
-        *seen.entry(r).or_default() += 1;
-    }
-    let dups: Vec<(_, _)> = seen.iter().filter(|(_, n)| **n > 1).collect();
-    assert!(dups.is_empty(), "duplicated rows: {dups:?}");
-    assert_eq!(
-        term.scrollback
-            .iter()
-            .filter(|r| r.as_str() == "◦ Thought for a while (999 chars)")
-            .count(),
-        1,
-        "label must reach the scrollback exactly once:\n{sb}"
-    );
-    let blanks = term.scrollback.iter().filter(|r| r.is_empty()).count();
-    assert_eq!(blanks, 5, "phantom blanks in scrollback:\n{sb}");
+    assert_clean(&term, "after turn2");
 }
-/// Two thinking blocks collapse in quick succession (a short turn between
-/// them), so the second collapse lands while the first's phantom band is
-/// still pending — exercising region re-anchoring across frames. The
-/// global invariant holds at every step: no non-blank row ever appears
-/// twice across scrollback + screen.
+
+/// A short thinking block that still fits inside the viewport folds
+/// normally, in place: the label replaces it, rows below keep their screen
+/// rows, and the scrollback is untouched (nothing above the viewport shrank).
 #[test]
-fn debug_diff_sequential_collapses_no_duplication() {
+fn debug_diff_visible_thinking_folds_in_place() {
     let width = 40u16;
     let height = 12u16;
     let mut renderer = MainScreenRenderer::new();
     let mut out: Vec<u8> = Vec::new();
     let mut term = VirtualTerm::new(width as usize, height as usize);
 
-    let assert_no_dups = |term: &VirtualTerm, tag: &str| {
-        let mut seen: std::collections::HashMap<String, usize> = Default::default();
-        for r in term
-            .scrollback
-            .iter()
-            .cloned()
-            .chain(term.rows.iter().map(|r| r.iter().collect::<String>()))
-            .map(|r| r.trim_end().to_string())
-            .filter(|r| !r.is_empty())
-        {
-            *seen.entry(r).or_default() += 1;
+    let mut expanded = vec![Line::plain("hist 1"), Line::plain("hist 2")];
+    for i in 0..3 {
+        expanded.push(Line::plain(format!("thinking row {i}")));
+    }
+    expanded.push(Line::plain("alpha text"));
+    expanded.push(Line::plain("⠋ Working…"));
+    expanded.push(Line::plain("> "));
+    expanded.push(Line::plain("footer"));
+    renderer
+        .render(&expanded, width, height, false, &mut out)
+        .unwrap();
+    term.feed(&out);
+
+    let mut collapsed = vec![Line::plain("hist 1"), Line::plain("hist 2")];
+    collapsed.push(Line::plain("◦ Thought for a while (300 chars)"));
+    collapsed.push(Line::plain("alpha text"));
+    collapsed.push(Line::plain("⠋ Working…"));
+    collapsed.push(Line::plain("> "));
+    collapsed.push(Line::plain("footer"));
+    out.clear();
+    renderer
+        .render(&collapsed, width, height, false, &mut out)
+        .unwrap();
+    term.feed(&out);
+    let s = String::from_utf8_lossy(&out);
+    assert!(!s.contains("\x1b[2J"), "needless clear: {s:?}");
+    assert!(!s.contains("\x1b[3J"), "scrollback wiped: {s:?}");
+    let vis = term.visible_text();
+    assert_eq!(vis.matches("Thought for a while").count(), 1, "{vis}");
+    assert!(!vis.contains("thinking row"), "{vis}");
+    assert_eq!(vis.matches("alpha text").count(), 1, "{vis}");
+    assert_eq!(vis.matches("footer").count(), 1, "{vis}");
+}
+
+/// A straddling collapse that still reaches the renderer (ctrl+t on old
+/// history while its tail is visible, compaction) clears the screen +
+/// scrollback and reprints the frame: no blank band, no pulled-back row
+/// that would later show up twice when scrolling back.
+#[test]
+fn debug_diff_straddling_collapse_clears_without_duplication() {
+    let width = 40u16;
+    let height = 12u16;
+    let mut renderer = MainScreenRenderer::new();
+    let mut out: Vec<u8> = Vec::new();
+    let mut term = VirtualTerm::new(width as usize, height as usize);
+
+    let hist: Vec<String> = (1..=6).map(|i| format!("hist {i}")).collect();
+    let text_rows = ["alpha text row", "beta text row", "gamma text row"];
+    let frame = |thinking_rows: Option<usize>| -> Vec<Line> {
+        let mut lines: Vec<Line> = hist.iter().map(|s| Line::plain(s.clone())).collect();
+        match thinking_rows {
+            Some(n) => {
+                for i in 0..n {
+                    lines.push(Line::plain(format!("thinking row {i}")));
+                }
+            }
+            None => lines.push(Line::plain("◦ Thought for a while (999 chars)")),
         }
-        let dups: Vec<(_, _)> = seen.iter().filter(|(_, n)| **n > 1).collect();
-        assert!(
-            dups.is_empty(),
-            "duplicated rows at {tag}: {dups:?}\nscreen:\n{}\nscrollback:\n{}",
-            term.dump(),
-            term.scrollback.join("\n")
-        );
-    };
-
-    let feed = |renderer: &mut MainScreenRenderer,
-                term: &mut VirtualTerm,
-                out: &mut Vec<u8>,
-                frame: &[Line]| {
-        out.clear();
-        renderer.render(frame, width, height, false, out).unwrap();
-        term.feed(out);
-        assert_no_dups(term, "frame");
-    };
-
-    let hist: Vec<Line> = (1..=6).map(|i| Line::plain(format!("hist {i}"))).collect();
-    let tail = |lines: &mut Vec<Line>| {
+        for t in text_rows {
+            lines.push(Line::plain(t));
+        }
         lines.push(Line::plain("⠋ Working…"));
         lines.push(Line::plain("> "));
         lines.push(Line::plain("footer"));
+        lines
     };
-
-    // Turn A: stream a 20-row thinking block + 2 text rows, then collapse.
-    let mut stream_a = hist.clone();
-    stream_a.extend((0..20).map(|i| Line::plain(format!("thinkingA row {i}"))));
-    stream_a.push(Line::plain("alpha text"));
-    stream_a.push(Line::plain("beta text"));
-    tail(&mut stream_a);
-    // Grow the frame row by row (streaming).
-    for k in 1..=stream_a.len() {
-        feed(&mut renderer, &mut term, &mut out, &stream_a[..k]);
+    for k in 0..=25usize {
+        out.clear();
+        renderer
+            .render(&frame(Some(k)), width, height, false, &mut out)
+            .unwrap();
+        term.feed(&out);
     }
-    let mut app = hist.clone();
-    app.push(Line::plain("◦ Thought A (500 chars)"));
-    app.push(Line::plain("alpha text"));
-    app.push(Line::plain("beta text"));
-    tail(&mut app);
-    feed(&mut renderer, &mut term, &mut out, &app);
-    let after_a = term.dump();
-    println!("=== after collapse A ===\n{after_a}");
-    assert!(!term.visible_text().contains("thinkingA row"), "{after_a}");
-
-    // Turn B: two text rows, then a 10-row thinking block + 1 text row,
-    // then collapse — while A's band is still pending.
-    let mut stream_b = app.clone();
-    stream_b.insert(stream_b.len() - 3, Line::plain("turnB row 0"));
-    feed(&mut renderer, &mut term, &mut out, &stream_b);
-    stream_b.insert(stream_b.len() - 3, Line::plain("turnB row 1"));
-    feed(&mut renderer, &mut term, &mut out, &stream_b);
-    for i in 0..10 {
-        stream_b.insert(
-            stream_b.len() - 3,
-            Line::plain(format!("thinkingB row {i}")),
-        );
-        feed(&mut renderer, &mut term, &mut out, &stream_b);
-    }
-    stream_b.insert(stream_b.len() - 3, Line::plain("gamma text"));
-    feed(&mut renderer, &mut term, &mut out, &stream_b);
-    // Collapse B: the 10 thinkingB rows fold into the label.
-    let mut collapsed_b = hist.clone();
-    collapsed_b.push(Line::plain("◦ Thought A (500 chars)"));
-    collapsed_b.push(Line::plain("alpha text"));
-    collapsed_b.push(Line::plain("beta text"));
-    collapsed_b.push(Line::plain("turnB row 0"));
-    collapsed_b.push(Line::plain("turnB row 1"));
-    collapsed_b.push(Line::plain("◦ Thought B (300 chars)"));
-    collapsed_b.push(Line::plain("gamma text"));
-    tail(&mut collapsed_b);
-    feed(&mut renderer, &mut term, &mut out, &collapsed_b);
-    let after_b = term.dump();
-    println!("=== after collapse B ===\n{after_b}");
+    out.clear();
+    renderer
+        .render(&frame(None), width, height, false, &mut out)
+        .unwrap();
+    term.feed(&out);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("\x1b[2J"), "screen not cleared: {s:?}");
+    assert!(s.contains("\x1b[3J"), "scrollback not cleared: {s:?}");
     let vis = term.visible_text();
-    assert!(!vis.contains("thinkingB row"), "{vis}");
-    assert_eq!(vis.matches("◦ Thought B").count(), 1, "{vis}");
-
-    // Turn C: stream 15 rows; bands scroll out.
-    for i in 0..15 {
-        let mut f = collapsed_b.clone();
-        for j in 0..=i {
-            f.insert(f.len() - 3, Line::plain(format!("turnC row {j}")));
-        }
-        feed(&mut renderer, &mut term, &mut out, &f);
+    assert_eq!(vis.matches("Thought for a while").count(), 1, "{vis}");
+    assert_eq!(vis.matches("alpha text row").count(), 1, "{vis}");
+    // No pulled-back row: the rewritten frame is the collapsed one only.
+    assert!(!vis.contains("thinking row"), "{vis}");
+    // The reprint may scroll its head into the (fresh) scrollback; every
+    // surviving row must still appear exactly once.
+    let screen: Vec<String> = term
+        .rows
+        .iter()
+        .map(|r| r.iter().collect::<String>().trim_end().to_string())
+        .filter(|r| !r.is_empty())
+        .collect();
+    let mut seen: std::collections::HashMap<String, usize> = Default::default();
+    for r in term.scrollback.iter().chain(screen.iter()) {
+        *seen.entry(r.clone()).or_default() += 1;
     }
-    let final_dump = term.dump();
-    let sb = term.scrollback.join("\n");
-    println!("=== final screen ===\n{final_dump}\n=== scrollback ===\n{sb}");
-    assert!(!term.visible_text().contains("thinking"), "{final_dump}");
-    for i in 0..15 {
-        assert!(
-            term.visible_text().contains(&format!("turnC row {i}"))
-                || term
-                    .scrollback
-                    .iter()
-                    .any(|r| r == &format!("turnC row {i}")),
-            "turnC row {i} lost"
-        );
-    }
-    // Each label reached the scrollback (or screen) exactly once.
-    for label in ["◦ Thought A (500 chars)", "◦ Thought B (300 chars)"] {
-        let on_screen = term.visible_text().matches(label).count();
-        let in_sb = term
-            .scrollback
-            .iter()
-            .filter(|r| r.as_str() == label)
-            .count();
-        assert_eq!(on_screen + in_sb, 1, "{label} count wrong:\n{sb}");
-    }
+    let dups: Vec<(_, _)> = seen.iter().filter(|(_, n)| **n > 1).collect();
+    assert!(
+        dups.is_empty(),
+        "duplicated rows: {dups:?}\n{}",
+        term.dump()
+    );
 }

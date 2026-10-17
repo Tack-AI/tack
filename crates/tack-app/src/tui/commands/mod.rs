@@ -388,6 +388,7 @@ impl TuiApp {
         self.items.push(TranscriptItem::Chat(ChatEntry::Assistant {
             message: assistant_notice(&text),
             streaming: false,
+            thinking_printed: false,
         }));
         self.line_cache.clear();
     }

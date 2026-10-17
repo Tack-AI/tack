@@ -185,6 +185,7 @@ impl TuiApp {
             mermaid: self.mermaid_enabled,
             hide_thinking: self.settings.hide_thinking_block,
             expand_thinking: self.thinking_expanded,
+            main_screen: !self.fullscreen,
             image_width_cells: self.settings.image_width_cells,
         }
     }
@@ -442,6 +443,7 @@ impl TuiApp {
             // a keystroke at a large transcript O(changed rows) instead
             // of O(transcript).
             fits &= Self::lines_fit(&tail, width);
+            self.last_tail_bottom = tail.len() + bottom.len();
             let debug_capture = std::mem::take(&mut self.debug_capture);
             let mut joined: Option<Vec<Line>> = None;
             let render_result = {

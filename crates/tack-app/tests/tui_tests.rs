@@ -487,6 +487,8 @@ struct VirtualTerm {
     cr: usize,
     cc: usize,
     pending_wrap: bool,
+    /// Rows scrolled off the top (terminal scrollback).
+    scrollback: Vec<String>,
 }
 
 impl VirtualTerm {
@@ -498,13 +500,15 @@ impl VirtualTerm {
             cr: 0,
             cc: 0,
             pending_wrap: false,
+            scrollback: Vec::new(),
         }
     }
 
     fn newline(&mut self) {
         self.pending_wrap = false;
         if self.cr == self.height - 1 {
-            self.rows.remove(0);
+            self.scrollback
+                .push(self.rows.remove(0).iter().collect::<String>());
             self.rows.push(Vec::new());
         } else {
             self.cr += 1;
@@ -591,6 +595,8 @@ impl VirtualTerm {
                     }
                     self.cr = 0;
                     self.cc = 0;
+                } else if clean == "3" {
+                    self.scrollback.clear();
                 }
             }
             "K" => {
@@ -1356,6 +1362,123 @@ async fn ctrl_t_cycles_thinking_collapsed_expanded_hidden() {
     assert!(!frame.contains("my secret reasoning"), "{frame:?}");
 }
 
+/// The reported regression: a long thinking block streams past the top of
+/// the screen, then MessageEnd commits it. Folding it into the one-row label
+/// would shrink the frame above the viewport — the terminal can only blank
+/// the visible thinking tail (the phantom-blank band) or pull scrollback rows
+/// back on screen (duplicates). The app keeps the printed block expanded
+/// instead, so the commit repaints nothing and the visible rows survive.
+#[tokio::test]
+async fn streamed_thinking_commit_keeps_visible_rows() {
+    use tack_agent_core::AgentEvent;
+    let cwd = tempfile::tempdir().unwrap();
+    let mut app = test_app(cwd.path()).await;
+    app.test_resize(50, 14);
+
+    let model =
+        tack_app::model::resolve_model("anthropic", Some("k3"), &tack_session::default_agent_dir())
+            .unwrap();
+    let thinking = |n: usize| tack_ai::ContentBlock::Thinking {
+        thinking: (0..n).map(|i| format!("- thought row {i}\n")).collect(),
+        thinking_signature: None,
+        redacted: None,
+    };
+
+    let mut term = VirtualTerm::new(50, 14);
+    let mut out: Vec<u8> = Vec::new();
+    app.render(&mut out).unwrap();
+    term.feed(&out);
+
+    app.handle_agent_event(AgentEvent::AgentStart).await;
+    let mut partial = tack_ai::AssistantMessage::pending(&model);
+    partial.content = vec![thinking(1)];
+    app.handle_agent_event(AgentEvent::MessageStart {
+        message: tack_agent_core::AgentMessage::Assistant(partial.clone()),
+    })
+    .await;
+    for k in 2..=30usize {
+        partial.content = vec![thinking(k)];
+        app.handle_agent_event(AgentEvent::MessageUpdate {
+            assistant_message_event: tack_ai::AssistantMessageEvent::ThinkingDelta {
+                content_index: 0,
+                delta: format!("- thought row {}\n", k - 1),
+                partial: partial.clone(),
+            },
+            message: tack_agent_core::AgentMessage::Assistant(partial.clone()),
+        })
+        .await;
+        app.test_flush_stream_render();
+        out.clear();
+        app.render(&mut out).unwrap();
+        term.feed(&out);
+    }
+    assert!(
+        term.scrollback.iter().any(|r| r.contains("thought row 0")),
+        "streaming did not scroll the thinking history:\n{}",
+        term.dump()
+    );
+
+    // MessageEnd: a short answer after the long thinking block. The fold
+    // would straddle the viewport top, so it must be skipped.
+    partial
+        .content
+        .push(tack_ai::ContentBlock::text("done.".to_string()));
+    app.handle_agent_event(AgentEvent::MessageEnd {
+        message: tack_agent_core::AgentMessage::Assistant(partial.clone()),
+    })
+    .await;
+    out.clear();
+    app.render(&mut out).unwrap();
+    term.feed(&out);
+    let dump = term.dump();
+    let vis = term.visible_text();
+    let commit_frame = String::from_utf8_lossy(&out);
+    assert!(
+        !commit_frame.contains("\x1b[2J"),
+        "commit cleared the screen instead of keeping the printed rows:\n{dump}"
+    );
+    assert!(
+        !vis.contains("Thought for a while"),
+        "thinking folded above the viewport:\n{dump}"
+    );
+    assert!(
+        vis.contains("thought row 29"),
+        "visible thinking tail lost:\n{dump}"
+    );
+    // No blank band inside the content.
+    let blank_run = term
+        .rows
+        .iter()
+        .map(|r| r.iter().collect::<String>().trim().is_empty())
+        .fold((0, 0), |(max, cur), b| {
+            if b {
+                (max.max(cur + 1), cur + 1)
+            } else {
+                (max, 0)
+            }
+        });
+    assert!(
+        blank_run.0 < 3,
+        "blank band of {} rows:\n{dump}",
+        blank_run.0
+    );
+    // No row exists twice across scrollback + screen (pulled-back rows show
+    // up here as duplicates).
+    let mut seen: std::collections::HashMap<String, usize> = Default::default();
+    for r in term
+        .scrollback
+        .iter()
+        .cloned()
+        .chain(term.rows.iter().map(|r| r.iter().collect::<String>()))
+        .map(|r| r.trim_end().to_string())
+        .filter(|r| !r.is_empty())
+    {
+        *seen.entry(r).or_default() += 1;
+    }
+    let dups: Vec<(_, _)> = seen.iter().filter(|(_, n)| **n > 1).collect();
+    assert!(dups.is_empty(), "duplicated rows: {dups:?}\n{dump}");
+}
+
 #[tokio::test]
 async fn alt_up_recalls_pending_send_now_and_cancels_it() {
     let cwd = tempfile::tempdir().unwrap();
@@ -1426,6 +1549,7 @@ async fn perf_frame_render_long_transcript() {
         app.test_push_chat(chat::ChatEntry::Assistant {
             message,
             streaming: false,
+            thinking_printed: false,
         });
     }
 
@@ -1441,6 +1565,7 @@ async fn perf_frame_render_long_transcript() {
     app.test_push_chat(chat::ChatEntry::Assistant {
         message: partial,
         streaming: true,
+        thinking_printed: false,
     });
 
     // Warm up (first full parse fills the line cache).

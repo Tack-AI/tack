@@ -1252,6 +1252,37 @@ impl TuiApp {
         }
     }
 
+    /// Must a just-finished assistant message keep its thinking block
+    /// expanded because the streamed rows already scrolled above the main
+    /// screen's viewport?
+    ///
+    /// The terminal can only append (main-screen mode): folding a thinking
+    /// block whose first row is above the viewport top would make the
+    /// renderer pull scrollback rows back on screen (visible duplicates) or
+    /// blank the visible thinking tail. Keeping the block expanded means
+    /// the committed entry renders exactly the rows the streaming partial
+    /// already printed, so the frame does not shrink above the viewport at
+    /// all. Thinking that still fits on screen folds in place as usual.
+    pub(super) fn keep_streamed_thinking_expanded(
+        &self,
+        message: &tack_ai::AssistantMessage,
+    ) -> bool {
+        if self.fullscreen || self.settings.hide_thinking_block {
+            return false;
+        }
+        let has_thinking = message.content.iter().any(|block| {
+            matches!(block, tack_ai::ContentBlock::Thinking { thinking, .. } if !thinking.trim().is_empty())
+        });
+        if !has_thinking {
+            return false;
+        }
+        let (width, height) = self.tui.size();
+        let mut media = self.media();
+        media.expand_thinking = true;
+        let entry_rows = chat::render_assistant(message, false, width, &self.theme, media).len();
+        chat::thinking_fold_scrolls_past_viewport(entry_rows, self.last_tail_bottom, height)
+    }
+
     pub async fn handle_agent_event(&mut self, event: AgentEvent) {
         // tack-ext: capture the lifecycle name + payload before consumption.
         // With no plugins loaded, skip the JSON serialization of every
@@ -1380,6 +1411,7 @@ impl TuiApp {
             }
             AgentEvent::MessageEnd { message } => {
                 if let AgentMessage::Assistant(a) = message {
+                    let thinking_printed = self.keep_streamed_thinking_expanded(&a);
                     self.streaming = None;
                     self.stream_rev += 1;
                     self.update_run_stats(&a, true);
@@ -1403,6 +1435,7 @@ impl TuiApp {
                         .push(chat::TranscriptItem::Chat(ChatEntry::Assistant {
                             message: a,
                             streaming: false,
+                            thinking_printed,
                         }));
                     // No line_cache.clear(): pushing keeps the index
                     // alignment intact and earlier entries are immutable, so
