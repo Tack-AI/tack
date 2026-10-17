@@ -116,6 +116,80 @@ async fn edit_exact_and_fuzzy() {
     assert!(err.contains("Could not find"));
 }
 
+/// Anchor ranges and replace-all go through the same prepare/validate path
+/// the agent loop uses; a single range object in `edits` is normalized into
+/// the array form.
+#[tokio::test]
+async fn edit_range_and_replace_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let services = services_in(&dir);
+    std::fs::write(
+        dir.path().join("b.txt"),
+        "head\n// BEGIN\nold\n// END\ntail\n",
+    )
+    .unwrap();
+    let edit = EditTool::new(services.clone());
+
+    let out = run_tool(
+        &edit,
+        json!({
+            "path": "b.txt",
+            "edits": { "from": "// BEGIN", "to": "// END", "newText": "x\n" }
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(out.contains("Successfully replaced 1 block"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+        "head\nx\n// END\ntail\n"
+    );
+
+    std::fs::write(dir.path().join("c.txt"), "foo foo\n").unwrap();
+    let out = run_tool(
+        &edit,
+        json!({
+            "path": "c.txt",
+            "edits": [{ "oldText": "foo", "newText": "bar", "all": true, "count": 2 }]
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(out.contains("Successfully replaced 2 block"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("c.txt")).unwrap(),
+        "bar bar\n"
+    );
+}
+
+/// A multi-hunk call reports every failing edit in one rejection (instead of
+/// discovering them one round-trip at a time) and leaves the file untouched.
+#[tokio::test]
+async fn edit_reports_all_failed_hunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let services = services_in(&dir);
+    std::fs::write(dir.path().join("a.txt"), "abc\n").unwrap();
+    let edit = EditTool::new(services);
+    let err = run_tool(
+        &edit,
+        json!({
+            "path": "a.txt",
+            "edits": [
+                { "oldText": "nope", "newText": "x" },
+                { "oldText": "missing", "newText": "y" }
+            ]
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("edits[0]:"), "{err}");
+    assert!(err.contains("edits[1]:"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "abc\n"
+    );
+}
+
 #[tokio::test]
 async fn edit_preserves_crlf() {
     let dir = tempfile::tempdir().unwrap();

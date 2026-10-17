@@ -829,8 +829,16 @@ pub fn format_match_error(
     } else {
         format!("Closest match was below the {threshold_percent}% similarity threshold.")
     };
+    // The most common near-miss after formatting/drift: the text is right
+    // but whitespace or indentation differs. Name it so the model fixes the
+    // anchor instead of re-quoting a whole region.
+    let whitespace_hint = if old_line != new_line && js_trim(old_line) == js_trim(new_line) {
+        "\nThe closest line differs only in whitespace/indentation — re-read the exact text."
+    } else {
+        ""
+    };
     format!(
-        "Could not find a close enough match in {path}.\n\nClosest match ({similarity_percent}% similar) at line {}:\n  - {old_line}\n  + {new_line}\n{hint}",
+        "Could not find a close enough match in {path}.\n\nClosest match ({similarity_percent}% similar) at line {}:\n  - {old_line}\n  + {new_line}\n{hint}{whitespace_hint}",
         closest.start_line
     )
 }
@@ -849,6 +857,78 @@ pub fn format_occurrence_error(path: &str, outcome: &MatchOutcome) -> String {
     };
     format!(
         "Found {occurrences} occurrences in {path}{more}:\n\n{previews}\n\nAdd more context lines to disambiguate."
+    )
+}
+
+/// Exact occurrence start offsets at/after `min_start`, counting
+/// overlapping occurrences ("aa" occurs twice in "aaa"), plus the total
+/// count. `limit` bounds the returned offsets; the count is always exact.
+///
+/// Used by the edit tool's anchor-range and replace-all modes, which are
+/// exact-only: fuzzy anchors could silently target the wrong region, so a
+/// zero-match is reported as a miss with the closest candidate instead.
+pub fn exact_occurrence_starts(
+    content: &str,
+    target: &str,
+    min_start: usize,
+    limit: usize,
+) -> (Vec<usize>, usize) {
+    let mut starts = Vec::new();
+    let mut total = 0usize;
+    if target.is_empty() {
+        return (starts, total);
+    }
+    let mut search_start = min_start.min(content.len());
+    while search_start <= content.len().saturating_sub(target.len()) {
+        let Some(relative) = content[search_start..].find(target) else {
+            break;
+        };
+        let index = search_start + relative;
+        total += 1;
+        if starts.len() < limit {
+            starts.push(index);
+        }
+        // Step one character (not the needle length): overlapping
+        // occurrences must count toward uniqueness, matching the exact
+        // uniqueness rule of `find_match`.
+        search_start = index + 1;
+        while search_start < content.len() && !content.is_char_boundary(search_start) {
+            search_start += 1;
+        }
+    }
+    (starts, total)
+}
+
+/// Format an ambiguity error for a named anchor (`from`, `to`, ...) from
+/// [`exact_occurrence_starts`] offsets. Anchors are exact-only, so the
+/// failure must say which anchor is ambiguous and where.
+pub fn format_exact_occurrences_error(
+    path: &str,
+    content: &str,
+    anchor: &str,
+    starts: &[usize],
+    total: usize,
+) -> String {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let previews = starts
+        .iter()
+        .map(|&index| {
+            let line_number = content[..index]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1;
+            format_preview_window(&lines, line_number - 1)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let more = if total > starts.len() {
+        format!(" (showing first {} of {total})", starts.len())
+    } else {
+        String::new()
+    };
+    format!(
+        "Found {total} occurrences of the {anchor} in {path}{more}:\n\n{previews}\n\nAdd more context to make the {anchor} unique."
     )
 }
 
@@ -1109,6 +1189,49 @@ mod tests {
             format_match_error("src/a.ts", "x", None, 0.95, None),
             "Could not find a close enough match in src/a.ts."
         );
+    }
+
+    #[test]
+    fn match_error_names_whitespace_only_difference() {
+        let closest = FuzzyMatch {
+            actual_text: "    foo();".to_owned(),
+            start_index: 0,
+            start_line: 3,
+            confidence: 0.9,
+        };
+        let e = format_match_error("a.rs", "  foo();", Some(&closest), 0.95, None);
+        assert!(e.contains("differs only in whitespace"), "{e}");
+        let closest = FuzzyMatch {
+            actual_text: "    bar();".to_owned(),
+            ..closest
+        };
+        let e = format_match_error("a.rs", "  foo();", Some(&closest), 0.95, None);
+        assert!(!e.contains("whitespace"), "{e}");
+    }
+
+    #[test]
+    fn exact_occurrence_starts_counts_overlaps_and_min_start() {
+        let (starts, total) = exact_occurrence_starts("aaaa", "aa", 0, 10);
+        assert_eq!((starts, total), (vec![0, 1, 2], 3));
+        // min_start skips earlier matches but keeps the total of the
+        // searched suffix.
+        let (starts, total) = exact_occurrence_starts("aaaa", "aa", 2, 10);
+        assert_eq!((starts, total), (vec![2], 1));
+        let (starts, total) = exact_occurrence_starts("abc", "abc", 1, 10);
+        assert!(starts.is_empty() && total == 0);
+        // limit bounds the returned offsets, not the count.
+        let (starts, total) = exact_occurrence_starts("aaaa", "aa", 0, 1);
+        assert_eq!((starts, total), (vec![0], 3));
+    }
+
+    #[test]
+    fn exact_occurrence_error_names_the_anchor() {
+        let content = "x\nBEGIN\ny\nBEGIN\n";
+        let (starts, total) = exact_occurrence_starts(content, "BEGIN", 0, 5);
+        let e = format_exact_occurrences_error("a.rs", content, "`from` anchor", &starts, total);
+        assert!(e.contains("2 occurrences of the `from` anchor"), "{e}");
+        assert!(e.contains("2 | BEGIN"), "{e}");
+        assert!(e.contains("4 | BEGIN"), "{e}");
     }
 
     #[test]

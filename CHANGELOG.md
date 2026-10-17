@@ -6,6 +6,26 @@ notice can parse entries (same convention as TS pi).
 
 ## [Unreleased]
 
+### Added
+
+- **Anchor-range and replace-all edit modes**: `edit` now accepts
+  `{from, to?, newText, mode?, expectLines?}` to replace a contiguous region
+  between two anchors (`to` omitted = through EOF; `mode: "inclusive"`
+  also removes the `to` anchor's line; `expectLines` guards the range
+  size), and `{oldText, newText, all: true, count?}` to replace every
+  exact occurrence (fuzzy matching is disabled for replace-all, and
+  `count` makes an unexpected occurrence count reject the call). Anchors
+  are exact-only and must each be unique: a duplicated `from`/`to` rejects
+  the whole call and lists every match location — it is never guessed and
+  never all replaced. Large contiguous deletions no longer require
+  quoting the entire block as `oldText`.
+
+- **Self-auditable edit results**: successful edits return a compact diff
+  of the affected regions (capped; the full diff stays in the tool
+  details), a multi-hunk call now reports **every** failing edit in one
+  rejection instead of only the first, and a closest match that differs
+  only in whitespace/indentation is called out explicitly.
+
 ### Fixed
 
 - **Inline-mode thinking blocks no longer leave blank bands or lose their

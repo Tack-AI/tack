@@ -128,12 +128,14 @@ pub const TOOL_SNIPPETS: &[(&str, &str)] = &[
 /// Tool guidelines (pi's *ToolSystemPromptContribution.guidelines).
 pub const TOOL_GUIDELINES: &[&str] = &[
     "Use read to examine files instead of cat or sed.",
-    "Use edit for precise changes (edits[].oldText must match exactly)",
-    "Edit calls are ATOMIC and single-file: if ANY edits[].oldText fails to match, the whole call is rejected and the file is left unchanged. Never batch edits for different files into one call.",
-    "Before editing regions you have not read recently (long files, compacted context), re-read the exact text with read or check uniqueness with grep. On edit failure, use the reported closest match to correct oldText and retry the whole call.",
+    "Use edit for precise changes. Each edit is matched against the original file (not incrementally); overlapping edits are rejected.",
+    "Edit calls are ATOMIC and single-file: every edit is validated before anything is written. If ANY edit fails, the whole call is rejected, the file is left unchanged, and ALL failing hunks are reported together. Never batch edits for different files into one call.",
+    "Use from/to anchors for large contiguous replacements or deletions instead of quoting the whole block. Anchors are exact-only and must each be unique (duplicates are rejected with every match location); omit `to` to target EOF, and `mode: \"inclusive\"` also removes the `to` anchor's line. `expectLines` guards the replaced range size.",
+    "Use `all: true` (with optional `count`) to replace repeated exact text. Replace-all never applies fuzzy matches; `count` turns an unexpected occurrence count into a rejected call.",
+    "Before editing regions you have not read recently (long files, compacted context), re-read the exact text with read or check uniqueness with grep. On failure, fix every reported hunk and retry the whole call (the error includes the closest candidate and names whitespace-only differences).",
     "When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
-    "Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
-    "Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
+    "Keep edits[].oldText/from/to as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
+    "Successful edits return a compact diff of the affected regions; review it (the full diff stays in the tool details).",
     "Use write only for new files or complete rewrites.",
     "Use web_search for current information beyond your training data, then web_fetch the most relevant result instead of guessing URLs.",
 ];
