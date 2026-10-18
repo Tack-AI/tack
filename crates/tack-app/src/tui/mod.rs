@@ -614,6 +614,10 @@ pub struct TuiApp {
     /// whether the committed thinking block starts above the viewport top
     /// (see `keep_streamed_thinking_expanded`).
     last_tail_bottom: usize,
+    /// Terminal size of the last drawn frame. A change means the next frame is
+    /// reprinted on a cleared screen, which makes the main-screen thinking
+    /// pins moot (nothing is "already printed" any more).
+    last_frame_size: Option<(u16, u16)>,
     /// Session (id, revision) `last_stats` was computed from. The recompute
     /// deep-clones every session entry (O(context size)), so it must not run
     /// per frame: keystrokes/paste re-render and would each pay that cost.
@@ -809,6 +813,7 @@ impl TuiApp {
             scroll,
             last_frame: Vec::new(),
             last_tail_bottom: 0,
+            last_frame_size: None,
             debug_capture: false,
             ac_sources: None,
             jump_pill: None,
@@ -1547,6 +1552,19 @@ impl TuiApp {
     #[doc(hidden)]
     pub fn test_push_chat(&mut self, entry: chat::ChatEntry) {
         self.items.push(chat::TranscriptItem::Chat(entry));
+    }
+
+    /// Test helper: assistant entries still pinned expanded on the main
+    /// screen (`thinking_printed`).
+    #[doc(hidden)]
+    pub fn test_pinned_thinking(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| match item {
+                chat::TranscriptItem::Chat(entry) => entry.thinking_pinned(),
+                chat::TranscriptItem::Tool(_) => false,
+            })
+            .count()
     }
 
     /// Test helper: queued steering/follow-up messages (FIFO).

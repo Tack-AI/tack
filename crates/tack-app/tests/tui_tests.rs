@@ -1961,3 +1961,202 @@ async fn ext_markdown_panel_renders_and_updates() {
         "old markdown survived the replacement:\n{frame}"
     );
 }
+
+// ------------------------------------------------------------------
+// Main-screen thinking pins: a block printed expanded at MessageEnd folds
+// once it has scrolled fully above the viewport (a scrollback-only edit),
+// and any wholesale reprint (resize) or explicit display choice (ctrl+t)
+// drops the pin instead of keeping long thinking expanded for the session.
+// ------------------------------------------------------------------
+
+fn k3_model() -> tack_ai::Model {
+    tack_app::model::resolve_model("anthropic", Some("k3"), &tack_session::default_agent_dir())
+        .unwrap()
+}
+
+/// Stream a 30-row thinking block and commit it with a short answer: the
+/// expanded commit straddles the viewport top, so the app pins it (see
+/// `streamed_thinking_commit_keeps_visible_rows`).
+async fn commit_pinned_thinking(app: &mut TuiApp, term: &mut VirtualTerm) {
+    use tack_agent_core::AgentEvent;
+    let mut partial = tack_ai::AssistantMessage::pending(&k3_model());
+    partial.content = vec![tack_ai::ContentBlock::Thinking {
+        thinking: (0..30).map(|i| format!("- thought row {i}\n")).collect(),
+        thinking_signature: None,
+        redacted: None,
+    }];
+    app.handle_agent_event(AgentEvent::AgentStart).await;
+    app.handle_agent_event(AgentEvent::MessageStart {
+        message: tack_agent_core::AgentMessage::Assistant(partial.clone()),
+    })
+    .await;
+    app.test_flush_stream_render();
+    let mut out = Vec::new();
+    app.render(&mut out).unwrap();
+    term.feed(&out);
+    partial
+        .content
+        .push(tack_ai::ContentBlock::text("done.".to_string()));
+    app.handle_agent_event(AgentEvent::MessageEnd {
+        message: tack_agent_core::AgentMessage::Assistant(partial),
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn scrolled_out_thinking_pin_folds_without_repaint() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut app = test_app(cwd.path()).await;
+    app.test_resize(50, 14);
+    let mut term = VirtualTerm::new(50, 14);
+    let mut out: Vec<u8> = Vec::new();
+    app.render(&mut out).unwrap();
+    term.feed(&out);
+
+    commit_pinned_thinking(&mut app, &mut term).await;
+    out.clear();
+    app.render(&mut out).unwrap();
+    term.feed(&out);
+    assert_eq!(
+        app.test_pinned_thinking(),
+        1,
+        "long thinking was not pinned:\n{}",
+        term.dump()
+    );
+    assert!(
+        term.visible_text().contains("thought row 29"),
+        "expanded thinking tail not visible:\n{}",
+        term.dump()
+    );
+
+    // A following answer pushes the whole pinned entry above the viewport. The
+    // fold is then a scrollback-only edit: the renderer must apply it without
+    // repainting or clearing.
+    let mut filler = tack_ai::AssistantMessage::pending(&k3_model());
+    filler.content = vec![tack_ai::ContentBlock::text(
+        (0..30)
+            .map(|i| format!("filler row {i}\n\n"))
+            .collect::<String>(),
+    )];
+    app.test_push_chat(chat::ChatEntry::Assistant {
+        message: filler,
+        streaming: false,
+        thinking_printed: false,
+    });
+    out.clear();
+    app.render(&mut out).unwrap();
+    term.feed(&out);
+    let frame = String::from_utf8_lossy(&out).to_string();
+    assert!(
+        !frame.contains("\x1b[2J"),
+        "the scrollback-only fold cleared the screen: {frame:?}"
+    );
+    assert!(
+        !frame.contains("\x1b[3J"),
+        "the scrollback-only fold wiped the scrollback: {frame:?}"
+    );
+    assert_eq!(
+        app.test_pinned_thinking(),
+        0,
+        "pin survived scrolling above the viewport"
+    );
+    assert!(
+        term.visible_text().contains("filler row"),
+        "{}",
+        term.dump()
+    );
+}
+
+#[tokio::test]
+async fn resize_reprints_pinned_thinking_collapsed() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut app = test_app(cwd.path()).await;
+    app.test_resize(50, 14);
+    let mut term = VirtualTerm::new(50, 14);
+    let mut out: Vec<u8> = Vec::new();
+    app.render(&mut out).unwrap();
+    term.feed(&out);
+
+    commit_pinned_thinking(&mut app, &mut term).await;
+    out.clear();
+    app.render(&mut out).unwrap();
+    term.feed(&out);
+    assert_eq!(app.test_pinned_thinking(), 1, "{}", term.dump());
+
+    // A height change reprints the frame on a cleared screen: nothing is
+    // "already printed" any more, so the pin must not survive into the
+    // reprint (it used to keep the block expanded for the rest of the
+    // session).
+    app.test_resize(50, 20);
+    let mut term = VirtualTerm::new(50, 20);
+    out.clear();
+    app.render(&mut out).unwrap();
+    term.feed(&out);
+    let frame = String::from_utf8_lossy(&out).to_string();
+    assert!(
+        frame.contains("\x1b[2J"),
+        "height change should reprint the frame: {frame:?}"
+    );
+    assert_eq!(
+        app.test_pinned_thinking(),
+        0,
+        "pin survived the reprint:\n{}",
+        term.dump()
+    );
+    let vis = term.visible_text();
+    assert!(
+        vis.contains("Thought for a while"),
+        "reprint kept the block expanded:\n{}",
+        term.dump()
+    );
+    assert!(
+        !vis.contains("thought row"),
+        "expanded thinking reprinted:\n{}",
+        term.dump()
+    );
+}
+
+#[tokio::test]
+async fn thinking_toggle_collapses_pinned_block() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut app = test_app(cwd.path()).await;
+    app.test_resize(50, 14);
+    let mut term = VirtualTerm::new(50, 14);
+    let mut out: Vec<u8> = Vec::new();
+    app.render(&mut out).unwrap();
+    term.feed(&out);
+
+    commit_pinned_thinking(&mut app, &mut term).await;
+    out.clear();
+    app.render(&mut out).unwrap();
+    term.feed(&out);
+    assert_eq!(app.test_pinned_thinking(), 1, "{}", term.dump());
+
+    // ctrl+t cycles collapsed -> expanded -> hidden -> collapsed. The pin must
+    // not override the explicit choice (previously the block stayed expanded
+    // no matter what the setting said).
+    for _ in 0..3 {
+        app.handle_input(InputEvent::Key(KeyEvent::ctrl(Key::Char('t'))))
+            .await;
+        out.clear();
+        app.render(&mut out).unwrap();
+        term.feed(&out);
+    }
+    assert_eq!(
+        app.test_pinned_thinking(),
+        0,
+        "ctrl+t left the block pinned:\n{}",
+        term.dump()
+    );
+    let vis = term.visible_text();
+    assert!(
+        vis.contains("Thought for a while"),
+        "collapsed label missing:\n{}",
+        term.dump()
+    );
+    assert!(
+        !vis.contains("thought row"),
+        "block still expanded after collapsing:\n{}",
+        term.dump()
+    );
+}

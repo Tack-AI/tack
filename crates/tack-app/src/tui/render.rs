@@ -266,7 +266,105 @@ impl TuiApp {
         (lines, fits)
     }
 
+    /// Compose and draw the frame.
+    ///
+    /// Two frames may be drawn: a main-screen thinking pin can only be
+    /// dropped once the entry it protects has scrolled fully above the
+    /// viewport, and that fold is a scrollback-only edit the renderer applies
+    /// without repainting (visible rows keep their content and screen rows).
+    /// Doing it right after a normal frame keeps it isolated from whatever
+    /// else changed on that frame — a fold applied while the frame is also
+    /// scrolled/appended lands in the renderer's "visible window changed"
+    /// branch and forces a full clear instead.
     pub fn render(&mut self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+        let (width, height) = self.tui.size();
+        let size_changed = self.last_frame_size != Some((width, height));
+        if size_changed {
+            // A size change reprints the frame on a cleared screen, so nothing
+            // is "already printed" any more: the pins would only keep long
+            // thinking expanded in the reprint.
+            self.reset_thinking_pins();
+        }
+        self.last_frame_size = Some((width, height));
+
+        self.render_frame(out)?;
+
+        if !self.fullscreen && !size_changed && self.fold_scrolled_thinking_pins(height) {
+            self.render_frame(out)?;
+        }
+        Ok(())
+    }
+
+    /// Drop every main-screen thinking pin and invalidate the cached renders
+    /// that kept those blocks expanded.
+    ///
+    /// The pin exists to keep a *live* frame from shrinking above the
+    /// viewport. It is meaningless when the printed frame is about to be
+    /// replaced (resize, screen-mode switch) or when the user explicitly asks
+    /// for collapsed thinking (ctrl+t) — otherwise it would keep the block
+    /// expanded for the rest of the session.
+    pub(crate) fn reset_thinking_pins(&mut self) {
+        for i in 0..self.items.len() {
+            self.unpin_thinking_item(i);
+        }
+    }
+
+    /// Drop the pin on item `i` (if any) and invalidate the cached render that
+    /// kept it expanded; returns whether a pin was set.
+    fn unpin_thinking_item(&mut self, i: usize) -> bool {
+        let unpinned = match &mut self.items[i] {
+            chat::TranscriptItem::Chat(entry) => entry.unpin_thinking(),
+            chat::TranscriptItem::Tool(_) => false,
+        };
+        if unpinned && let Some(cache) = self.line_cache.get_mut(i) {
+            *cache = LineCacheEntry::default();
+        }
+        unpinned
+    }
+
+    /// Fold pins whose entry has scrolled entirely above the viewport,
+    /// returning whether any were dropped.
+    ///
+    /// A pinned entry was printed expanded; folding it shrinks the frame
+    /// above the viewport, where the terminal's scrollback cannot be
+    /// rewritten — but when the whole entry sits above the visible window the
+    /// shrink changes nothing on screen (rows below keep their content, the
+    /// window top moves up by the same amount), so the renderer takes its
+    /// no-repaint path. Item offsets/heights of committed entries are stable
+    /// across frames (items are append-only), so the geometry computed for the
+    /// frame just drawn is also the geometry the screen currently shows.
+    fn fold_scrolled_thinking_pins(&mut self, height: u16) -> bool {
+        if height == 0 {
+            return false;
+        }
+        // Called right after a frame, so the offsets/heights computed for it
+        // are exactly the geometry the screen shows.
+        if self.offsets.len() != self.items.len() || self.item_heights.len() != self.items.len() {
+            return false;
+        }
+        let viewport_top = self.tui.main_viewport_top();
+        if viewport_top == 0 {
+            return false; // nothing has scrolled off yet
+        }
+        let mut folded = false;
+        for i in 0..self.items.len() {
+            let pinned = match &self.items[i] {
+                chat::TranscriptItem::Chat(entry) => entry.thinking_pinned(),
+                chat::TranscriptItem::Tool(_) => false,
+            };
+            // Entirely above the visible window: its last row is above the
+            // window top (frame rows [0, viewport_top) live in scrollback).
+            if !pinned || self.offsets[i] + self.item_heights[i] > viewport_top {
+                continue;
+            }
+            folded |= self.unpin_thinking_item(i);
+        }
+        folded
+    }
+
+    /// Draw one frame. Scrollback-only edits (thinking pins) are handled by
+    /// the [`render`](Self::render) wrapper, which may draw a second frame.
+    fn render_frame(&mut self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
         let (width, height) = self.tui.size();
         let mut fits = true;
 

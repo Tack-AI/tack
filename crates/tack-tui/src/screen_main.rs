@@ -228,6 +228,18 @@ impl MainScreenRenderer {
         *self = MainScreenRenderer::default();
     }
 
+    /// Frame row index of the visible window's top row after the last
+    /// render.
+    ///
+    /// Rows above it live in the terminal's append-only scrollback: editing
+    /// them cannot repaint the screen, so a caller that already printed
+    /// content it may later want to shorten can wait until the whole block
+    /// has scrolled above this row — the shrink is then a scrollback-only
+    /// edit the renderer applies without touching the visible window.
+    pub fn viewport_top(&self) -> usize {
+        self.previous_viewport_top
+    }
+
     /// Emit a Kitty image line: verbatim the first time (the terminal
     /// receives the pixel data), then as a delete + tiny re-placement — the
     /// bitmap stays in terminal memory keyed by image id.

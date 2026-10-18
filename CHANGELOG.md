@@ -47,6 +47,19 @@ notice can parse entries (same convention as TS pi).
   no duplicated rows and no blank band, at the cost of replacing the
   superseded scrollback copy.
 
+- **Inline-mode thinking blocks no longer stay expanded for the rest of the
+  session**: the run-end pin above had no expiry — ctrl+t's "collapsed"
+  state could not fold those blocks, and any later reprint (terminal
+  resize, `/fullscreen` switch) brought the full thinking back. The pin now
+  lives only while its entry is part of the visible window: once the whole
+  entry has scrolled above the viewport the block folds back to its
+  "Thought for a while" label (a scrollback-only shrink the renderer
+  applies without repainting, clearing, or duplicating rows), a resize or
+  screen-mode reprint drops the pins (nothing is "already printed" in a
+  fresh frame), and ctrl+t's collapse now wins over the pin. The commit
+  frame itself is unchanged: a block whose fold would straddle the
+  viewport top still stays expanded until it scrolls off.
+
 ## [1.0.10] - 2026-10-11
 
 ### Fixed

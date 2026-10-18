@@ -109,6 +109,40 @@ impl ChatEntry {
         }
     }
 
+    /// Is this entry keeping its already-printed thinking expanded on the
+    /// main screen (see the `thinking_printed` field)?
+    pub fn thinking_pinned(&self) -> bool {
+        matches!(
+            self,
+            ChatEntry::Assistant {
+                thinking_printed: true,
+                ..
+            }
+        )
+    }
+
+    /// Drop the main-screen "streamed expanded" pin, returning whether it
+    /// was set.
+    ///
+    /// The pin only protects the *live* frame from shrinking above the
+    /// viewport (the append-only main screen cannot rewrite scrollback). Once
+    /// those rows no longer belong to the visible window — the entry scrolled
+    /// fully above it, the frame is about to be reprinted from scratch
+    /// (resize, screen-mode switch), or the user explicitly collapsed
+    /// thinking (ctrl+t) — folding is safe again and the block renders as its
+    /// compact label.
+    pub fn unpin_thinking(&mut self) -> bool {
+        match self {
+            ChatEntry::Assistant {
+                thinking_printed, ..
+            } if *thinking_printed => {
+                *thinking_printed = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Render to lines (finalized entries only — streaming entries use
     /// `render_streaming`).
     pub fn render(&self, width: u16, theme: &Theme, media: Media) -> Vec<Line> {

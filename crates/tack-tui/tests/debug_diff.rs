@@ -1013,3 +1013,69 @@ fn debug_diff_straddling_collapse_clears_without_duplication() {
         term.dump()
     );
 }
+
+/// A shrink whose removed rows all live above the viewport (the app folds a
+/// "printed expanded" thinking block only after it has scrolled off) changes
+/// nothing on screen: every row below the removed range keeps its content and
+/// its screen row (the window top moves up by the same count). The renderer
+/// must apply it as a scrollback-only edit — no repaint, no clear, no blank
+/// band, no pulled-back row.
+#[test]
+fn debug_diff_scrollback_only_shrink_keeps_viewport() {
+    let width = 30u16;
+    let height = 10u16;
+    let mut renderer = MainScreenRenderer::new();
+    let mut out: Vec<u8> = Vec::new();
+    let mut term = VirtualTerm::new(width as usize, height as usize);
+    let frame = |start: usize, n: usize| -> Vec<Line> {
+        (start..start + n)
+            .map(|i| Line::plain(format!("row {i}")))
+            .collect()
+    };
+
+    // 20 rows: the first 10 scroll into the scrollback, the viewport shows
+    // rows 10..=19.
+    out.clear();
+    renderer
+        .render(&frame(0, 20), width, height, false, &mut out)
+        .unwrap();
+    term.feed(&out);
+    let before = term.visible_text();
+    assert!(before.contains("row 10"), "{}", term.dump());
+    assert!(before.contains("row 19"), "{}", term.dump());
+
+    // Fold: the first 5 rows disappear (all above the viewport). The visible
+    // window must keep showing exactly the same content at the same rows.
+    out.clear();
+    renderer
+        .render(&frame(5, 15), width, height, false, &mut out)
+        .unwrap();
+    term.feed(&out);
+    assert!(
+        out.is_empty(),
+        "scrollback-only shrink repainted: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    assert_eq!(
+        term.visible_text(),
+        before,
+        "viewport changed:\n{}",
+        term.dump()
+    );
+    assert!(!term.scrollback.is_empty(), "scrollback lost");
+    // Bookkeeping followed the fold: the next row appended lands right after
+    // the (now shorter) frame instead of the stale position.
+    out.clear();
+    renderer
+        .render(&frame(5, 16), width, height, false, &mut out)
+        .unwrap();
+    term.feed(&out);
+    let dump = term.dump();
+    let vis = term.visible_text();
+    assert!(vis.contains("row 15"), "appended row misplaced:\n{dump}");
+    assert_eq!(
+        vis.matches("row 15").count(),
+        1,
+        "appended row duplicated:\n{dump}"
+    );
+}

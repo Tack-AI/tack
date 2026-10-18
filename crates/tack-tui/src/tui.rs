@@ -119,6 +119,13 @@ impl Tui {
         (self.width, self.height)
     }
 
+    /// Frame row index of the main screen's visible window top after the
+    /// last regular-mode frame (0 when nothing has scrolled off yet). See
+    /// [`MainScreenRenderer::viewport_top`].
+    pub fn main_viewport_top(&self) -> usize {
+        self.main.viewport_top()
+    }
+
     pub fn resize(&mut self, width: u16, height: u16) {
         self.width = width;
         self.height = height;

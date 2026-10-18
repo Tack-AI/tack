@@ -16,6 +16,13 @@ impl TuiApp {
     /// Runtime fullscreen toggle (`/fullscreen`).
     pub fn toggle_fullscreen(&mut self) {
         self.fullscreen = !self.fullscreen;
+        // The screen-mode switch repaints the frame from scratch, and the
+        // line cache holds renders made under the other mode's thinking
+        // policy (main screen keeps printed blocks expanded, the alt screen
+        // honors the collapse setting). Drop both so the repaint is
+        // consistent and nothing stays pinned for the rest of the session.
+        self.reset_thinking_pins();
+        self.line_cache.clear();
         self.tui.set_mode(if self.fullscreen {
             TuiMode::Fullscreen
         } else {
@@ -534,6 +541,11 @@ impl TuiApp {
                 };
             self.thinking_expanded = expand;
             self.settings.hide_thinking_block = hide;
+            // An explicit display choice wins over the main-screen pin: a
+            // block kept expanded because it was already printed follows the
+            // new setting (pins only exist to avoid an above-viewport rewrite,
+            // not to override ctrl+t).
+            self.reset_thinking_pins();
             self.line_cache.clear();
             self.notice(crate::i18n::t(self.lang, label, &[]), NoticeKind::Info);
             return true;

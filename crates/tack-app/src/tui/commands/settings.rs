@@ -225,6 +225,11 @@ impl TuiApp {
             if key == "clearOnShrink" {
                 self.tui.set_clear_on_shrink(self.settings.clear_on_shrink);
             }
+            if key == "hideThinkingBlock" {
+                // Same explicit display choice as ctrl+t: a block pinned
+                // because it was already printed expanded must follow it.
+                self.reset_thinking_pins();
+            }
             self.line_cache.clear();
         }
         self.settings.theme = if key == "theme" {
