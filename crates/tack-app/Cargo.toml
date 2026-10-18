@@ -76,7 +76,7 @@ oauth2 = { version = "5", default-features = false }
 keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
 sha2.workspace = true
 # Marketplace catalog signature verification (TOFU-pinned ed25519 keys).
-ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc"] }
 chrono.workspace = true
 cron = "0.17"
 # WebSocket transport for `serve --listen ws:` (server handshake + framing;
