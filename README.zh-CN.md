@@ -318,7 +318,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | `tack-ai` | 统一消息模型 + provider 适配器（Anthropic、OpenAI、Azure、Codex、Google、Mistral、Bedrock……） |
 | `tack-agent-core` | Agent 循环、`AgentTool`/`AgentHooks`/`Extension` trait、`AgentEvent` 流 |
 | `tack-session` | 会话持久化（树结构）+ 上下文压缩 |
-| `tack-tools` | 内置工具：read、bash、git、edit、write、grep、find、ls、web_fetch、web_search、todo |
+| `tack-tools` | 内置工具：read、bash、edit、write、grep、find、ls、web_fetch、web_search、todo |
 | `tack-tui` | 终端 UI 库：样式行、组件、diff + alt-screen 渲染器 |
 | `tack-protocol` | CBOR 远程会话协议：schema、分帧、`RemoteClient` |
 | `tack-ext` | 扩展宿主：tack-RPC v3（schema 生成的 `rpc3` 类型）、process/MCP 载体、store、市场、策略 |

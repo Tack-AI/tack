@@ -337,7 +337,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | `tack-ai` | Unified message model + provider adapters (Anthropic, OpenAI, Azure, Codex, Google, Mistral, Bedrock, …) |
 | `tack-agent-core` | Agent loop, `AgentTool`/`AgentHooks`/`Extension` traits, `AgentEvent` stream |
 | `tack-session` | Session persistence (tree structure) + context compaction |
-| `tack-tools` | Built-in tools: read, bash, git, edit, write, grep, find, ls, web_fetch, web_search, todo |
+| `tack-tools` | Built-in tools: read, bash, edit, write, grep, find, ls, web_fetch, web_search, todo |
 | `tack-tui` | Terminal UI library: styled lines, components, diff + alt-screen renderers |
 | `tack-protocol` | CBOR remote-session protocol: schemas, framing, `RemoteClient` |
 | `tack-ext` | Extension host: tack-RPC v3 (schema-generated `rpc3` types), process/MCP carriers, store, marketplace, policy |

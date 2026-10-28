@@ -331,39 +331,6 @@ The parent's loaded plugins are shared in-process (no respawn); the
 JSON-RPC peer multiplexes concurrent parent/child calls. The key layers
 like any settings key, so managed settings can pin it.
 
-### Controlled git tool
-
-Built-in `git` tool: the agent invokes git structurally with `command:
-"status"` / `"add -A"` / `"commit -m msg"`; the tool parses the subcommand
-itself, so the permission system classifies by subcommand instead of matching
-free text (bash wildcards are easily bypassed by `git -C`, aliases, quoting):
-
-- Purely read-only subcommands (status/log/diff/show/blame/reflog/rev-list/
-  ls-tree/ls-remote/branch in list form/explicitly read forms like
-  `config --get`/…) are prompt-free in plan mode and ask mode, and
-  prompt-free under `Git` rules; all other subcommands go through the normal
-  permission prompt.
-- Quote-aware parsing: shell metacharacters are only rejected **outside
-  quotes**, so commit messages like `commit -m "fix: a > b \`x\` $(y)"` work
-  fine; every parsed argument is re-escaped with single quotes before
-  execution, making quoted content fully inert to the shell.
-- `commands: ["status", "log --oneline -10"]` batch form: multiple
-  invocations executed in one call (in order, stop on first error). The
-  read-only classification requires **every** entry to be read-only;
-  permission rules match batch calls per entry — a deny hit on any entry
-  rejects the whole call, allow requires all entries to match.
-- Validation rejects unquoted shell metacharacters, global options
-  (`-C`/`--git-dir`), and subcommands not on the whitelist — which also
-  blocks the config-alias (`alias.x = !shell`) injection path. Execution goes
-  through the bash executor, with sandbox policy aligned with the ACP client
-  terminal.
-- Permission rules are written just like bash: `permissions.allow:
-  ["Git(push *)"]`, `permissions.deny: ["Git(reset --hard*)"]` (wildcard
-  matching, deny wins).
-
-bash is still available (temp directories, non-git tasks), but the system
-prompt steers toward the git tool first.
-
 ### Context usage visualization
 
 `/context`: shows how many tokens each segment of the current context window

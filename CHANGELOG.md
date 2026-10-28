@@ -4,6 +4,16 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [1.0.12] - 2026-10-29
+
+### Removed
+
+- **Dedicated `git` tool**: git operations now go through `bash`, so normal
+  shell pipelines, `&&`, quoting, and redirection work without a second
+  command parser. The existing sandbox and `Bash(...)` permission rules apply;
+  use rules such as `Bash(git push *)` instead of the removed `Git(...)`
+  rules. Git-specific read-only auto-approval has also been removed.
+
 ## [1.0.11] - 2026-10-18
 
 ### Added

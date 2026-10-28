@@ -106,7 +106,7 @@ Plugin system (`tack-ext` subprocess NDJSON protocol / `tack-ext-wasm` wasmtime 
 | Headless print mode | `tack-app/src/print_mode.rs` | README |
 | ACP editor integration (Zed etc.) | `tack-app/src/acp/` | docs/features.md |
 | RPC / remote sessions / serve | `tack-app/src/rpc/`, `remote*.rs`, `crates/tack-protocol` | docs/features.md |
-| Built-in tools (read/bash/edit/write/git/grep/web/todo…) | `crates/tack-tools/src/` | docs/architecture.md |
+| Built-in tools (read/bash/edit/write/grep/web/todo…) | `crates/tack-tools/src/` | docs/architecture.md |
 | Background tasks | `tack-tools/src/background.rs` | docs/features.md |
 | LSP tools | `tack-tools/src/lsp/` | docs/features.md |
 | Checkpoint rollback | `tack-tools/src/checkpoint.rs` | docs/features.md |
@@ -144,7 +144,7 @@ flowchart TB
     end
 
     CORE["tack-agent-core<br/>agent_loop · AgentEvent<br/>AgentTool / AgentHooks / Extension"]
-    TOOLS["tack-tools<br/>read·bash·edit·git·web·lsp·checkpoint…"]
+    TOOLS["tack-tools<br/>read·bash·edit·web·lsp·checkpoint…"]
     AI["tack-ai<br/>message model · EventStream · Provider trait<br/>api/ per-vendor adapters"]
     SESS["tack-session<br/>JSONL v3 tree · compaction"]
     TUILIB["tack-tui<br/>renderer · components"]

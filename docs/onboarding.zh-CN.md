@@ -106,7 +106,7 @@ tack-tui（终端 UI 库）· tack-protocol（CBOR 远程协议）· tack-ext / 
 | 无头 print 模式 | `tack-app/src/print_mode.rs` | README |
 | ACP 编辑器集成（Zed 等） | `tack-app/src/acp/` | docs/features.md |
 | RPC / 远程会话 / serve | `tack-app/src/rpc/`、`remote*.rs`、`crates/tack-protocol` | docs/features.md |
-| 内置工具（read/bash/edit/write/git/grep/web/todo…） | `crates/tack-tools/src/` | docs/architecture.md |
+| 内置工具（read/bash/edit/write/grep/web/todo…） | `crates/tack-tools/src/` | docs/architecture.zh-CN.md |
 | 后台任务 | `tack-tools/src/background.rs` | docs/features.md |
 | LSP 工具 | `tack-tools/src/lsp/` | docs/features.md |
 | Checkpoint 回滚 | `tack-tools/src/checkpoint.rs` | docs/features.md |
@@ -144,7 +144,7 @@ flowchart TB
     end
 
     CORE["tack-agent-core<br/>agent_loop · AgentEvent<br/>AgentTool / AgentHooks / Extension"]
-    TOOLS["tack-tools<br/>read·bash·edit·git·web·lsp·checkpoint…"]
+    TOOLS["tack-tools<br/>read·bash·edit·web·lsp·checkpoint…"]
     AI["tack-ai<br/>消息模型 · EventStream · Provider trait<br/>api/ 各家适配器"]
     SESS["tack-session<br/>JSONL v3 树 · compaction"]
     TUILIB["tack-tui<br/>渲染器 · 组件"]

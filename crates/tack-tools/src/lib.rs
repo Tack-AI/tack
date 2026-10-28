@@ -14,7 +14,6 @@ pub mod edit;
 pub mod edit_diff;
 pub mod edit_fuzzy;
 pub mod executor;
-pub mod git_tool;
 pub mod lsp;
 pub mod mcp;
 pub mod mcp_sse;
@@ -41,7 +40,6 @@ use tack_agent_core::AgentTool;
 
 pub use bash::BashTool;
 pub use edit::EditTool;
-pub use git_tool::GitTool;
 pub use powershell::PowerShellTool;
 pub use read::ReadTool;
 pub use search::{FindTool, GrepTool, LsTool};
@@ -85,7 +83,6 @@ pub fn create_coding_tools(services: &ToolServices) -> Vec<Arc<dyn AgentTool>> {
     let mut tools: Vec<Arc<dyn AgentTool>> = vec![
         Arc::new(ReadTool::new(services.clone())),
         Arc::new(BashTool::new(services.clone())),
-        Arc::new(GitTool::new(services.clone())),
         Arc::new(background::BashOutputTool::new(services.clone())),
         Arc::new(background::BashWaitTool::new(services.clone())),
         Arc::new(background::KillShellTool::new(services.clone())),
@@ -122,7 +119,6 @@ pub fn create_all_tools(services: &ToolServices) -> Vec<Arc<dyn AgentTool>> {
         Arc::new(ReadTool::new(services.clone())),
         Arc::new(BashTool::new(services.clone())),
         Arc::new(PowerShellTool::new(services.clone())),
-        Arc::new(GitTool::new(services.clone())),
         Arc::new(background::BashOutputTool::new(services.clone())),
         Arc::new(background::BashWaitTool::new(services.clone())),
         Arc::new(background::KillShellTool::new(services.clone())),
@@ -147,6 +143,15 @@ pub fn create_all_tools(services: &ToolServices) -> Vec<Arc<dyn AgentTool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_operations_use_bash_without_a_dedicated_tool() {
+        let services = crate::default_services(std::path::PathBuf::from("/tmp"));
+        for tools in [create_coding_tools(&services), create_all_tools(&services)] {
+            assert!(tools.iter().any(|tool| tool.name() == "bash"));
+            assert!(!tools.iter().any(|tool| tool.name() == "git"));
+        }
+    }
 
     /// TS pi fcff255b0: the core built-in tools (read/bash/edit/write)
     /// default to strict JSON-schema sampling in "prefer" mode.

@@ -229,18 +229,6 @@ model: anthropic/k3
 
 父代理已加载的插件在进程内共享（不重新 spawn）；JSON-RPC peer 多路复用父/子并发调用。该键与普通设置键一样分层，managed 层可钉死。
 
-### 受控 git 工具
-
-内置 `git` 工具：agent 用 `command: "status"` / `"add -A"` / `"commit -m msg"` 结构化调用 git，工具自己解析子命令，权限系统按子命令分类而不是匹配自由文本（bash 通配符易被 `git -C`、alias、引号绕过）：
-
-- 纯读子命令（status/log/diff/show/blame/reflog/rev-list/ls-tree/ls-remote/branch 列表形式/`config --get` 等显式读形式/…）在 plan 模式、ask 模式下免提示，`Git` 规则免提示；其余子命令走正常权限询问。
-- 引号感知解析：shell 元字符只在**引号外**被拒绝，所以 `commit -m "fix: a > b \`x\` $(y)"` 这类提交信息可以正常写；解析后的每个参数在执行前重新加单引号转义，引号内容对 shell 完全惰性。
-- `commands: ["status", "log --oneline -10"]` 批量形式：多条调用一次执行（按顺序，遇错即止）。只读分类要求**每条**都只读；权限规则对批量按条目匹配——deny 命中任意一条即拒，allow 要求全部命中。
-- 校验拒绝未加引号的 shell 元字符、全局选项（`-C`/`--git-dir`）和不在白名单上的子命令——同时阻断了 config alias（`alias.x = !shell`）注入路径。执行走 bash 执行器，沙箱策略与 ACP client terminal 对齐。
-- 权限规则写法与 bash 一致：`permissions.allow: ["Git(push *)"]`、`permissions.deny: ["Git(reset --hard*)"]`（通配符匹配，deny 优先）。
-
-bash 仍然可用（临时目录、非 git 任务），但系统提示会引导优先用 git 工具。
-
 ### 上下文占用可视化
 
 `/context`：展示当前上下文窗口里各段占多少 token——系统提示、工具 schema、用户消息、助手消息、thinking、tool results（含最大的几个工具按体积排序），并用 provider 报告的真实值校准估算，给出窗口占比与自动压缩触发余量。压缩变贵变慢之前就能看出是哪段在膨胀。`/todo` 查看会话任务列表（`/todo clear` 清空），与 TUI 面板同一状态。

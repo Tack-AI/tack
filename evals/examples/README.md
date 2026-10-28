@@ -23,7 +23,7 @@
 | rename-function | 跨文件引用更新（编辑 + 搜索） |
 | run-and-fix | 运行-观察-修复回路（bash + 迭代） |
 | sort-lines / dedupe-lines | 内容重写 + 约束遵守（顺序/去重） |
-| git-commit | git 工具（或 bash）+ 权限模式 |
+| git-commit | bash + 权限模式 |
 | extract-todos | 只读提取 + 新文件创建 + 不动原文件 |
 | json-fix | 语法纠错 + 语义保持（结构化验证） |
 | multi-file-edit | 签名变更波及多文件（定义 + 两个调用点 + 运行验证） |

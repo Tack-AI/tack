@@ -117,10 +117,6 @@ pub const TOOL_SNIPPETS: &[(&str, &str)] = &[
     ),
     ("find", "Find files by glob pattern (respects .gitignore)"),
     ("ls", "List directory contents"),
-    (
-        "git",
-        "Run git commands (validated subcommands, permission-aware read-only classification)",
-    ),
     ("web_fetch", "Fetch a URL and return its content as text"),
     ("web_search", "Search the web for current information"),
 ];

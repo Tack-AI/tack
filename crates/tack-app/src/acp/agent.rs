@@ -210,7 +210,7 @@ impl TackAcpAgent {
         ]
     }
 
-    /// Tools that never need a prompt (read-only builtins; `git` by subcommand).
+    /// Tools that never need a prompt (read-only builtins).
     fn is_read_only_tool(name: &str, args: &serde_json::Value) -> bool {
         crate::permissions::is_read_only_tool(name, args)
     }

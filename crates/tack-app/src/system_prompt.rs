@@ -188,12 +188,6 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
             );
         }
     }
-    if tools.iter().any(|t| t == "git") {
-        add_guideline(
-            "Use the git tool instead of bash for git operations — it is validated and permission-aware",
-            &mut guidelines,
-        );
-    }
     for g in options.prompt_guidelines {
         let normalized = g.trim();
         if !normalized.is_empty() {

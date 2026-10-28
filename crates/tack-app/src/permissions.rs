@@ -6,8 +6,8 @@
 //!
 //! Rule syntax: `"Tool(pattern)"` — e.g. `Bash(npm run *)`, `Edit(src/**)`,
 //! `Write(*.env)`, or a bare `Bash` (all calls of that tool). `deny` always
-//! wins over `allow`. Matching: shell commands (bash/powershell/git) use
-//! `*` wildcards; file paths use glob (`**` crosses directories).
+//! wins over `allow`. Matching: shell commands (bash/powershell) use `*`
+//! wildcards; file paths use glob (`**` crosses directories).
 //!
 //! Persistence: "allow always" answers are appended to
 //! `<agent dir>/permissions.json` ({"allowAlways": [...]}), merged with the
@@ -17,31 +17,15 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-/// Tools that never need a prompt (read-only builtins). The `git` tool is
-/// classified by subcommand: only pure-read invocations are read-only.
+/// Tools that never need a prompt (read-only builtins).
 /// MCP tools (`mcp__*`) are classified by the SERVER-DECLARED
 /// `readOnlyHint` annotation (published to `tack_tools::mcp`'s registry
 /// when the tool set is built): a hint is honored only when the server
 /// did not also mark the tool destructive — contradictory hints resolve
 /// to the safe side.
-pub fn is_read_only_tool(name: &str, args: &Value) -> bool {
+pub fn is_read_only_tool(name: &str, _args: &Value) -> bool {
     match name {
         "read" | "grep" | "find" | "ls" => true,
-        "git" => {
-            if let Some(command) = args.get("command").and_then(Value::as_str) {
-                return tack_tools::git_tool::is_read_only_command(command);
-            }
-            // Batch form: read-only only if EVERY entry is.
-            if let Some(entries) = args.get("commands").and_then(Value::as_array) {
-                let commands: Vec<String> = entries
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect();
-                return tack_tools::git_tool::is_read_only_commands(&commands);
-            }
-            false
-        }
         _ if name.starts_with("mcp__") => tack_tools::mcp::mcp_tool_annotations(name)
             .map(|a| a.read_only && !a.destructive)
             .unwrap_or(false),
@@ -53,7 +37,7 @@ pub fn is_read_only_tool(name: &str, args: &Value) -> bool {
 ///
 /// `matcher` is the glob pattern compiled ONCE at parse time (file-tool
 /// rules only): glob compilation is far too expensive to redo per tool call
-/// × per rule. Shell-command rules (bash/git/powershell) use `*`-wildcard
+/// × per rule. Shell-command rules (bash/powershell) use `*`-wildcard
 /// matching instead and keep `matcher: None`.
 #[derive(Clone)]
 pub struct Rule {
@@ -87,9 +71,7 @@ impl std::fmt::Debug for Rule {
 
 /// Shell-command tools match with `*` wildcards, not path globs.
 fn is_shell_rule_tool(tool: &str) -> bool {
-    tool.eq_ignore_ascii_case("bash")
-        || tool.eq_ignore_ascii_case("git")
-        || tool.eq_ignore_ascii_case("powershell")
+    tool.eq_ignore_ascii_case("bash") || tool.eq_ignore_ascii_case("powershell")
 }
 
 /// Compile a path-glob matcher with the exact semantics glob_match has
@@ -154,17 +136,9 @@ impl Rule {
             .unwrap_or("")
     }
 
-    /// One target per git `commands` batch entry; otherwise a single target.
-    fn targets<'a>(&self, tool_name: &str, args: &'a Value) -> Vec<&'a str> {
-        if let Some(entries) = args.get("commands").and_then(Value::as_array) {
-            return entries.iter().filter_map(Value::as_str).collect();
-        }
-        vec![self.target(tool_name, args)]
-    }
-
     fn matches_target(&self, tool_name: &str, target: &str) -> bool {
         let pattern = self.pattern.as_ref().expect("checked by caller");
-        if tool_name == "bash" || tool_name == "git" || tool_name == "powershell" {
+        if tool_name == "bash" || tool_name == "powershell" {
             wildcard_match(pattern, target)
         } else if let Some(matcher) = &self.matcher {
             // Precompiled glob (identical semantics to glob_match: exact
@@ -175,8 +149,7 @@ impl Rule {
         }
     }
 
-    /// deny semantics: a batch matches when ANY entry matches — a denied
-    /// subcommand anywhere in the batch denies the whole call.
+    /// deny semantics: a rule matches against the tool call's command/path.
     fn matches_deny(&self, tool_name: &str, args: &Value) -> bool {
         if !self.tool.eq_ignore_ascii_case(tool_name) {
             return false;
@@ -184,12 +157,10 @@ impl Rule {
         if self.pattern.is_none() {
             return true;
         }
-        let targets = self.targets(tool_name, args);
-        !targets.is_empty() && targets.iter().any(|t| self.matches_target(tool_name, t))
+        let target = self.target(tool_name, args);
+        !target.is_empty() && self.matches_target(tool_name, target)
     }
 
-    /// allow semantics: a batch matches only when EVERY entry matches —
-    /// `Git(status*)` must not approve ["status", "push origin main"].
     fn matches_allow(&self, tool_name: &str, args: &Value) -> bool {
         if !self.tool.eq_ignore_ascii_case(tool_name) {
             return false;
@@ -197,14 +168,15 @@ impl Rule {
         if self.pattern.is_none() {
             return true;
         }
-        let targets = self.targets(tool_name, args);
-        !targets.is_empty() && targets.iter().all(|t| self.matches_target(tool_name, t))
+        let target = self.target(tool_name, args);
+        !target.is_empty() && self.matches_target(tool_name, target)
     }
 }
 
 /// `*` matches any byte sequence (bash commands). Whitespace runs are
 /// collapsed first so deny rules cannot be sidestepped by padding a command
-/// with extra spaces (e.g. deny `Git(push --force*)` vs `push  --force`).
+/// with extra spaces (e.g. deny `Bash(git push --force*)` vs
+/// `git push  --force`).
 fn wildcard_match(pattern: &str, target: &str) -> bool {
     if pattern == target {
         return true;
@@ -735,74 +707,6 @@ mod tests {
             !is_read_only_tool("mcp__t__unknown", &args),
             "unregistered MCP tools are not read-only"
         );
-    }
-
-    #[test]
-    fn git_rules_match_command_and_read_only_gating() {
-        // Git(...) rules match against the tool's `command` argument.
-        let rules = PermissionRules {
-            allow: vec![],
-            deny: vec![Rule::parse("Git(push --force*)").unwrap()],
-        };
-        let forced = serde_json::json!({ "command": "push  --force origin main" });
-        assert!(rules.deny_match("git", &forced).is_some());
-        let normal = serde_json::json!({ "command": "push origin main" });
-        assert!(rules.deny_match("git", &normal).is_none());
-
-        // Plan/ask modes auto-approve only structurally read-only git calls;
-        // write/exec options on read subcommands must not slip through.
-        assert!(is_read_only_tool(
-            "git",
-            &serde_json::json!({ "command": "log --oneline" })
-        ));
-        assert!(!is_read_only_tool(
-            "git",
-            &serde_json::json!({ "command": "log --output=/tmp/x" })
-        ));
-        assert!(!is_read_only_tool(
-            "git",
-            &serde_json::json!({ "command": "grep -Oevil x" })
-        ));
-        assert!(!is_read_only_tool(
-            "git",
-            &serde_json::json!({ "command": "stash" })
-        ));
-        assert!(is_read_only_tool(
-            "git",
-            &serde_json::json!({ "command": "stash list" })
-        ));
-    }
-
-    #[test]
-    fn git_batch_rules_and_read_only_gating() {
-        // Read-only gating: every batch entry must be read-only.
-        assert!(is_read_only_tool(
-            "git",
-            &serde_json::json!({ "commands": ["status", "log --oneline -5"] })
-        ));
-        assert!(!is_read_only_tool(
-            "git",
-            &serde_json::json!({ "commands": ["status", "push origin main"] })
-        ));
-        assert!(!is_read_only_tool(
-            "git",
-            &serde_json::json!({ "commands": [] })
-        ));
-
-        // deny = ANY entry matches: a denied subcommand anywhere in the
-        // batch denies the whole call.
-        let rules = PermissionRules {
-            allow: vec![Rule::parse("Git(status*)").unwrap()],
-            deny: vec![Rule::parse("Git(push*)").unwrap()],
-        };
-        let batch = serde_json::json!({ "commands": ["status", "push origin main"] });
-        assert!(rules.deny_match("git", &batch).is_some());
-
-        // allow = ALL entries must match: Git(status*) must not approve a
-        // batch smuggling a second command.
-        assert!(rules.allow_match("git", &batch).is_none());
-        let clean = serde_json::json!({ "commands": ["status", "status --short"] });
-        assert!(rules.allow_match("git", &clean).is_some());
     }
 
     #[test]
