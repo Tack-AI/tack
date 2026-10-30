@@ -89,3 +89,4 @@ pub mod system_prompt;
 pub mod task;
 pub mod tools_manager;
 pub mod tui;
+pub mod worktrees;

@@ -132,6 +132,25 @@ Typical uses: dev servers, `cargo build`, long test runs. Background tasks
 survive across runs (TUI/RPC session scope) and are reaped when the process
 exits.
 
+#### Control panel (`/tasks`)
+
+`/tasks` opens a live panel over one shared registry of background bash
+tasks **and** fire-and-forget subagents:
+
+- rows update in place (running marker `●`, finished `✓`/`✗`) with status
+  and elapsed time; registration order is stable, so the cursor never jumps
+  when a task finishes;
+- Enter opens a tail-following output viewer (`↑↓`/PgUp/PgDn scroll,
+  `f` toggles follow); subagent progress lines and the final result are in
+  the same log;
+- `x` cancels the selected running task (bash: whole process tree;
+  subagent: cancellation token); `c` clears finished rows;
+- `m` on a running subagent opens an inline message box: `Enter` queues the
+  text for the child's next turn boundary (steering), `Esc` cancels. Bash
+  tasks have no message channel and refuse with a note;
+- Esc closes. Headless surfaces keep using `bash_output`/`bash_wait` — the
+  panel is a human control surface, not a second protocol.
+
 Disable: `"features": {"backgroundTasks": false}` — the `run_in_background`
 parameter disappears from bash's schema entirely; the model never knows it
 exists.
@@ -285,8 +304,36 @@ the same name overrides the global one.
 `subagent` with `isolation: "worktree"`: automatically `git worktree add` a
 temporary branch; the subagent edits files inside it, and the result comes
 with the branch name + path + diff stat. Multiple subagents editing the same
-codebase in parallel don't step on each other; the parent agent decides
-whether to merge or discard.
+codebase in parallel don't step on each other.
+
+Every worktree is recorded in `<agentDir>/worktrees.json` (task label,
+branch, path) and can be managed without leaving the TUI:
+
+- `/worktree` (or `/worktree list`): branch, task label, diff summary,
+  path, and whether it was already applied;
+- `/worktree apply [branch]`: commits the worktree's changes on its branch
+  and squash-merges it into the current repo's **index** — staged, not
+  committed, so the human keeps the final say. With exactly one worktree
+  the branch can be omitted; the checkout tack itself is running in is
+  refused;
+- `/worktree discard <branch>`: removes the worktree and deletes its branch
+  (only `tack-subagent-*` branches; the checkout tack itself is running in
+  is refused);
+- `/worktree prune`: forgets registry rows whose worktree disappeared
+  (e.g. removed outside tack).
+
+Worktrees created before this registry (or by another checkout) are still
+found through `git worktree list`, so nothing is lost. Applying/discarding
+is refused while an agent run is active (it would race the edits); listing
+stays available.
+
+### Shared task board
+
+When the TUI has a todo list, subagents receive the same `todo` tool backed
+by the **same state**: the parent can seed the plan and parallel children
+claim/complete items as they go. `/todo` and the panel therefore show one
+board instead of N private lists. Custom agent definitions can narrow the
+child tool set as usual (include `todo` in `tools:` to keep it).
 
 ### Concurrency cap and shared budget
 

@@ -99,6 +99,22 @@ impl OutputAccumulator {
         }
     }
 
+    /// Total bytes accepted so far (in-memory head + spill), O(1).
+    /// Lets live viewers detect growth without snapshotting (which would
+    /// persist a truncated file on every poll). Once spilling, the spill
+    /// file already contains the in-memory head (written at creation), so
+    /// its byte count is the total — adding `buffer.len()` would double
+    /// count the head.
+    pub fn len(&self) -> usize {
+        self.spill
+            .as_ref()
+            .map_or(self.buffer.len(), |spill| spill.written)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn append(&mut self, data: &[u8]) {
         let max_spill = self.max_spill_bytes;
         if let Some(spill) = &mut self.spill {
@@ -237,6 +253,9 @@ mod tests {
         acc.append(b"0123456789"); // 10 bytes, in memory
         acc.append(b"abcdefghij0123456789"); // 20 bytes: 6 fit, 14 spill
         assert_eq!(acc.buffer.len(), 16, "in-memory cap must hold exactly");
+        // The spill file already holds the head, so len() counts it once.
+        assert_eq!(acc.len(), 30);
+        assert!(!acc.is_empty());
 
         let snap = acc.snapshot(true);
         assert!(snap.truncation.truncated);

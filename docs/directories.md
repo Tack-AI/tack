@@ -18,6 +18,7 @@ Configuration, rules, skills, and MCP: where Tack looks, and in what order.
     extensions/         # installed extensions (always loaded)
     marketplaces/       # extension marketplace catalogs (tack ext marketplace)
     cron.json           # scheduled jobs (/cron, missed runs fire once at startup)
+    worktrees.json      # subagent worktree registry (/worktree)
     managed-hooks.json  # org-managed hooks (enforced with managedHooksOnly)
     AGENTS.md           # global rules (single file, TS pi layout)
     rules/              # global rules directory (*.md, all loaded, sorted by name)
@@ -155,5 +156,6 @@ Known keys: `defaultProvider`, `defaultModel`, `shellPath`, `theme`,
 | Extensions | `~/.tack/agent/extensions/` | `<cwd>/.pi/extensions/` | both loaded; project trust-gated |
 | Marketplaces | `~/.tack/agent/marketplaces/` | — | per-catalog files |
 | Cron jobs | `~/.tack/agent/cron.json` | — | single file |
+| Subagent worktrees | `~/.tack/agent/worktrees.json` | — | single file (`/worktree`) |
 | Managed hooks | `~/.tack/agent/managed-hooks.json` | — | single file (enterprise) |
 | Sessions | `~/.tack/agent/sessions/--<cwd>--/` | — | per-cwd |

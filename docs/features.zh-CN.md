@@ -99,6 +99,16 @@ registry 可用 `TACK_MODEL_CATALOG_REGISTRY` 覆盖。带截断防护（<20 pro
 
 典型用法：dev server、`cargo build`、长测试。后台任务跨 run 存活（TUI/RPC 会话级），进程退出即回收。
 
+#### 控制面板（`/tasks`）
+
+`/tasks` 打开一个实时面板，统一管理后台 bash 任务**和** fire-and-forget 子代理：
+
+- 行内实时更新（运行中 `●`、已完成 `✓`/`✗`），带状态与耗时；顺序按注册顺序稳定，任务完成时光标不会跳走；
+- 回车打开尾部跟随的输出查看器（`↑↓`/PgUp/PgDn 滚动，`f` 切换跟随）；子代理的进度行和最终结果都在同一份日志里；
+- `x` 停止选中的运行中任务（bash：整个进程树；子代理：取消令牌）；`c` 清理已完成行；
+- 对运行中的子代理按 `m` 打开行内消息框：`回车` 把文本排入子代理下一个回合边界（steering），`esc` 取消。bash 任务没有消息通道，会给出提示并拒绝；
+- Esc 关闭。headless 场景继续用 `bash_output`/`bash_wait`——面板是人的控制面，不是第二套协议。
+
 关闭：`"features": {"backgroundTasks": false}` —— bash 的 schema 里 `run_in_background` 参数整个消失，模型不知道它的存在。
 
 ### 后台子代理（fire-and-forget subagent）
@@ -200,7 +210,20 @@ model: anthropic/k3
 
 ### Worktree 隔离
 
-`subagent` 加 `isolation: "worktree"`：自动 `git worktree add` 临时分支，子代理在其中改文件，结果附分支名 + 路径 + diff stat。多个子代理并行改同一代码库互不踩踏；父代理自行决定 merge 还是丢弃。
+`subagent` 加 `isolation: "worktree"`：自动 `git worktree add` 临时分支，子代理在其中改文件，结果附分支名 + 路径 + diff stat。多个子代理并行改同一代码库互不踩踏。
+
+每个工作树都会记录到 `<agentDir>/worktrees.json`（任务标签、分支、路径），不离开 TUI 就能管理：
+
+- `/worktree`（或 `/worktree list`）：分支、任务标签、diff 摘要、路径、是否已应用；
+- `/worktree apply [branch]`：先把工作树里的改动提交到其分支，再 squash-merge 进当前仓库的**索引**——只暂存、不提交，最终决定权留给人。只有一个工作树时可省略分支；tack 自身正在其中运行的 checkout 会被拒绝；
+- `/worktree discard <branch>`：删除工作树并删掉其分支（只允许 `tack-subagent-*` 分支；tack 自身正在其中运行的 checkout 会被拒绝）；
+- `/worktree prune`：清掉工作树已消失（例如被外部删除）的注册记录。
+
+在此注册表之前创建（或由其他 checkout 创建）的工作树仍能通过 `git worktree list` 发现，不会丢。agent 运行期间拒绝 apply/discard（会和编辑竞争），但列取仍可用。
+
+### 共享任务板
+
+TUI 有任务列表时，子代理会拿到同一个 `todo` 工具、共享**同一份状态**：父代理可以先铺计划，并行的子代理边做边认领/完成条目。`/todo` 和面板看到的是同一块任务板，而不是 N 份私有列表。自定义 agent 定义仍可用 `tools:` 收紧子代理工具集（要保留就写上 `todo`）。
 
 ### 并发上限与共享预算
 

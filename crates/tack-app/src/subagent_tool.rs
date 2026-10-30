@@ -16,7 +16,8 @@
 //!   match the sub-agent name (custom agent name, `subagent` for the
 //!   default) — same as SubagentStop.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use tack_agent_core::{
@@ -34,6 +35,26 @@ struct NoopHooks;
 
 #[async_trait::async_trait]
 impl AgentHooks for NoopHooks {}
+
+/// Steering messages queued for one background subagent. `/tasks` delivers
+/// them through the task registry's message sink; the child loop drains the
+/// queue at each turn boundary (the same hook the TUI uses for user typing).
+type SteeringInbox = Arc<Mutex<VecDeque<String>>>;
+
+struct SteeringHook {
+    inbox: SteeringInbox,
+}
+
+#[async_trait::async_trait]
+impl AgentHooks for SteeringHook {
+    async fn steering_messages(&self) -> Vec<tack_agent_core::AgentMessage> {
+        let mut inbox = self.inbox.lock().unwrap_or_else(|e| e.into_inner());
+        inbox
+            .drain(..)
+            .map(tack_agent_core::AgentMessage::user)
+            .collect()
+    }
+}
 
 /// Cross-run coordination for sub-agents, shared by every SubagentTool clone
 /// in a session (foreground, parallel batches, and fire-and-forget children):
@@ -146,6 +167,13 @@ pub struct SubagentTool {
     /// Plugin tools shared from the parent's loaded extensions (consumed
     /// when inherit_plugins is Full).
     extension_tools: Vec<Arc<dyn AgentTool>>,
+    /// Agent dir for the worktree registry (`/worktree` apply/discard).
+    /// None falls back to `tack_session::default_agent_dir()`.
+    agent_dir: Option<std::path::PathBuf>,
+    /// Parent session's todo state: the child gets the same `todo` tool, so
+    /// parallel subagents share one task board with the parent (only
+    /// surfaces that have a task board — currently the TUI — pass one).
+    todo_state: Option<Arc<tokio::sync::Mutex<tack_tools::todo::TodoState>>>,
 }
 
 /// Progress callback for background sub-agents (tool activity lines).
@@ -173,6 +201,8 @@ impl Clone for SubagentTool {
             inherit_plugins: self.inherit_plugins,
             extension_hooks: self.extension_hooks.clone(),
             extension_tools: self.extension_tools.clone(),
+            agent_dir: self.agent_dir.clone(),
+            todo_state: self.todo_state.clone(),
         }
     }
 }
@@ -203,6 +233,8 @@ impl SubagentTool {
             inherit_plugins: crate::settings::SubagentInheritance::default(),
             extension_hooks: Vec::new(),
             extension_tools: Vec::new(),
+            agent_dir: None,
+            todo_state: None,
         }
     }
 
@@ -304,6 +336,22 @@ impl SubagentTool {
     /// inheritance is Full.
     pub fn with_extension_tools(mut self, tools: Vec<Arc<dyn AgentTool>>) -> Self {
         self.extension_tools = tools;
+        self
+    }
+
+    /// Agent dir used for the worktree registry (default: the standard
+    /// `~/.tack/agent`, or TACK_AGENT_DIR).
+    pub fn with_agent_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.agent_dir = Some(dir);
+        self
+    }
+
+    /// Share the parent session's todo list with the child (`todo` tool).
+    pub fn with_todo_state(
+        mut self,
+        state: Arc<tokio::sync::Mutex<tack_tools::todo::TodoState>>,
+    ) -> Self {
+        self.todo_state = Some(state);
         self
     }
 
@@ -537,6 +585,18 @@ impl AgentTool for SubagentTool {
                 .collect();
             let handle = manager.register(format!("subagent: {task_preview}"));
             let id = handle.id.clone();
+            // `/tasks` steering channel: the panel's message sink queues text
+            // that the child loop drains at its next turn boundary.
+            let inbox: SteeringInbox = Arc::new(Mutex::new(VecDeque::new()));
+            {
+                let inbox = inbox.clone();
+                handle.set_message_sink(Arc::new(move |text: &str| {
+                    inbox
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push_back(text.to_string());
+                }));
+            }
             let this = self.clone();
             tokio::spawn(async move {
                 use futures_util::FutureExt as _;
@@ -551,15 +611,30 @@ impl AgentTool for SubagentTool {
                 };
                 let progress: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(progress);
                 let cancel = handle.cancel.clone();
-                let run = this.run_gated(params, cancel, Some(progress), gate);
+                let run = this.run_gated(params, cancel, Some(progress), gate, Some(inbox));
                 match std::panic::AssertUnwindSafe(run).catch_unwind().await {
-                    Ok(Ok((text, _))) => {
+                    Ok(Ok((text, details))) => {
                         handle.log("\n=== final result ===");
                         handle.log(&text);
+                        // Surface delegation cost in the control panel
+                        // output (the tool result details are not logged).
+                        if let Some(tokens) = details.get("usageTokens").and_then(Value::as_u64) {
+                            handle.log(&format!("[usage: {tokens} tokens]"));
+                        }
                         handle.finish(tack_tools::background::TaskStatus::Exited(0), None);
                     }
                     Ok(Err(e)) => {
-                        handle.finish(tack_tools::background::TaskStatus::Failed, Some(e));
+                        // A user cancellation through /tasks is a kill, not a
+                        // failure (same status bash tasks report).
+                        let cancelled = handle.cancel.is_cancelled();
+                        handle.finish(
+                            if cancelled {
+                                tack_tools::background::TaskStatus::Killed
+                            } else {
+                                tack_tools::background::TaskStatus::Failed
+                            },
+                            if cancelled { None } else { Some(e) },
+                        );
                     }
                     Err(_) => {
                         // Panic: the hook logged details; never leave the
@@ -716,18 +791,20 @@ impl SubagentTool {
         progress: Option<ProgressFn>,
     ) -> Result<(String, Value), String> {
         let gate = self.subagent_start_gate(&params).await?;
-        self.run_gated(params, cancel, progress, gate).await
+        self.run_gated(params, cancel, progress, gate, None).await
     }
 
     /// Child-loop run behind an already-evaluated SubagentStart gate
     /// (background callers gate synchronously in `execute` so a block
-    /// surfaces as a tool error, not an out-of-band task failure).
+    /// surfaces as a tool error, not an out-of-band task failure). `steer`
+    /// is the `/tasks` message channel (background subagents only).
     async fn run_gated(
         &self,
         params: Value,
         cancel: CancellationToken,
         progress: Option<ProgressFn>,
         gate: StartGate,
+        steer: Option<SteeringInbox>,
     ) -> Result<(String, Value), String> {
         // Shared budget: refuse new children once sub-agents collectively
         // burned the allowance (background children would otherwise be
@@ -786,6 +863,31 @@ impl SubagentTool {
             None => None,
         };
 
+        // Record the worktree for `/worktree` (best-effort: a registry
+        // failure must never fail the delegated run). Hosts that did not
+        // pass an agent dir skip registration; git discovery still lists
+        // the worktree, only the task label is missing.
+        if let Some(agent_dir) = &self.agent_dir
+            && let Some(worktree) = &worktree
+        {
+            let label: String = params
+                .get("task")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect();
+            if let Err(e) = crate::worktrees::register(
+                agent_dir,
+                &worktree.repo_root,
+                &worktree.path,
+                &worktree.branch,
+                &label,
+            ) {
+                tracing::warn!("failed to register subagent worktree: {e}");
+            }
+        }
+
         let child_cwd = match &worktree {
             Some(w) => w.path.clone(),
             None => self.cwd()?,
@@ -816,7 +918,16 @@ impl SubagentTool {
             }
             _ => services,
         };
-        let tools = tack_tools::create_coding_tools(&services);
+        let mut tools = tack_tools::create_coding_tools(&services);
+        // Shared task board: the child gets the parent session's todo list
+        // (same Arc), so parallel subagents can claim/complete parent items.
+        // Only surfaces that have a task board (currently the TUI) pass one.
+        if let Some(todo_state) = &self.todo_state {
+            tools.push(Arc::new(tack_tools::todo::TodoTool::new(
+                services.clone(),
+                todo_state.clone(),
+            )));
+        }
         let mut tools = crate::cli_flags::filter_feature_tools(tools, &self.features);
         // Plugin inheritance (subagents.inheritPlugins "full"): plugin
         // tools join BEFORE the agent-definition whitelist so `tools`
@@ -848,6 +959,11 @@ impl SubagentTool {
         // NoopHooks when neither is configured.
         let hooks: Arc<dyn AgentHooks> = {
             let mut chain: Vec<Arc<dyn AgentHooks>> = Vec::new();
+            // Steering first: a queued user message must reach the child
+            // regardless of which plugin/guardrail hooks also run.
+            if let Some(inbox) = steer {
+                chain.push(Arc::new(SteeringHook { inbox }));
+            }
             if self.inherit_plugins.inherits_hooks() {
                 chain.extend(self.extension_hooks.iter().cloned());
             }
@@ -1494,6 +1610,39 @@ mod tests {
         assert!(tool.resolve_child_model(None, agent_dir.path()).is_ok());
     }
 
+    /// A child gets the parent's todo list (same Arc), so parallel subagents
+    /// share one task board instead of each keeping a private one.
+    #[tokio::test]
+    async fn child_shares_parent_todo_board() {
+        let state = Arc::new(tokio::sync::Mutex::new(
+            tack_tools::todo::TodoState::default(),
+        ));
+        let tool = super::SubagentTool::new(
+            Arc::new(
+                super::subagent_tool_test_support::ToolResultProbeProvider::new(
+                    "todo",
+                    json!({ "action": "add", "text": "from child" }),
+                    "from child",
+                ),
+            ),
+            super::subagent_tool_test_support::test_model(),
+            Arc::new(tack_ai::oauth::StaticAuth::from(None)),
+        )
+        .with_todo_state(state.clone());
+        let (text, _) = tool
+            .run(
+                json!({ "task": "add a todo" }),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(text.contains("needle-found"), "{text}");
+        let state = state.lock().await;
+        assert_eq!(state.items.len(), 1, "{:?}", state.items);
+        assert_eq!(state.items[0].text, "from child");
+    }
+
     // ---- SubagentStart / SubagentStop hooks --------------------------
 
     fn reviewer_agent() -> crate::agents::AgentDefinition {
@@ -1894,6 +2043,42 @@ mod tests {
         );
     }
 
+    /// A background subagent's `/tasks` steering sink reaches the child
+    /// loop: the queued message shows up in the provider's next-turn context.
+    #[tokio::test]
+    async fn background_subagent_receives_tasks_steering_message() {
+        use tack_agent_core::AgentTool as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let manager = tack_tools::background::BackgroundTaskManager::new();
+        let tool = super::SubagentTool::new(
+            Arc::new(super::subagent_tool_test_support::SteeringProbeProvider::new("STEER-MARKER")),
+            super::subagent_tool_test_support::test_model(),
+            Arc::new(tack_ai::oauth::StaticAuth::from(None)),
+        )
+        .with_cwd(dir.path().to_path_buf())
+        .with_background(manager.clone());
+        let result = tool
+            .execute(
+                "call-1",
+                json!({ "task": "probe steering", "run_in_background": true }),
+                CancellationToken::new(),
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        let id = result.details["taskId"].as_str().unwrap().to_string();
+        manager
+            .send_message(&id, "STEER-MARKER please use the index")
+            .unwrap();
+        let snapshot = manager
+            .wait(&id, std::time::Duration::from_secs(20))
+            .await
+            .unwrap();
+        let output = snapshot["output"].as_str().unwrap();
+        assert!(output.contains("needle-found"), "{output}");
+    }
+
     #[tokio::test]
     async fn worktree_create_and_diff() {
         // Set up a repo with one commit.
@@ -1941,15 +2126,76 @@ mod tests {
         .await
         .unwrap();
     }
+
+    #[tokio::test]
+    async fn worktree_runs_are_registered_for_slash_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "one").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+
+        let tool = super::SubagentTool::new(
+            Arc::new(super::subagent_tool_test_support::ScriptProvider {
+                event: super::subagent_tool_test_support::done_event("done", 0),
+            }),
+            super::subagent_tool_test_support::test_model(),
+            Arc::new(tack_ai::oauth::StaticAuth::from(None)),
+        )
+        .with_cwd(repo.clone())
+        .with_agent_dir(agent_dir.clone());
+        let (text, details) = tool
+            .run(
+                json!({ "task": "refactor auth", "isolation": "worktree" }),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(text.contains("Worktree isolation"), "{text}");
+        let branch = details["worktree"]["branch"].as_str().unwrap().to_string();
+        assert!(branch.starts_with("tack-subagent-"), "{branch}");
+
+        let registry = std::fs::read_to_string(agent_dir.join("worktrees.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&registry).unwrap();
+        let rows = value["worktrees"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["branch"], branch);
+        assert_eq!(rows[0]["label"], "refactor auth");
+
+        // Cleanup through the same path `/worktree discard` uses.
+        crate::worktrees::discard(&agent_dir, &repo, &branch)
+            .await
+            .unwrap();
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod subagent_tool_test_support {
     #![allow(clippy::unwrap_used)]
+    use serde_json::json;
     use tack_ai::provider::{Provider, StreamOptions};
     use tack_ai::stream::AssistantMessageEventStream;
     use tack_ai::types::{Context, Model};
-
     /// Provider that immediately finishes (for schema tests only).
     #[derive(Debug)]
     pub struct NullProvider;
@@ -2173,6 +2419,75 @@ pub(crate) mod subagent_tool_test_support {
             sampling_params: None,
             headers: None,
             compat: None,
+        }
+    }
+
+    /// Provider that calls `read` once, then answers whether a steered user
+    /// message with `marker` reached the context.
+    #[derive(Debug)]
+    pub struct SteeringProbeProvider {
+        marker: &'static str,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SteeringProbeProvider {
+        pub fn new(marker: &'static str) -> Self {
+            SteeringProbeProvider {
+                marker,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Provider for SteeringProbeProvider {
+        fn stream(
+            &self,
+            _model: &Model,
+            context: &Context,
+            _options: StreamOptions,
+        ) -> AssistantMessageEventStream {
+            let (sender, stream) = tack_ai::stream::event_stream();
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let event = if call == 0 {
+                let mut message = tack_ai::AssistantMessage::pending(&test_model());
+                message.stop_reason = tack_ai::StopReason::ToolUse;
+                message.content = vec![tack_ai::ContentBlock::ToolCall {
+                    id: "call-1".into(),
+                    name: "read".into(),
+                    arguments: json!({ "path": "a.txt" }),
+                    thought_signature: None,
+                    namespace: None,
+                }];
+                tack_ai::AssistantMessageEvent::Done {
+                    reason: tack_ai::StopReason::ToolUse,
+                    message,
+                }
+            } else {
+                let found = context.messages.iter().any(|message| match message {
+                    tack_ai::Message::User(user) => match &user.content {
+                        tack_ai::UserContent::Text(text) => text.contains(self.marker),
+                        tack_ai::UserContent::Blocks(blocks) => {
+                            blocks.iter().any(|block| match block {
+                                tack_ai::InputContentBlock::Text { text, .. } => {
+                                    text.contains(self.marker)
+                                }
+                                _ => false,
+                            })
+                        }
+                    },
+                    _ => false,
+                });
+                done_event(
+                    if found {
+                        "needle-found"
+                    } else {
+                        "needle-missing"
+                    },
+                    0,
+                )
+            };
+            sender.finish(event);
+            stream
         }
     }
 

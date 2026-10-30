@@ -197,10 +197,16 @@ impl TuiApp {
                     dirty = true;
                 }
                 _ = tick.tick() => {
-                    // Only the spinner needs periodic redraws, and only while
-                    // a run is active.
+                    // The spinner needs periodic redraws while a run is
+                    // active; the /tasks panel polls live task state (and
+                    // repaints only when something actually changed).
                     if let Some(status) = &mut self.status {
                         status.tick();
+                        dirty = true;
+                    }
+                    if let Some(dialog) = &mut self.dialog
+                        && dialog.tick()
+                    {
                         dirty = true;
                     }
                     // Cron: check every ~2s; fire due jobs into the session.
@@ -704,6 +710,8 @@ impl TuiApp {
             )
             .with_shared_limits(subagent_limits)
             .with_background(self.background_tasks.clone())
+            .with_agent_dir(self.agent_dir.clone())
+            .with_todo_state(self.todo_state.clone())
             // Plugin inheritance (subagents.inheritPlugins): hook bridges
             // and plugin tools shared from this session's loaded
             // extensions; the tool gates per surface on the mode.

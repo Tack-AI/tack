@@ -13,12 +13,14 @@ mod model;
 mod multi_select;
 mod scoped_models;
 mod session;
+mod tasks;
 mod tree;
 
 pub use model::{ModelDialog, ModelEntry};
 pub use multi_select::MultiSelectDialog;
 pub use scoped_models::ScopedModelsDialog;
 pub use session::SessionDialog;
+pub use tasks::TaskDialog;
 pub use tree::{TreeDialog, TreeFilter, build_tree_items, build_tree_items_filtered};
 
 /// Active modal dialog.
@@ -32,6 +34,8 @@ pub enum Dialog {
     Sessions(SessionDialog),
     Tree(TreeDialog),
     Input(InputDialog),
+    /// `/tasks` — live background task & agent control panel.
+    Tasks(TaskDialog),
 }
 
 impl Dialog {
@@ -49,6 +53,7 @@ impl Dialog {
             Dialog::Sessions(d) => d.render(width),
             Dialog::Tree(d) => d.render(width),
             Dialog::Input(d) => d.render(width),
+            Dialog::Tasks(d) => d.render(width),
         }
     }
 
@@ -63,6 +68,7 @@ impl Dialog {
             Dialog::Sessions(d) => d.handle_input(event),
             Dialog::Tree(d) => d.handle_input(event),
             Dialog::Input(d) => d.handle_input(event),
+            Dialog::Tasks(d) => d.handle_input(event),
         }
     }
 
@@ -76,6 +82,16 @@ impl Dialog {
             Dialog::Sessions(d) => d.done,
             Dialog::Tree(d) => d.done,
             Dialog::Input(d) => d.done,
+            Dialog::Tasks(d) => d.done(),
+        }
+    }
+
+    /// Poll the open dialog for live changes (`/tasks`). Returns true when
+    /// the app should repaint; other dialogs are static and cost nothing.
+    pub fn tick(&mut self) -> bool {
+        match self {
+            Dialog::Tasks(d) => d.tick(),
+            _ => false,
         }
     }
 

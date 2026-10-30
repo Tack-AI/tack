@@ -9,8 +9,8 @@ use super::{AppEvent, ChatEntry, NoticeKind, TuiApp, lock_recover};
 
 pub use super::dialogs::{
     Dialog, InputDialog, ModelDialog, ModelEntry, MultiSelectDialog, ScopedModelsDialog,
-    SelectDialog, SelectPurpose, SessionDialog, TreeDialog, TreeFilter, build_tree_items,
-    build_tree_items_filtered,
+    SelectDialog, SelectPurpose, SessionDialog, TaskDialog, TreeDialog, TreeFilter,
+    build_tree_items, build_tree_items_filtered,
 };
 pub use super::export::export_html;
 
@@ -44,6 +44,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/cost", "cmd.desc.cost"),
     ("/context", "cmd.desc.context"),
     ("/todo", "cmd.desc.todo"),
+    ("/tasks", "cmd.desc.tasks"),
+    ("/worktree", "cmd.desc.worktree"),
     ("/rules", "cmd.desc.rules"),
     ("/changelog", "cmd.desc.changelog"),
     ("/debug", "cmd.desc.debug"),
@@ -123,6 +125,8 @@ mod models;
 mod select;
 mod session;
 mod settings;
+mod tasks;
+mod worktree;
 
 impl TuiApp {
     /// Dispatch a slash command (text after the leading `/`).
@@ -223,6 +227,8 @@ impl TuiApp {
             "cost" => self.command_cost(),
             "context" => self.command_context(),
             "todo" => self.command_todo(args).await,
+            "tasks" => self.command_tasks(),
+            "worktree" | "worktrees" => self.command_worktree(args).await,
             "rules" => self.command_rules(),
             "changelog" => {
                 self.items.push(TranscriptItem::Chat(ChatEntry::Markdown {

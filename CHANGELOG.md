@@ -4,6 +4,33 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [Unreleased]
+
+### Added
+
+- **`/tasks` control panel**: background bash tasks and fire-and-forget
+  subagents share one live registry in the TUI. Rows update in place
+  (stable registration order), Enter opens a tail-following output viewer
+  with scrolling, `x` cancels the selected running task (process tree for
+  bash, cancellation token for subagents), and `c` clears finished rows.
+  `m` on a running subagent opens an inline message box — the text is
+  queued and steered into the child loop at its next turn boundary (bash
+  tasks have no message channel). Headless surfaces keep using
+  `bash_output`/`bash_wait`.
+- **`/worktree` management**: every subagent worktree is recorded in
+  `<agentDir>/worktrees.json` (task label, branch, path). `/worktree [list]`
+  shows branch, label, diff summary and path; `/worktree apply [branch]`
+  commits the worktree's changes on its branch and squash-merges them into
+  the current repo's index (staged, not committed); `/worktree discard
+  <branch>` removes the checkout and branch (only `tack-subagent-*`
+  branches; never the active checkout); `/worktree prune` forgets rows whose
+  worktree disappeared. Apply/discard are refused while an agent run is
+  active.
+- **Shared task board**: subagents started from the TUI now receive the
+  parent session's `todo` tool backed by the same state, so a parent can
+  seed a plan and parallel children claim/complete items on one board
+  (custom agent `tools:` whitelists still apply).
+
 ## [1.0.12] - 2026-10-29
 
 ### Removed

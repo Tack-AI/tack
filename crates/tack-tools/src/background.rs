@@ -42,6 +42,10 @@ impl TaskStatus {
     }
 }
 
+/// Callback installed by tasks that accept steering messages (background
+/// subagents); `send_message` invokes it while the task is running.
+pub type MessageSink = Arc<dyn Fn(&str) + Send + Sync>;
+
 struct BackgroundTask {
     command: String,
     started: Instant,
@@ -49,6 +53,54 @@ struct BackgroundTask {
     error: Option<String>,
     output: Arc<Mutex<OutputAccumulator>>,
     cancel: CancellationToken,
+    /// Optional steering channel: a background subagent installs a sink that
+    /// queues messages for its child loop. Bash tasks leave it empty.
+    message_sink: Option<MessageSink>,
+}
+
+/// Lightweight task row for host UI (no output body). `id` keeps the
+/// registration order (`bg1`, `bg2`, ...), so a panel can stay stable while
+/// tasks finish.
+#[derive(Clone, Debug)]
+pub struct TaskSummary {
+    pub id: String,
+    pub label: String,
+    pub status: TaskStatus,
+    pub error: Option<String>,
+    pub elapsed_seconds: u64,
+    /// True when the task can receive steering messages (background
+    /// subagents install a sink; bash tasks cannot).
+    pub accepts_messages: bool,
+}
+
+impl TaskSummary {
+    pub fn running(&self) -> bool {
+        self.status == TaskStatus::Running
+    }
+
+    /// Human status line, including the error when one was recorded.
+    pub fn status_text(&self) -> String {
+        let mut status = self.status.describe();
+        if let Some(error) = &self.error {
+            status = format!("{status}: {error}");
+        }
+        status
+    }
+}
+
+/// Tail-truncated output of one task, shaped for a live viewer.
+#[derive(Clone, Debug)]
+pub struct TaskOutput {
+    pub content: String,
+    pub truncated: bool,
+    pub full_output_path: Option<String>,
+}
+
+/// Registration order without parsing JSON ('bg12' → 12).
+fn task_number(id: &str) -> u64 {
+    id.strip_prefix("bg")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(u64::MAX)
 }
 
 /// Notification emitted when a task reaches a terminal state.
@@ -134,6 +186,16 @@ impl TaskHandle {
         let mut out = self.output.lock().unwrap_or_else(|e| e.into_inner());
         out.append(line.as_bytes());
         out.append(b"\n");
+    }
+
+    /// Install a steering sink for this task: `send_message` calls it while
+    /// the task is running. Background subagents use it to feed their child
+    /// loop; bash tasks never call this.
+    pub fn set_message_sink(&self, sink: MessageSink) {
+        let mut inner = self.manager.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(task) = inner.tasks.get_mut(&self.id) {
+            task.message_sink = Some(sink);
+        }
     }
 
     /// Mark the task finished and emit the completion notification.
@@ -260,6 +322,7 @@ impl BackgroundTaskManager {
                     error: None,
                     output: output.clone(),
                     cancel: cancel.clone(),
+                    message_sink: None,
                 },
             );
             id
@@ -333,6 +396,28 @@ impl BackgroundTaskManager {
         });
 
         Ok(id)
+    }
+
+    /// Deliver a steering message to a running task. Fails for unknown,
+    /// finished, or sink-less tasks (bash has no message channel).
+    pub fn send_message(&self, task_id: &str, text: &str) -> Result<(), String> {
+        let (sink, running) = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let task = inner
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| format!("unknown task: {task_id}"))?;
+            (
+                task.message_sink.clone(),
+                task.status == TaskStatus::Running,
+            )
+        };
+        if !running {
+            return Err(format!("task {task_id} has already finished"));
+        }
+        let sink = sink.ok_or_else(|| format!("task {task_id} does not accept messages"))?;
+        sink(text);
+        Ok(())
     }
 
     /// Kill a task's process tree.
@@ -435,6 +520,64 @@ impl BackgroundTaskManager {
             .collect();
         tasks.sort_by_key(|t| t["running"].as_bool().map(|r| !r));
         json!(tasks)
+    }
+
+    /// Typed task rows for host UI: creation order (stable while tasks
+    /// finish), no output bodies.
+    pub fn tasks(&self) -> Vec<TaskSummary> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tasks: Vec<TaskSummary> = inner
+            .tasks
+            .iter()
+            .map(|(id, t)| TaskSummary {
+                id: id.clone(),
+                label: t.command.clone(),
+                status: t.status,
+                error: t.error.clone(),
+                elapsed_seconds: t.started.elapsed().as_secs(),
+                accepts_messages: t.message_sink.is_some(),
+            })
+            .collect();
+        tasks.sort_by_key(|t| task_number(&t.id));
+        tasks
+    }
+
+    /// True while at least one task is still running (drives live panels and
+    /// auto-wake decisions without allocating a full task list).
+    pub fn has_running(&self) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .tasks
+            .values()
+            .any(|t| t.status == TaskStatus::Running)
+    }
+
+    /// Current output length in bytes (O(1)). A live viewer polls this to
+    /// detect growth without snapshotting — `snapshot(true)` persists a temp
+    /// file when the output is truncated, which must not run on every tick.
+    pub fn output_len(&self, task_id: &str) -> Option<usize> {
+        let output = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.tasks.get(task_id)?.output.clone()
+        };
+        Some(output.lock().unwrap_or_else(|e| e.into_inner()).len())
+    }
+
+    /// Tail-truncated output of one task, shaped for a live viewer.
+    pub fn output(&self, task_id: &str) -> Option<TaskOutput> {
+        let output = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.tasks.get(task_id)?.output.clone()
+        };
+        let snapshot = output
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot(true);
+        Some(TaskOutput {
+            content: sanitize_binary_output(&snapshot.content),
+            truncated: snapshot.truncation.truncated,
+            full_output_path: snapshot.full_output_path.map(|p| p.display().to_string()),
+        })
     }
 
     /// Drop finished tasks (keep currently running ones).
@@ -939,6 +1082,73 @@ mod tests {
         let manager = BackgroundTaskManager::new();
         assert!(manager.snapshot("nope").is_none());
         assert!(!manager.kill("nope").signalled());
+    }
+
+    /// Steering messages reach a running subagent-like task through its
+    /// sink; unknown/finished/sink-less tasks refuse instead of silently
+    /// dropping the message.
+    #[tokio::test]
+    async fn steering_sink_receives_messages_only_while_running() {
+        let manager = BackgroundTaskManager::new();
+        let handle = manager.register("agent".to_string());
+        let id = handle.id.clone();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        handle.set_message_sink(Arc::new(move |text| {
+            sink.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(text.to_string());
+        }));
+        assert!(manager.tasks()[0].accepts_messages);
+        manager.send_message(&id, "hello").unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec!["hello".to_string()]);
+
+        assert!(manager.send_message("nope", "x").is_err());
+        handle.finish(TaskStatus::Exited(0), None);
+        assert!(manager.send_message(&id, "late").is_err());
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        // A task without a sink (bash) refuses too.
+        let bash = manager.register("bash".to_string());
+        assert!(!manager.tasks()[1].accepts_messages);
+        assert!(manager.send_message(&bash.id, "x").is_err());
+    }
+
+    /// Typed host-UI API: creation-order rows, O(1) output growth polling,
+    /// and a tail-shaped output snapshot.
+    #[tokio::test]
+    async fn typed_task_rows_and_output() {
+        let manager = BackgroundTaskManager::new();
+        let first = manager.register("first".to_string());
+        let second = manager.register("second".to_string());
+        first.log("hello");
+        second.log("world");
+
+        let tasks = manager.tasks();
+        assert_eq!(
+            tasks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["bg1", "bg2"]
+        );
+        assert!(tasks[0].running() && tasks[1].running());
+        assert!(manager.has_running());
+        assert_eq!(manager.output_len("bg1"), Some(6), "hello + newline");
+
+        let output = manager.output("bg1").unwrap();
+        assert!(output.content.contains("hello"));
+        assert!(!output.content.contains("world"));
+        assert!(!output.truncated);
+        assert!(manager.output("nope").is_none());
+        assert!(manager.output_len("nope").is_none());
+
+        first.finish(TaskStatus::Exited(0), None);
+        let tasks = manager.tasks();
+        assert!(!tasks[0].running());
+        assert_eq!(tasks[0].status_text(), "exited with code 0");
+        assert!(manager.has_running(), "bg2 is still running");
+
+        second.finish(TaskStatus::Failed, Some("boom".to_string()));
+        assert!(!manager.has_running());
+        assert_eq!(manager.tasks()[1].status_text(), "failed: boom");
     }
 
     /// kill_shell on an already-finished task must not claim it sent a kill

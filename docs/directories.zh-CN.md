@@ -18,6 +18,7 @@
     extensions/         # 已安装扩展（总是加载）
     marketplaces/       # 扩展市场目录（tack ext marketplace）
     cron.json           # 定时任务（/cron，错过的运行会在启动时触发一次）
+    worktrees.json      # 子代理工作树注册表（/worktree）
     managed-hooks.json  # 组织管理的 hooks（配合 managedHooksOnly 强制）
     AGENTS.md           # 全局 rules（单文件，TS pi 布局）
     rules/              # 全局 rules 目录（*.md，全部加载，按文件名排序）
@@ -153,5 +154,6 @@ server 条目**按名称合并，项目优先**：
 | 扩展 | `~/.tack/agent/extensions/` | `<cwd>/.pi/extensions/` | 两者都加载；项目级经信任门控 |
 | 市场 | `~/.tack/agent/marketplaces/` | — | 每个目录（catalog）一个文件 |
 | Cron 任务 | `~/.tack/agent/cron.json` | — | 单文件 |
+| 子代理工作树 | `~/.tack/agent/worktrees.json` | — | 单文件（`/worktree`） |
 | 受管 hooks | `~/.tack/agent/managed-hooks.json` | — | 单文件（企业版） |
 | 会话 | `~/.tack/agent/sessions/--<cwd>--/` | — | 按 cwd 划分 |

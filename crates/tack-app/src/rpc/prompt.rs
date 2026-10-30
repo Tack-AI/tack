@@ -118,6 +118,7 @@ pub(crate) async fn spawn_prompt(
                 crate::project_trust::is_trusted(&cwd, &agent_dir),
             ))
             .with_cwd(cwd.clone())
+            .with_agent_dir(agent_dir.clone())
             .with_features(settings.features.clone())
             .with_deny_rules(deny_rules)
             .with_memory_dir(settings.memory_directory.clone())

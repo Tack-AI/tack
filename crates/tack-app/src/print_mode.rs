@@ -481,6 +481,7 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
                 crate::project_trust::is_trusted(&options.cwd, &agent_dir),
             ))
             .with_cwd(options.cwd.clone())
+            .with_agent_dir(agent_dir.clone())
             .with_features(settings.features.clone())
             .with_deny_rules(deny_rules.clone())
             .with_memory_dir(settings.memory_directory.clone())
