@@ -219,11 +219,13 @@ model: anthropic/k3
 - `/worktree discard <branch>`：删除工作树并删掉其分支（只允许 `tack-subagent-*` 分支；tack 自身正在其中运行的 checkout 会被拒绝）；
 - `/worktree prune`：清掉工作树已消失（例如被外部删除）的注册记录。
 
-在此注册表之前创建（或由其他 checkout 创建）的工作树仍能通过 `git worktree list` 发现，不会丢。agent 运行期间拒绝 apply/discard（会和编辑竞争），但列取仍可用。
+在此注册表之前创建（或由其他 checkout 创建）的工作树仍能通过 `git worktree list` 发现，不会丢。agent 运行期间拒绝 apply/discard（会和编辑竞争）；本 tack 进程内、工作树自己的后台子代理仍在运行时也会拒绝（先从 `/tasks` 停止它），列取仍可用。由其他进程（如 `tack serve`/RPC）拥有的运行对本 TUI 的任务面板不可见，应用其工作树前请先停掉那个进程。
 
 ### 共享任务板
 
 TUI 有任务列表时，子代理会拿到同一个 `todo` 工具、共享**同一份状态**：父代理可以先铺计划，并行的子代理边做边认领/完成条目。`/todo` 和面板看到的是同一块任务板，而不是 N 份私有列表。自定义 agent 定义仍可用 `tools:` 收紧子代理工具集（要保留就写上 `todo`）。
+
+共享是实时、内存态的：子代理的 todo 更新不会写入父会话文件，所以恢复会话后 `/todo` 会从最后一次父侧 todo 结果重建。
 
 ### 并发上限与共享预算
 

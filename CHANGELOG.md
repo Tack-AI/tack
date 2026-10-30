@@ -25,7 +25,8 @@ notice can parse entries (same convention as TS pi).
   <branch>` removes the checkout and branch (only `tack-subagent-*`
   branches; never the active checkout); `/worktree prune` forgets rows whose
   worktree disappeared. Apply/discard are refused while an agent run is
-  active.
+  active, and while the worktree's own background subagent is still
+  running in this process (stop it from /tasks first).
 - **Shared task board**: subagents started from the TUI now receive the
   parent session's `todo` tool backed by the same state, so a parent can
   seed a plan and parallel children claim/complete items on one board

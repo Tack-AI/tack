@@ -31,6 +31,10 @@ pub struct WorktreeRecord {
     /// Unix seconds (display only).
     pub created: i64,
     pub applied: bool,
+    /// Background subagent task that owns this worktree (`bg3`). `None` for
+    /// foreground runs and records written before this field existed.
+    #[serde(default)]
+    pub task_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -49,6 +53,7 @@ pub struct WorktreeInfo {
     pub applied: bool,
     pub present: bool,
     pub summary: Option<WorktreeSummary>,
+    pub task_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -129,6 +134,7 @@ pub fn register(
     path: &Path,
     branch: &str,
     label: &str,
+    task_id: Option<&str>,
 ) -> Result<(), String> {
     validate_branch(branch)?;
     let mut registry = read_registry(agent_dir);
@@ -143,6 +149,7 @@ pub fn register(
         label: label.to_string(),
         created: now_secs(),
         applied: false,
+        task_id: task_id.map(str::to_string),
     });
     write_registry(agent_dir, &registry)
 }
@@ -166,6 +173,7 @@ fn mark_applied(agent_dir: &Path, repo: &Path, branch: &str, label: &str) {
             label: label.to_string(),
             created: now_secs(),
             applied: true,
+            task_id: None,
         });
     }
     let _ = write_registry(agent_dir, &registry);
@@ -243,6 +251,7 @@ async fn make_info(
         applied: record.is_some_and(|r| r.applied),
         present,
         summary,
+        task_id: record.and_then(|r| r.task_id.clone()),
     }
 }
 
@@ -525,6 +534,7 @@ branch refs/heads/feature/other
             &wt,
             "tack-subagent-test",
             "refactor auth",
+            Some("bg7"),
         )
         .unwrap();
 
@@ -532,6 +542,7 @@ branch refs/heads/feature/other
         assert_eq!(infos.len(), 1, "{infos:?}");
         assert!(infos[0].present);
         assert_eq!(infos[0].label, "refactor auth");
+        assert_eq!(infos[0].task_id.as_deref(), Some("bg7"));
         assert!(!infos[0].applied);
         let summary = infos[0].summary.as_ref().unwrap();
         assert!(summary.shortstat.is_some(), "{summary:?}");
@@ -606,7 +617,15 @@ branch refs/heads/feature/other
         // Simulate a user checking out their own branch in the worktree.
         run_git(&wt, &["checkout", "-q", "-b", "user-branch"]);
         std::fs::write(wt.join("a.txt"), "user work\n").unwrap();
-        register(&agent_dir, &repo, &wt, "tack-subagent-switched", "switched").unwrap();
+        register(
+            &agent_dir,
+            &repo,
+            &wt,
+            "tack-subagent-switched",
+            "switched",
+            None,
+        )
+        .unwrap();
 
         let err = apply(&agent_dir, &repo, "tack-subagent-switched")
             .await
@@ -649,6 +668,7 @@ branch refs/heads/feature/other
             &wt,
             "tack-subagent-empty",
             "nothing to do",
+            None,
         )
         .unwrap();
         assert!(matches!(
@@ -726,7 +746,7 @@ branch refs/heads/feature/other
                 "HEAD",
             ],
         );
-        register(&agent_dir, &repo, &wt, "tack-subagent-gone", "gone").unwrap();
+        register(&agent_dir, &repo, &wt, "tack-subagent-gone", "gone", None).unwrap();
         std::fs::remove_dir_all(&wt).unwrap();
         assert_eq!(prune(&agent_dir, &repo).await, 1);
         assert!(list(&agent_dir, &repo, false).await.is_empty());

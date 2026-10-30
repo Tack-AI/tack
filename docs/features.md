@@ -324,8 +324,11 @@ branch, path) and can be managed without leaving the TUI:
 
 Worktrees created before this registry (or by another checkout) are still
 found through `git worktree list`, so nothing is lost. Applying/discarding
-is refused while an agent run is active (it would race the edits); listing
-stays available.
+is refused while an agent run is active (it would race the edits), and while
+the worktree's own background subagent is still running in this tack process
+(stop it from `/tasks` first); listing stays available. A run owned by a
+different process (e.g. `tack serve`/RPC) is not visible to this TUI's task
+panel, so stop that process before applying its worktrees.
 
 ### Shared task board
 
@@ -334,6 +337,10 @@ by the **same state**: the parent can seed the plan and parallel children
 claim/complete items as they go. `/todo` and the panel therefore show one
 board instead of N private lists. Custom agent definitions can narrow the
 child tool set as usual (include `todo` in `tools:` to keep it).
+
+The sharing is live and in-memory: child todo updates are not written to the
+parent session file, so after resuming a session `/todo` rebuilds from the
+last parent-side todo result.
 
 ### Concurrency cap and shared budget
 

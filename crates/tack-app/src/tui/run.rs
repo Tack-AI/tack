@@ -38,6 +38,17 @@ pub(crate) fn quit_grace_decision(
     QuitGraceDecision::Wait
 }
 
+fn todo_fingerprint(state: &tack_tools::todo::TodoState) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for item in &state.items {
+        item.id.hash(&mut hasher);
+        item.text.hash(&mut hasher);
+        item.status.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 impl TuiApp {
     /// The main loop: terminal input + agent events + spinner ticks.
     pub(crate) async fn run(&mut self) -> Result<i32> {
@@ -65,6 +76,9 @@ impl TuiApp {
         // Rendering is dirty-gated: an unconditional redraw would yank the
         // terminal viewport back to the bottom, breaking scrollback browsing.
         let mut dirty = false;
+        // Shared todo board: background subagents update the same state while
+        // the parent may be idle, so the tick below repaints on changes.
+        let mut last_todo_fp = todo_fingerprint(&*self.todo_state.lock().await);
         // Graceful-quit state: the first quit request with a running agent
         // cancels the run and waits (bounded) for it to settle — otherwise
         // an in-flight tool call is orphaned in the session (no result is
@@ -208,6 +222,19 @@ impl TuiApp {
                         && dialog.tick()
                     {
                         dirty = true;
+                    }
+                    // A background subagent can claim/complete items on the
+                    // shared todo board while the parent is idle; without
+                    // this the persistent panel would stay stale until the
+                    // next unrelated event.
+                    if self.background_tasks.has_running()
+                        && let Ok(todo) = self.todo_state.try_lock()
+                    {
+                        let fingerprint = todo_fingerprint(&todo);
+                        if fingerprint != last_todo_fp {
+                            last_todo_fp = fingerprint;
+                            dirty = true;
+                        }
                     }
                     // Cron: check every ~2s; fire due jobs into the session.
                     if self.settings.features.cron

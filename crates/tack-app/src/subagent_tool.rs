@@ -41,6 +41,13 @@ impl AgentHooks for NoopHooks {}
 /// queue at each turn boundary (the same hook the TUI uses for user typing).
 type SteeringInbox = Arc<Mutex<VecDeque<String>>>;
 
+/// Background-only run context: the task id (so the worktree registry can
+/// associate the checkout with its task) and the steering queue.
+struct BackgroundContext {
+    task_id: String,
+    inbox: SteeringInbox,
+}
+
 struct SteeringHook {
     inbox: SteeringInbox,
 }
@@ -586,17 +593,26 @@ impl AgentTool for SubagentTool {
             let handle = manager.register(format!("subagent: {task_preview}"));
             let id = handle.id.clone();
             // `/tasks` steering channel: the panel's message sink queues text
-            // that the child loop drains at its next turn boundary.
+            // that the child loop drains at its next turn boundary, and logs
+            // the message so the task output (and the model via bash_output)
+            // keeps an audit trail.
             let inbox: SteeringInbox = Arc::new(Mutex::new(VecDeque::new()));
             {
                 let inbox = inbox.clone();
+                let output = handle.output.clone();
                 handle.set_message_sink(Arc::new(move |text: &str| {
+                    let mut out = output.lock().unwrap_or_else(|e| e.into_inner());
+                    out.append(format!("[steering] {text}\n").as_bytes());
                     inbox
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .push_back(text.to_string());
                 }));
             }
+            let bg_context = BackgroundContext {
+                task_id: id.clone(),
+                inbox,
+            };
             let this = self.clone();
             tokio::spawn(async move {
                 use futures_util::FutureExt as _;
@@ -611,7 +627,7 @@ impl AgentTool for SubagentTool {
                 };
                 let progress: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(progress);
                 let cancel = handle.cancel.clone();
-                let run = this.run_gated(params, cancel, Some(progress), gate, Some(inbox));
+                let run = this.run_gated(params, cancel, Some(progress), gate, Some(bg_context));
                 match std::panic::AssertUnwindSafe(run).catch_unwind().await {
                     Ok(Ok((text, details))) => {
                         handle.log("\n=== final result ===");
@@ -796,15 +812,16 @@ impl SubagentTool {
 
     /// Child-loop run behind an already-evaluated SubagentStart gate
     /// (background callers gate synchronously in `execute` so a block
-    /// surfaces as a tool error, not an out-of-band task failure). `steer`
-    /// is the `/tasks` message channel (background subagents only).
+    /// surfaces as a tool error, not an out-of-band task failure). `bg` is
+    /// the `/tasks` context for background subagents (task id + steering
+    /// queue); foreground runs pass `None`.
     async fn run_gated(
         &self,
         params: Value,
         cancel: CancellationToken,
         progress: Option<ProgressFn>,
         gate: StartGate,
-        steer: Option<SteeringInbox>,
+        bg: Option<BackgroundContext>,
     ) -> Result<(String, Value), String> {
         // Shared budget: refuse new children once sub-agents collectively
         // burned the allowance (background children would otherwise be
@@ -883,6 +900,7 @@ impl SubagentTool {
                 &worktree.path,
                 &worktree.branch,
                 &label,
+                bg.as_ref().map(|bg| bg.task_id.as_str()),
             ) {
                 tracing::warn!("failed to register subagent worktree: {e}");
             }
@@ -961,8 +979,10 @@ impl SubagentTool {
             let mut chain: Vec<Arc<dyn AgentHooks>> = Vec::new();
             // Steering first: a queued user message must reach the child
             // regardless of which plugin/guardrail hooks also run.
-            if let Some(inbox) = steer {
-                chain.push(Arc::new(SteeringHook { inbox }));
+            if let Some(bg) = &bg {
+                chain.push(Arc::new(SteeringHook {
+                    inbox: bg.inbox.clone(),
+                }));
             }
             if self.inherit_plugins.inherits_hooks() {
                 chain.extend(self.extension_hooks.iter().cloned());
@@ -2183,6 +2203,77 @@ mod tests {
         assert_eq!(rows[0]["label"], "refactor auth");
 
         // Cleanup through the same path `/worktree discard` uses.
+        crate::worktrees::discard(&agent_dir, &repo, &branch)
+            .await
+            .unwrap();
+    }
+
+    /// Background worktrees record the owning task id, which lets
+    /// `/worktree` refuse apply/discard while that subagent is still running.
+    #[tokio::test]
+    async fn background_worktree_records_its_task_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "one").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+
+        let manager = tack_tools::background::BackgroundTaskManager::new();
+        let tool = super::SubagentTool::new(
+            Arc::new(super::subagent_tool_test_support::ScriptProvider {
+                event: super::subagent_tool_test_support::done_event("done", 0),
+            }),
+            super::subagent_tool_test_support::test_model(),
+            Arc::new(tack_ai::oauth::StaticAuth::from(None)),
+        )
+        .with_cwd(repo.clone())
+        .with_agent_dir(agent_dir.clone())
+        .with_background(manager.clone());
+        use tack_agent_core::AgentTool as _;
+        let result = tool
+            .execute(
+                "call-1",
+                json!({
+                    "task": "background worktree",
+                    "isolation": "worktree",
+                    "run_in_background": true
+                }),
+                CancellationToken::new(),
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        let id = result.details["taskId"].as_str().unwrap().to_string();
+        manager
+            .wait(&id, std::time::Duration::from_secs(20))
+            .await
+            .unwrap();
+
+        let registry = std::fs::read_to_string(agent_dir.join("worktrees.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&registry).unwrap();
+        let rows = value["worktrees"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["task_id"], id);
+        let branch = rows[0]["branch"].as_str().unwrap().to_string();
         crate::worktrees::discard(&agent_dir, &repo, &branch)
             .await
             .unwrap();

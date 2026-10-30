@@ -959,6 +959,11 @@ const EN: &[(&str, &str)] = &[
     ("msg.worktree_unknown", "Unknown worktree branch: {branch}"),
     ("msg.worktree_status_applied", "applied"),
     ("msg.worktree_status_pending", "pending"),
+    ("msg.worktree_status_running", "running"),
+    (
+        "msg.worktree_task_running",
+        "Subagent {id} is still running — stop it from /tasks before touching its worktree.",
+    ),
     ("msg.worktree_untracked", "{count} untracked"),
     ("msg.worktree_missing", "missing (prune to forget)"),
     (
@@ -1801,6 +1806,11 @@ const ZH: &[(&str, &str)] = &[
     ("msg.worktree_unknown", "未知工作树分支：{branch}"),
     ("msg.worktree_status_applied", "已应用"),
     ("msg.worktree_status_pending", "待应用"),
+    ("msg.worktree_status_running", "运行中"),
+    (
+        "msg.worktree_task_running",
+        "子代理 {id} 仍在运行——请先从 /tasks 停止它，再操作其工作树。",
+    ),
     ("msg.worktree_untracked", "{count} 个未跟踪文件"),
     ("msg.worktree_missing", "已丢失（可用 prune 清理）"),
     (

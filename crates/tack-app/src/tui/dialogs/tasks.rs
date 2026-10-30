@@ -126,7 +126,13 @@ impl TaskDialog {
                 } else {
                     "✗"
                 };
-                let label = format!("{mark} {}  {}", task.id, truncate(&task.label, 64));
+                let label = format!(
+                    "{mark} {}  {}",
+                    task.id,
+                    // Background bash labels are full commands and may be
+                    // multi-line; a newline would split the select row.
+                    truncate(&task.label.replace(['\n', '\r'], " "), 64)
+                );
                 let description = i18n::trf(
                     "tasks.row",
                     &[
@@ -159,10 +165,7 @@ impl TaskDialog {
         let id = task.id.clone();
         match self.manager.output(&id) {
             Some(output) => {
-                let mut lines: Vec<String> = output.content.lines().map(str::to_string).collect();
-                if lines.is_empty() {
-                    lines.push(i18n::tr("tasks.no_output"));
-                }
+                let lines = output_lines(&output.content);
                 self.note = None;
                 let output_len = self.manager.output_len(&id).unwrap_or(0);
                 self.viewer = Some(Viewer {
@@ -198,10 +201,7 @@ impl TaskDialog {
         let Some(output) = self.manager.output(&viewer.task_id) else {
             return;
         };
-        let mut lines: Vec<String> = output.content.lines().map(str::to_string).collect();
-        if lines.is_empty() {
-            lines.push(i18n::tr("tasks.no_output"));
-        }
+        let lines = output_lines(&output.content);
         viewer.lines = lines;
         viewer.truncated = output.truncated;
         viewer.full_output_path = output.full_output_path;
@@ -353,6 +353,13 @@ impl TaskDialog {
     }
 
     pub fn handle_input(&mut self, event: &InputEvent) -> bool {
+        // A paste while composing a steering message appends to the input.
+        if let InputEvent::Paste(text) = event {
+            if let Some(composing) = &mut self.composing {
+                composing.push_str(text);
+            }
+            return true;
+        }
         let InputEvent::Key(key) = event else {
             return true;
         };
@@ -437,7 +444,7 @@ impl TaskDialog {
                 .unwrap_or_default();
             let mut input = Line::new();
             input.push(Span::styled(
-                format!(" {} {id}> {text}", i18n::tr("tasks.message_prompt")),
+                format!(" {} {id}> {text}▏", i18n::tr("tasks.message_prompt")),
                 self.theme.accent,
             ));
             input.truncate(width as usize, true);
@@ -522,6 +529,24 @@ fn truncate(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// Split sanitized task output into display lines. Carriage returns survive
+/// `sanitize_binary_output` (progress bars use them); rendered raw they would
+/// move the terminal cursor and overwrite the panel, so treat `\r` as a line
+/// break (CRLF first, so Windows output does not gain blank lines).
+fn output_lines(content: &str) -> Vec<String> {
+    let normalized = content
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        // Tabs have no fixed width in the frame math; expand them so
+        // truncation and padding stay aligned.
+        .replace('\t', "    ");
+    let mut lines: Vec<String> = normalized.lines().map(str::to_string).collect();
+    if lines.is_empty() {
+        lines.push(i18n::tr("tasks.no_output"));
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -535,6 +560,15 @@ mod tests {
 
     fn dialog() -> TaskDialog {
         TaskDialog::new(BackgroundTaskManager::new(), Theme::dark())
+    }
+
+    #[test]
+    fn output_lines_normalize_carriage_returns() {
+        // CRLF and bare CR both become line breaks (progress bars must not
+        // move the terminal cursor over the panel).
+        assert_eq!(output_lines("a\r\nb\rc\nd"), vec!["a", "b", "c", "d"]);
+        assert_eq!(output_lines("a\tb"), vec!["a    b"]);
+        assert_eq!(output_lines(""), vec![i18n::tr("tasks.no_output")]);
     }
 
     #[test]
@@ -555,8 +589,19 @@ mod tests {
         let manager = BackgroundTaskManager::new();
         let first = manager.register("first task".to_string());
         let second = manager.register("second task".to_string());
+        // Background bash commands are often multi-line; rows must stay one line.
+        let _multiline = manager.register("echo a\necho b".to_string());
         let mut dialog = TaskDialog::new(manager.clone(), Theme::dark());
-        assert_eq!(dialog.summaries.len(), 2);
+        assert_eq!(dialog.summaries.len(), 3);
+        assert!(
+            dialog
+                .list
+                .items
+                .iter()
+                .all(|item| !item.label.contains('\n')),
+            "rows must not contain newlines: {:?}",
+            dialog.list.items
+        );
         // Select the second row, then finish the first: order is stable.
         dialog.list.selected = 1;
         first.finish(TaskStatus::Exited(0), None);

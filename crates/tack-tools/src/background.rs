@@ -79,9 +79,12 @@ impl TaskSummary {
     }
 
     /// Human status line, including the error when one was recorded.
+    /// Newlines are folded to spaces: this string is rendered inside a
+    /// one-line list row and a multi-line stderr would break the panel.
     pub fn status_text(&self) -> String {
         let mut status = self.status.describe();
         if let Some(error) = &self.error {
+            let error = error.replace(['\n', '\r'], " ");
             status = format!("{status}: {error}");
         }
         status
@@ -1149,6 +1152,17 @@ mod tests {
         second.finish(TaskStatus::Failed, Some("boom".to_string()));
         assert!(!manager.has_running());
         assert_eq!(manager.tasks()[1].status_text(), "failed: boom");
+
+        // Multi-line stderr must not split a one-line panel row.
+        let multiline = manager.register("third".to_string());
+        multiline.finish(
+            TaskStatus::Failed,
+            Some("first line\nsecond line".to_string()),
+        );
+        assert_eq!(
+            manager.tasks()[2].status_text(),
+            "failed: first line second line"
+        );
     }
 
     /// kill_shell on an already-finished task must not claim it sent a kill
