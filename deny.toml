@@ -70,16 +70,12 @@ skip = [
     { crate = "rand_chacha@0.3" },
     { crate = "getrandom@0.2" },
     { crate = "getrandom@0.4" },
-    # wasmtime 49 internal: the `wat` feature pins wat 1.261 (wast 261)
-    # while wiggle (wasmtime-wasi) still uses wast 35; the wit-bindgen
-    # chain (wit-component/wasm-metadata 0.258) keeps wasm-encoder 0.258.
-    { crate = "wasm-encoder@0.258" },
+    # wasmtime 50's `wat` feature pins wast 261 while witx (via
+    # wiggle-generate, used by wasmtime-wasi) still uses wast 35.
     { crate = "wast@261" },
-    # wasmtime 48 (wit-bindgen) uses hashbrown 0.17; the rest of the tree is
+    # wasmtime 50 (wit-bindgen) uses hashbrown 0.17; the rest of the tree is
     # on 0.16.
     { crate = "hashbrown@0.17" },
-    # wasmtime 48's io-lifetimes 2 coexists with rustix 1's io-lifetimes 3.
-    { crate = "io-lifetimes@2" },
     # async-trait 0.1.92+ is on syn 3; the rest of the proc-macro ecosystem
     # is still on syn 2.
     { crate = "syn@3" },

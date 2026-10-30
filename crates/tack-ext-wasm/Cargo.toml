@@ -3,8 +3,8 @@ name = "tack-ext-wasm"
 description = "Tack extension host: sandboxed WASM (wasmtime / WASI p1) carrier for the tack-ext NDJSON plugin protocol"
 version.workspace = true
 edition.workspace = true
-# wasmtime 49 declares rust-version 1.96 — that is this crate's real floor.
-rust-version = "1.96"
+# wasmtime 50 declares rust-version 1.97 — that is this crate's real floor.
+rust-version = "1.97"
 license.workspace = true
 repository.workspace = true
 
@@ -21,21 +21,18 @@ tracing.workspace = true
 # (the last one alone drags in the whole wasm-compose chain). `async` and
 # `component-model` are forced by wasmtime-wasi's p1 → p2 chain and are
 # declared explicitly to document that.
-wasmtime = { version = "49", default-features = false, features = [
+wasmtime = { version = "50.0.1", default-features = false, features = [
     "addr2line",
     "anyhow",
     "async",
     "backtrace",
-    # KNOWN UPSTREAM BUG (wasmtime 49.x, macOS): the Mach exception handler
-    # thread aborts the whole process when mach_msg returns
-    # MACH_RCV_INTERRUPTED — any caught signal (SIGCHLD from tokio::process
-    # child spawns) delivered to that thread triggers it. This is the flaky
-    # `cargo test -p tack-app --lib` SIGABRT on macOS. Fixed upstream by
-    # PR #14414 (issue #14393); the fix missed 49.0.2 (still on
-    # MACH_RCV_INTERRUPT there), so bump to 50.0.0 as soon as it ships.
-    # Store call hooks, used to replenish the guest's fuel budget on every
-    # guest→host call (no transitive dependencies).
-    "call-hook",
+    # >=50.0.1 is required, not cosmetic: wasmtime <=49.x has a macOS bug
+    # where the Mach exception handler thread aborts the whole process when
+    # mach_msg returns MACH_RCV_INTERRUPTED — any caught signal (e.g. SIGCHLD
+    # from tokio::process child spawns) delivered to that thread triggers it.
+    # That was the flaky `cargo test -p tack-app --lib` SIGABRT on macOS.
+    # Fixed upstream by PR #14414 (issue #14393) in the 50 series; pin
+    # 50.0.1 for its accompanying security fixes.
     "component-model",
     "cranelift",
     "demangle",
@@ -44,7 +41,12 @@ wasmtime = { version = "49", default-features = false, features = [
     "std",
     "wat",
 ] }
-wasmtime-wasi = { version = "49", features = ["p1"] }
+wasmtime-wasi = { version = "50.0.1", features = ["p1"] }
+# `GuestMemory`/ABI helpers behind wasmtime-wasi's p1 functions: the
+# budget-rearming wrappers for fd_read/fd_write reconstruct the (small)
+# generated linker wrapper, so they need the same type wasmtime-wasi's
+# p1 trait signatures use.
+wiggle = { version = "50.0.1", default-features = false, features = ["wasmtime"] }
 
 [dev-dependencies]
 # Temp directories for preopen-grant tests (host side of the fs fixtures).

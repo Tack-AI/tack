@@ -41,10 +41,15 @@ pub mod component;
 
 use tack_ext::v3::{HostClient, JsonRpcPeer, PeerHandler};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf};
-use wasmtime::{CallHook, Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{
+    AsContextMut, Caller, Config, Engine, Extern, Linker, Module, Store, StoreLimits,
+    StoreLimitsBuilder,
+};
 use wasmtime_wasi::cli::{AsyncStdinStream, AsyncStdoutStream};
+use wasmtime_wasi::p1::wasi_snapshot_preview1::{self as p1abi, WasiSnapshotPreview1};
 use wasmtime_wasi::p1::{self, WasiP1Ctx};
 use wasmtime_wasi::{FsPerms, WasiCtxBuilder};
+use wiggle::GuestMemory;
 
 /// Engine epoch tick used to enforce [`WasmLimits::max_execution`].
 const EPOCH_TICK: Duration = Duration::from_millis(10);
@@ -99,7 +104,7 @@ pub const HOST_MAX_EXECUTION: Duration = Duration::from_secs(3600);
 /// Default wall-clock window without protocol I/O progress after which
 /// the guest is trapped: 10 minutes. A guest gets ONE `_start` for its
 /// whole life; the deadline re-arms on every protocol-pipe byte moved
-/// (see the call hook at instantiation), so this is a hang watchdog, not
+/// (see `wrap_protocol_call`), so this is a hang watchdog, not
 /// a lifetime cap. Without a default, a guest that keeps its fuel topped
 /// up via protocol I/O would run forever with no backstop.
 ///
@@ -199,11 +204,11 @@ pub struct PreopenGrant {
 /// Network capability flags (TCP, UDP, DNS name lookup).
 ///
 /// **These flags are forward-looking and currently inert for the guests
-/// this carrier runs.** They map to wasmtime-wasi 48's
+/// this carrier runs.** They map to wasmtime-wasi's
 /// `WasiCtxBuilder::allow_tcp` / `allow_udp` / `allow_ip_name_lookup`,
 /// which configure the WASI **p2** sockets context. The p1 ABI
 /// (`wasi_snapshot_preview1`) that this carrier links has no working
-/// socket entry points — wasmtime-wasi 48's p1 `sock_*` functions are
+/// socket entry points — wasmtime-wasi's p1 `sock_*` functions remain
 /// unimplemented stubs — so a WASI p1 guest cannot open sockets whether
 /// or not these are set. The grants are recorded on the context so that
 /// future p2/component guests (or future host-provided socket functions)
@@ -247,8 +252,8 @@ struct PluginState {
 }
 
 /// Wraps the guest's stdin pipe and counts PROTOCOL bytes the guest
-/// actually consumed (see the fuel-replenishment comment at the call
-/// hook: only real protocol progress refuels).
+/// actually consumed (see `wrap_protocol_call`: only real protocol
+/// progress refuels).
 struct CountingReader<R> {
     inner: R,
     progress: Arc<AtomicU64>,
@@ -306,6 +311,74 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CountingWriter<W> {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
+}
+
+/// Wrap one WASI p1 call so the guest's fuel budget and epoch deadline
+/// are re-armed whenever that call moved protocol bytes.
+///
+/// wasmtime >=50 made `StoreHookState` (the value `Store::call_hook` and
+/// `Store::epoch_deadline_callback` receive) read-only with respect to
+/// wasm-facing store state, so a hook can no longer call `set_fuel` /
+/// `set_epoch_deadline`. A host-function `Caller` still has a mutable
+/// store context, and it runs before the guest resumes, so the re-arm
+/// moves into wrappers around the two p1 functions that carry every
+/// protocol byte (request reads and response writes). The body mirrors
+/// wiggle's generated linker wrapper (`get_export("memory")` +
+/// `GuestMemory`) because the generated wrapper has no re-entry point;
+/// it dispatches the same ABI function, then re-arms.
+///
+/// Semantics are unchanged: a plugin is refuelled only on real protocol
+/// progress, never by metadata calls like `clock_time_get`.
+macro_rules! wrap_protocol_call {
+    ($linker:expr, $name:literal, $abi:path, $progress:expr, $max_fuel:expr, $rearm_ticks:expr) => {{
+        let progress = $progress;
+        let max_fuel = $max_fuel;
+        let rearm_ticks = $rearm_ticks;
+        let _ = $linker
+            .func_wrap_async(
+                "wasi_snapshot_preview1",
+                $name,
+                move |mut caller: Caller<'_, PluginState>,
+                      (a0, a1, a2, a3): (i32, i32, i32, i32)| {
+                    let progress = progress.clone();
+                    Box::new(async move {
+                        let before = progress.load(Ordering::Relaxed);
+                        let hostcall_fuel = caller.as_context_mut().hostcall_fuel();
+                        let (rc, moved) = {
+                            let export = caller.get_export("memory");
+                            let (mut memory, wasi) = match &export {
+                                Some(Extern::Memory(m)) => {
+                                    let (bytes, state) = m.data_and_store_mut(&mut caller);
+                                    state.wasi.set_hostcall_fuel(hostcall_fuel);
+                                    (GuestMemory::Unshared(bytes), &mut state.wasi)
+                                }
+                                Some(Extern::SharedMemory(m)) => {
+                                    let state = caller.data_mut();
+                                    state.wasi.set_hostcall_fuel(hostcall_fuel);
+                                    (GuestMemory::Shared(m.data()), &mut state.wasi)
+                                }
+                                _ => {
+                                    return Err(wasmtime::Error::msg(
+                                        "missing required memory export",
+                                    ));
+                                }
+                            };
+                            let rc = $abi(wasi, &mut memory, a0, a1, a2, a3).await?;
+                            (rc, progress.load(Ordering::Relaxed) != before)
+                        };
+                        if moved {
+                            let mut ctx = caller.as_context_mut();
+                            let _ = ctx.set_fuel(max_fuel);
+                            if let Some(ticks) = rearm_ticks {
+                                ctx.set_epoch_deadline(ticks);
+                            }
+                        }
+                        Ok(rc)
+                    })
+                },
+            )
+            .map_err(|e| format!("failed to wrap wasi p1 {}: {e}", $name))?;
+    }};
 }
 
 /// On-demand wake source for the epoch ticker. The ticker only needs to
@@ -386,7 +459,7 @@ impl WasmCarrier {
     /// [`WasmCarrier::new`] with explicit sandbox caps.
     pub fn with_sandbox_caps(caps: WasmSandboxCaps) -> Result<Self, String> {
         let mut config = Config::new();
-        // Async is always on in wasmtime 48 (`async_support` is a no-op);
+        // Async is always on (`async_support` is a no-op);
         // instantiate_async/call_async are available unconditionally.
         config.consume_fuel(true);
         config.epoch_interruption(true);
@@ -538,49 +611,25 @@ impl WasmCarrier {
         store
             .set_fuel(limits.max_fuel)
             .map_err(|e| format!("failed to set fuel: {e}"))?;
-        // Replenish the fuel budget every time the guest moves bytes on
-        // the PROTOCOL pipes (consuming request bytes, producing
-        // response bytes). The guest's whole life is one `_start` call,
-        // so without replenishment the budget would be a one-shot
-        // lifetime allotment and a well-behaved long-lived plugin would
-        // trap with "all fuel consumed" mid-session. Refueling keys off
-        // the pipe-progress counter rather than "any WASI call
-        // completed": wasmtime's internal libcalls (`out_of_gas`,
-        // `new_epoch`) also fire this hook (naively refilling on every
-        // hook would refuel the guest at the exact moment it runs out of
-        // gas — an infinite refuel loop), and a guest looping {{ pure
-        // compute; clock_time_get() }} must not refuel either — cheap
-        // metadata WASI calls are not protocol progress.
-        // A well-behaved long-lived plugin must not refuel by spinning
-        // cheap metadata WASI calls — and, symmetrically, must not be
-        // killed by a fixed wall-clock lifetime either. Both budgets are
-        // therefore RE-ARMED on protocol progress: fuel here, and the
-        // epoch deadline below is re-set to a fresh `max_execution`
-        // window on the same condition, turning the wall-clock cap into
-        // a hang watchdog ("no protocol progress for max_execution")
-        // rather than a lifetime limit. While the guest is parked inside
-        // a blocking fd_read no guest code executes (no epoch checks),
-        // and the ReturningFromHost hook re-arms the deadline before the
-        // guest resumes, so idle-then-active plugins are never trapped.
+        // The guest's whole life is one `_start` call, so without
+        // replenishment the budget would be a one-shot lifetime allotment
+        // and a well-behaved long-lived plugin would trap with "all fuel
+        // consumed" mid-session. Both budgets are therefore RE-ARMED on
+        // protocol progress: fuel back to the full budget, and the epoch
+        // deadline to a fresh `max_execution` window, turning the
+        // wall-clock cap into a hang watchdog ("no protocol progress for
+        // max_execution") rather than a lifetime limit. Refueling keys off
+        // the pipe-progress counter, not "any WASI call completed": a
+        // guest looping {{ pure compute; clock_time_get() }} must not
+        // refuel, and cheap metadata WASI calls are not protocol progress.
+        // While the guest is parked inside a blocking fd_read no guest
+        // code executes (no epoch checks), and the re-arm below runs
+        // before the guest resumes, so idle-then-active plugins are never
+        // trapped.
         let max_fuel = limits.max_fuel;
         let rearm_ticks = limits.max_execution.map(|duration| {
             let ticks = duration.as_millis().max(1) / EPOCH_TICK.as_millis().max(1);
             u64::try_from(ticks).unwrap_or(u64::MAX).saturating_add(1)
-        });
-        let hook_progress = io_progress.clone();
-        let mut seen_progress = 0u64;
-        store.call_hook(move |mut store, hook| {
-            if let CallHook::ReturningFromHost = hook {
-                let progress = hook_progress.load(Ordering::Relaxed);
-                if progress != seen_progress {
-                    seen_progress = progress;
-                    let _ = store.set_fuel(max_fuel);
-                    if let Some(ticks) = rearm_ticks {
-                        store.set_epoch_deadline(ticks);
-                    }
-                }
-            }
-            Ok(())
         });
 
         // Epoch deadlines are counted in ticks beyond the CURRENT epoch,
@@ -597,8 +646,32 @@ impl WasmCarrier {
         store.set_epoch_deadline(deadline);
 
         let mut linker = Linker::new(&self.engine);
+        // The two protocol-pipe WASI calls are re-defined below to re-arm
+        // the budgets, so shadowing must be allowed.
+        linker.allow_shadowing(true);
         p1::add_to_linker_async(&mut linker, |state: &mut PluginState| &mut state.wasi)
             .map_err(|e| format!("failed to link WASI p1: {e}"))?;
+        // wasmtime >=50 hands `Store::call_hook` a read-only StoreHookState,
+        // so a hook can no longer call set_fuel/set_epoch_deadline. Re-arm
+        // from wrappers around the two p1 calls that carry all plugin
+        // protocol bytes instead: a host-function Caller still has a
+        // mutable store context, and it runs before wasm resumes.
+        wrap_protocol_call!(
+            linker,
+            "fd_read",
+            p1abi::fd_read,
+            io_progress.clone(),
+            max_fuel,
+            rearm_ticks
+        );
+        wrap_protocol_call!(
+            linker,
+            "fd_write",
+            p1abi::fd_write,
+            io_progress.clone(),
+            max_fuel,
+            rearm_ticks
+        );
 
         tokio::spawn(forward_stderr(host_stderr));
 

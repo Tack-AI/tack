@@ -32,6 +32,21 @@ notice can parse entries (same convention as TS pi).
   seed a plan and parallel children claim/complete items on one board
   (custom agent `tools:` whitelists still apply).
 
+### Fixed
+
+- **macOS SIGABRT when WASM plugins coexist with child processes**:
+  upgraded wasmtime 49.0.2 → 50.0.1. In 49.x the macOS Mach exception
+  handler thread called `mach_msg` with `MACH_RCV_INTERRUPT` and aborted
+  the whole process on `MACH_RCV_INTERRUPTED`, so any caught signal
+  (e.g. `SIGCHLD` from a spawned child) delivered to that thread could
+  crash the process — the flaky `cargo test -p tack-app --lib` abort, and
+  a real crash for any long-lived process that embeds WASM extensions and
+  spawns subprocesses. wasmtime 50 drops the flag and retries the receive
+  (upstream issue #14393, PR #14414). Because 50 also makes
+  `Store::call_hook` read-only, fuel/epoch re-arming on protocol progress
+  now lives in wrappers around WASI `fd_read`/`fd_write`; the limits
+  behave exactly as before.
+
 ## [1.0.12] - 2026-10-29
 
 ### Removed
