@@ -11,10 +11,13 @@
 //! - only branches with the `tack-subagent-` prefix are ever removed;
 //! - apply stages changes in the main repo (`merge --squash`), never
 //!   commits or pushes on the user's behalf;
+//! - registry writes are serialized (in-process mutex + sibling `.guard`),
+//!   so parallel subagents cannot lose each other's rows;
 //! - worktree paths are passed as argv to git (never through a shell).
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -73,6 +76,38 @@ struct Registry {
 
 fn registry_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("worktrees.json")
+}
+
+/// Serializes registry read-modify-write inside this process. Parallel
+/// subagents are the normal registration pattern (`register` runs on the
+/// tokio workers), and an unlocked read-modify-write loses rows: eight
+/// simultaneous registers reproducibly left one. The sibling `.guard` file
+/// (see [`crate::file_lock`]) covers other tack processes (TUI + RPC/serve);
+/// it is best-effort, which is exactly why the in-process lock must not be.
+static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+
+const REGISTRY_GUARD_STALE: Duration = Duration::from_secs(120);
+const REGISTRY_GUARD_WAIT: Duration = Duration::from_secs(5);
+
+struct RegistryGuard {
+    _serial: std::sync::MutexGuard<'static, ()>,
+    _file: crate::file_lock::Guard,
+}
+
+/// Hold both locks for one read-modify-write of `worktrees.json`. Callers
+/// must drop the guard before awaiting: `MutexGuard` is not `Send`, and
+/// holding it across an await would stall every other registry writer.
+fn lock_registry(agent_dir: &Path) -> RegistryGuard {
+    let serial = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let file = crate::file_lock::lock(
+        &registry_path(agent_dir),
+        REGISTRY_GUARD_STALE,
+        REGISTRY_GUARD_WAIT,
+    );
+    RegistryGuard {
+        _serial: serial,
+        _file: file,
+    }
 }
 
 fn read_registry(agent_dir: &Path) -> Registry {
@@ -137,6 +172,7 @@ pub fn register(
     task_id: Option<&str>,
 ) -> Result<(), String> {
     validate_branch(branch)?;
+    let _guard = lock_registry(agent_dir);
     let mut registry = read_registry(agent_dir);
     let repo = canonical(repo);
     registry
@@ -155,6 +191,7 @@ pub fn register(
 }
 
 fn mark_applied(agent_dir: &Path, repo: &Path, branch: &str, label: &str) {
+    let _guard = lock_registry(agent_dir);
     let mut registry = read_registry(agent_dir);
     let repo_path = canonical(repo);
     if let Some(record) = registry
@@ -180,6 +217,7 @@ fn mark_applied(agent_dir: &Path, repo: &Path, branch: &str, label: &str) {
 }
 
 fn remove_record(agent_dir: &Path, repo: &Path, branch: &str) -> Result<(), String> {
+    let _guard = lock_registry(agent_dir);
     let mut registry = read_registry(agent_dir);
     let repo = canonical(repo);
     let before = registry.worktrees.len();
@@ -404,15 +442,21 @@ pub async fn discard(agent_dir: &Path, repo: &Path, branch: &str) -> Result<(), 
 /// git to prune its own metadata. Returns how many rows were dropped.
 pub async fn prune(agent_dir: &Path, repo: &Path) -> usize {
     let repo = canonical(repo);
-    let mut registry = read_registry(agent_dir);
-    let before = registry.worktrees.len();
-    registry
-        .worktrees
-        .retain(|r| !same_repo(r, &repo) || Path::new(&r.path).exists());
-    let removed = before - registry.worktrees.len();
-    if removed > 0 {
-        let _ = write_registry(agent_dir, &registry);
-    }
+    let removed = {
+        // Scope the guard: holding a non-Send MutexGuard across the git
+        // await below would stall every other registry writer.
+        let _guard = lock_registry(agent_dir);
+        let mut registry = read_registry(agent_dir);
+        let before = registry.worktrees.len();
+        registry
+            .worktrees
+            .retain(|r| !same_repo(r, &repo) || Path::new(&r.path).exists());
+        let removed = before - registry.worktrees.len();
+        if removed > 0 {
+            let _ = write_registry(agent_dir, &registry);
+        }
+        removed
+    };
     let _ = git_cmd(&repo, &["worktree", "prune"]).await;
     removed
 }

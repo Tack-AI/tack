@@ -3050,67 +3050,13 @@ fn write_lock(agent_dir: &Path, lock: &ExtensionsLock) -> anyhow::Result<()> {
 /// LOCK_GUARD_STALE_SECS, and a process that cannot acquire within the
 /// wait budget proceeds without it rather than blocking startup.
 const LOCK_GUARD_STALE_SECS: u64 = 120;
-struct LockGuard {
-    path: PathBuf,
-}
 
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        if !self.path.as_os_str().is_empty() {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
-fn lock_guard(agent_dir: &Path) -> LockGuard {
-    let path = lock_path(agent_dir).with_extension("guard");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2_000);
-    loop {
-        match std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-        {
-            Ok(_) => return LockGuard { path },
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|mtime| mtime.elapsed().ok())
-                    .is_some_and(|age| age.as_secs() > LOCK_GUARD_STALE_SECS);
-                if stale {
-                    // Rename-claim the stale guard aside (never delete
-                    // in place — two concurrent reclaims could then
-                    // both create_new successfully). Ownership is
-                    // decided ONLY by the create_new below.
-                    let nanos = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos())
-                        .unwrap_or(0);
-                    let claimed =
-                        path.with_extension(format!("stale-{}-{nanos}", std::process::id()));
-                    if std::fs::rename(&path, &claimed).is_ok() {
-                        let _ = std::fs::remove_file(&claimed);
-                        continue;
-                    }
-                }
-                if std::time::Instant::now() >= deadline {
-                    tracing::warn!(
-                        "extensions lockfile guard held by another process; proceeding without it"
-                    );
-                    return LockGuard {
-                        path: PathBuf::new(),
-                    };
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(_) => {
-                return LockGuard {
-                    path: PathBuf::new(),
-                };
-            }
-        }
-    }
+fn lock_guard(agent_dir: &Path) -> crate::file_lock::Guard {
+    crate::file_lock::lock(
+        &lock_path(agent_dir),
+        std::time::Duration::from_secs(LOCK_GUARD_STALE_SECS),
+        std::time::Duration::from_millis(2_000),
+    )
 }
 
 /// Upsert the lock entry for a freshly installed extension.

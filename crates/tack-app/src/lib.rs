@@ -47,6 +47,7 @@ pub mod extension_host;
 pub mod extension_host_stub;
 #[cfg(not(feature = "ext"))]
 pub use extension_host_stub as extension_host;
+pub mod file_lock;
 pub mod hooks;
 pub mod i18n;
 pub mod logs;

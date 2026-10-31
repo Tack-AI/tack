@@ -4,6 +4,16 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [Unreleased]
+
+### Fixed
+
+- **Worktree registry writes are serialized**: a process-wide lock plus a
+  sibling `<agentDir>/worktrees.guard` for other tack processes. Eight
+  parallel subagents used to lose seven of their rows, which also disabled
+  the "refuse apply/discard while the owning subagent is still running"
+  guard for the lost records.
+
 ## [1.0.13] - 2026-10-31
 
 ### Added
