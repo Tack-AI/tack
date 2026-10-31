@@ -1603,6 +1603,14 @@ impl TuiApp {
         self.running
     }
 
+    /// Test helper: the session-scoped background task registry (the same
+    /// instance `/tasks` and the subagent tool use), so integration tests
+    /// can spawn and inspect real tasks.
+    #[doc(hidden)]
+    pub fn test_background_tasks(&self) -> tack_tools::background::BackgroundTaskManager {
+        self.background_tasks.clone()
+    }
+
     /// Test helper: toggle background-task auto-wake.
     #[doc(hidden)]
     pub fn test_set_background_auto_wake(&mut self, enabled: bool) {

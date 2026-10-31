@@ -8,6 +8,13 @@ notice can parse entries (same convention as TS pi).
 
 ### Fixed
 
+- **`/worktree apply` is retryable**: it now refuses a repository with
+  uncommitted tracked changes *before* touching anything, and a failed or
+  conflicting squash merge is rolled back to the pre-merge state (a
+  conflicted `merge --squash` writes no `MERGE_HEAD`, so `git merge --abort`
+  could not undo it). Previously the first failure left the worktree clean,
+  every retry then reported "no changes", and the child's committed work
+  never landed — after which `discard` deleted its only copy.
 - **Worktree registry writes are serialized**: a process-wide lock plus a
   sibling `<agentDir>/worktrees.guard` for other tack processes. Eight
   parallel subagents used to lose seven of their rows, which also disabled

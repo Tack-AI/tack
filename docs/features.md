@@ -315,7 +315,10 @@ branch, path) and can be managed without leaving the TUI:
   and squash-merges it into the current repo's **index** — staged, not
   committed, so the human keeps the final say. With exactly one worktree
   the branch can be omitted; the checkout tack itself is running in is
-  refused;
+  refused. The current repo must have no uncommitted tracked changes
+  (commit or stash first); a failed or conflicting merge is rolled back to
+  the pre-merge state, so after resolving the conflict the same command can
+  simply be retried;
 - `/worktree discard <branch>`: removes the worktree and deletes its branch
   (only `tack-subagent-*` branches; the checkout tack itself is running in
   is refused);
@@ -323,8 +326,10 @@ branch, path) and can be managed without leaving the TUI:
   (e.g. removed outside tack).
 
 Worktrees created before this registry (or by another checkout) are still
-found through `git worktree list`, so nothing is lost. Applying/discarding
-is refused while an agent run is active (it would race the edits), and while
+found through `git worktree list`, so nothing is lost. Registry writes are
+serialized, so parallel subagents (and other tack processes) all keep their
+rows. Applying/discarding is refused while an agent run is active (it would
+race the edits), and while
 the worktree's own background subagent is still running in this tack process
 (stop it from `/tasks` first); listing stays available. A run owned by a
 different process (e.g. `tack serve`/RPC) is not visible to this TUI's task

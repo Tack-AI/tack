@@ -215,11 +215,11 @@ model: anthropic/k3
 每个工作树都会记录到 `<agentDir>/worktrees.json`（任务标签、分支、路径），不离开 TUI 就能管理：
 
 - `/worktree`（或 `/worktree list`）：分支、任务标签、diff 摘要、路径、是否已应用；
-- `/worktree apply [branch]`：先把工作树里的改动提交到其分支，再 squash-merge 进当前仓库的**索引**——只暂存、不提交，最终决定权留给人。只有一个工作树时可省略分支；tack 自身正在其中运行的 checkout 会被拒绝；
+- `/worktree apply [branch]`：先把工作树里的改动提交到其分支，再 squash-merge 进当前仓库的**索引**——只暂存、不提交，最终决定权留给人。只有一个工作树时可省略分支；tack 自身正在其中运行的 checkout 会被拒绝。当前仓库不能有未提交的已跟踪改动（先 commit 或 stash）；合并失败/冲突会自动回滚到合并前状态，解决冲突后原命令重试即可；
 - `/worktree discard <branch>`：删除工作树并删掉其分支（只允许 `tack-subagent-*` 分支；tack 自身正在其中运行的 checkout 会被拒绝）；
 - `/worktree prune`：清掉工作树已消失（例如被外部删除）的注册记录。
 
-在此注册表之前创建（或由其他 checkout 创建）的工作树仍能通过 `git worktree list` 发现，不会丢。agent 运行期间拒绝 apply/discard（会和编辑竞争）；本 tack 进程内、工作树自己的后台子代理仍在运行时也会拒绝（先从 `/tasks` 停止它），列取仍可用。由其他进程（如 `tack serve`/RPC）拥有的运行对本 TUI 的任务面板不可见，应用其工作树前请先停掉那个进程。
+在此注册表之前创建（或由其他 checkout 创建）的工作树仍能通过 `git worktree list` 发现，不会丢。注册表写入是串行的，并行子代理（以及其他 tack 进程）的记录都不会丢。agent 运行期间拒绝 apply/discard（会和编辑竞争）；本 tack 进程内、工作树自己的后台子代理仍在运行时也会拒绝（先从 `/tasks` 停止它），列取仍可用。由其他进程（如 `tack serve`/RPC）拥有的运行对本 TUI 的任务面板不可见，应用其工作树前请先停掉那个进程。
 
 ### 共享任务板
 

@@ -10,7 +10,9 @@
 //! Safety rules:
 //! - only branches with the `tack-subagent-` prefix are ever removed;
 //! - apply stages changes in the main repo (`merge --squash`), never
-//!   commits or pushes on the user's behalf;
+//!   commits or pushes on the user's behalf; it refuses a repo with
+//!   uncommitted tracked changes and rolls a failed merge back, so the
+//!   operation is retryable and never strands the child's commit;
 //! - registry writes are serialized (in-process mutex + sibling `.guard`),
 //!   so parallel subagents cannot lose each other's rows;
 //! - worktree paths are passed as argv to git (never through a shell).
@@ -344,6 +346,11 @@ async fn locate(agent_dir: &Path, repo: &Path, branch: &str) -> Result<WorktreeI
 /// Commit the worktree's changes on its branch, then squash-merge that
 /// branch into the main repo's index. Stops at "staged": committing is the
 /// user's decision.
+///
+/// Idempotent across failures: the parent's index is only touched when it
+/// is clean (checked first), and a failed/conflicting merge is rolled back,
+/// so a retry after the user resolves the conflict really does finish the
+/// merge instead of reporting "no changes" on a commit that never landed.
 pub async fn apply(agent_dir: &Path, repo: &Path, branch: &str) -> Result<ApplyOutcome, String> {
     validate_branch(branch)?;
     let info = locate(agent_dir, repo, branch).await?;
@@ -365,36 +372,79 @@ pub async fn apply(agent_dir: &Path, repo: &Path, branch: &str) -> Result<ApplyO
             current.trim()
         ));
     }
-    let status = git_output(&info.path, &["status", "--porcelain"]).await?;
-    if status.trim().is_empty() {
+    let worktree_clean = worktree_is_clean(&info.path).await?;
+    // Repeat apply after a success: the branch's work is already staged in
+    // the parent. A second `merge --squash` would collide with that staged
+    // result, so report the recorded state instead. (With new edits in the
+    // worktree, or after the user reset the staged result, we fall through
+    // and merge again.)
+    if info.applied
+        && worktree_clean
+        && !git_status_ok(&info.repo, &["diff", "--cached", "--quiet"]).await?
+    {
         return Ok(ApplyOutcome::NoChanges);
     }
-    git_output(&info.path, &["add", "-A"]).await?;
-    // Untracked files staged above; if nothing is staged (e.g. only ignored
-    // files changed) there is nothing to apply.
-    if git_status_ok(&info.path, &["diff", "--cached", "--quiet"]).await? {
-        return Ok(ApplyOutcome::NoChanges);
-    }
-    let message = commit_message(&info.label, branch);
-    git_output(
-        &info.path,
-        &[
-            "-c",
-            "user.name=tack-subagent",
-            "-c",
-            "user.email=subagent@tack.local",
-            // Never let a configured commit.gpgsign turn apply into a
-            // pinentry prompt the TUI cannot show.
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-m",
-            &message,
-        ],
+    // The parent must be clean before we touch its index: a squash merge
+    // into unrelated work either fails halfway or stages the merge next to
+    // the user's changes — and the rollback below (reset --hard) would then
+    // discard those changes too. Refusing early also keeps `apply`
+    // retryable: nothing happened, so nothing needs undoing.
+    let dirty = git_output(
+        &info.repo,
+        &["status", "--porcelain", "--untracked-files=no"],
     )
     .await?;
+    if !dirty.trim().is_empty() {
+        return Err(
+            "the current repository has uncommitted changes — commit or stash them before applying"
+                .to_string(),
+        );
+    }
+    // Commit the child's changes on its branch (the squash merge needs a
+    // commit). A clean worktree is fine: a previous apply may have committed
+    // but failed to merge, and the retry must still merge that commit.
+    if !worktree_clean {
+        git_output(&info.path, &["add", "-A"]).await?;
+        // Untracked files staged above; if nothing is staged (e.g. only
+        // ignored files changed) there is nothing to commit.
+        if !git_status_ok(&info.path, &["diff", "--cached", "--quiet"]).await? {
+            let message = commit_message(&info.label, branch);
+            git_output(
+                &info.path,
+                &[
+                    "-c",
+                    "user.name=tack-subagent",
+                    "-c",
+                    "user.email=subagent@tack.local",
+                    // Never let a configured commit.gpgsign turn apply into a
+                    // pinentry prompt the TUI cannot show.
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-m",
+                    &message,
+                ],
+            )
+            .await?;
+        }
+    }
 
-    git_output(&info.repo, &["merge", "--squash", branch]).await?;
+    let head = git_output(&info.repo, &["rev-parse", "HEAD"]).await?;
+    if let Err(error) = git_output(&info.repo, &["merge", "--squash", branch]).await {
+        // A conflicted squash merge writes markers and unmerged index
+        // entries but no MERGE_HEAD, so `git merge --abort` cannot undo it.
+        // The parent was clean, so restoring HEAD loses nothing of the
+        // user's; the child's work is committed on its branch either way.
+        let _ = git_output(&info.repo, &["reset", "--hard", head.trim()]).await;
+        return Err(format!(
+            "{error} — the repository was restored; resolve the conflict and retry"
+        ));
+    }
+    // Merged, but the result equals HEAD: the branch is already contained
+    // (or has a net-zero diff). Nothing to stage.
+    if git_status_ok(&info.repo, &["diff", "--cached", "--quiet"]).await? {
+        return Ok(ApplyOutcome::NoChanges);
+    }
     mark_applied(agent_dir, &info.repo, branch, &info.label);
     let summary = git_output(&info.repo, &["diff", "--cached", "--shortstat"])
         .await
@@ -402,6 +452,13 @@ pub async fn apply(agent_dir: &Path, repo: &Path, branch: &str) -> Result<ApplyO
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     Ok(ApplyOutcome::Applied { summary })
+}
+
+async fn worktree_is_clean(path: &Path) -> Result<bool, String> {
+    Ok(git_output(path, &["status", "--porcelain"])
+        .await?
+        .trim()
+        .is_empty())
 }
 
 fn commit_message(label: &str, branch: &str) -> String {
