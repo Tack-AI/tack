@@ -20,6 +20,9 @@ notice can parse entries (same convention as TS pi).
   parallel subagents used to lose seven of their rows, which also disabled
   the "refuse apply/discard while the owning subagent is still running"
   guard for the lost records.
+- **`/tasks` folds tabs as well as CR/newlines** in row labels, status lines
+  and the steering compose box, so a command or compiler error containing a
+  tab cannot desync the panel layout.
 
 ## [1.0.13] - 2026-10-31
 

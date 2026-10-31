@@ -210,8 +210,12 @@ impl TuiApp {
             let label = if info.label.is_empty() {
                 String::new()
             } else {
-                // Task text may be multi-line; keep the list item on one line.
-                format!(" — {}", info.label.replace(['\n', '\r'], " "))
+                // Task text may be multi-line; keep the list item on one line
+                // (tabs would desync the markdown list's width).
+                format!(
+                    " — {}",
+                    info.label.replace(['\n', '\r'], " ").replace('\t', "    ")
+                )
             };
             text.push_str(&format!(
                 "- `{}` [{status}] {summary}{label}\n  `{}`\n",

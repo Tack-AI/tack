@@ -130,8 +130,12 @@ impl TaskDialog {
                     "{mark} {}  {}",
                     task.id,
                     // Background bash labels are full commands and may be
-                    // multi-line; a newline would split the select row.
-                    truncate(&task.label.replace(['\n', '\r'], " "), 64)
+                    // multi-line; a control character would split the select
+                    // row or desync its width math.
+                    truncate(
+                        &task.label.replace(['\n', '\r'], " ").replace('\t', "    "),
+                        64
+                    )
                 );
                 let description = i18n::trf(
                     "tasks.row",
@@ -443,8 +447,11 @@ impl TaskDialog {
                 .map(|task| task.id.clone())
                 .unwrap_or_default();
             let mut input = Line::new();
+            // Fold control characters for display only: a pasted tab/newline
+            // must not break the box, but the message itself stays verbatim.
+            let shown = text.replace(['\n', '\r'], " ").replace('\t', "    ");
             input.push(Span::styled(
-                format!(" {} {id}> {text}▏", i18n::tr("tasks.message_prompt")),
+                format!(" {} {id}> {shown}▏", i18n::tr("tasks.message_prompt")),
                 self.theme.accent,
             ));
             input.truncate(width as usize, true);

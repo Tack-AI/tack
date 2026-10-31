@@ -79,12 +79,13 @@ impl TaskSummary {
     }
 
     /// Human status line, including the error when one was recorded.
-    /// Newlines are folded to spaces: this string is rendered inside a
-    /// one-line list row and a multi-line stderr would break the panel.
+    /// Control characters are folded: this string is rendered inside a
+    /// one-line list row, where a multi-line stderr (or a tab from a
+    /// compiler diagnostic) would break the panel's width math.
     pub fn status_text(&self) -> String {
         let mut status = self.status.describe();
         if let Some(error) = &self.error {
-            let error = error.replace(['\n', '\r'], " ");
+            let error = error.replace(['\n', '\r'], " ").replace('\t', "    ");
             status = format!("{status}: {error}");
         }
         status
