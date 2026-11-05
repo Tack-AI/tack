@@ -1176,10 +1176,12 @@ impl TuiApp {
         kb.register("app.thinking.cycle", &[]);
         kb.register("app.thinking.toggle", &["ctrl+t"]);
         kb.register("app.message.copy", &["ctrl+x"]);
-        // alt+↑ needs a terminal that reports Option as Meta/Esc+ (stock
-        // Terminal.app and iTerm2's defaults swallow it). ctrl+r used to be
-        // a second binding here; it now opens the history reverse search
-        // (bash convention), leaving alt+up as the dequeue binding.
+        // alt+↑ is reported as CSI 1;3A by xterm-style terminals, and as a
+        // double Escape (ESC ESC [ A) by macOS Terminal.app with "Use
+        // Option as Meta key" and by iTerm2 in Meta mode; the input layer
+        // folds that back into Alt+↑. ctrl+r used to be a second binding
+        // here; it now opens the history reverse search (bash convention),
+        // leaving alt+up as the dequeue binding.
         kb.register("app.message.dequeue", &["alt+up"]);
         // Bash-style incremental history search (reverse-i-search).
         kb.register("app.editor.historySearch", &["ctrl+r"]);
@@ -1579,6 +1581,18 @@ impl TuiApp {
             out.extend(q.iter().cloned());
         }
         out
+    }
+
+    /// Test helper: drain the steering queue exactly like the agent hook does,
+    /// without delivering the MessageStart events. This reproduces the window
+    /// in which a transcript echo still says "queued" but the message has
+    /// already been handed to the model.
+    #[doc(hidden)]
+    pub fn test_drain_steering(&self) -> Vec<String> {
+        self.steering
+            .try_lock()
+            .map(|mut q| q.drain(..).collect())
+            .unwrap_or_default()
     }
 
     /// Test helper: drive an app event (RunFinished, agent events, ...).

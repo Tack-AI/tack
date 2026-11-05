@@ -1178,6 +1178,57 @@ async fn alt_up_recalls_newest_queued_message_to_editor() {
 }
 
 #[tokio::test]
+async fn alt_up_does_not_recall_an_already_drained_message() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut app = test_app(cwd.path()).await;
+    app.test_set_running(true);
+    app.on_submit("in flight".to_string()).await;
+
+    // The agent hook drained the queue, but the TUI has not handled the
+    // MessageStart event yet: the echo still looks queued to the user.
+    assert_eq!(app.test_drain_steering(), vec!["in flight".to_string()]);
+    app.handle_input(InputEvent::Key(KeyEvent::new(Key::Up, Modifiers::ALT)))
+        .await;
+
+    // Must not be recalled (that would send it twice): the echo stays put
+    // until the in-flight delivery flips it.
+    assert_eq!(app.test_editor_text(), "");
+    assert!(app.test_queued_messages().is_empty());
+    let frame = frame_text(&mut app);
+    assert!(frame.contains("queued"), "echo vanished: {frame:?}");
+    assert!(frame.contains("in flight"), "echo text gone: {frame:?}");
+
+    // Delivery lands late: the echo becomes a normal user entry.
+    app.handle_agent_event(tack_agent_core::AgentEvent::MessageStart {
+        message: tack_agent_core::AgentMessage::user("in flight"),
+    })
+    .await;
+    let frame = frame_text(&mut app);
+    assert!(!frame.contains("queued"), "still queued: {frame:?}");
+    assert!(frame.contains("in flight"), "user entry missing: {frame:?}");
+}
+
+#[tokio::test]
+async fn alt_up_recall_clears_a_stale_autocomplete_popup() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut app = test_app(cwd.path()).await;
+    app.test_set_running(true);
+    app.on_submit("queued".to_string()).await;
+
+    // Open the slash-command popup on a draft, then recall over it. The
+    // recalled message is appended to the existing draft (newline-joined).
+    app.handle_input(key(Key::Char('/'))).await;
+    assert!(!app.test_autocomplete_labels().is_empty());
+    app.handle_input(InputEvent::Key(KeyEvent::new(Key::Up, Modifiers::ALT)))
+        .await;
+    assert_eq!(app.test_editor_text(), "/\nqueued");
+    assert!(
+        app.test_autocomplete_labels().is_empty(),
+        "popup computed for the old draft survived the recall"
+    );
+}
+
+#[tokio::test]
 async fn ctrl_r_history_search_filters_accepts_and_restores() {
     // ctrl+r opens an incremental reverse search through prompt history
     // (bash reverse-i-search); alt+↑ keeps the queue-recall binding.

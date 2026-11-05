@@ -532,7 +532,7 @@ tack eval evals/examples --runs 3 --report report.json --baseline baseline.json
 ## TUI 体验
 
 - **启动更新提示**：TUI 启动后后台检查新版本（结果缓存 24h，离线跳过），有更新时 footer 显示 `↑ vX.Y.Z` 并在聊天区提示 `tack update`。关闭：`"updateCheck": false`。
-- **Ctrl+R 历史反向搜索**：编辑器内 Ctrl+R 进入增量搜索——输入即过滤 prompt 历史（新→旧，大小写不敏感），↑/↓/重复 Ctrl+R 循环命中，Enter 接受、Esc 取消恢复草稿。（原 Ctrl+R 的 dequeue 绑定迁移为 Alt+↑。）
+- **Ctrl+R 历史反向搜索**：编辑器内 Ctrl+R 进入增量搜索——输入即过滤 prompt 历史（新→旧，大小写不敏感），↑/↓/重复 Ctrl+R 循环命中，Enter 接受、Esc 取消恢复草稿。（原 Ctrl+R 的 dequeue 绑定迁移为 Alt+↑；macOS Terminal.app 启用 "Use Option as Meta key" 或 iTerm2 的 Meta 模式会把该键发成双 Escape，输入层会还原。）
 - **桌面通知**：权限弹窗弹出、run 完成/出错、后台任务完成时发 OSC 9 / OSC 777 终端通知（按事件源 5s 节流，终端不支持则静默无效）。关闭：`"notifications": false`。
 - **plan mode 闭环**：`/mode plan` 下 agent 拿到 `exit_plan_mode` 工具——计划落盘 `~/.tack/agent/plans/` 并弹审批框：Yes→acceptEdits（改动自由、命令仍问）、Always→bypass、No→留在 plan 模式修订。
 - **ask_user 工具**：agent 可以在 run 中途暂停，向用户提结构化问题（`ask_user`，每次 1–4 个）——多选项选择题（2–4 个带描述的选项，外加“其他…”自由输入出口；`multi_select: true` 时变为可多选的勾选对话框，回答是全部选中标签）或省略选项时的纯自由输入。TUI 逐题弹对话框（Esc 取消整批，工具结果会提示模型自行决策）。headless 模式（print/rpc/acp/serve）和 subagent 注册的是无交互 handler 的工具：调用后返回带内的“无交互用户”消息，模型据此自行判断继续，不会永久阻塞（与 MCP elicitation decline 同一策略）。

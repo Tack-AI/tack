@@ -569,16 +569,24 @@ impl TuiApp {
                 );
                 return true;
             };
-            let (text, follow_up) = match self.items.remove(pos) {
+            // Inspect first; only remove the echo once the message is
+            // actually withdrawn. The agent loop drains the queue just before
+            // it emits MessageStart, and the UI can handle a keypress in
+            // between: the echo then still looks queued although the message
+            // is already on its way to the model. Recalling it back would send
+            // it twice (and the old "out of sync" fallback could pop an
+            // unrelated queued message instead).
+            let (text, follow_up) = match &self.items[pos] {
                 chat::TranscriptItem::Chat(ChatEntry::Queued { text, follow_up }) => {
-                    (text, follow_up)
+                    (text.clone(), *follow_up)
                 }
                 _ => unreachable!(),
             };
             // A "send now" echo lives in no queue — just cancel the pending
             // resubmission. Otherwise withdraw the message from its queue.
-            if self.pending_send_now.as_deref() == Some(text.as_str()) {
+            let withdrawn = if self.pending_send_now.as_deref() == Some(text.as_str()) {
                 self.pending_send_now = None;
+                true
             } else {
                 let queue = if follow_up {
                     &self.follow_up
@@ -589,13 +597,22 @@ impl TuiApp {
                 match q.iter().rposition(|m| *m == text) {
                     Some(i) => {
                         q.remove(i);
+                        true
                     }
-                    // Out of sync (shouldn't happen): withdraw the newest.
-                    None => {
-                        q.pop_back();
-                    }
+                    None => false,
                 }
+            };
+            if !withdrawn {
+                self.notice(
+                    crate::i18n::t(self.lang, "msg.dequeue_in_flight", &[]),
+                    NoticeKind::Info,
+                );
+                return true;
             }
+            self.items.remove(pos);
+            // The recalled text replaces the editor draft: any popup computed
+            // for the old draft is stale.
+            self.autocomplete = None;
             self.line_cache.clear();
             let existing = self.editor.text();
             self.editor.set_text(&if existing.is_empty() {

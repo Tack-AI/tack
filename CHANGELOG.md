@@ -4,6 +4,26 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [Unreleased]
+
+### Fixed
+
+- **Queued-message recall can no longer grab a message that is already being
+  sent**: `alt+↑` used to remove the transcript echo and withdraw the text in
+  the short window between the agent loop draining a queued steering message
+  and the UI marking it delivered. The message was already on its way (so it
+  could be submitted twice), and the "out of sync" fallback could even evict
+  a different still-queued message. Recall now checks the queue first: if the
+  text is gone the echo stays and a notice explains that it is already on its
+  way. Recalling also clears an autocomplete popup computed for the old
+  editor draft.
+- **`alt+↑` now works on macOS terminals that send Option as Meta**: Terminal.app
+  (with "Use Option as Meta key") and iTerm2 in Meta mode encode Option+↑ as
+  `ESC ESC [ A`. crossterm 0.29 splits that into Esc, `[`, `A`, so pressing the
+  recall key aborted the running turn and typed `[A` instead. The terminal
+  input layer folds the double-escape CSI/SS3 shape back into Alt+↑ (and the
+  other arrows/Home/End), leaving ordinary Escape and typing untouched.
+
 ## [1.0.14] - 2026-10-31
 
 ### Fixed

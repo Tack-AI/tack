@@ -371,6 +371,7 @@ impl TerminalEvents {
         }
         if !self.burst.is_active() {
             let first = self.read_mapped().await?;
+            let first = self.fold_legacy_alt(first).await;
             if burst_char(&first).is_none() {
                 return Some(first);
             }
@@ -421,6 +422,84 @@ impl TerminalEvents {
     /// relies on under `select!`.
     pub async fn try_next(&mut self) -> Option<InputEvent> {
         tokio::time::timeout(Duration::ZERO, self.next())
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Reassemble the `ESC ESC [ A` / `ESC ESC O A` shape some terminals use
+    /// for Option+arrow (macOS Terminal.app with "Use Option as Meta key",
+    /// iTerm2 in Meta mode). crossterm 0.29 parses the double Escape as
+    /// Esc + '[' + 'A': without folding, the Esc aborts the running turn and
+    /// "[A" lands in the editor instead of recalling the queued message.
+    ///
+    /// The peek is non-blocking: one terminal write is parsed into all its
+    /// events before the first is delivered, so the rest is already queued.
+    /// Anything consumed but not folded goes back to `pending` in order.
+    async fn fold_legacy_alt(&mut self, first: InputEvent) -> InputEvent {
+        let InputEvent::Key(esc) = &first else {
+            return first;
+        };
+        if esc.key != Key::Escape || esc.modifiers != Modifiers::NONE || esc.is_release {
+            return first;
+        }
+        let Some(next) = self.try_read_mapped().await else {
+            return first;
+        };
+        let InputEvent::Key(intro) = &next else {
+            self.pending.push_back(next);
+            return first;
+        };
+        let Key::Char(intro_char) = intro.key else {
+            self.pending.push_back(next);
+            return first;
+        };
+        if intro.modifiers.ctrl || intro.modifiers.alt || (intro_char != '[' && intro_char != 'O') {
+            self.pending.push_back(next);
+            return first;
+        }
+        let mut peeked = vec![next];
+        if intro_char == '[' {
+            // Parameter bytes (digits/';') up to the final letter. Stop at
+            // the first non-parameter event so a following paste is not
+            // consumed; the cap bounds a malformed run.
+            while peeked.len() < 10 {
+                let Some(event) = self.try_read_mapped().await else {
+                    break;
+                };
+                let final_byte = match &event {
+                    InputEvent::Key(k) => !matches!(
+                        k.key,
+                        Key::Char(c) if c.is_ascii_digit() || c == ';'
+                    ),
+                    _ => true,
+                };
+                peeked.push(event);
+                if final_byte {
+                    break;
+                }
+            }
+        } else if let Some(event) = self.try_read_mapped().await {
+            peeked.push(event);
+        }
+        match fold_legacy_alt_key(&peeked) {
+            Some((folded, consumed)) => {
+                for event in peeked.drain(consumed..).rev() {
+                    self.pending.push_front(event);
+                }
+                folded
+            }
+            None => {
+                for event in peeked.into_iter().rev() {
+                    self.pending.push_front(event);
+                }
+                first
+            }
+        }
+    }
+
+    /// Non-blocking peek at the next mapped event (see `fold_legacy_alt`).
+    async fn try_read_mapped(&mut self) -> Option<InputEvent> {
+        tokio::time::timeout(Duration::ZERO, self.read_mapped())
             .await
             .unwrap_or_default()
     }
@@ -501,6 +580,63 @@ fn burst_char(event: &InputEvent) -> Option<char> {
         Key::Enter if key.modifiers == Modifiers::NONE => Some('\n'),
         // Pasted tab byte (kept out of the autocomplete trigger).
         Key::Tab if key.modifiers == Modifiers::NONE => Some('\t'),
+        _ => None,
+    }
+}
+
+/// Map a legacy CSI/SS3 final byte to its key. Uppercase letters reach us with
+/// the SHIFT modifier (crossterm infers Shift from the character itself), which
+/// is not a real Shift in the escape sequence.
+fn legacy_special_key(key: &Key, modifiers: Modifiers) -> Option<Key> {
+    if modifiers.ctrl || modifiers.alt {
+        return None;
+    }
+    match key {
+        Key::Char('A' | 'a') => Some(Key::Up),
+        Key::Char('B' | 'b') => Some(Key::Down),
+        Key::Char('C' | 'c') => Some(Key::Right),
+        Key::Char('D' | 'd') => Some(Key::Left),
+        Key::Char('H' | 'h') => Some(Key::Home),
+        Key::Char('F' | 'f') => Some(Key::End),
+        _ => None,
+    }
+}
+
+/// Fold a peeked CSI/SS3 body (events after a `bare Esc`) into one
+/// Alt-modified key. `events` starts at the introducer ('[' or 'O'). Returns
+/// the folded event and how many events it consumed.
+fn fold_legacy_alt_key(events: &[InputEvent]) -> Option<(InputEvent, usize)> {
+    let InputEvent::Key(intro) = events.first()? else {
+        return None;
+    };
+    let Key::Char(intro_char) = intro.key else {
+        return None;
+    };
+    match intro_char {
+        'O' => {
+            let InputEvent::Key(k) = events.get(1)? else {
+                return None;
+            };
+            let key = legacy_special_key(&k.key, k.modifiers)?;
+            Some((InputEvent::Key(KeyEvent::new(key, Modifiers::ALT)), 2))
+        }
+        '[' => {
+            let mut idx = 1;
+            while let Some(InputEvent::Key(k)) = events.get(idx) {
+                if let Key::Char(c) = k.key
+                    && (c.is_ascii_digit() || c == ';')
+                {
+                    idx += 1;
+                    continue;
+                }
+                break;
+            }
+            let InputEvent::Key(k) = events.get(idx)? else {
+                return None;
+            };
+            let key = legacy_special_key(&k.key, k.modifiers)?;
+            Some((InputEvent::Key(KeyEvent::new(key, Modifiers::ALT)), idx + 1))
+        }
         _ => None,
     }
 }
@@ -918,12 +1054,65 @@ fn parse_osc11_response(data: &[u8]) -> Option<(u8, u8, u8)> {
 mod tests {
     use super::{
         Capabilities, CapabilityOverrides, ImageCapabilityOverride, burst_char, coalesce_burst,
-        finish_burst, is_release, sanitize_osc,
+        finish_burst, fold_legacy_alt_key, is_release, sanitize_osc,
     };
     use crate::input::{InputEvent, Key, KeyEvent, Modifiers};
 
     fn key(k: Key, modifiers: Modifiers) -> InputEvent {
         InputEvent::Key(KeyEvent::new(k, modifiers))
+    }
+
+    #[test]
+    fn legacy_double_escape_csi_arrow_folds_to_alt() {
+        // macOS Terminal.app with "Use Option as Meta key" sends Option+Up
+        // as ESC ESC [ A; crossterm splits it into '[' and 'A' (uppercase =>
+        // SHIFT).
+        let peeked = vec![
+            key(Key::Char('['), Modifiers::NONE),
+            key(Key::Char('A'), Modifiers::SHIFT),
+        ];
+        assert_eq!(
+            fold_legacy_alt_key(&peeked),
+            Some((key(Key::Up, Modifiers::ALT), 2))
+        );
+        // Parameterized variant: ESC ESC [ 1 ; 3 A.
+        let peeked = vec![
+            key(Key::Char('['), Modifiers::NONE),
+            key(Key::Char('1'), Modifiers::NONE),
+            key(Key::Char(';'), Modifiers::NONE),
+            key(Key::Char('3'), Modifiers::NONE),
+            key(Key::Char('A'), Modifiers::SHIFT),
+        ];
+        assert_eq!(
+            fold_legacy_alt_key(&peeked),
+            Some((key(Key::Up, Modifiers::ALT), 5))
+        );
+        // SS3 variant: ESC ESC O A.
+        let peeked = vec![
+            key(Key::Char('O'), Modifiers::SHIFT),
+            key(Key::Char('A'), Modifiers::SHIFT),
+        ];
+        assert_eq!(
+            fold_legacy_alt_key(&peeked),
+            Some((key(Key::Up, Modifiers::ALT), 2))
+        );
+    }
+
+    #[test]
+    fn legacy_double_escape_keeps_non_key_sequences() {
+        // A CSI that is not an arrow/Home/End (e.g. PageUp's '~') stays as
+        // separate events: only the Option+special-key shape is folded.
+        let peeked = vec![
+            key(Key::Char('['), Modifiers::NONE),
+            key(Key::Char('5'), Modifiers::NONE),
+            key(Key::Char('~'), Modifiers::NONE),
+        ];
+        assert_eq!(fold_legacy_alt_key(&peeked), None);
+        // A plain char after Esc is ordinary typing, not a sequence.
+        assert_eq!(
+            fold_legacy_alt_key(&[key(Key::Char('a'), Modifiers::NONE)]),
+            None
+        );
     }
 
     fn burst(text: &str) -> Vec<InputEvent> {

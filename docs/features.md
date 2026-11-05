@@ -865,7 +865,9 @@ definition edits needed.
 - **Ctrl+R reverse history search**: Ctrl+R in the editor enters incremental
   search — typing filters prompt history (newest→oldest, case-insensitive),
   ↑/↓/repeated Ctrl+R cycle matches, Enter accepts, Esc cancels and restores
-  the draft. (The original Ctrl+R dequeue binding moved to Alt+↑.)
+  the draft. (The original Ctrl+R dequeue binding moved to Alt+↑; macOS
+  Terminal.app with "Use Option as Meta key" and iTerm2's Meta mode send
+  that key as a double Escape, which the input layer folds back.)
 - **Desktop notifications**: OSC 9 / OSC 777 terminal notifications fire on
   permission dialogs, run completion/errors, and background-task completion
   (5s throttle per event source; silently inert on unsupported terminals).

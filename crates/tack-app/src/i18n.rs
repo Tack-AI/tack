@@ -718,6 +718,10 @@ const EN: &[(&str, &str)] = &[
     ("msg.thinking_collapsed", "thinking blocks collapsed"),
     ("msg.no_queued", "no queued messages"),
     (
+        "msg.dequeue_in_flight",
+        "message is already on its way to the model",
+    ),
+    (
         "msg.model_fallback",
         "model fallback: {from} → {to} ({reason})",
     ),
@@ -1603,6 +1607,7 @@ const ZH: &[(&str, &str)] = &[
     ("msg.thinking_hidden", "思考块已隐藏"),
     ("msg.thinking_collapsed", "思考块已折叠"),
     ("msg.no_queued", "没有排队消息"),
+    ("msg.dequeue_in_flight", "消息已发往模型，无法撤回"),
     ("msg.model_fallback", "模型回退：{from} → {to}（{reason}）"),
     (
         "msg.cache_miss",
