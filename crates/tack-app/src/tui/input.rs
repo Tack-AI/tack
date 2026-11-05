@@ -559,48 +559,25 @@ impl TuiApp {
             // before it reaches the model. Queued transcript entries are in
             // enqueue order, so the last one identifies which queue/message
             // to withdraw; repeated presses drain the queue one by one.
-            let pos = self.items.iter().rposition(|item| {
-                matches!(item, chat::TranscriptItem::Chat(ChatEntry::Queued { .. }))
-            });
-            let Some(pos) = pos else {
+            let Some((pos, text, follow_up)) = self.newest_queued_echo() else {
                 self.notice(
                     crate::i18n::t(self.lang, "msg.no_queued", &[]),
                     NoticeKind::Info,
                 );
                 return true;
             };
-            // Inspect first; only remove the echo once the message is
-            // actually withdrawn. The agent loop drains the queue just before
-            // it emits MessageStart, and the UI can handle a keypress in
-            // between: the echo then still looks queued although the message
-            // is already on its way to the model. Recalling it back would send
-            // it twice (and the old "out of sync" fallback could pop an
-            // unrelated queued message instead).
-            let (text, follow_up) = match &self.items[pos] {
-                chat::TranscriptItem::Chat(ChatEntry::Queued { text, follow_up }) => {
-                    (text.clone(), *follow_up)
-                }
-                _ => unreachable!(),
-            };
             // A "send now" echo lives in no queue — just cancel the pending
             // resubmission. Otherwise withdraw the message from its queue.
+            // Inspect first: the agent loop drains the queue just before it
+            // emits MessageStart, and the UI can handle a keypress in
+            // between, when the echo still looks queued although the message
+            // is already on its way to the model. Recalling that would send
+            // it twice.
             let withdrawn = if self.pending_send_now.as_deref() == Some(text.as_str()) {
                 self.pending_send_now = None;
                 true
             } else {
-                let queue = if follow_up {
-                    &self.follow_up
-                } else {
-                    &self.steering
-                };
-                let mut q = queue.lock().await;
-                match q.iter().rposition(|m| *m == text) {
-                    Some(i) => {
-                        q.remove(i);
-                        true
-                    }
-                    None => false,
-                }
+                self.withdraw_queued_text(&text, follow_up).await
             };
             if !withdrawn {
                 self.notice(
@@ -663,34 +640,62 @@ impl TuiApp {
             return true;
         }
         // Ctrl+Enter / Ctrl+S: send NOW — abort the current run and submit
-        // the text as soon as it finishes (idle: same as Enter).
+        // the text as soon as it finishes (idle: same as Enter). With an
+        // empty editor, send the newest queued message instead: the queued
+        // echo promises "ctrl+s send now", and the old no-op made that hint
+        // a lie.
         if self.kb.matches("app.message.sendNow", key) {
             let mut text = self.editor.text();
-            if !text.trim().is_empty() {
-                self.editor.clear();
+            if text.trim().is_empty() {
+                if self.pending_send_now.is_some() || self.compacting {
+                    return true;
+                }
+                let Some((pos, queued, follow_up)) = self.newest_queued_echo() else {
+                    return true;
+                };
+                if !self.withdraw_queued_text(&queued, follow_up).await {
+                    self.notice(
+                        crate::i18n::t(self.lang, "msg.dequeue_in_flight", &[]),
+                        NoticeKind::Info,
+                    );
+                    return true;
+                }
                 if self.running {
-                    // A previous "send now" is still waiting for the abort
-                    // to land: merge it instead of orphaning its echo.
-                    if let Some(prev) = self.pending_send_now.take() {
-                        self.items.retain(|item| {
-                            !matches!(
-                                item,
-                                chat::TranscriptItem::Chat(ChatEntry::Queued { text: t, .. })
-                                    if *t == prev
-                            )
-                        });
-                        text = format!("{prev}\n{text}");
-                    }
-                    self.items
-                        .push(chat::TranscriptItem::Chat(ChatEntry::Queued {
-                            text: text.clone(),
-                            follow_up: false,
-                        }));
-                    self.pending_send_now = Some(text);
+                    // Keep the echo: RunFinished drops it and submits for real.
+                    self.pending_send_now = Some(queued);
                     self.cancel.cancel();
                 } else {
-                    self.on_submit(text).await;
+                    // Idle (e.g. after an abort): submit immediately. Drop the
+                    // queued echo first so the user entry is not duplicated.
+                    self.items.remove(pos);
+                    self.line_cache.clear();
+                    self.on_submit(queued).await;
                 }
+                return true;
+            }
+            self.editor.clear();
+            if self.running {
+                // A previous "send now" is still waiting for the abort
+                // to land: merge it instead of orphaning its echo.
+                if let Some(prev) = self.pending_send_now.take() {
+                    self.items.retain(|item| {
+                        !matches!(
+                            item,
+                            chat::TranscriptItem::Chat(ChatEntry::Queued { text: t, .. })
+                                if *t == prev
+                        )
+                    });
+                    text = format!("{prev}\n{text}");
+                }
+                self.items
+                    .push(chat::TranscriptItem::Chat(ChatEntry::Queued {
+                        text: text.clone(),
+                        follow_up: false,
+                    }));
+                self.pending_send_now = Some(text);
+                self.cancel.cancel();
+            } else {
+                self.on_submit(text).await;
             }
             return true;
         }
@@ -712,6 +717,39 @@ impl TuiApp {
             return true;
         }
         false
+    }
+
+    /// Newest queued-message transcript echo: position, text, and which queue
+    /// it belongs to. `None` when nothing is waiting.
+    fn newest_queued_echo(&self) -> Option<(usize, String, bool)> {
+        let pos = self.items.iter().rposition(|item| {
+            matches!(item, chat::TranscriptItem::Chat(ChatEntry::Queued { .. }))
+        })?;
+        match &self.items[pos] {
+            chat::TranscriptItem::Chat(ChatEntry::Queued { text, follow_up }) => {
+                Some((pos, text.clone(), *follow_up))
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Remove `text` from its steering/follow-up queue. `false` when the agent
+    /// loop already drained it (the echo then stays until the delivery event
+    /// flips it; callers must not resend).
+    async fn withdraw_queued_text(&self, text: &str, follow_up: bool) -> bool {
+        let queue = if follow_up {
+            &self.follow_up
+        } else {
+            &self.steering
+        };
+        let mut q = queue.lock().await;
+        match q.iter().rposition(|m| m == text) {
+            Some(i) => {
+                q.remove(i);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Recompute the autocomplete popup from the editor text.

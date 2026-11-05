@@ -4,6 +4,17 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [Unreleased]
+
+### Fixed
+
+- **`ctrl+s` now sends a queued message when the editor is empty**: the queued
+  echo has always advertised "ctrl+s send now", but with an empty editor the
+  shortcut was a no-op — the message had to be recalled first. It now
+  withdraws the newest queued message and resubmits it immediately (aborting
+  the current run, or starting one when idle). Messages the agent already
+  drained are left alone (no double send), and the draft flow is unchanged.
+
 ## [1.0.15] - 2026-11-05
 
 ### Fixed

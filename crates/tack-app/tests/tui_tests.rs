@@ -2211,3 +2211,102 @@ async fn thinking_toggle_collapses_pinned_block() {
         term.dump()
     );
 }
+
+#[tokio::test]
+async fn ctrl_s_with_queued_message_sends_it_now() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut app = test_app(cwd.path()).await;
+    app.test_set_running(true);
+    app.on_submit("pending note".to_string()).await;
+    assert_eq!(app.test_editor_text(), "");
+    assert_eq!(app.test_queued_messages(), vec!["pending note".to_string()]);
+
+    // The queued echo promises "ctrl+s send now": with an empty editor the
+    // newest queued message is withdrawn and resubmitted after the abort.
+    app.handle_input(InputEvent::Key(KeyEvent::ctrl(Key::Char('s'))))
+        .await;
+    assert!(app.test_queued_messages().is_empty(), "queue not withdrawn");
+    assert!(
+        app.test_is_running(),
+        "run must stay active until it settles"
+    );
+    assert_eq!(app.test_editor_text(), "");
+
+    // The aborted run finishes: the echo becomes a real user entry and the
+    // prompt is submitted for real.
+    app.test_app_event(AppEvent::RunFinished).await;
+    assert!(app.test_is_running(), "send-now prompt did not start a run");
+    let frame = frame_text(&mut app);
+    assert!(
+        !frame.contains("recall"),
+        "send-now echo lingered: {frame:?}"
+    );
+    assert_eq!(frame.matches("pending note").count(), 1, "{frame:?}");
+    app.test_app_event(AppEvent::RunFinished).await;
+}
+
+#[tokio::test]
+async fn ctrl_s_with_empty_editor_does_not_resend_an_already_drained_message() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut app = test_app(cwd.path()).await;
+    app.test_set_running(true);
+    app.on_submit("in flight".to_string()).await;
+
+    // The agent hook drained the queue; the delivery event has not landed.
+    assert_eq!(app.test_drain_steering(), vec!["in flight".to_string()]);
+    app.handle_input(InputEvent::Key(KeyEvent::ctrl(Key::Char('s'))))
+        .await;
+
+    // Must not arm a second send: the message is already on its way.
+    assert!(app.test_queued_messages().is_empty());
+    assert_eq!(app.test_editor_text(), "");
+    assert!(frame_text(&mut app).contains("queued"));
+    app.handle_agent_event(tack_agent_core::AgentEvent::MessageStart {
+        message: tack_agent_core::AgentMessage::user("in flight"),
+    })
+    .await;
+    app.test_app_event(AppEvent::RunFinished).await;
+    assert!(!app.test_is_running(), "drained message was resubmitted");
+}
+
+#[tokio::test]
+async fn ctrl_s_with_queued_message_when_idle_sends_it_now() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut app = test_app(cwd.path()).await;
+    app.test_set_running(true);
+    app.on_submit("pending note".to_string()).await;
+    app.test_app_event(AppEvent::RunFinished).await;
+    assert!(!app.test_is_running());
+    assert_eq!(app.test_queued_messages(), vec!["pending note".to_string()]);
+
+    app.handle_input(InputEvent::Key(KeyEvent::ctrl(Key::Char('s'))))
+        .await;
+    assert!(app.test_is_running(), "idle send-now did not start a run");
+    assert!(app.test_queued_messages().is_empty());
+    let frame = frame_text(&mut app);
+    assert!(!frame.contains("recall"), "queued echo lingered: {frame:?}");
+    assert_eq!(frame.matches("pending note").count(), 1, "{frame:?}");
+    app.test_app_event(AppEvent::RunFinished).await;
+}
+
+#[tokio::test]
+async fn ctrl_s_with_draft_aborts_and_sends_after_run() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut app = test_app(cwd.path()).await;
+    app.test_set_running(true);
+    for event in type_text("urgent") {
+        app.handle_input(event).await;
+    }
+    app.handle_input(InputEvent::Key(KeyEvent::ctrl(Key::Char('s'))))
+        .await;
+
+    assert!(app.test_queued_messages().is_empty());
+    assert_eq!(app.test_editor_text(), "");
+    assert!(frame_text(&mut app).contains("queued"));
+
+    app.test_app_event(AppEvent::RunFinished).await;
+    let frame = frame_text(&mut app);
+    assert!(!frame.contains("queued"), "echo not replaced: {frame:?}");
+    assert!(frame.contains("urgent"), "prompt missing: {frame:?}");
+    app.test_app_event(AppEvent::RunFinished).await;
+}
