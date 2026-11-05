@@ -4,6 +4,16 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [Unreleased]
+
+### Fixed
+
+- **Dependency security sweep**: `zip` 9.3.0 (extraction symlink/SUID/DoS
+  advisories), `rustls` 0.23.46, `tokio` 1.54.1, `rustls-webpki` 0.103.16,
+  `webpki-roots` 1.0.11, `pulldown-cmark` 0.13.6 and `ctutils` 0.4.8.
+  `crypto-bigint` 0.5 remains only through jsonwebtoken's unused p256/p384
+  support (tack signs RS256 only); documented as a `deny.toml` exception.
+
 ## [1.0.16] - 2026-11-05
 
 ### Fixed

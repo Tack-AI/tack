@@ -83,7 +83,7 @@ dunce = "1"
 # managed binary downloads (fd/rg installer)
 tar = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 
 # session
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

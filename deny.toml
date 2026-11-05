@@ -12,6 +12,12 @@ ignore = [
     # rsa enters via jsonwebtoken (tack-ai, sign/verify only — no RSA
     # decryption path); the Marvin timing sidechannel has no patched release.
     { id = "RUSTSEC-2023-0071", reason = "rsa via jsonwebtoken (sign/verify only, no decryption); no patched release exists" },
+    # crypto-bigint 0.5 arrives through jsonwebtoken's rust_crypto feature
+    # (p256/p384 ECDSA support). tack only calls encode() with RS256 for
+    # Vertex ADC; the affected secret-integer arithmetic is never exercised.
+    # jsonwebtoken 11 still pins elliptic-curve 0.13, so there is no
+    # compatible upgrade path yet.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 is only reachable via unused p256/p384 code; tack signs RS256 only" },
     # Unmaintained but load-bearing; replacements are follow-ups, kept
     # non-blocking (pre-0.20 warn-level intent).
     { id = "RUSTSEC-2025-0141", reason = "bincode 1.x via transitive deps; unmaintained, no vulnerability" },
