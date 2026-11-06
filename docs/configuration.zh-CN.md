@@ -154,6 +154,13 @@ Tack 从四级读取配置，**后加载的层级覆盖先加载的**（部分�
 | `webSearch.provider` | string | `"bing"` | 搜索后端：`bing` \| `duckduckgo` \| `brave` \| `tavily` \| `exa`。两个免 key 的抓取后端（`bing`/`duckduckgo`）失败时互相回退 |
 | `webSearch.apiKey` | string | — | 后端 API key（或用 `BRAVE_API_KEY`/`TAVILY_API_KEY`/`EXA_API_KEY` 环境变量） |
 
+两个免 key 的抓取后端（`bing`、`duckduckgo`）无需账号，但只是尽力而为：
+`www.bing.com` 对中国大陆出口会重定向到 `cn.bing.com`，其面向爬虫的 SERP 可能
+只按查询的第一个词作答，而 `duckduckgo.com` 在该网络下不可达。当结果集只覆盖
+查询词不足 60% 时，`web_search` 仍会回退到另一个免 key 后端，最后返回最佳的一次
+尝试并**附上警告**，而不是把它当作答案呈现。生产质量请配置 `brave`、`tavily`
+或 `exa`（配合 `webSearch.apiKey`）。
+
 ### 会话与历史
 
 | 键 | 类型 | 默认 | 说明 |

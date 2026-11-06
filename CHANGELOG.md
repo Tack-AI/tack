@@ -4,6 +4,23 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [Unreleased]
+
+### Fixed
+
+- **`web_search` no longer presents a degraded keyless scrape as an answer**:
+  from some egresses (notably mainland China, where `www.bing.com` redirects to
+  `cn.bing.com`) the scraped SERP answers only the first query term — “best
+  cloud hosting” returned ten dictionary pages for “best” — while still looking
+  like a normal result list. A result set that mentions fewer than 60% of the
+  query's terms now counts as degraded: the scrape chain moves on to the other
+  keyless backend (previously any non-empty set ended the chain), and if both
+  are degraded the best attempt is still returned but prefixed with a warning
+  pointing at `webSearch.provider` instead of being passed off as an answer.
+  Bing results are also URL-cleaned (`&amp;` in `href` is decoded, `bing.com/ck/a`
+  click-tracker wrappers are unwrapped to the real target) and ad blocks that
+  some markets render inside a `b_algo` shell are dropped.
+
 ## [1.0.17] - 2026-11-05
 
 ### Fixed

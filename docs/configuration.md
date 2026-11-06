@@ -198,6 +198,15 @@ sensitive params).
 | `webSearch.provider` | string | `"bing"` | Search backend: `bing` \| `duckduckgo` \| `brave` \| `tavily` \| `exa`. The two keyless scrapes (`bing`/`duckduckgo`) fall back to each other on failure |
 | `webSearch.apiKey` | string | — | Backend API key (or use the `BRAVE_API_KEY`/`TAVILY_API_KEY`/`EXA_API_KEY` env vars) |
 
+The keyless scrapes (`bing`, `duckduckgo`) need no account but are best-effort.
+`www.bing.com` redirects mainland-China egresses to `cn.bing.com`, whose
+crawler-facing SERP can silently answer only the first query term, and
+`duckduckgo.com` is unreachable from there. When a result set mentions less
+than 60% of the query's terms, `web_search` still falls back to the other
+keyless backend and then returns the best attempt *with a warning* instead of
+presenting it as an answer. Configure `brave`, `tavily` or `exa` (plus
+`webSearch.apiKey`) for production-quality results.
+
 ### Session & history
 
 | Key | Type | Default | Notes |

@@ -566,6 +566,17 @@ impl SearchBackend {
         }
     }
 
+    /// Short name as it appears in settings and logs.
+    pub fn label(&self) -> &'static str {
+        match self {
+            SearchBackend::DuckDuckGo => "duckduckgo",
+            SearchBackend::Bing => "bing",
+            SearchBackend::Brave => "brave",
+            SearchBackend::Tavily => "tavily",
+            SearchBackend::Exa => "exa",
+        }
+    }
+
     /// Environment variable consulted for the API key when settings
     /// `webSearch.apiKey` is empty.
     pub fn api_key_env(&self) -> Option<&'static str> {
@@ -587,6 +598,90 @@ pub struct WebSearchConfig {
 
 /// One normalized result triple (title, url, snippet).
 type SearchResults = Vec<(String, String, String)>;
+
+/// Minimum share of query terms a result set must mention to count as an
+/// answer. Below it the keyless scrapes are assumed to have degraded (see
+/// [`query_coverage`]) and the chain tries the next backend.
+const COVERAGE_FLOOR: f32 = 0.6;
+
+/// Words that carry no search intent alone: counting them made a dictionary
+/// page for "best" look like an answer to "best cloud hosting".
+const QUERY_STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "do", "does", "for", "from",
+    "how", "i", "in", "into", "is", "it", "my", "no", "not", "of", "on", "or", "our", "should",
+    "than", "that", "the", "their", "then", "this", "to", "vs", "versus", "was", "what", "when",
+    "where", "which", "who", "why", "will", "with", "you", "your",
+];
+
+/// How much of the query a result set reflects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Coverage {
+    hits: usize,
+    terms: usize,
+}
+
+impl Coverage {
+    fn ratio(self) -> f32 {
+        self.hits as f32 / self.terms as f32
+    }
+
+    fn is_degraded(self) -> bool {
+        self.ratio() < COVERAGE_FLOOR
+    }
+}
+
+/// Query terms worth looking for: lowercase alphanumeric words, stopwords and
+/// single characters dropped.
+fn query_terms(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|term| term.chars().count() > 1 && !QUERY_STOPWORDS.contains(&term.as_str()))
+        .collect()
+}
+
+/// Share of the query's meaningful terms that occur in the results' titles and
+/// snippets.
+///
+/// A keyless scrape can return ten well-formed rows that answer only the first
+/// word of the query (seen on `cn.bing.com`, where `www.bing.com` redirects
+/// mainland-China egresses) while the page itself looks perfectly normal. Term
+/// coverage is the cheapest signal that separates that from a real answer.
+/// `None` means the query cannot be judged this way: a single word, only
+/// stopwords, or CJK typed without spaces (Chinese has no word separators, so
+/// treating the whole query as one token would flag result sets that do in
+/// fact cover it).
+fn query_coverage(query: &str, results: &[(String, String, String)]) -> Option<Coverage> {
+    let terms = query_terms(query);
+    if terms.len() < 2 {
+        return None;
+    }
+    let mut haystack = String::new();
+    for (title, _, snippet) in results {
+        haystack.push_str(&title.to_lowercase());
+        haystack.push(' ');
+        haystack.push_str(&snippet.to_lowercase());
+        haystack.push(' ');
+    }
+    let hits = terms.iter().filter(|term| haystack.contains(*term)).count();
+    Some(Coverage {
+        hits,
+        terms: terms.len(),
+    })
+}
+
+/// Warning prefixed to a result set that failed the coverage floor, so the
+/// model does not mistake a degraded scrape for an answer.
+fn degraded_results_note(backend: &SearchBackend, coverage: Coverage) -> String {
+    format!(
+        "warning: these results mention only {}/{} query terms, so the {} scrape likely \
+         answered part of the query — treat them as unreliable. Prefer web_fetch on a known \
+         URL, or configure a keyed backend (webSearch.provider = tavily | brave | exa).",
+        coverage.hits,
+        coverage.terms,
+        backend.label()
+    )
+}
 
 async fn search_brave(query: &str, api_key: &str) -> Result<SearchResults, String> {
     let response = http_client()
@@ -783,6 +878,10 @@ impl AgentTool for WebSearchTool {
             .ok_or_else(|| "missing required parameter: query".to_string())?;
 
         let config = &self.services.web_search;
+        // Best degraded attempt, kept for the case where no backend in the
+        // chain covers the query: an annotated answer beats an error.
+        let mut degraded: Option<(Coverage, SearchBackend, SearchResults)> = None;
+        let mut note: Option<String> = None;
         let results: SearchResults = match &config.backend {
             backend @ (SearchBackend::DuckDuckGo | SearchBackend::Bing) => {
                 // Keyless scrapes: a backend that is unreachable from this
@@ -790,21 +889,49 @@ impl AgentTool for WebSearchTool {
                 // the tool — fall through to the other one. Only a double
                 // failure surfaces an error; one empty page alone still
                 // means "no results".
+                //
+                // Non-empty is not enough to end the chain: the scrapes can
+                // return ten plausible rows that answer only the first query
+                // term (Bing's no-JS SERP does exactly that from some
+                // egresses). Relevance is judged by query-term coverage, and
+                // only a set that covers the query stops the walk.
                 let mut results = Vec::new();
                 let mut last_err: Option<String> = None;
                 let mut saw_empty_ok = false;
                 for backend in scrape_chain(backend) {
                     match scrape_search(&backend, query, &cancel).await {
-                        Ok(r) if !r.is_empty() => {
-                            results = r;
-                            break;
-                        }
+                        Ok(r) if !r.is_empty() => match query_coverage(query, &r) {
+                            Some(coverage) if coverage.is_degraded() => {
+                                tracing::debug!(
+                                    "web_search backend {backend:?} returned degraded results \
+                                     ({}/{} query terms matched); trying the next backend",
+                                    coverage.hits,
+                                    coverage.terms
+                                );
+                                let better = degraded
+                                    .as_ref()
+                                    .is_none_or(|(best, _, _)| coverage.ratio() > best.ratio());
+                                if better {
+                                    degraded = Some((coverage, backend.clone(), r));
+                                }
+                            }
+                            _ => {
+                                results = r;
+                                break;
+                            }
+                        },
                         Ok(_) => saw_empty_ok = true,
                         Err(e) => {
                             tracing::debug!("web_search scrape backend {backend:?} failed: {e}");
                             last_err = Some(e);
                         }
                     }
+                }
+                if results.is_empty()
+                    && let Some((coverage, backend, degraded_results)) = degraded
+                {
+                    note = Some(degraded_results_note(&backend, coverage));
+                    results = degraded_results;
                 }
                 if results.is_empty()
                     && !saw_empty_ok
@@ -844,6 +971,10 @@ impl AgentTool for WebSearchTool {
             return Ok(AgentToolResult::text(format!("no results for {query:?}")));
         }
         let mut out = format!("Search results for {query:?}:\n\n");
+        if let Some(note) = note {
+            out.push_str(&note);
+            out.push_str("\n\n");
+        }
         for (i, (title, link, snippet)) in results.iter().take(MAX_SEARCH_RESULTS).enumerate() {
             out.push_str(&format!(
                 "{}. {}\n   {}\n   {}\n\n",
@@ -880,6 +1011,10 @@ fn urlencoding(s: &str) -> String {
 /// snippet. Tag/entity handling reuses html_to_text on the fragments.
 /// Falls back to empty on layout drift (the scrape chain then tries the
 /// other free backend).
+///
+/// Ads normally live in sibling `<li class="b_ad">` containers that the
+/// selector never matches, but some markets wrap them in a `b_algo` shell
+/// with a badge — [`is_ad_block`] drops those.
 fn parse_bing_results(html: &str) -> Vec<(String, String, String)> {
     fn fragment_text(fragment: &str) -> String {
         html_to_text(fragment)
@@ -900,17 +1035,25 @@ fn parse_bing_results(html: &str) -> Vec<(String, String, String)> {
             None => after,
         };
         rest = &after[block.len()..];
+        if is_ad_block(block) {
+            continue;
+        }
 
         let Some(h2) = block.find("<h2").map(|i| &block[i..]) else {
             continue;
         };
-        let Some(url) = h2
+        let Some(href) = h2
             .find("href=\"")
             .map(|i| &h2[i + "href=\"".len()..])
             .and_then(|s| s.find('"').map(|end| s[..end].to_string()))
         else {
             continue;
         };
+        // The attribute is read raw: `&amp;` would otherwise reach the model
+        // verbatim, and Bing's click-tracker wrappers (`/ck/a?...&u=`) would
+        // be fetched instead of the real target.
+        let href = decode_attr_entities(&href);
+        let url = unwrap_bing_redirect(&href).unwrap_or(href);
         if !url.starts_with("http") {
             continue;
         }
@@ -944,6 +1087,96 @@ fn parse_bing_results(html: &str) -> Vec<(String, String, String)> {
         results.push((title, url, snippet));
     }
     results
+}
+
+/// Structural ad markers inside a `b_algo` block.
+///
+/// The markers are class/id names, never the visible word "Sponsored": a
+/// snippet may legitimately contain that word, but an ad badge is rendered by
+/// a themed element.
+fn is_ad_block(block: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "class=\"b_ad\"",
+        "class=\"b_adTop\"",
+        "b_adBadge",
+        "b_adProvider",
+        "sb_adLabel",
+    ];
+    MARKERS.iter().any(|marker| block.contains(marker))
+}
+
+/// Decode the handful of entities Bing emits inside `href="..."`.
+fn decode_attr_entities(value: &str) -> String {
+    if !value.contains('&') {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find('&') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        let Some(end) = after.find(';').filter(|end| *end <= 10) else {
+            out.push('&');
+            rest = &after[1..];
+            continue;
+        };
+        let decoded = match &after[1..end] {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" | "#39" => Some('\''),
+            "nbsp" => Some(' '),
+            entity => entity
+                .strip_prefix('#')
+                .and_then(
+                    |num| match num.strip_prefix('x').or_else(|| num.strip_prefix('X')) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                        None => num.parse().ok(),
+                    },
+                )
+                .and_then(char::from_u32),
+        };
+        match decoded {
+            Some(ch) => {
+                out.push(ch);
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &after[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Decode Bing's `ck/a` click-tracker wrapper (`.../ck/a?...&u=a1<base64url>`).
+///
+/// Some markets (and `ensearch=1`) route every organic link through it. The
+/// wrapper is useless to the model — `web_fetch` would follow a tracking shell
+/// — so decode the `u` parameter, which is the URL with an `a1` prefix.
+fn unwrap_bing_redirect(url: &str) -> Option<String> {
+    use base64::Engine as _;
+    let (base, query) = url.split_once('?')?;
+    if !base.contains("bing.com/ck/a") {
+        return None;
+    }
+    for pair in query.split('&') {
+        let Some(value) = pair.strip_prefix("u=") else {
+            continue;
+        };
+        let encoded = value.strip_prefix("a1").unwrap_or(value);
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded.trim_end_matches('='))
+            .ok()?;
+        let decoded = String::from_utf8(bytes).ok()?;
+        // A few entries point at relative Bing pages (`/images/search`);
+        // those are navigation, not results, so leave the wrapper alone.
+        return decoded.starts_with("http").then_some(decoded);
+    }
+    None
 }
 
 /// Parse DuckDuckGo HTML-lite output (after html_to_text): result blocks look
@@ -1172,5 +1405,80 @@ mod tests {
         // Public literal IPs pass without touching DNS.
         assert!(ensure_public_url("http://8.8.8.8/").await.is_ok());
         assert!(ensure_public_url("https://1.1.1.1/").await.is_ok());
+    }
+
+    #[test]
+    fn bing_parser_unwraps_click_trackers_and_decodes_entities() {
+        use base64::Engine as _;
+        let target = "https://example.com/page?a=1&b=two";
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(target);
+        // Hotlink shape seen with `ensearch=1`: the href is HTML-escaped and
+        // the real URL hides in `u=a1<base64url>`.
+        let href =
+            format!("https://www.bing.com/ck/a?!&amp;&amp;p=abc&amp;u=a1{payload}&amp;ntb=1");
+        let html = format!(
+            "<li class=\"b_algo\"><h2><a href=\"{href}\">Wrapped</a></h2><p>snippet</p></li>"
+        );
+        let results = parse_bing_results(&html);
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(results[0].1, target);
+    }
+
+    #[test]
+    fn bing_parser_drops_badged_ads() {
+        let html = r#"<li class="b_algo"><h2><a href="https://shop.example/x">Shop</a></h2><div class="b_adBadge">Sponsored</div><p>buy now</p></li>
+            <li class="b_algo"><h2><a href="https://docs.example/y">Organic</a></h2><p>read this</p></li>"#;
+        let results = parse_bing_results(html);
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(results[0].1, "https://docs.example/y");
+    }
+
+    #[test]
+    fn coverage_flags_first_term_only_results() {
+        // Live shape: "best cloud hosting" against cn.bing.com returned ten
+        // dictionary pages for "best" and nothing about hosting.
+        let results = vec![
+            (
+                "best（英语单词）_百度百科".to_string(),
+                "https://baike.example/best".to_string(),
+                "常见短语包含 all the best ...".to_string(),
+            ),
+            (
+                "BEST Definition & Meaning".to_string(),
+                "https://dict.example/best".to_string(),
+                "of the highest quality".to_string(),
+            ),
+        ];
+        let coverage = query_coverage("best cloud hosting", &results).unwrap();
+        assert_eq!(coverage, Coverage { hits: 1, terms: 3 });
+        assert!(coverage.is_degraded());
+
+        let good = vec![(
+            "Cloud hosting compared".to_string(),
+            "https://example.com/cloud".to_string(),
+            "The best cloud hosting options".to_string(),
+        )];
+        let coverage = query_coverage("best cloud hosting", &good).unwrap();
+        assert!(!coverage.is_degraded(), "{coverage:?}");
+    }
+
+    #[test]
+    fn coverage_does_not_judge_unscoreable_queries() {
+        // One usable term, only stopwords, or CJK typed without spaces: no
+        // verdict rather than a false "degraded".
+        assert_eq!(query_coverage("rust", &[]), None);
+        assert_eq!(query_coverage("the of and", &[]), None);
+        assert_eq!(query_coverage("云服务器推荐", &[]), None);
+        // A spaced CJK query is scoreable by substring hits.
+        let results = vec![(
+            "云服务器推荐".to_string(),
+            "https://example.com/cn".to_string(),
+            "2026 年云服务器推荐清单".to_string(),
+        )];
+        assert!(
+            !query_coverage("云服务器 推荐", &results)
+                .unwrap()
+                .is_degraded()
+        );
     }
 }
