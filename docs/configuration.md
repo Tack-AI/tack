@@ -203,8 +203,8 @@ The keyless scrapes (`bing`, `duckduckgo`) need no account but are best-effort.
 crawler-facing SERP can silently answer only the first query term, and
 `duckduckgo.com` is unreachable from there. When a result set mentions less
 than 60% of the query's terms, `web_search` still falls back to the other
-keyless backend and then returns the best attempt *with a warning* instead of
-presenting it as an answer. Configure `brave`, `tavily` or `exa` (plus
+keyless backend (each attempt is capped at 10s) and then returns the best
+attempt *with a warning* instead of presenting it as an answer. Configure `brave`, `tavily` or `exa` (plus
 `webSearch.apiKey`) for production-quality results.
 
 ### Session & history

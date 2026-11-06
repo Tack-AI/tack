@@ -604,6 +604,15 @@ type SearchResults = Vec<(String, String, String)>;
 /// [`query_coverage`]) and the chain tries the next backend.
 const COVERAGE_FLOOR: f32 = 0.6;
 
+/// Per-attempt budget for a keyless scrape, shorter than the client-wide 30s.
+///
+/// A degraded set sends the chain to the second backend, and from mainland
+/// China that backend (duckduckgo.com) is blackholed rather than refused:
+/// waiting the full client timeout turned one bad search into a 30s stall.
+/// The scrapes answer in ~1s when reachable, and a slower-than-10s HTML SERP
+/// is a failure to be annotated anyway. Keyed API backends keep 30s.
+const SCRAPE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Words that carry no search intent alone: counting them made a dictionary
 /// page for "best" look like an answer to "best cloud hosting".
 const QUERY_STOPWORDS: &[&str] = &[
@@ -783,7 +792,9 @@ async fn search_ddg(query: &str, cancel: &CancellationToken) -> Result<SearchRes
     let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoding(query));
     let html = tokio::select! {
         _ = cancel.cancelled() => return Err("Operation aborted".to_string()),
-        r = http_client().get(&url).send() => r.map_err(|e| format!("search failed: {e}"))?,
+        r = http_client().get(&url).timeout(SCRAPE_TIMEOUT).send() => {
+            r.map_err(|e| format!("search failed: {e}"))?
+        }
     };
     let body = html_to_text(&read_body_capped(html, MAX_BODY_BYTES).await?);
     Ok(parse_ddg_results(&body))
@@ -793,7 +804,9 @@ async fn search_bing(query: &str, cancel: &CancellationToken) -> Result<SearchRe
     let url = format!("https://www.bing.com/search?q={}", urlencoding(query));
     let html = tokio::select! {
         _ = cancel.cancelled() => return Err("Operation aborted".to_string()),
-        r = http_client().get(&url).send() => r.map_err(|e| format!("bing search failed: {e}"))?,
+        r = http_client().get(&url).timeout(SCRAPE_TIMEOUT).send() => {
+            r.map_err(|e| format!("bing search failed: {e}"))?
+        }
     };
     // Bing geo-redirects (www.bing.com → cn.bing.com on some egresses);
     // the shared client follows redirects, and the markup shape is the

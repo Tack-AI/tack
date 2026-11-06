@@ -19,7 +19,9 @@ notice can parse entries (same convention as TS pi).
   pointing at `webSearch.provider` instead of being passed off as an answer.
   Bing results are also URL-cleaned (`&amp;` in `href` is decoded, `bing.com/ck/a`
   click-tracker wrappers are unwrapped to the real target) and ad blocks that
-  some markets render inside a `b_algo` shell are dropped.
+  some markets render inside a `b_algo` shell are dropped. Each keyless scrape
+  attempt is capped at 10s (the pair used to cost a fixed 30s per attempt when
+  the fallback is blackholed), so a degraded search costs ~13s instead of ~31s.
 
 ## [1.0.17] - 2026-11-05
 
