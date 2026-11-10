@@ -16,6 +16,11 @@ notice can parse entries (same convention as TS pi).
   tail in the summary input; this both preserves that history and allows
   overflow recovery when the first tool turn after a compaction overflows.
 
+- **Dependency security sweep**: `rmcp` 3.9.0 fixes OAuth client SSRF and
+  two Streamable HTTP denial-of-service issues; `rusqlite` 0.41.1 upgrades
+  the bundled SQLite through `libsqlite3-sys` 0.39.1 (RUSTSEC-2026-0457,
+  RUSTSEC-2026-0459, RUSTSEC-2026-0461 and RUSTSEC-2026-0462).
+
 ## [1.0.18] - 2026-11-06
 
 ### Fixed

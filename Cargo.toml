@@ -53,7 +53,7 @@ futures-util = "0.3"
 futures-core = "0.3"
 
 # http / sse
-# 0.13 aligns with rmcp 3.1's pinned reqwest — one HTTP/TLS stack workspace-
+# 0.13 aligns with rmcp 3.9's reqwest — one HTTP/TLS stack workspace-
 # wide (0.12 + 0.13 duplicated hyper/rustls and two webpki-roots copies).
 # rustls-no-provider: reqwest 0.13's `rustls` feature forces the aws-lc-rs
 # C build; we install the ring provider at startup instead (tack_ai::tls).
@@ -63,7 +63,7 @@ eventsource-stream = "0.2"
 # crates opt into connect/handshake/TLS features additively.
 tokio-tungstenite = { version = "0.30", default-features = false }
 # MCP SDK (client in tack-tools, client+server in tack-app); crates add features.
-rmcp = { version = "3.1.4" }
+rmcp = { version = "3.9.0" }
 globset = "0.4"
 
 # errors / logging

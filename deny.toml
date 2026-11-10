@@ -40,10 +40,7 @@ deny = [
     { crate = "openssl-sys", reason = "workspace is rustls-only" },
 ]
 skip = [
-    # rmcp 3.1.4 still depends on reqwest 0.13 while the workspace is on
-    # 0.12 — tracked; align when rmcp is upgraded.
-    { crate = "reqwest@0.13" },
-    # rmcp 3.1.4 uses base64 0.23; the workspace pins 0.22. Converges on the
+    # rmcp 3.9 uses base64 0.23; the workspace pins 0.22. Converges on the
     # next workspace base64 upgrade.
     { crate = "base64@0.23" },
     # jsonwebtoken 10 (tack-ai, normal dep) and the dev-only rand08 alias in
@@ -59,11 +56,12 @@ skip = [
     # tokio-tungstenite 0.30's rustls-tls-webpki-roots feature pins
     # webpki-roots 0.26; tack-app uses 1.0 directly for its TLS server.
     { crate = "webpki-roots@0.26" },
-    # digest 0.11 chain comes from sha1 0.11 (tungstenite 0.30 WebSocket
-    # handshake, matched by the workspace sha1 pin); the workspace crypto
-    # stack (sha2/hmac/aes-gcm) still pins digest 0.10. Converges when the
-    # RustCrypto hashes move to digest 0.11.
+    # digest 0.11 comes from sha1 0.11 (tungstenite 0.30 WebSocket
+    # handshake) and rmcp 3.9's sha2 0.11; the workspace crypto stack
+    # (sha2/hmac/aes-gcm) still pins 0.10. Converges when the RustCrypto
+    # hashes move to digest 0.11.
     { crate = "digest@0.11" },
+    { crate = "sha2@0.11" },
     { crate = "crypto-common@0.2" },
     { crate = "block-buffer@0.12" },
     { crate = "const-oid@0.10" },
