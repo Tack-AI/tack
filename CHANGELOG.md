@@ -4,6 +4,18 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [1.0.19] - 2026-11-10
+
+### Fixed
+
+- **Automatic compaction now shrinks token-dense sessions and remains
+  recoverable on the next turn**: `minKeptTurns` is a soft preference when
+  honoring it would retain more tokens than are summarized (previously two
+  large turns could leave nearly the whole window intact). Subsequent
+  compactions also include the previous checkpoint's materialized retained
+  tail in the summary input; this both preserves that history and allows
+  overflow recovery when the first tool turn after a compaction overflows.
+
 ## [1.0.18] - 2026-11-06
 
 ### Fixed

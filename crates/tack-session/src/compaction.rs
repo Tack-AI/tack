@@ -30,9 +30,9 @@ pub struct CompactionSettings {
     /// recency-biased attention zone. Append-only, so prompt-cache
     /// friendly. Session files are never touched.
     pub goal_recitation: bool,
-    /// Never compact away all but fewer than this many turn-start
-    /// entries: a token-dense tail (huge tool results) could otherwise
-    /// leave the model with near-zero usable history after compaction.
+    /// Prefer to keep at least this many turn-start entries. The floor is
+    /// relaxed when a token-dense tail would leave more history retained
+    /// than summarized (or suppress compaction altogether).
     pub min_kept_turns: usize,
 }
 
@@ -838,11 +838,13 @@ pub fn prepare_compaction(
         .rposition(|e| matches!(e, SessionEntry::Compaction { .. }));
 
     let mut previous_summary: Option<String> = None;
+    let mut previous_retained_tail: Vec<AgentMessage> = Vec::new();
     let mut boundary_start = 0usize;
     if let Some(index) = prev_compaction_index {
         let SessionEntry::Compaction {
             summary,
             first_kept_entry_id,
+            retained_tail,
             details,
             from_hook,
             ..
@@ -851,14 +853,35 @@ pub fn prepare_compaction(
             unreachable!()
         };
         previous_summary = Some(summary.clone());
-        boundary_start = first_kept_entry_id
-            .as_ref()
-            .and_then(|id| path_entries.iter().position(|e| e.id() == id))
-            .unwrap_or(index + 1);
+        if let Some(tail) = retained_tail {
+            // A checkpoint replaces its physical kept entries with this
+            // materialized tail. The next compaction must summarize that
+            // tail explicitly: firstKeptEntryId still points at the old
+            // physical entries in memory, and is absent after a v4 reload.
+            boundary_start = index + 1;
+            previous_retained_tail.extend(
+                tail.iter()
+                    .filter(|m| !matches!(m, AgentMessage::System(_)))
+                    .cloned(),
+            );
+        } else {
+            boundary_start = first_kept_entry_id
+                .as_ref()
+                .and_then(|id| path_entries.iter().position(|e| e.id() == id))
+                .unwrap_or(index + 1);
+        }
         // Pull forward file ops from the previous pi-generated compaction.
         let _ = (details, from_hook);
     }
     let boundary_end = path_entries.len();
+    if find_valid_cut_points(path_entries, boundary_start, boundary_end).is_empty() {
+        // A checkpoint can end with an assistant tool call whose results
+        // are appended afterwards (notably dangling-call repair). With no
+        // real cut point, find_cut_point returns the first tool result;
+        // summarizing the checkpoint call while retaining that result
+        // would orphan it. Keep the checkpoint intact instead.
+        return None;
+    }
 
     let tokens_before =
         estimate_context_tokens(&build_session_context(path_entries, None).messages).tokens;
@@ -874,7 +897,7 @@ pub fn prepare_compaction(
         } else {
             cut_point.first_kept_entry_index
         };
-        let mut messages_to_summarize: Vec<AgentMessage> = Vec::new();
+        let mut messages_to_summarize: Vec<AgentMessage> = previous_retained_tail.clone();
         for entry in &path_entries[boundary_start..history_end] {
             if let Some(msg) = message_from_entry_for_compaction(entry) {
                 messages_to_summarize.push(msg);
@@ -906,14 +929,25 @@ pub fn prepare_compaction(
     );
     let (mut first_kept_entry_id, mut messages_to_summarize, mut turn_prefix_messages) =
         collect(&cut_point);
-    if messages_to_summarize.is_empty()
-        && turn_prefix_messages.is_empty()
-        && settings.min_kept_turns > 0
+    let kept_tokens: u64 = path_entries[cut_point.first_kept_entry_index..boundary_end]
+        .iter()
+        .flat_map(session_entry_to_context_messages)
+        .map(|m| estimate_tokens(&m))
+        .sum();
+    let summarized_tokens = messages_to_summarize
+        .iter()
+        .chain(&turn_prefix_messages)
+        .map(estimate_tokens)
+        .sum::<u64>();
+    if settings.min_kept_turns > 0
+        && ((messages_to_summarize.is_empty() && turn_prefix_messages.is_empty())
+            || kept_tokens > summarized_tokens)
     {
-        // min_kept_turns suppressed compaction entirely: when the window
-        // is full, a thin kept tail beats no compaction at all — the
-        // summary preserves history semantically. The floor is a
-        // preference, not a hard constraint: retry without it.
+        // The floor is a preference, not a hard constraint: when the
+        // window is full, a thin kept tail beats no compaction at all.
+        // Also relax it when token-dense turns would retain more than the
+        // history being summarized; otherwise compaction can leave almost
+        // the whole window intact and the next tool turn overflows again.
         cut_point = find_cut_point(
             path_entries,
             boundary_start,
@@ -1175,7 +1209,7 @@ mod tests {
             min_kept_turns: 3,
         };
         let entries = vec![
-            msg_entry("a", None, "one"),
+            msg_entry("a", None, &"old history ".repeat(80)),
             msg_entry("b", Some("a"), "two"),
             msg_entry("c", Some("b"), "three"),
             msg_entry("d", Some("c"), "four"),
@@ -1205,6 +1239,28 @@ mod tests {
         let prep = prepare_compaction(&entries, &settings).unwrap();
         assert_eq!(prep.first_kept_entry_id, "b");
         assert_eq!(prep.messages_to_summarize.len(), 1);
+    }
+
+    #[test]
+    fn min_kept_turns_yields_to_a_token_dense_tail() {
+        // Two requested turns contain 8k characters while the history
+        // before them is tiny. Preserving both would make the "compacted"
+        // context larger than the history being summarized.
+        let settings = CompactionSettings {
+            enabled: true,
+            reserve_tokens: 100,
+            keep_recent_tokens: 100,
+            goal_recitation: true,
+            min_kept_turns: 2,
+        };
+        let entries = vec![
+            msg_entry("a", None, "old history"),
+            msg_entry("b", Some("a"), &"b".repeat(4000)),
+            msg_entry("c", Some("b"), &"c".repeat(4000)),
+        ];
+        let prep = prepare_compaction(&entries, &settings).unwrap();
+        assert_eq!(prep.first_kept_entry_id, "c");
+        assert_eq!(prep.messages_to_summarize.len(), 2);
     }
 
     fn assistant_entry(
@@ -1252,6 +1308,111 @@ mod tests {
                 timestamp: 0,
             }),
         }
+    }
+
+    #[test]
+    fn next_compaction_summarizes_the_previous_checkpoint_tail() {
+        // In-memory checkpoints retain firstKeptEntryId; v4 checkpoints do
+        // not. Both forms must summarize the materialized tail rather than
+        // replaying old physical entries or finding nothing to compact.
+        for first_kept in [Some("a"), None] {
+            let entries = vec![
+                msg_entry("a", None, "old physical history"),
+                SessionEntry::Compaction {
+                    id: "c1".to_string(),
+                    parent_id: Some("a".to_string()),
+                    timestamp: "2026-01-01T00:00:00.000Z".to_string(),
+                    summary: "previous summary".to_string(),
+                    first_kept_entry_id: first_kept.map(str::to_string),
+                    tokens_before: 100,
+                    retained_tail: Some(vec![AgentMessage::user("checkpoint tail")]),
+                    details: None,
+                    usage: None,
+                    from_hook: Some(false),
+                    system_message: None,
+                    first_kept_entry_index: None,
+                },
+                assistant_entry(
+                    "b",
+                    Some("c1"),
+                    vec![ContentBlock::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": "fresh.txt"}),
+                        thought_signature: None,
+                        namespace: None,
+                    }],
+                    StopReason::ToolUse,
+                ),
+                tool_result_entry("c", Some("b"), "fresh result".to_string()),
+            ];
+            let settings = CompactionSettings {
+                enabled: true,
+                reserve_tokens: 100,
+                keep_recent_tokens: 1,
+                goal_recitation: true,
+                min_kept_turns: 0,
+            };
+            let prep = prepare_compaction(&entries, &settings).unwrap();
+            assert_eq!(prep.first_kept_entry_id, "b");
+            assert_eq!(prep.previous_summary.as_deref(), Some("previous summary"));
+            assert_eq!(prep.messages_to_summarize.len(), 1);
+            let AgentMessage::User(tail) = &prep.messages_to_summarize[0] else {
+                panic!("expected the checkpoint's retained user message");
+            };
+            assert_eq!(
+                tail.content,
+                UserContent::Text("checkpoint tail".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_tool_results_without_a_cut_point_are_left_intact() {
+        let call_entry = assistant_entry(
+            "old-call",
+            Some("a"),
+            vec![ContentBlock::ToolCall {
+                id: "call-1".to_string(),
+                name: "read".to_string(),
+                arguments: serde_json::json!({"path": "old.txt"}),
+                thought_signature: None,
+                namespace: None,
+            }],
+            StopReason::ToolUse,
+        );
+        let SessionEntry::Message {
+            message: old_call, ..
+        } = call_entry
+        else {
+            unreachable!()
+        };
+        let entries = vec![
+            msg_entry("a", None, "old physical history"),
+            SessionEntry::Compaction {
+                id: "c1".to_string(),
+                parent_id: Some("a".to_string()),
+                timestamp: "2026-01-01T00:00:00.000Z".to_string(),
+                summary: "previous summary".to_string(),
+                first_kept_entry_id: None,
+                tokens_before: 100,
+                retained_tail: Some(vec![old_call]),
+                details: None,
+                usage: None,
+                from_hook: Some(false),
+                system_message: None,
+                first_kept_entry_index: None,
+            },
+            tool_result_entry("r", Some("c1"), "repaired result".to_string()),
+        ];
+        let settings = CompactionSettings {
+            enabled: true,
+            reserve_tokens: 100,
+            keep_recent_tokens: 1,
+            goal_recitation: true,
+            min_kept_turns: 0,
+        };
+        assert!(prepare_compaction(&entries, &settings).is_none());
     }
 
     /// Regression for pi #9740: a trailing tool result that exceeds

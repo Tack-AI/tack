@@ -37,7 +37,7 @@ Tack 从四级读取配置，**后加载的层级覆盖先加载的**（部分�
 | `backgroundAutoWake` | bool | `true` | 后台任务在 agent 空闲时完成：自动开一轮让 agent 读输出接着干（与 cron 触发同一模式）。设为 `false` 则只在 transcript 出通知，不自动唤醒 |
 | `httpIdleTimeoutMs` | number | — | HTTP 读空闲超时 |
 | `retry` | object | `{enabled:true, maxRetries:3, baseDelayMs:2000, maxAgentDelayMs:60000}` | 瞬态错误自动重试（`maxAgentDelayMs` 为单次退避上限） |
-| `compaction` | object | `{enabled:true, reserveTokens:…, keepRecentTokens:…, goalRecitation:true, minKeptTurns:2}` | 自动上下文压缩。`goalRecitation`：压缩后把摘要的 Goal/Next Steps 作为尾部用户消息复述进上下文（仅 LLM 侧副本，append-only 不破坏缓存）；`minKeptTurns`：压缩切点保证的最少保留轮数 |
+| `compaction` | object | `{enabled:true, reserveTokens:…, keepRecentTokens:…, goalRecitation:true, minKeptTurns:2}` | 自动上下文压缩。`goalRecitation`：压缩后把摘要的 Goal/Next Steps 作为尾部用户消息复述进上下文（仅 LLM 侧副本，append-only 不破坏缓存）；`minKeptTurns`：压缩切点优先保留的最少轮数；如果该下限会导致无法压缩，或保留的 token 多于被摘要的 token，则自动放宽 |
 | `microcompact` | object | `{enabled:true, maxChars:20000, keepRecent:3, minSavingsChars:8000}` | 老超长 tool result 原地裁剪（全文落盘可回读）。`minSavingsChars`：总回收量低于该值不改写历史（保护提示缓存前缀）。`enabled:false` 会连带关闭下面三项历史优化 |
 | `maskDuplicateReads` | bool | `true` | 同一文件被 read 两次且内容逐字节一致时，把较早的结果替换为指针（较新副本仍在上下文中，零信息损失） |
 | `toolResultMaxChars` | number | `60000` | 任意 tool result（含最新几轮）的硬上限，超出截断并把全文落盘 `<id>.full.log`；`0` 关闭 |
