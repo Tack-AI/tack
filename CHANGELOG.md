@@ -16,6 +16,13 @@ notice can parse entries (same convention as TS pi).
   configuration errors are also returned as normal errors instead of
   panicking and appending to `crash.log`.
 
+- **Dependency security sweep**: Wasmtime 50.0.3 addresses the November
+  2026 runtime/WASI advisories, including a Windows WASI filesystem sandbox
+  escape (RUSTSEC-2026-0587). The new `chrono` unmaintained notice
+  (RUSTSEC-2026-0543) reports no vulnerability and is documented as a
+  non-blocking exception while a replacement migration remains follow-up
+  work.
+
 ## [1.0.19] - 2026-11-10
 
 ### Fixed

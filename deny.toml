@@ -25,6 +25,7 @@ ignore = [
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser via mermaid-rs-renderer; unmaintained, no vulnerability" },
     { id = "RUSTSEC-2026-0206", reason = "rustybuzz via mermaid-rs-renderer; unmaintained, no vulnerability" },
     { id = "RUSTSEC-2024-0320", reason = "yaml-rust via syntect; unmaintained, no vulnerability" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono direct + cron/oauth2/schemars transitive; unmaintained notice, no vulnerability; jiff migration is a follow-up" },
 ]
 
 [bans]
