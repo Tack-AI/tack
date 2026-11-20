@@ -103,6 +103,23 @@ pub fn load_cached_override(agent_dir: &Path) -> Option<(usize, usize)> {
     let raw = std::fs::read_to_string(&path).ok()?;
     match parse_catalog_json(&raw) {
         Ok(mut catalog) => {
+            // Older refresh code persisted pi-ai's flattened `chat:<id>`
+            // storage keys as model IDs. Such a cache hides the real models
+            // (for example kimi-coding/k3) on every startup. It is disposable
+            // derived data, so discard it and use the embedded catalog; the
+            // next refresh writes canonical IDs from each entry's `id` field.
+            if catalog
+                .values()
+                .flatten()
+                .any(|model| model.id.starts_with("chat:"))
+            {
+                tracing::warn!(
+                    "cached catalog contains flattened chat: model keys; removing stale cache"
+                );
+                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(catalog_meta_path(agent_dir));
+                return None;
+            }
             // Re-apply the untrusted-data rules on load: a cache written by
             // an older, unsanitizing build (or hand-edited) must not smuggle
             // in off-host baseUrls or auth headers.
@@ -554,8 +571,12 @@ fn sanitize_catalog_headers(headers: BTreeMap<String, String>) -> Option<BTreeMa
     if clean.is_empty() { None } else { Some(clean) }
 }
 
-/// Convert one provider data file — `{ "<api>": { "<modelId>": {…} } }`
+/// Convert one provider data file — `{ "<api>": { "<storageKey>": {…} } }`
 /// (TS providers/data JSON + flattenModelCatalog) — into catalog models.
+/// Current upstream storage keys are type-namespaced (`chat:<id>`); the
+/// entry's own `id` is the canonical wire/model-picker ID. Only chat models
+/// belong in this catalog: image/classifier entries have different APIs and
+/// capabilities that [`Model`] cannot represent.
 fn convert_provider_data(
     provider_id: &str,
     default_base_url: &str,
@@ -564,15 +585,33 @@ fn convert_provider_data(
     let parsed: BTreeMap<String, BTreeMap<String, Value>> = serde_json::from_str(raw).ok()?;
     let mut models = Vec::new();
     for (api, group) in parsed {
-        for (id, fields) in group {
+        for (storage_key, fields) in group {
             let obj = fields.as_object()?;
+            if obj
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind != "chat")
+            {
+                continue;
+            }
             let get_str = |key: &str| obj.get(key).and_then(|v| v.as_str()).map(str::to_string);
+            // Older provider data used the bare model ID as the map key and
+            // had no inner `id`; retain that layout as a fallback. Never
+            // expose the current `chat:` storage namespace as a model ID.
+            let model_id = get_str("id")
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| {
+                    storage_key
+                        .strip_prefix("chat:")
+                        .unwrap_or(&storage_key)
+                        .to_string()
+                });
             let base_url = get_str("baseUrl").filter(|u| !u.is_empty());
             let mut model = Model {
-                id: id.clone(),
+                id: model_id.clone(),
                 name: get_str("name")
                     .filter(|n| !n.is_empty())
-                    .unwrap_or_else(|| id.clone()),
+                    .unwrap_or_else(|| model_id.clone()),
                 api: api.clone(),
                 provider: provider_id.to_string(),
                 base_url: sanitize_catalog_base_url(base_url, default_base_url),
@@ -668,6 +707,27 @@ mod tests {
         assert!(m.supports_images());
         assert_eq!(m.context_window, 200000);
         assert_eq!(m.cost.input, 1.0);
+    }
+
+    #[test]
+    fn converts_flattened_storage_keys_to_wire_model_ids() {
+        // pi-ai 1.4.x namespaces provider-data map keys by model type. The
+        // nested ID, not the flattened storage key, is sent to the provider.
+        let raw = r#"{
+            "openai-completions": {
+                "chat:k3": { "id": "k3", "name": "Kimi K3", "type": "chat" },
+                "chat:k3-256k": { "name": "Kimi K3-256K", "type": "chat" },
+                "image:k3": { "id": "k3", "name": "Not a chat model", "type": "image" }
+            }
+        }"#;
+        let models =
+            convert_provider_data("kimi-coding", "https://api.kimi.com/coding", raw).unwrap();
+        assert_eq!(
+            models.iter().map(|m| &m.id).collect::<Vec<_>>(),
+            ["k3", "k3-256k"]
+        );
+        assert_eq!(models[0].name, "Kimi K3");
+        assert_eq!(models[0].api, "openai-completions");
     }
 
     #[test]
@@ -951,6 +1011,33 @@ mod tests {
         let headers = m.headers.as_ref().unwrap();
         assert_eq!(headers.len(), 1);
         assert_eq!(headers.get("User-Agent").map(String::as_str), Some("ok"));
+    }
+
+    #[test]
+    fn cached_flattened_storage_keys_are_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = serde_json::json!({
+            "kimi-coding": {
+                "api": "openai-completions",
+                "models": [{
+                    "id": "chat:k3", "name": "Kimi K3", "api": "openai-completions",
+                    "provider": "kimi-coding", "baseUrl": "https://api.kimi.com/coding/v1",
+                    "reasoning": true, "input": ["text", "image"],
+                    "cost": {"input":0,"output":0,"cacheRead":0,"cacheWrite":0},
+                    "contextWindow": 1048576, "maxTokens": 131072
+                }]
+            }
+        });
+        let path = catalog_cache_path(dir.path());
+        std::fs::write(&path, serde_json::to_string(&cache).unwrap()).unwrap();
+        std::fs::write(catalog_meta_path(dir.path()), "{}").unwrap();
+
+        assert_eq!(load_cached_override(dir.path()), None);
+        assert!(!path.exists(), "stale catalog cache must be removed");
+        assert!(
+            !catalog_meta_path(dir.path()).exists(),
+            "stale catalog metadata must be removed with the cache"
+        );
     }
 
     #[test]

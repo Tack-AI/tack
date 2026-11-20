@@ -29,7 +29,7 @@ pub type SharedConn = Rc<RefCell<Option<Rc<AgentSideConnection>>>>;
 /// Run the ACP server on stdin/stdout until the client disconnects.
 pub async fn serve(overrides: &agent::AcpOverrides) -> anyhow::Result<()> {
     let shared_conn: SharedConn = Rc::new(RefCell::new(None));
-    let agent = TackAcpAgent::new(shared_conn.clone(), overrides);
+    let agent = TackAcpAgent::new(shared_conn.clone(), overrides)?;
     // Kept alive past the connection so session plugins can be shut down
     // once the client disconnects (graceful stop + final metrics drain).
     let sessions = agent.sessions();

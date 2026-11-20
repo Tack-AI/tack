@@ -185,3 +185,90 @@ fn acp_honors_provider_flag_on_command_line() {
         "expected provider=openai on stderr, got: {stderr}"
     );
 }
+
+/// Regression for the reported kimi-coding/k3 crash: a cache written by the
+/// old refresh parser contains `chat:k3`, while models.json adds a custom
+/// model to the same built-in provider. Startup must discard that cache and
+/// resolve the embedded k3 instead of failing the custom-provider merge.
+#[test]
+fn acp_discards_flattened_catalog_cache_and_resolves_kimi_k3() {
+    let agent_dir = tempfile::tempdir().unwrap();
+    let custom = serde_json::json!({
+        "providers": {
+            "kimi-coding": {
+                "baseUrl": "https://api.kimi.com/coding/v1",
+                "api": "openai-completions",
+                "models": [{"id": "k3.1-pro"}]
+            }
+        }
+    });
+    std::fs::write(
+        agent_dir.path().join("models.json"),
+        serde_json::to_string(&custom).unwrap(),
+    )
+    .unwrap();
+    let cache = serde_json::json!({
+        "kimi-coding": {
+            "api": "openai-completions",
+            "models": [{
+                "id": "chat:k3", "name": "Kimi K3", "api": "openai-completions",
+                "provider": "kimi-coding", "baseUrl": "https://api.kimi.com/coding/v1",
+                "reasoning": true, "input": ["text", "image"],
+                "cost": {"input":0,"output":0,"cacheRead":0,"cacheWrite":0},
+                "contextWindow": 1048576, "maxTokens": 131072
+            }]
+        }
+    });
+    let cache_path = agent_dir.path().join("catalog.json");
+    std::fs::write(&cache_path, serde_json::to_string(&cache).unwrap()).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tack"))
+        .args([
+            "--offline",
+            "--provider",
+            "kimi-coding",
+            "--model",
+            "k3",
+            "acp",
+        ])
+        .env("TACK_AGENT_DIR", agent_dir.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "ACP should start with the embedded k3 catalog: {stderr}"
+    );
+    assert!(
+        stderr.contains("provider=kimi-coding model=k3"),
+        "expected resolved kimi-coding/k3 on stderr, got: {stderr}"
+    );
+    assert!(!cache_path.exists(), "stale cache should be discarded");
+}
+
+#[test]
+fn acp_invalid_startup_provider_is_an_error_not_a_panic() {
+    let agent_dir = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tack"))
+        .args(["--offline", "--provider", "not-a-real-provider", "acp"])
+        .env("TACK_AGENT_DIR", agent_dir.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("ACP mode: unknown provider"),
+        "expected a configuration error, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("tack crashed"),
+        "startup misconfiguration must not invoke the panic hook: {stderr}"
+    );
+    assert!(!agent_dir.path().join("crash.log").exists());
+}

@@ -4,6 +4,18 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [Unreleased]
+
+### Fixed
+
+- **Refreshed model catalogs now preserve canonical model IDs**: current
+  `@earendil-works/pi-ai` provider data uses `chat:<id>` storage keys with
+  the real model ID in the entry's `id` field. Tack no longer exposes those
+  storage keys as model IDs, and discards previously corrupted catalog
+  caches on startup (falling back to the embedded catalog). ACP startup
+  configuration errors are also returned as normal errors instead of
+  panicking and appending to `crash.log`.
+
 ## [1.0.19] - 2026-11-10
 
 ### Fixed

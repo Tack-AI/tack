@@ -66,7 +66,7 @@ pub struct AcpOverrides {
 }
 
 impl TackAcpAgent {
-    pub fn new(shared_conn: SharedConn, overrides: &AcpOverrides) -> Self {
+    pub fn new(shared_conn: SharedConn, overrides: &AcpOverrides) -> anyhow::Result<Self> {
         // Resolve configuration synchronously at startup: some clients call
         // session/new immediately after initialize with no slack.
         let cwd = std::env::current_dir().unwrap_or_default();
@@ -86,8 +86,9 @@ impl TackAcpAgent {
             .or(settings.default_model.as_deref())
             .or(env_model.as_deref());
         let model = crate::model::resolve_model(provider_name, model_id, &agent_dir)
-            .unwrap_or_else(|e| panic!("ACP mode: {e}"));
-        let provider = tack_ai::provider_for(&model).expect("built-in adapter exists");
+            .map_err(|e| anyhow::anyhow!("ACP mode: {e}"))?;
+        let provider = tack_ai::provider_for(&model)
+            .ok_or_else(|| anyhow::anyhow!("ACP mode: no adapter for api kind {}", model.api))?;
         let provider: Arc<dyn Provider> = Arc::new(tack_ai::retry::RetryingProvider {
             inner: provider,
             policy: settings.retry.policy(),
@@ -121,7 +122,14 @@ impl TackAcpAgent {
             .flatten();
         let thinking = overrides.thinking.or(env_thinking);
 
-        Self::with_dependencies(shared_conn, model, provider, auth, settings, thinking)
+        Ok(Self::with_dependencies(
+            shared_conn,
+            model,
+            provider,
+            auth,
+            settings,
+            thinking,
+        ))
     }
 
     /// Handle to the live sessions map, for connection-end teardown in
