@@ -1,7 +1,7 @@
 {
   "id": "tack",
   "name": "tack",
-  "version": "1.0.20",
+  "version": "1.0.21",
   "description": "Rust reimplementation of the pi coding agent — interactive TUI, ACP editor integration, JSONL RPC, and remote sessions. Wire- and storage-compatible with TypeScript pi.",
   "repository": "https://github.com/Tack-AI/tack",
   "website": "https://github.com/Tack-AI/tack#readme",
@@ -11,38 +11,38 @@
   "distribution": {
     "binary": {
       "darwin-aarch64": {
-        "archive": "https://github.com/Tack-AI/tack/releases/download/tack-v1.0.20/tack-aarch64-apple-darwin.tar.gz",
-        "sha256": "d5130d020bfb625e287a885c75ff17232363855f96f8c5fd50016e48b5fe39a8",
+        "archive": "https://github.com/Tack-AI/tack/releases/download/tack-v1.0.21/tack-aarch64-apple-darwin.tar.gz",
+        "sha256": "c585402c469a343ac29141b3b642ca9b4b9ede09b4d7014a35cff2f338af35a3",
         "cmd": "./tack",
         "args": ["acp"]
       },
       "darwin-x86_64": {
-        "archive": "https://github.com/Tack-AI/tack/releases/download/tack-v1.0.20/tack-x86_64-apple-darwin.tar.gz",
-        "sha256": "a3264a513890d9adda45de73e354e3a11b58e0d0575c1f4e640beb9f13cb5360",
+        "archive": "https://github.com/Tack-AI/tack/releases/download/tack-v1.0.21/tack-x86_64-apple-darwin.tar.gz",
+        "sha256": "eea884559d76168a63540fae27f48224ece5795f47308b6f1590fcdfab525e06",
         "cmd": "./tack",
         "args": ["acp"]
       },
       "linux-aarch64": {
-        "archive": "https://github.com/Tack-AI/tack/releases/download/tack-v1.0.20/tack-aarch64-unknown-linux-gnu.tar.gz",
-        "sha256": "bdbd50bd3206776ea3352e88a9a0efeb3f83d83d6e862bfb4bb59ed7e10b1da5",
+        "archive": "https://github.com/Tack-AI/tack/releases/download/tack-v1.0.21/tack-aarch64-unknown-linux-gnu.tar.gz",
+        "sha256": "be3809a3c909a9788c69c6d00be68db67bbdf9decc6c634b36e421c0fb6185cb",
         "cmd": "./tack",
         "args": ["acp"]
       },
       "linux-x86_64": {
-        "archive": "https://github.com/Tack-AI/tack/releases/download/tack-v1.0.20/tack-x86_64-unknown-linux-gnu.tar.gz",
-        "sha256": "6ec790eb001302ac1f2e7d8998fd88d28ae9bbda2dc4f509d06063157f6753b5",
+        "archive": "https://github.com/Tack-AI/tack/releases/download/tack-v1.0.21/tack-x86_64-unknown-linux-gnu.tar.gz",
+        "sha256": "b3bf6922a172952058eef277d6295019398f4c9d90cfcc93c2575023c34d98cb",
         "cmd": "./tack",
         "args": ["acp"]
       },
       "windows-aarch64": {
-        "archive": "https://github.com/Tack-AI/tack/releases/download/tack-v1.0.20/tack-aarch64-pc-windows-msvc.zip",
-        "sha256": "4989731b34e3f737156b527f220b86973e162f106d69d7f5936144369663682c",
+        "archive": "https://github.com/Tack-AI/tack/releases/download/tack-v1.0.21/tack-aarch64-pc-windows-msvc.zip",
+        "sha256": "0bcfd9d8a907c430bb074611377ff5a840d02fadaba05ac701e3e986488bbd6b",
         "cmd": "tack.exe",
         "args": ["acp"]
       },
       "windows-x86_64": {
-        "archive": "https://github.com/Tack-AI/tack/releases/download/tack-v1.0.20/tack-x86_64-pc-windows-msvc.zip",
-        "sha256": "af93c04b44f93b0faec31d616aff093f15b5ef87e444855a12fd70a18413ca9c",
+        "archive": "https://github.com/Tack-AI/tack/releases/download/tack-v1.0.21/tack-x86_64-pc-windows-msvc.zip",
+        "sha256": "44921bcc7fe0f5f30dbeca6ea86854234d1ba73a1ff4a5097d18985c631395a1",
         "cmd": "tack.exe",
         "args": ["acp"]
       }
