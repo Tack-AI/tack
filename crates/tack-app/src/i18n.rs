@@ -1109,7 +1109,7 @@ const EN: &[(&str, &str)] = &[
     ("notify.run_error", "Agent run failed ({model})"),
     ("notify.bg_task_title", "Background task {status}"),
     // -- fullscreen jump-to-bottom pill --
-    ("fs.back_to_bottom", "↓ Back to bottom · End"),
+    ("fs.back_to_bottom", "↓ Back to bottom · Ctrl+End"),
 ];
 
 const ZH: &[(&str, &str)] = &[
@@ -1933,7 +1933,7 @@ const ZH: &[(&str, &str)] = &[
     ("notify.run_error", "agent 运行出错（{model}）"),
     ("notify.bg_task_title", "后台任务{status}"),
     // -- 全屏回到底部悬浮按钮 --
-    ("fs.back_to_bottom", "↓ 回到底部 · End"),
+    ("fs.back_to_bottom", "↓ 回到底部 · Ctrl+End"),
 ];
 
 /// Translate `key`, substituting `{name}` placeholders from `args`.

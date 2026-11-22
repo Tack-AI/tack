@@ -207,9 +207,11 @@ jobs:
   # Docs/code drift self-audit — grep-level, no model/network. Fails when a
   # documented settings key / hook event / CLI flag / feature gate does not
   # exist in code (the implemented-but-undocumented direction only warns).
+  # The upstream-delta parser has its own offline shell regression test here.
   evals-selftest:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: evals/selftest.sh
       - run: evals/docs-audit/static_check.sh
+      - run: scripts/upstream-delta.test.sh

@@ -67,6 +67,11 @@ impl SessionDialog {
     }
 
     fn refresh(&mut self) {
+        // Rebuilding the list must not silently adopt whichever session lands
+        // at index zero. Preserve identity across rename/sort; after delete,
+        // fall back to the next row (or the previous one at the end).
+        let selected_path = self.selected_path();
+        let selected_index = self.list.selected;
         let mut sessions = tack_session::list_sessions(&self.dir);
         if self.sort_by_name {
             sessions.sort_by_key(|s| session_label(s).to_lowercase());
@@ -90,6 +95,21 @@ impl SessionDialog {
             .collect();
         self.list = SelectList::new(items);
         self.list.set_filter(filter);
+        if !self.list.filtered.is_empty()
+            && let Some(path) = selected_path
+        {
+            let selected_value = path.to_string_lossy();
+            if let Some(index) = self
+                .list
+                .filtered
+                .iter()
+                .position(|&item_index| self.list.items[item_index].value == selected_value)
+            {
+                self.list.selected = index;
+            } else {
+                self.list.selected = selected_index.min(self.list.filtered.len() - 1);
+            }
+        }
     }
 
     fn selected_path(&self) -> Option<PathBuf> {
@@ -260,5 +280,77 @@ impl SessionDialog {
                 handled
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use tack_tui::KeyEvent;
+
+    fn create_session(cwd: &Path, dir: &Path, prompt: &str) -> PathBuf {
+        let mut session = SessionManager::create(cwd, Some(dir.to_path_buf())).unwrap();
+        session
+            .append_message(tack_agent_core::AgentMessage::user(prompt))
+            .unwrap();
+        session
+            .append_session_info(Some(prompt.to_string()))
+            .unwrap();
+        session.session_file().unwrap().to_path_buf()
+    }
+
+    fn sorted_dialog(dir: &Path) -> SessionDialog {
+        let mut dialog = SessionDialog::new(dir.to_path_buf(), None, Theme::dark());
+        dialog.sort_by_name = true;
+        dialog.refresh();
+        dialog
+    }
+
+    fn key(key: Key) -> InputEvent {
+        InputEvent::Key(KeyEvent::plain(key))
+    }
+
+    #[test]
+    fn refresh_preserves_renamed_session_and_sort_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions");
+        let _alpha = create_session(tmp.path(), &dir, "alpha");
+        let beta = create_session(tmp.path(), &dir, "beta");
+        let _gamma = create_session(tmp.path(), &dir, "gamma");
+        let mut dialog = sorted_dialog(&dir);
+
+        dialog.list.selected = 1;
+        assert_eq!(dialog.selected_path(), Some(beta.clone()));
+        dialog.handle_input(&InputEvent::Key(KeyEvent::ctrl(Key::Char('r'))));
+        for c in "renamed".chars() {
+            dialog.handle_input(&key(Key::Char(c)));
+        }
+        dialog.handle_input(&key(Key::Enter));
+        assert_eq!(dialog.selected_path(), Some(beta.clone()));
+
+        dialog.handle_input(&InputEvent::Key(KeyEvent::ctrl(Key::Char('s'))));
+        assert_eq!(dialog.selected_path(), Some(beta));
+    }
+
+    #[test]
+    fn delete_selects_next_then_previous_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions");
+        let alpha = create_session(tmp.path(), &dir, "alpha");
+        let beta = create_session(tmp.path(), &dir, "beta");
+        let gamma = create_session(tmp.path(), &dir, "gamma");
+        let mut dialog = sorted_dialog(&dir);
+
+        dialog.list.selected = 1;
+        dialog.handle_input(&InputEvent::Key(KeyEvent::ctrl(Key::Char('d'))));
+        dialog.handle_input(&key(Key::Enter));
+        assert!(!beta.exists());
+        assert_eq!(dialog.selected_path(), Some(gamma.clone()));
+
+        dialog.handle_input(&InputEvent::Key(KeyEvent::ctrl(Key::Char('d'))));
+        dialog.handle_input(&key(Key::Enter));
+        assert!(!gamma.exists());
+        assert_eq!(dialog.selected_path(), Some(alpha));
     }
 }

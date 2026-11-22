@@ -197,11 +197,10 @@ pub fn truncate_tail(
         return untruncated(content, max_lines, max_bytes);
     }
 
-    let mut output: Vec<&str> = Vec::new();
+    let mut output: Vec<std::borrow::Cow<'_, str>> = Vec::new();
     let mut output_bytes = 0usize;
     let mut truncated_by = TruncatedBy::Lines;
     let mut last_line_partial = false;
-    let mut partial: Option<String> = None;
 
     for line in lines.iter().rev() {
         if output.len() >= max_lines {
@@ -210,31 +209,34 @@ pub fn truncate_tail(
         let line_bytes = line.len() + usize::from(!output.is_empty());
         if output_bytes + line_bytes > max_bytes {
             truncated_by = TruncatedBy::Bytes;
-            if output.is_empty() {
-                // Edge case: the last line alone exceeds the budget — take its tail.
-                let truncated_line = truncate_str_to_bytes_from_end(line, max_bytes);
-                output_bytes = truncated_line.len();
-                partial = Some(truncated_line);
+            // Keep the tail of an oversized line even when only blank lines
+            // follow it; otherwise the retained output is just whitespace.
+            let separator_bytes = usize::from(!output.is_empty());
+            let remaining_bytes = max_bytes.saturating_sub(output_bytes + separator_bytes);
+            let only_blank_lines_follow = output.iter().all(|line| line.trim().is_empty());
+            if output.is_empty()
+                || (!line.trim().is_empty() && only_blank_lines_follow && remaining_bytes > 0)
+            {
+                let truncated_line = truncate_str_to_bytes_from_end(line, remaining_bytes);
+                output_bytes += line_bytes - line.len() + truncated_line.len();
+                output.push(std::borrow::Cow::Owned(truncated_line));
                 last_line_partial = true;
             }
             break;
         }
-        output.push(line);
+        output.push(std::borrow::Cow::Borrowed(*line));
         output_bytes += line_bytes;
     }
     if output.len() >= max_lines && output_bytes <= max_bytes {
         truncated_by = TruncatedBy::Lines;
     }
-    if partial.is_none() && output.len() == lines.len() {
+    if !last_line_partial && output.len() == lines.len() {
         // Every line was kept: see truncate_head.
         return untruncated(content, max_lines, max_bytes);
     }
 
     output.reverse();
-    let content_out = match partial {
-        Some(p) => p,
-        None => output.join("\n"),
-    };
+    let content_out = output.join("\n");
     TruncationResult {
         output_bytes: content_out.len(),
         output_lines: output.len().max(usize::from(last_line_partial)),
@@ -323,6 +325,27 @@ mod tests {
         assert!(r.last_line_partial);
         assert!(r.output_bytes <= DEFAULT_MAX_BYTES);
         assert!(r.content.chars().all(|c| c == '中'));
+    }
+
+    /// Upstream #12350: a long final line followed by a blank line must not
+    /// collapse the model-visible output to whitespace. Cover small and large
+    /// inputs with both LF and CRLF line endings.
+    #[test]
+    fn tail_keeps_partial_long_line_before_blank_line() {
+        for (length, eol) in [(60_000, "\n"), (219_000, "\n"), (219_000, "\r\n")] {
+            let long_line = format!("{}END", "y".repeat(length));
+            let content = format!("first line{eol}{long_line}{eol}{eol}");
+            let r = truncate_tail(&content, None, None);
+            assert!(r.last_line_partial, "length={length}, eol={eol:?}");
+            assert_eq!(r.total_lines, 3, "length={length}, eol={eol:?}");
+            assert_eq!(r.output_lines, 2, "length={length}, eol={eol:?}");
+            assert!(r.output_bytes <= DEFAULT_MAX_BYTES);
+            assert!(r.content.starts_with('y'), "lost long-line tail: {eol:?}");
+            assert!(
+                r.content.trim_end().ends_with("END"),
+                "missing long-line tail: {eol:?}"
+            );
+        }
     }
 
     #[test]

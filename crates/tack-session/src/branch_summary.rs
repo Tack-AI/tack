@@ -229,7 +229,6 @@ pub async fn generate_branch_summary(
         model,
         provider,
         &build_summarization_context(&prompt_text),
-        2048,
         auth,
         reasoning,
         session_id,

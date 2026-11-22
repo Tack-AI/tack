@@ -221,7 +221,7 @@ fn convert_messages(
             Message::Assistant(a) => {
                 let mut assistant_msg = json!({
                     "role": "assistant",
-                    "content": if compat.requires_assistant_after_tool_result { json!("") } else { Value::Null },
+                    "content": if compat.requires_assistant_after_tool_result || compat.requires_non_null_assistant_content { json!("") } else { Value::Null },
                 });
 
                 let text: String = a
@@ -572,9 +572,9 @@ pub(crate) fn build_params(
         if compat.zai_tool_stream {
             params["tool_stream"] = json!(true);
         }
-    } else if has_tool_history(&context.messages) {
-        // Anthropic (via LiteLLM/proxy) requires tools when the conversation
-        // has tool_calls/tool results.
+    } else if compat.requires_tools_with_tool_history && has_tool_history(&context.messages) {
+        // Compatibility escape hatch for older LiteLLM/Anthropic proxies;
+        // vLLM and other OpenAI-compatible servers reject an empty array.
         params["tools"] = json!([]);
     }
 
@@ -1146,6 +1146,96 @@ mod tests {
             .find(|m| m["role"] == "assistant")
             .expect("assistant message");
         assert_eq!(assistant["reasoning_details"], json!([detail]));
+    }
+
+    fn tool_only_assistant(model: &Model) -> crate::types::AssistantMessage {
+        let mut assistant = crate::types::AssistantMessage::pending(model);
+        assistant.stop_reason = crate::types::StopReason::ToolUse;
+        assistant.content = vec![ContentBlock::ToolCall {
+            id: "call_1".into(),
+            name: "read".into(),
+            arguments: json!({ "path": "a.txt" }),
+            thought_signature: None,
+            namespace: None,
+        }];
+        assistant
+    }
+
+    #[test]
+    fn instruction_role_defaults_to_system_outside_openai() {
+        for (provider, base_url) in [
+            ("groq", "https://api.groq.com/openai/v1"),
+            ("openrouter", "https://openrouter.ai/api/v1"),
+        ] {
+            let model = generic_model(provider, base_url);
+            let context = Context {
+                system_prompt: Some("instructions".into()),
+                ..Default::default()
+            };
+            let messages =
+                convert_messages(&model, &context, &get_compat(&model), &Default::default());
+            assert_eq!(messages[0]["role"], "system", "{provider}");
+        }
+
+        let model = generic_model("openai", "https://api.openai.com/v1");
+        let context = Context {
+            system_prompt: Some("instructions".into()),
+            ..Default::default()
+        };
+        let messages = convert_messages(&model, &context, &get_compat(&model), &Default::default());
+        assert_eq!(messages[0]["role"], "developer");
+
+        let mut overridden = generic_model("groq", "https://api.groq.com/openai/v1");
+        overridden.compat = Some(json!({ "supportsDeveloperRole": true }));
+        let messages = convert_messages(
+            &overridden,
+            &context,
+            &get_compat(&overridden),
+            &Default::default(),
+        );
+        assert_eq!(messages[0]["role"], "developer");
+    }
+
+    #[test]
+    fn empty_tools_are_omitted_unless_a_proxy_requires_them() {
+        let mut model = generic_model("vllm", "http://localhost:8000/v1");
+        let context = Context {
+            messages: vec![Message::Assistant(tool_only_assistant(&model))],
+            ..Default::default()
+        };
+        let params = build_params(
+            &model,
+            &context,
+            &StreamOptions::default(),
+            &get_compat(&model),
+            CacheRetention::None,
+        );
+        assert!(params.get("tools").is_none());
+
+        model.compat = Some(json!({ "requiresToolsWithToolHistory": true }));
+        let params = build_params(
+            &model,
+            &context,
+            &StreamOptions::default(),
+            &get_compat(&model),
+            CacheRetention::None,
+        );
+        assert_eq!(params["tools"], json!([]));
+    }
+
+    #[test]
+    fn non_null_assistant_content_is_an_explicit_compat_opt_in() {
+        let mut model = generic_model("proxy", "https://proxy.example.com/v1");
+        let context = Context {
+            messages: vec![Message::Assistant(tool_only_assistant(&model))],
+            ..Default::default()
+        };
+        let messages = convert_messages(&model, &context, &get_compat(&model), &Default::default());
+        assert_eq!(messages[0]["content"], Value::Null);
+
+        model.compat = Some(json!({ "requiresNonNullAssistantContent": true }));
+        let messages = convert_messages(&model, &context, &get_compat(&model), &Default::default());
+        assert_eq!(messages[0]["content"], "");
     }
 
     /// Garbage signatures never become reasoning_details.

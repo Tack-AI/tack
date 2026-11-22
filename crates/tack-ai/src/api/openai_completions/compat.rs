@@ -129,6 +129,8 @@ pub struct OpenAiCompat {
     pub max_tokens_field: Option<String>,
     pub requires_tool_result_name: Option<bool>,
     pub requires_assistant_after_tool_result: Option<bool>,
+    pub requires_non_null_assistant_content: Option<bool>,
+    pub requires_tools_with_tool_history: Option<bool>,
     pub requires_thinking_as_text: Option<bool>,
     pub requires_reasoning_content_on_assistant_messages: Option<bool>,
     pub thinking_format: Option<String>,
@@ -163,6 +165,8 @@ pub struct ResolvedCompat {
     pub max_tokens_field: String, // "max_completion_tokens" | "max_tokens"
     pub requires_tool_result_name: bool,
     pub requires_assistant_after_tool_result: bool,
+    pub requires_non_null_assistant_content: bool,
+    pub requires_tools_with_tool_history: bool,
     pub requires_thinking_as_text: bool,
     pub requires_reasoning_content_on_assistant_messages: bool,
     pub thinking_format: String,
@@ -229,8 +233,9 @@ fn detect_compat(model: &Model) -> ResolvedCompat {
         || is_zai;
 
     let is_grok = provider == "xai" || base_url.contains("api.x.ai");
-    let is_openrouter_developer_role_model =
-        is_openrouter && (model.id.starts_with("anthropic/") || model.id.starts_with("openai/"));
+    // The developer role is OpenAI's. Other hosts' chat templates often
+    // reject it, while system is accepted across OpenAI-compatible APIs.
+    let is_openai = provider == "openai" || base_url.contains("api.openai.com");
     let cache_control_format = if provider == "openrouter" && model.id.starts_with("anthropic/") {
         Some("anthropic".to_string())
     } else {
@@ -239,8 +244,7 @@ fn detect_compat(model: &Model) -> ResolvedCompat {
 
     ResolvedCompat {
         supports_store: !is_non_standard,
-        supports_developer_role: is_openrouter_developer_role_model
-            || (!is_non_standard && !is_openrouter),
+        supports_developer_role: is_openai,
         supports_reasoning_effort: !is_grok
             && !is_zai
             && !is_moonshot
@@ -257,6 +261,8 @@ fn detect_compat(model: &Model) -> ResolvedCompat {
         },
         requires_tool_result_name: false,
         requires_assistant_after_tool_result: false,
+        requires_non_null_assistant_content: false,
+        requires_tools_with_tool_history: false,
         requires_thinking_as_text: false,
         requires_reasoning_content_on_assistant_messages: is_deepseek,
         thinking_format: if is_deepseek {
@@ -335,6 +341,12 @@ pub(crate) fn get_compat(model: &Model) -> ResolvedCompat {
         requires_assistant_after_tool_result: overrides
             .requires_assistant_after_tool_result
             .unwrap_or(detected.requires_assistant_after_tool_result),
+        requires_non_null_assistant_content: overrides
+            .requires_non_null_assistant_content
+            .unwrap_or(detected.requires_non_null_assistant_content),
+        requires_tools_with_tool_history: overrides
+            .requires_tools_with_tool_history
+            .unwrap_or(detected.requires_tools_with_tool_history),
         requires_thinking_as_text: overrides
             .requires_thinking_as_text
             .unwrap_or(detected.requires_thinking_as_text),

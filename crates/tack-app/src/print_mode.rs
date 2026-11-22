@@ -789,16 +789,17 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
                 _ => {}
             }
         }
-        // Persist every completed message + error exit code (both modes).
+        // Persist every completed message + unsuccessful exit code (both modes).
         if let AgentEvent::MessageEnd { message } = &event {
             let skip = matches!(message, AgentMessage::Custom(_));
             if !skip && let Err(e) = session.lock().await.append_message(message.clone()) {
                 tracing::warn!("failed to persist message: {e}");
             }
-            if let AgentMessage::Assistant(a) = message
-                && a.stop_reason == tack_ai::StopReason::Error
-            {
-                exit_code = 1;
+            if let AgentMessage::Assistant(a) = message {
+                if a.stop_reason == tack_ai::StopReason::Length {
+                    eprintln!("Response was truncated: the model reached its output token limit.");
+                }
+                exit_code = exit_code.max(print_stop_exit_code(a.stop_reason));
             }
         }
         if event.is_terminal() {
@@ -824,6 +825,15 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
         .await;
     extensions.shutdown().await;
     Ok(exit_code)
+}
+
+fn print_stop_exit_code(reason: tack_ai::StopReason) -> i32 {
+    // A length-stopped answer is useful partial output, but a one-shot caller
+    // must still be able to tell that the requested response is incomplete.
+    i32::from(matches!(
+        reason,
+        tack_ai::StopReason::Error | tack_ai::StopReason::Length
+    ))
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
@@ -972,6 +982,16 @@ pub async fn run_compact(cwd: PathBuf) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+
+    #[test]
+    fn print_exit_status_marks_errors_and_truncation_as_failures() {
+        for reason in [tack_ai::StopReason::Stop, tack_ai::StopReason::ToolUse] {
+            assert_eq!(super::print_stop_exit_code(reason), 0, "{reason:?}");
+        }
+        for reason in [tack_ai::StopReason::Error, tack_ai::StopReason::Length] {
+            assert_eq!(super::print_stop_exit_code(reason), 1, "{reason:?}");
+        }
+    }
 
     /// A disabled feature must be invisible in the system prompt: no
     /// guideline, no memory section.

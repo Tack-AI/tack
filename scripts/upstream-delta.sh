@@ -45,10 +45,11 @@ if [ -z "$base" ]; then
         echo "错误：找不到 $doc（可用 UPSTREAM_BASE 直接指定基线）" >&2
         exit 1
     fi
-    # 「对齐到的 commit」一行形如：
-    #   | 对齐到的 commit | `4a6ed01945c7f6a2a350996fb439148149ab65ee`（...） |
-    # 提取该行第一个 40 位 hex。
-    base=$(grep '对齐到的 commit' "$doc" | head -n 1 \
+    # Bilingual canonical docs use one of these table labels:
+    #   | Aligned-to commit | `<40-hex>` (...) |
+    #   | 对齐到的 commit | `<40-hex>`（...） |
+    # Match only the baseline table row, then take its first 40-digit hash.
+    base=$(grep -E '^\|[[:space:]]*(Aligned-to commit|对齐到的 commit)[[:space:]]*\|' "$doc" | head -n 1 \
         | sed -n 's/.*`\([0-9a-f]\{40\}\)`.*/\1/p')
 fi
 if ! printf '%s' "$base" | grep -qE '^[0-9a-f]{40}$'; then

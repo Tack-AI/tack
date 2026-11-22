@@ -296,7 +296,7 @@ pub(crate) async fn run_shell_command(
                 .unwrap_or_default();
             let footer = if truncation.last_line_partial {
                 format!(
-                    "\n\n[Showing last {} of line {end_line}. Full output: {full_path}]",
+                    "\n\n[Showing last {} of line {start_line}. Full output: {full_path}]",
                     format_size(truncation.output_bytes)
                 )
             } else if truncation.truncated_by == Some(TruncatedBy::Lines) {

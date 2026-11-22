@@ -31,6 +31,156 @@
    `dist/providers/data/*.json`），注意发布后合入的路由规则需手工叠加
    （见 2026-09-08 的 Copilot 条目）。
 
+## 2026-11-22 上游增量预审（10d1ad621 → 9c4652688）
+
+本次是**针对性预审，不是已完成的对齐批次**。审阅范围包括 v0.87.0–v1.6.0
+changelog、feature/fix 提交记录，以及与 Tack 实现的定点对比；并未逐条审阅
+全部 commit。因此对齐基线仍保持 `10d1ad621`。本节条目除非明确列入落地表，
+否则均不视为已落地。
+
+| 项 | 值 |
+| --- | --- |
+| 预审目标 | `9c4652688590abb836b40ebd1e4725ecf9a7c7d1`（2026-11-22；v1.6.0 加发布后提交） |
+| 距基线增量 | 1,684 个 commit（1,660 个非合并 commit） |
+| 预审时的 Tack | v1.0.21，`09e887eec096a488a84108b52c49a43db8742cc1` |
+| 验证程度 | 仅源码/changelog 对比；未做真实 provider 或真实终端验证 |
+
+以下成本估算包含针对性实现与回归测试：**S** 为局部小改，**M** 跨模块或需要
+平台验证，**L** 为多日/跨 crate 项目，**XL** 应有独立设计与交付计划。
+
+### 同步自动化阻塞点（下一对齐批次前先修）
+
+本地实际运行 `UPSTREAM_REPO=/Users/zugle/workspaces/github/pi
+scripts/upstream-delta.sh`，失败于 `无法解析基线 commit（得到 ''）`。修复前，
+英文 canonical 文档使用 `Aligned-to commit`，而 `scripts/upstream-delta.sh`
+只 grep `对齐到的 commit`；`.github/workflows/upstream-delta.yml` 又没有覆盖
+`UPSTREAM_BASE`，因此其报告步骤有相同故障。这可能解释了对齐基线为何停止
+推进，但本次没有审计 workflow 运行历史，不能据此断定因果。
+
+双语解析修复已记入下方“首批小修落地”表。报告增加 `tui`、`mcp`、`codemode`、
+`chord`、`durable`、`apps/p2`、`apps/p3` 分组，以及“稳定主线 / 实验架构”
+视图仍待完成；当前五个分组会把多数新工作塞进“其他”。
+
+### 立即候选：正确性、安全性与 Provider 兼容
+
+| 上游 commit | 候选 | Tack 现状 / 实现注意点 | 成本 |
+| --- | --- | --- | --- |
+| `87f9a3641` + `1b2aa0ca0` | 最终工具参数严格完整性 | 流式预览可容错，但最终 JSON 畸形、Responses 调用缺 `output_item.done` 时不得执行。Tack 目前对最终参数仍调用 `parse_streaming_json()`，且没有 `argumentsError`；应保留原始参数供模型纠错，而不是执行修复后的前缀。 | M |
+| `f715a15c1` | 增量流式 JSON 解析器 | Tack 的 coalescer 虽降低解析频率，Anthropic、OpenAI Completions/Responses、Bedrock、Mistral 等 adapter 仍会在 flush 时重解析累计文本。应实现共享增量解析器，并与上面的“流中容错 / 最终严格”区分一起落地，不能只搬性能半部分。 | L |
+| `b82477b7b` + `7a6bd5a97` + `14b804d80` | OpenAI-compatible 请求兼容 | 非 OpenAI 的 instruction 消息默认用 `system`；工具禁用时省略空 `tools: []`；新增 `requiresNonNullAssistantContent`。Tack 仍有 tool history 时发送空数组，也缺后一个 compat 开关。可修 Groq、vLLM/LiteLLM 与代理 400。 | S–M |
+| `406e719a6` + `4a6a58eb5` + `aa47cedce` | strict/untyped 与 Anthropic schema | 含无 `type` 节点时退出 strict；Anthropic 非 strict schema 保留根 `$defs`、`definitions`、`additionalProperties`。Tack 的 `convert_tools()` 当前重建窄根对象，可能破坏 MCP `$ref`，或丢失禁止额外参数的约束。 | M |
+| `6fcb48670` + `441f5767c` | 摘要上限与 print 截断退出码 | 取消摘要固定输出上限，避免 reasoning 耗尽摘要额度；print 保留截断输出但告警并在 `stopReason=length` 时非零退出。Tack 有固定摘要预算，print 目前只有 `Error` 设置退出 1。 | S |
+| `0a4fad548` + `d3398f826` + `73f8de80b` + `3dd803d7e` | overflow 识别与 output-token 钳制 | 为 OpenRouter tokenizer 高估预留余量；识别 LiteLLM、Copilot HTTP 413、Z.AI CN 的 overflow 形式，避免不必要的 400 与误 compaction。Tack 已有摘要重试和摘要禁缓存，不要重写这些部分。 | M |
+| `a00a5048d` + `25190b72c` + `4699b5b26` | 重试分类 | 重试临时流内 provider 故障、空/不完整 gateway 响应和独立 socket 错误，同时排除永久配额错误。需同时覆盖 assistant classifier 与初始 HTTP 层，只改一层会留下不一致行为。 | M |
+| `1d74741e1` + `bde882c74` + `b2cb62923` + `f10993bc7` | OAuth 刷新生命周期 | 跨进程串行刷新；调用方取消后仍保存 rotated token；退出时等待已启动刷新落盘；MCP 登录可取消。Tack 有进程内 provider 锁，但没有等价的跨进程/退出生命周期。 | M–L |
+| `5806068c2` + `d850edee9` + `e529a82c9` + `9ffd27cfa` | MCP OAuth 存储与授权加固 | 凭证按服务器 name **和 URL** 隔离；支持 metadata URL override、RFC 9207 `iss`；step-up 保留 granted scopes；授权 URL 只允许 HTTP(S)。旧 token 项需要迁移，不能简单换 key 使其静默失效。 | M |
+
+### 高价值功能与架构候选
+
+| 优先级 | 上游 commit / 来源 | 候选与建议形态 | 成本 |
+| --- | --- | --- | --- |
+| 高——存储兼容 | `466db0fec` | **`ContextEditEntry` 与安全 context 边界。** 先实现读取/projection，再考虑写入：按分支隐藏/替换模型上下文而不改 raw history，并统一作用于 compaction、branch summary、失败恢复和 fork。拆分普通 `context` 与显式全量 `context_with_system`；Tack 当前 transform hook 暴露完整消息，且没有 context-edit projection。 | L |
+| 高——新 agent 能力 | `8562bcf66`；`packages/codemode/README.md` | **非持久 Code Mode MVP。** 模型用 JavaScript 循环、分支、并发组合工具，中间结果留在脚本内，只有最终输出进入模型上下文。首版 opt-in，QuickJS/WASM，无 fs/net/env/timers，严格限制时间/内存/输出/并发/嵌套深度；嵌套调用统一走保留参数校验、hooks、权限、输出上限的 executor。复用 WASM 资源限制经验，不复用长期插件 ABI。确定性 journal replay 与 durable 恢复后置。 | XL |
+| 高——延迟与工具控制 | `e029c3ed0` + `30a1d1849` + `ddaa0a034` + `04b97ef00` | **deferred MCP 连接与分层工具选择。** 首个 prompt 只等待 direct server；搜索/调用时再等待所需 deferred server，重连后恢复工具。增加 `+name`/`-name`、`*` 模式和禁用 MCP 的上游 CLI 开关；普通 `--tools` 不得意外清空 MCP 工具。 | L |
+| 高——项目 MCP 配置 | `1387af7b4` + `91f9f3b5d` | 项目 MCP 条目可只覆盖全局 server 的 `enabled`/`exposure`/`toolExposure`；MCP server 可通过 `auth.provider` 复用 provider 登录。 | M |
+| 中——缓存与成本 | `60ac3bcc3` + `fcc33744b` + `b271b0a52` + `caa6967b6` | GPT thinking level 切换及动态工具增删时保留 prompt cache。按协议使用 `configuration_update`、Anthropic inline additions、Responses 消息锚定 additional tools；历史编辑和工具重定义需要显式回退行为。 | L |
+| 中——provider 目录与计费 | `ee409a85f` + `7c22a93d0` | 拉取 OpenRouter 按 API key 定制的模型、限额与价格；区分 provider 实报账单总额与目录估算。Tack 已有长上下文分级定价，不要重复实现。 | M |
+| 中——provider continuation | `a758f3ae4` + `49fe0a237` | **Anthropic Message Threads。** 有效时只发送新增消息，早先 context/tool 变化后回退完整请求，并清理 per-session 资源。收益是减少重复上传与延迟，不是 token 单价下降。cache warming 和摘要不得触碰主 thread。 | L |
+| 中——协议对齐 | `e473b5cd8` + `beffcde92` + `6aab551a7` + `e03dca7a3` | RPC prompt 以 additive 字段返回 `started`/`queued`/`handled` disposition；session replacement 的生命周期事件恰好一次，并先订阅再执行 startup handler，避免 JSON/RPC 客户端丢失 `session_start` 事件。 | M–L |
+| 中——当前模型 | `a37306d43` + `a3f265b1c` + `139707002` + `3e4f87265` + `1692bba63` + `fe8a6f5dc` + `86918f9ee` | 内置目录刷新要与协议迁移一起：Azure Foundry Chat Completions、Kimi Coding 改 OpenAI Completions、Qwen 新网关与 Individual CN、Gemini 4/带前缀 Gemini 3+、Copilot reasoning metadata。只刷新 JSON 不够；`providers.rs` 仍有旧 Azure ID、Kimi 协议/base URL 和 Qwen host。 | M–L |
+| 中——工具发现 | `ae823bc0b` + `cc44fa216` + `e033f255f` + `79006f061` + `6d3e342b2` | 改进 `tool_search`：完整名称/多 query term 排名、名称高于描述、Unicode 规范化，以及局部 `$ref` 后属性可搜索。Tack 当前只索引小写 name/description 文本。 | M |
+| 后期——workbench | p2 command menu/projects；`4839e41d6`、`5a14e69c0` | 用 Cmd/Ctrl+K 统一暴露已有内建/会话/模型/扩展命令；增加按 cwd/project 分组的 sidebar，显示 working/failed/unread/子代理状态。权限与命令可用性由 host 决定，不增加远程任意 CLI 执行接口。 | M–L |
+| 后期——agent 产出 | p2 artifacts；`6f1a96e1d`、`da57c1662` | 增加版本化 Markdown/静态 HTML artifacts，支持 list/read/write/edit/show 与 transcript 引用。使用 session sidecar 或独立 store，不改 v4 格式。首版只做沙箱静态渲染；HTML eval、自由批注、共享插件 pane 后置。 | L |
+| 后期——remote UI 基础 | Chord delta/sync 设计 | 在现有 CBOR 协议上增加单调 progress revision、`afterRevision`、有界操作日志、transcript window、snapshot reset/gap 恢复。只借鉴可恢复 watch 语义，不换成 Chord，也不宣称多 writer CRDT。 | L |
+| 后期——durable 等待 | `473515f9c`；`packages/durable` | 选一个显式 park 的工具（webhook 或人工审批）做原型：typed signal inbox、持久 checkpoint/deadline、timeout/cancel/duplicate 处理与重启恢复。不要尝试冻结任意 bash、Tokio future 或运行中的子代理，也不承诺外部副作用 exactly-once。 | L–XL |
+
+### 值得集中成批的低成本 TUI 与平台修复
+
+| 上游 commit | 候选 | Tack 现状 |
+| --- | --- | --- |
+| `9e9609216` | bash 超长行后接空行时仍保留输出 | `truncate_tail()` 仅在累计 output 为空时保留超长行尾部；尾部空行可能因此抑制有用文本。同时检查 bash footer 的 `endLine` 与 `startLine`。 |
+| `6100fe5a8` + `3bae85274` | 编辑器 Home/End 与 selector PageUp/PageDown | fullscreen 当前先于 editor/autocomplete/dialog 截获这些键。transcript 首尾改用 Ctrl+Home/Ctrl+End，打开的菜单优先处理选择键。 |
+| `a635f390` | `/resume` 刷新/重命名/删除后选中稳定 | Tack 会重建 select list 并重置过滤选择；应按 path 保持身份，定义删除后的回退，不必移植上游 progressive-loading 机制。 |
+| `be2744d95` | full redraw 后 Kitty 图片仍有效 | 主屏 ED2/ED3 可能使图片失效，而 upload cache 随后只发 placement。清屏时应失效并重传，或避免破坏性清屏。 |
+| `672000c80c` + `4622edb79` + `4464442f9` + `1c8cb1781` | fullscreen 图片最后绘制；裁剪 anchor 在 viewport 上方的图片 | 分离文本清屏/输出与图片 placement，再增加有界图片高度元数据/搜索来生成裁剪 placement。需在 Kitty/WezTerm/Orca 实测，不能当成单终端修复。 |
+| `e4f50d76d` + `3107a58d2` | 外部 SIGTSTP 走 Ctrl+Z 的终端恢复路径 | 必须包含 terminal ownership 后续语义：start 前不监听，恢复终端后再移除监听，不干扰外部编辑器。 |
+| `31b407dc6` | Windows console close 的 shutdown cleanup | close/SIGHUP 走与正常退出相同且有时限的 shutdown。现有 Job Object 能回收多数子进程，但不能替代扩展/OAuth 清理。 |
+| `b7bb7ca90` | fullscreen 滚动剩余性能优化 | Tack 已有 visible-window materialization 和有界 cache。只优化剩余的全量 offsets/spans 扫描（view-only frame、复用、二分），不要移植上游 readonly render array 的 breaking API。 |
+
+### 已核对，无需立即重复移植
+
+- `4438c58ba`（abort 批次补齐所有 tool result）：Tack 顺序与并行路径均已给未开始
+  调用写入 `"Operation aborted"` 结果。可选小收尾是把取消检查提前到 lookup/hooks 前。
+- `3a7bb6f48`（流式 read）：已有有界 `BufReader` 行窗口实现覆盖。
+- `cb1205e46`（compaction 后极多 entry）：Tack 迭代构建 session path，不受 JavaScript
+  spread/调用栈故障影响。
+- `51ba3ab5b`（retry abort listener 堆积）：Rust cancellation token/future 没有 Node
+  listener 保留机制。
+- `5b5be2c3`（超大自渲染 tool result）：上游崩溃是 V8 spread 参数上限；Tack 使用 Rust
+  迭代/extend。大渲染性能是独立问题，不是同一个 crash fix。
+
+### 明确暂缓 / 不整体移植
+
+- **p2**：README 明确称其为 experimental prototype，且“will be gone soon”。只借鉴
+  command menu、project/sidebar、workflow、artifact 思路。
+- **p3**：目前仍是 headless 骨架，不是完整继任产品。Tack 已有更丰富的 process/WASM
+  插件载体；新 host capability 应增量 dogfood，不把核心重写为插件。
+- **Chord / Durable**：不整体迁移。分别借鉴可恢复 watch 与显式 parked wait。
+  Durable Code Mode replay 是更后期的独立项目。
+- **Radius/cloud backup、通用 rooms/CRDT 协作、remote execution environment**：当前不作
+  对齐承诺；现有 `tack serve` 仍是 remote-session 路径。
+- **pi-schema**：主要解决 TypeScript/CSP/TypeBox 问题，不是 Tack 的独立产品功能。
+- **agent 自写并自我应用生产插件**：不得绕过 Tack 的安装策略、审核和 WASM capability
+  边界。
+
+### 实现时的兼容约束
+
+1. **Context edit**：写新 entry 前先增加 v3/v4 互操作 fixture。若忽略 context projection，
+   仅把未知 entry 保留为 custom 并不够。覆盖 migration、fork、compaction、summary、usage。
+2. **OAuth 存储**：name → name+URL 的 key 变化需要向后兼容迁移、跨进程
+   read/modify/write 保护，以及按 symlink 解析后路径确定的锁身份。
+3. **RPC**：disposition 等可选响应字段是 additive；生命周期事件顺序不是。为
+   startup/new/switch/fork/clone/reload 和 JSON print 增加 golden trace，覆盖恰好一次订阅及
+   handler 发出的事件。
+4. **Thread/缓存保持**：compaction、context edit、system/tool 变化、summary、cache warming
+   需要完整请求或 disable-continuation 回退，以及 session resource cleanup。
+5. **Code Mode**：嵌套调用必须与顶层调用共享安全/权限路径。版本化 schema 设计前，
+   程序用 structured result 不进入持久 wire；限制 fan-out、嵌套调用、输出和资源用量。
+6. **Project/artifact**：使用 additive 协议元数据与 sidecar store。UI 分组、已读状态、
+   artifact 版本不得改变 session v4。
+
+### 建议交付顺序
+
+1. 修复 delta 自动化，并增加解析/分组测试。
+2. 以聚焦 PR 落地最终参数完整性、OpenAI/schema 兼容、摘要/print 修复及低成本 TUI 批次。
+3. 加固 OAuth/MCP 生命周期与关闭清理。
+4. 将共享增量 JSON 解析器作为独立性能项目交付。
+5. 增加 ContextEdit 读兼容、deferred MCP 启动、provider/catalog 迁移及互操作测试。
+6. 在 feature gate 后实现非持久 Code Mode MVP。
+7. 若浏览器 workbench 是产品重点，依次增加 command menu/project sidebar、可恢复 watch、
+   静态版本化 artifacts。
+
+### 首批小修落地（未发布）
+
+以下低风险项已在当前工作树实现，并有针对性回归测试，但尚未进入 tagged release。
+
+| 上游 commit | Tack 落地 |
+| --- | --- |
+| delta 自动化阻塞点 | `scripts/upstream-delta.sh` 同时接受 `Aligned-to commit` 与 `对齐到的 commit`；新增离线 `scripts/upstream-delta.test.sh` 覆盖两种语言，并接入 `evals-selftest` CI job。扩展报告分组仍待完成。 |
+| `9e9609216` | `truncate_tail()` 在超长行后只有空行时保留该行尾部及空行后缀，并保持字节/行数元数据一致；bash footer 使用部分行真实的 `start_line`。单测覆盖 60 KB/219 KB、LF/CRLF，另有真实 bash 工具回归测试。 |
+| `441f5767c` | print 在 `StopReason::Length` 时保留部分 stdout，同时在 stderr 告警并退出 1，text/JSON 两种模式一致；Error 行为不变。独立的 `6fcb48670` 摘要预算项已记入下方第二批落地表。 |
+| `6100fe5a8` + `3bae85274` 的局部 | 裸 Home/End 交给 fullscreen 编辑器；Ctrl+Home/Ctrl+End 控制 transcript 首尾；autocomplete 打开时优先接收 PageUp/PageDown。dialog 本就有输入优先级。其余自定义 selector 工作与上游 `capturesViewportInput` 组件 API 未移植。 |
+
+### 第二批小修落地（未发布）
+
+以下后续项也已实现并有针对性测试。
+
+| 上游 commit | Tack 落地 |
+| --- | --- |
+| `b82477b7b` + `7a6bd5a97` + `14b804d80` | OpenAI 官方 API 之外的 instruction 消息默认使用 `system`；只有 `requiresToolsWithToolHistory` 显式开启时才发送空 `tools: []`；`requiresNonNullAssistantContent` 独立控制工具调用 assistant 回放使用 `""`。显式 `supportsDeveloperRole` 仍覆盖自动探测。请求级测试覆盖 OpenAI/Groq/OpenRouter role、vLLM 风格空 tools、两个 opt-in，以及 null 与空字符串 assistant content。 |
+| `a635f390` 的局部 | `/resume` 刷新在 rename 和排序切换时按 path 保持选中会话；删除时选择下一行，末尾则选择前一行。Tack 是同步加载而非渐进加载，无需上游 pending-partial-list 机制。测试使用真实命名 session 文件。 |
+| `6fcb48670` | compaction history、split-turn prefix、abandoned-branch summary 直接使用 `model.max_tokens`；模型上限为 0 时省略覆盖。`reserveTokens` 仅保留为 compaction 触发阈值。测试捕获 provider options，验证使用模型上限而非 reserve 派生预算。 |
+
 ## 2026-09-21 对齐批次（基线 4a6ed0194 → 10d1ad621）
 
 160 个上游 commit 经逐条审阅（报告由 `scripts/upstream-delta.sh` 生成）。

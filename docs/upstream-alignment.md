@@ -39,6 +39,174 @@ upstream sync.
    `dist/providers/data/*.json`). Note that routing rules merged after a
    release must be overlaid manually (see the Copilot entry from 2026-09-08).
 
+## 2026-11-22 upstream delta triage (10d1ad621 → 9c4652688)
+
+This is a **targeted triage, not a completed alignment batch**. The review covered
+the v0.87.0–v1.6.0 changelogs, feature/fix logs, and targeted comparisons against
+Tack's implementation; it did not review every commit individually. The aligned-to
+baseline therefore remains `10d1ad621`. No item in this section is recorded as
+landed unless it is explicitly included in a landing table.
+
+| Item | Value |
+| --- | --- |
+| Review target | `9c4652688590abb836b40ebd1e4725ecf9a7c7d1` (2026-11-22; v1.6.0 plus post-release commits) |
+| Delta since baseline | 1,684 commits (1,660 non-merge commits) |
+| Tack reviewed at | v1.0.21, `09e887eec096a488a84108b52c49a43db8742cc1` |
+| Verification level | Source/changelog comparison only; no live-provider or real-terminal verification |
+
+Cost estimates below include focused implementation and regression tests: **S** is
+a small local change, **M** crosses modules or needs platform validation, **L** is
+a multi-day/cross-crate project, and **XL** should have its own design and delivery
+plan.
+
+### Sync automation blocker (fix before the next alignment batch)
+
+`UPSTREAM_REPO=/Users/zugle/workspaces/github/pi scripts/upstream-delta.sh` was run
+locally and failed with `无法解析基线 commit（得到 ''）`. Before the fix below,
+the canonical English document used `Aligned-to commit`, while
+`scripts/upstream-delta.sh` only grepped for `对齐到的 commit`;
+`.github/workflows/upstream-delta.yml` did not override `UPSTREAM_BASE`, so its
+report step had the same failure. This may explain why the alignment baseline
+stopped advancing, although the workflow history was not audited as part of
+this review.
+
+The bilingual parser fix is recorded in the landed table below. Expanded report
+groups for `tui`, `mcp`, `codemode`, `chord`, `durable`, `apps/p2`, and `apps/p3`,
+plus a stable-mainline versus experimental-architecture view, remain pending;
+the current five groups put most of the new work under "other".
+
+### Immediate correctness, safety, and provider-compatibility candidates
+
+| Upstream commit | Candidate | Tack finding / implementation note | Cost |
+| --- | --- | --- | --- |
+| `87f9a3641` + `1b2aa0ca0` | Strict final tool-call argument integrity | Streaming previews may use tolerant parsing, but malformed final JSON and Responses calls without `output_item.done` must not execute. Tack currently applies `parse_streaming_json()` to final arguments and has no `argumentsError`; preserve raw arguments for model feedback instead of executing a repaired prefix. | M |
+| `f715a15c1` | Incremental streaming JSON parser | Tack's coalescer reduces parse frequency but Anthropic, OpenAI Completions/Responses, Bedrock, Mistral, and other adapters still reparse accumulated text at flush time. Build one shared incremental parser and pair it with the strict-final distinction above; do not land only the performance half. | L |
+| `b82477b7b` + `7a6bd5a97` + `14b804d80` | OpenAI-compatible request compatibility | Default non-OpenAI instruction messages to `system`, omit empty `tools: []` when tools are disabled, and add `requiresNonNullAssistantContent`. Tack still emits an empty array for tool history and lacks the latter compat switch. Addresses Groq, vLLM/LiteLLM, and proxy 400s. | S–M |
+| `406e719a6` + `4a6a58eb5` + `aa47cedce` | Strict/untyped and Anthropic schema handling | Fall back from strict schemas with untyped nodes; preserve root `$defs`, `definitions`, and `additionalProperties` in non-strict Anthropic schemas. Tack's `convert_tools()` currently rebuilds a narrow root and can break MCP `$ref`s or hide the extra-argument constraint. | M |
+| `6fcb48670` + `441f5767c` | Summary limits and print truncation exit status | Remove fixed summary output caps so reasoning cannot consume the whole summary allowance; preserve truncated print output but warn and exit non-zero on `stopReason=length`. Tack has fixed summary budgets and currently sets print exit 1 only for `Error`. | S |
+| `0a4fad548` + `d3398f826` + `73f8de80b` + `3dd803d7e` | Overflow detection and output-token clamping | Leave headroom for OpenRouter tokenizer overcount, and recognize LiteLLM, Copilot HTTP 413, and Z.AI CN overflow forms. Prevents avoidable 400s and unnecessary compaction. Tack already has summary retry and cache-disabled summaries; do not rewrite those parts. | M |
+| `a00a5048d` + `25190b72c` + `4699b5b26` | Retry classification | Retry temporary in-stream provider failures, empty/partial gateway responses, and standalone socket errors while excluding permanent quota failures. Cover both the assistant classifier and initial HTTP handling; changing only one layer leaves behavior inconsistent. | M |
+| `1d74741e1` + `bde882c74` + `b2cb62923` + `f10993bc7` | OAuth refresh lifecycle | Serialize refreshes across processes, persist rotated tokens even if the caller is cancelled, wait for started refreshes during shutdown, and make MCP sign-in cancellable. Tack has an in-process provider lock but no equivalent cross-process/exit lifecycle. | M–L |
+| `5806068c2` + `d850edee9` + `e529a82c9` + `9ffd27cfa` | MCP OAuth storage and authorization hardening | Key credentials by server name **and URL**, support metadata URL override and RFC 9207 `iss`, retain granted scopes on step-up, and allow only HTTP(S) authorization URLs. Migrate old token entries rather than silently invalidating them. | M |
+
+### High-value feature and architecture candidates
+
+| Priority | Upstream commit / source | Candidate and recommended shape | Cost |
+| --- | --- | --- | --- |
+| High — storage compatibility | `466db0fec` | **`ContextEditEntry` plus safe context boundaries.** Implement read/projection semantics before writing: branch-relative hide/replace of model context without changing raw history, shared by compaction, branch summaries, failure recovery, and forks. Split ordinary `context` from explicit full-system `context_with_system`; Tack currently exposes full messages through its transform hook and has no context-edit projection. | L |
+| High — new agent capability | `8562bcf66`; `packages/codemode/README.md` | **Non-persistent Code Mode MVP.** Model-written JavaScript composes tools with loops, branching, and concurrency; intermediate results stay in the script and only the final output enters model context. Start opt-in with QuickJS/WASM, no fs/net/env/timers, strict time/memory/output/concurrency/depth limits, and one nested executor that preserves validation, hooks, permissions, and output caps. Reuse WASM resource-limit experience, not the long-lived plugin ABI. Defer deterministic journal replay and durable recovery. | XL |
+| High — latency and tool control | `e029c3ed0` + `30a1d1849` + `ddaa0a034` + `04b97ef00` | **Deferred MCP connection and layered tool selection.** Wait only for direct servers before the first prompt; wait for deferred servers when searched/called and restore their tools after reconnect. Add `+name`/`-name`, `*` patterns, and an upstream CLI switch for disabling MCP; ordinary `--tools` must not accidentally clear MCP tools. | L |
+| High — project MCP configuration | `1387af7b4` + `91f9f3b5d` | Let project MCP entries override only `enabled`/`exposure`/`toolExposure` of a global server, and let MCP servers reuse a provider login through `auth.provider`. | M |
+| Medium — cache and cost | `60ac3bcc3` + `fcc33744b` + `b271b0a52` + `caa6967b6` | Preserve prompt caches across GPT thinking-level changes and dynamic tool additions/removals. Use `configuration_update`, Anthropic inline additions, and Responses message-anchored additional tools as appropriate; history edits and tool redefinitions need explicit fallback behavior. | L |
+| Medium — provider catalogs and billing | `ee409a85f` + `7c22a93d0` | Fetch OpenRouter's per-key model list, limits, and prices; distinguish provider-reported billed totals from catalog estimates. Tack already has long-context tier pricing, so do not duplicate it. | M |
+| Medium — provider continuation | `a758f3ae4` + `49fe0a237` | **Anthropic Message Threads.** Send only new messages when valid, fall back to a full request after earlier context/tool changes, and clean up per-session resources. The benefit is less repeated upload/latency, not a cheaper token price. Cache warming and summaries must not touch the main thread. | L |
+| Medium — protocol parity | `e473b5cd8` + `beffcde92` + `6aab551a7` + `e03dca7a3` | Add additive RPC prompt `started`/`queued`/`handled` disposition; make session replacement emit lifecycle events exactly once and subscribe before running startup handlers so JSON/RPC clients do not lose `session_start` events. | M–L |
+| Medium — current models | `a37306d43` + `a3f265b1c` + `139707002` + `3e4f87265` + `1692bba63` + `fe8a6f5dc` + `86918f9ee` | Refresh the embedded catalog **together with protocol migrations**: Azure Foundry Chat Completions, Kimi Coding over OpenAI Completions, current Qwen gateways and Individual CN, Gemini 4/prefixed Gemini 3+, and Copilot reasoning metadata. A JSON-only refresh is insufficient; `providers.rs` still contains the old Azure ID, Kimi protocol/base URL, and Qwen hosts. | M–L |
+| Medium — tool discovery | `ae823bc0b` + `cc44fa216` + `e033f255f` + `79006f061` + `6d3e342b2` | Improve `tool_search`: exact/full-name and multi-term ranking, name-over-description weighting, Unicode normalization, and searchable properties behind local `$ref`s. Tack currently indexes only lowercase name/description text. | M |
+| Later — workbench | p2 command menu/projects; `4839e41d6`, `5a14e69c0` | Add Cmd/Ctrl+K over existing built-in/session/model/extension commands and a cwd/project sidebar with working/failed/unread/child status. Keep authorization and command availability host-owned; do not add a remote arbitrary-CLI endpoint. | M–L |
+| Later — agent output | p2 artifacts; `6f1a96e1d`, `da57c1662` | Add versioned Markdown/static-HTML artifacts with list/read/write/edit/show and transcript references. Use a session sidecar or independent store, not a v4 format change. Start with sandboxed static rendering; defer HTML eval, free-form annotation, and shared plugin panes. | L |
+| Later — remote UI foundation | Chord delta/sync design | Add monotonic progress revisions, `afterRevision`, a bounded operation log, transcript windows, and snapshot reset/gap recovery to the existing CBOR protocol. Borrow resumable watch semantics; do not replace the protocol with Chord or claim multi-writer CRDT behavior. | L |
+| Later — durable waits | `473515f9c`; `packages/durable` | Prototype one explicit parked tool (webhook or human approval) with a typed signal inbox, persisted checkpoint/deadline, timeout/cancel/duplicate handling, and restart recovery. Do not attempt to freeze arbitrary bash, Tokio futures, or running subagents, and do not promise exactly-once external side effects. | L–XL |
+
+### Low-cost TUI and platform fixes worth batching
+
+| Upstream commit | Candidate | Tack finding |
+| --- | --- | --- |
+| `9e9609216` | Preserve bash output when an over-long line is followed by a blank line | `truncate_tail()` only takes an oversized line's tail while the accumulated output is empty; a trailing blank line can therefore suppress the useful text. Also review the bash footer's `endLine` versus `startLine`. |
+| `6100fe5a8` + `3bae85274` | Editor Home/End and selector PageUp/PageDown | Fullscreen currently captures these keys before the editor/autocomplete/dialogs. Use Ctrl+Home/Ctrl+End for transcript boundaries and let open menus handle selection keys first. |
+| `a635f390` | Stable `/resume` selection across refresh/rename/delete | Tack rebuilds its select list and resets filtering selection; preserve identity by path and define deletion fallback rather than porting upstream's progressive-loading machinery. |
+| `be2744d95` | Keep Kitty images valid after full redraw | Main-screen ED2/ED3 can invalidate an image while the upload cache later emits only its placement. Invalidate/retransmit on clear or avoid the destructive clear. |
+| `672000c80c` + `4622edb79` + `4464442f9` + `1c8cb1781` | Draw fullscreen images last and crop images anchored above the viewport | Separate text clearing/output from image placement, then add bounded image-height metadata/search for cropped placements. Validate on Kitty/WezTerm/Orca rather than treating this as a single-terminal fix. |
+| `e4f50d76d` + `3107a58d2` | Handle external SIGTSTP through the Ctrl+Z terminal-restore path | Include terminal-ownership follow-up semantics: no listener before start, remove only after terminal restoration, and do not interfere with an external editor. |
+| `31b407dc6` | Windows console-close shutdown cleanup | Route close/SIGHUP through the same bounded shutdown as normal exit. The existing Job Object handles many child processes but does not replace extension/OAuth cleanup. |
+| `b7bb7ca90` | Remaining fullscreen scroll optimization | Tack already materializes a visible window and bounds caches. Only optimize the remaining full-item offsets/spans scans (view-only frames, reuse, binary search); do not port upstream's readonly-render-array breaking API. |
+
+### Reviewed with no immediate duplicate work
+
+- `4438c58ba` (answer every tool call after an aborted batch): Tack already writes
+  `"Operation aborted"` results for unstarted calls in sequential and parallel paths.
+  An optional small follow-up is to check cancellation before lookup/hooks.
+- `3a7bb6f48` (streaming read): already covered by the bounded `BufReader` line-window
+  implementation.
+- `cb1205e46` (very many entries after compaction): Tack builds its session path
+  iteratively and is not exposed to the JavaScript spread/call-stack failure.
+- `51ba3ab5b` (retry abort-listener buildup): Rust cancellation tokens/futures do not
+  have the Node listener-retention mechanism.
+- `5b5be2c3` (very large self-rendered tool result): the upstream crash is a V8
+  spread-argument limit; Tack uses Rust iteration/extend. Large-render performance is
+  a separate concern, not the same crash fix.
+
+### Explicitly deferred / do not port wholesale
+
+- **p2:** its README calls it an experimental prototype that "will be gone soon".
+  Borrow command-menu, project/sidebar, workflow, and artifact ideas only.
+- **p3:** currently a headless skeleton, not a complete successor product. Tack
+  already has richer process/WASM plugin carriers; dogfood new host capabilities
+  incrementally instead of rewriting the core as plugins.
+- **Chord / Durable:** no wholesale migration. Borrow resumable watches and explicit
+  parked waits respectively. Durable Code Mode replay is a later, separate project.
+- **Radius/cloud backup, generic rooms/CRDT collaboration, and remote execution
+  environments:** no current alignment commitment. Existing `tack serve` remains the
+  remote-session path.
+- **pi-schema:** primarily solves TypeScript/CSP/TypeBox concerns; it is not an
+  independent Tack product feature.
+- **Agent-authored self-applied production plugins:** do not bypass Tack's install
+  policy, review, and WASM capability boundaries.
+
+### Compatibility constraints for implementation
+
+1. **Context edits:** add v3 and v4 interoperability fixtures before writing new
+   entries. Preserving an unknown entry as custom data is not enough if its context
+   projection is ignored. Cover migration, fork, compaction, summaries, and usage.
+2. **OAuth stores:** name → name+URL key changes need backward-compatible migration,
+   cross-process read/modify/write protection, and symlink-resolved lock identity.
+3. **RPC:** optional response fields such as disposition are additive; lifecycle event
+   ordering is not. Add golden traces for startup/new/switch/fork/clone/reload and
+   JSON print, including exactly-once subscription and handler-emitted events.
+4. **Threads/cache preservation:** compaction, context edits, system/tool changes,
+   summaries, and cache warming need full-request or non-continuation fallbacks plus
+   session-resource cleanup.
+5. **Code Mode:** nested calls must share the top-level security/permission path.
+   Keep program-only structured results off the persisted wire until a versioned
+   schema is designed; cap fan-out, nested calls, output, and resource use.
+6. **Projects/artifacts:** use additive protocol metadata and sidecar stores. Do not
+   change session v4 for UI-owned grouping, read state, or artifact versions.
+
+### Recommended delivery order
+
+1. Repair delta automation and add parser/grouping tests.
+2. Land final-argument integrity, OpenAI/schema compatibility, summary/print fixes,
+   and the low-cost TUI batch as focused PRs.
+3. Harden OAuth/MCP lifecycle and shutdown behavior.
+4. Deliver the shared incremental JSON parser as its own performance project.
+5. Add ContextEdit read compatibility, deferred MCP startup, and provider/catalog
+   migrations with interoperability tests.
+6. Build the non-persistent Code Mode MVP behind a feature gate.
+7. If the browser workbench is a product priority, add command menu/project sidebar,
+   resumable watch, and static versioned artifacts in that order.
+
+### First small-fix landing (Unreleased)
+
+These low-risk items are implemented in the current working tree and covered by
+focused regression tests. They are not yet in a tagged release.
+
+| Upstream commit | Tack landing |
+| --- | --- |
+| Delta automation blocker | `scripts/upstream-delta.sh` accepts both `Aligned-to commit` and `对齐到的 commit`; new offline `scripts/upstream-delta.test.sh` verifies both languages and runs in the `evals-selftest` CI job. Expanded report grouping remains pending. |
+| `9e9609216` | `truncate_tail()` retains the end of an oversized line when only blank lines follow, preserves that suffix, and keeps byte/line metadata consistent; the bash footer uses the partial line's real `start_line`. Unit coverage includes 60 KB/219 KB and LF/CRLF cases, plus a real bash-tool regression test. |
+| `441f5767c` | Print mode warns on stderr and exits 1 for `StopReason::Length` in both text and JSON modes while retaining partial stdout. Error behavior is unchanged. The separate `6fcb48670` summary-budget item is recorded in the second landing table below. |
+| `6100fe5a8` + scoped portion of `3bae85274` | Bare Home/End reach the fullscreen editor; Ctrl+Home/Ctrl+End own transcript boundaries; open autocomplete receives PageUp/PageDown before transcript scrolling. Dialogs already had input priority. The remaining custom-selector work and upstream's `capturesViewportInput` component API are not ported. |
+
+### Second small-fix landing (Unreleased)
+
+These follow-up items are also implemented and covered by focused tests.
+
+| Upstream commit | Tack landing |
+| --- | --- |
+| `b82477b7b` + `7a6bd5a97` + `14b804d80` | OpenAI-compatible instruction messages default to `system` outside OpenAI's own API; empty `tools: []` is omitted unless `requiresToolsWithToolHistory` opts in; `requiresNonNullAssistantContent` independently selects `""` for tool-call-only assistant replay. Explicit `supportsDeveloperRole` still overrides detection. Request-level tests cover OpenAI/Groq/OpenRouter roles, vLLM-style empty tools, both opt-ins, and null versus empty-string assistant content. |
+| Scoped portion of `a635f390` | `/resume` refresh preserves the selected session path across rename and sort changes. Delete falls back to the next row, then the previous row at the end. Tack has synchronous rather than progressive loading, so upstream's pending-partial-list machinery is unnecessary. Tests use real named session files. |
+| `6fcb48670` | Compaction history, split-turn prefix, and abandoned-branch summaries use `model.max_tokens` directly; a zero model limit omits the override. `reserveTokens` remains only the compaction trigger. Tests capture provider options and verify the model limit instead of a reserve-derived cap. |
+
 ## 2026-09-21 alignment batch (baseline 4a6ed0194 → 10d1ad621)
 
 160 upstream commits reviewed one by one (report generated by

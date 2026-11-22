@@ -1683,6 +1683,48 @@ async fn bg_notification_stays_idle_when_auto_wake_disabled() {
 }
 
 #[tokio::test]
+async fn fullscreen_home_and_end_belong_to_editor() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut app = test_app(cwd.path()).await;
+    app.toggle_fullscreen();
+
+    for event in type_text("bc") {
+        app.handle_input(event).await;
+    }
+    app.handle_input(key(Key::Home)).await;
+    for event in type_text("a") {
+        app.handle_input(event).await;
+    }
+    assert_eq!(app.test_editor_text(), "abc");
+
+    app.handle_input(key(Key::Home)).await;
+    for event in type_text("x") {
+        app.handle_input(event).await;
+    }
+    assert_eq!(app.test_editor_text(), "xabc");
+    app.handle_input(key(Key::End)).await;
+    for event in type_text("z") {
+        app.handle_input(event).await;
+    }
+    assert_eq!(app.test_editor_text(), "xabcz");
+}
+
+#[tokio::test]
+async fn fullscreen_page_down_pages_open_autocomplete() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut app = test_app(cwd.path()).await;
+    app.toggle_fullscreen();
+    app.handle_input(key(Key::Char('/'))).await;
+
+    let labels = app.test_autocomplete_labels();
+    assert!(labels.len() > 10, "not enough completions: {labels:?}");
+    let expected = format!("/{} ", labels[10].trim_start_matches('/'));
+    app.handle_input(key(Key::PageDown)).await;
+    app.handle_input(key(Key::Enter)).await;
+    assert_eq!(app.test_editor_text(), expected);
+}
+
+#[tokio::test]
 async fn fullscreen_scroll_up_works_after_run_finishes() {
     use tack_agent_core::AgentEvent;
     let cwd = tempfile::tempdir().unwrap();
@@ -1736,8 +1778,10 @@ async fn fullscreen_scroll_up_works_after_run_finishes() {
         "pill missing:\n{}",
         strip_ansi(&after)
     );
-    // End key jumps back to the bottom and resumes following.
-    app.handle_input(key(Key::End)).await;
+    // Ctrl+End jumps back to the bottom and resumes following; bare End
+    // remains an editor key.
+    app.handle_input(InputEvent::Key(KeyEvent::ctrl(Key::End)))
+        .await;
     let bottom = frame_text(&mut app);
     assert!(
         !strip_ansi(&bottom).contains("Back to bottom"),

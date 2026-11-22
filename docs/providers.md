@@ -66,6 +66,14 @@ stdout as the key (same behavior as TS pi). Catalogs probed from local
 providers are sparsely merged with models.json fields such as
 `contextWindow` (models.json wins).
 
+For `openai-completions` models, these compatibility overrides are available:
+
+| `compat` key | Default | Behavior |
+| --- | --- | --- |
+| `supportsDeveloperRole` | `true` only for OpenAI's own API | Send the system prompt and mid-conversation system messages as `developer` instead of `system`. Other OpenAI-compatible hosts default to `system`; an explicit value overrides detection. |
+| `requiresNonNullAssistantContent` | `false` | Send `""` instead of `null` for replayed assistant messages with no text, such as tool-call-only messages. Enable for proxies that reject null assistant content. |
+| `requiresToolsWithToolHistory` | `false` | Send `"tools": []` when tools are disabled but history contains tool calls/results. Only enable for older proxies (for example, older LiteLLM in front of Anthropic) that require the field; vLLM and other servers reject an empty array. |
+
 ## Amazon Bedrock (`bedrock-converse-stream`)
 
 Implemented without the AWS SDK:

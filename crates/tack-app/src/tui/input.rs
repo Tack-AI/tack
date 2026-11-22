@@ -264,7 +264,11 @@ impl TuiApp {
             self.autocomplete = None;
             return true;
         }
-        if key.matches("up") || key.matches("down") {
+        if key.matches("up")
+            || key.matches("down")
+            || key.matches("pageup")
+            || key.matches("pagedown")
+        {
             if let Some(auto) = &mut self.autocomplete {
                 auto.list.handle_input(event);
             }
@@ -1028,13 +1032,23 @@ impl TuiApp {
                 self.jump_prompt(1);
                 true
             }
-            InputEvent::Key(key)
-                if key.matches("pageup")
-                    || key.matches("pagedown")
-                    || key.matches("home")
-                    || key.matches("end") =>
-            {
-                self.scroll.handle_input(event);
+            InputEvent::Key(key) if key.matches("pageup") || key.matches("pagedown") => {
+                // An open completion menu pages its selection; without one,
+                // these keys keep scrolling the fullscreen transcript.
+                if self.autocomplete.is_some() {
+                    false
+                } else {
+                    self.scroll.handle_input(event);
+                    true
+                }
+            }
+            InputEvent::Key(key) if key.matches("ctrl+home") || key.matches("ctrl+end") => {
+                if key.matches("ctrl+home") {
+                    self.scroll.scroll_top = 0;
+                    self.scroll.follow_end = false;
+                } else {
+                    self.scroll.scroll_to_end();
+                }
                 true
             }
             InputEvent::Mouse(mouse) => {

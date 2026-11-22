@@ -63,6 +63,14 @@ URL/code，或使用 `--device-code`。
 TS pi 行为一致）。本地 provider 探测到的目录与 models.json 的
 `contextWindow` 等字段做稀疏合并（models.json 优先）。
 
+`openai-completions` 模型支持以下兼容覆盖项：
+
+| `compat` 字段 | 默认值 | 行为 |
+| --- | --- | --- |
+| `supportsDeveloperRole` | 仅 OpenAI 官方 API 为 `true` | 将 system prompt 与会话中途的 system 消息以 `developer` 而不是 `system` 发送。其他 OpenAI-compatible host 默认用 `system`；显式配置覆盖自动探测。 |
+| `requiresNonNullAssistantContent` | `false` | 回放无正文的 assistant 消息（例如只有工具调用）时发送 `""` 而不是 `null`。用于拒绝 null assistant content 的代理。 |
+| `requiresToolsWithToolHistory` | `false` | 工具已禁用但历史含 tool call/result 时发送 `"tools": []`。仅用于要求该字段的旧代理（例如 Anthropic 前的旧版 LiteLLM）；vLLM 等服务会拒绝空数组。 |
+
 ## Amazon Bedrock（`bedrock-converse-stream`）
 
 不依赖 AWS SDK 实现：

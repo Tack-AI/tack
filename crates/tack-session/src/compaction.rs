@@ -620,14 +620,15 @@ pub(crate) async fn complete_summarization(
     model: &tack_ai::Model,
     provider: &Arc<dyn Provider>,
     context: &Context,
-    max_tokens: u64,
     auth: &tack_ai::oauth::ResolvedAuth,
     reasoning: Option<tack_ai::ThinkingLevel>,
     session_id: Option<&str>,
     cancel: &CancellationToken,
 ) -> Result<tack_ai::AssistantMessage, String> {
     let options = StreamOptions {
-        max_tokens: Some(max_tokens.min(u32::MAX as u64) as u32),
+        // Summary requests use the model's own output limit. reserveTokens
+        // only decides when compaction starts; it is not an output budget.
+        max_tokens: (model.max_tokens > 0).then_some(model.max_tokens),
         api_key: auth.api_key.clone(),
         headers: auth.headers.clone(),
         // Avoid cache writes for one-off summaries.
@@ -678,7 +679,6 @@ async fn generate_summary_with_usage(
     current_messages: &[AgentMessage],
     model: &tack_ai::Model,
     provider: &Arc<dyn Provider>,
-    reserve_tokens: u64,
     auth: &tack_ai::oauth::ResolvedAuth,
     custom_instructions: Option<&str>,
     previous_summary: Option<&str>,
@@ -686,13 +686,6 @@ async fn generate_summary_with_usage(
     session_id: Option<&str>,
     cancel: &CancellationToken,
 ) -> Result<SummaryWithUsage, String> {
-    let max_tokens = (0.8 * reserve_tokens as f64).floor() as u64;
-    let max_tokens = if model.max_tokens > 0 {
-        max_tokens.min(model.max_tokens as u64)
-    } else {
-        max_tokens
-    };
-
     let mut base_prompt = if previous_summary.is_some() {
         UPDATE_SUMMARIZATION_PROMPT
     } else {
@@ -718,7 +711,6 @@ async fn generate_summary_with_usage(
         model,
         provider,
         &build_summarization_context(&prompt_text),
-        max_tokens,
         auth,
         reasoning,
         session_id,
@@ -737,19 +729,11 @@ async fn generate_turn_prefix_summary(
     messages: &[AgentMessage],
     model: &tack_ai::Model,
     provider: &Arc<dyn Provider>,
-    reserve_tokens: u64,
     auth: &tack_ai::oauth::ResolvedAuth,
     reasoning: Option<tack_ai::ThinkingLevel>,
     session_id: Option<&str>,
     cancel: &CancellationToken,
 ) -> Result<SummaryWithUsage, String> {
-    let max_tokens = (0.5 * reserve_tokens as f64).floor() as u64;
-    let max_tokens = if model.max_tokens > 0 {
-        max_tokens.min(model.max_tokens as u64)
-    } else {
-        max_tokens
-    };
-
     let llm_messages = AgentMessage::default_convert_to_llm(messages);
     let conversation_text = serialize_conversation(&llm_messages);
     let prompt_text = format!(
@@ -760,7 +744,6 @@ async fn generate_turn_prefix_summary(
         model,
         provider,
         &build_summarization_context(&prompt_text),
-        max_tokens,
         auth,
         reasoning,
         session_id,
@@ -1039,7 +1022,6 @@ pub async fn compact(
                     &preparation.messages_to_summarize,
                     model,
                     provider,
-                    preparation.settings.reserve_tokens,
                     auth,
                     custom_instructions,
                     preparation.previous_summary.as_deref(),
@@ -1055,7 +1037,6 @@ pub async fn compact(
                 &preparation.turn_prefix_messages,
                 model,
                 provider,
-                preparation.settings.reserve_tokens,
                 auth,
                 reasoning,
                 session_id,
@@ -1076,7 +1057,6 @@ pub async fn compact(
                 &preparation.messages_to_summarize,
                 model,
                 provider,
-                preparation.settings.reserve_tokens,
                 auth,
                 custom_instructions,
                 preparation.previous_summary.as_deref(),
@@ -1169,6 +1149,88 @@ mod tests {
             timestamp: "2026-01-01T00:00:00.000Z".to_string(),
             message: AgentMessage::user(text),
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct CaptureProvider {
+        options: std::sync::Mutex<Vec<StreamOptions>>,
+    }
+
+    impl Provider for CaptureProvider {
+        fn stream(
+            &self,
+            model: &tack_ai::Model,
+            _context: &Context,
+            options: StreamOptions,
+        ) -> tack_ai::AssistantMessageEventStream {
+            self.options.lock().unwrap().push(options);
+            let (sender, stream) = tack_ai::event_stream();
+            let mut message = tack_ai::AssistantMessage::pending(model);
+            message.stop_reason = StopReason::Stop;
+            message.content = vec![ContentBlock::text("summary")];
+            sender.finish(tack_ai::AssistantMessageEvent::Done {
+                reason: StopReason::Stop,
+                message,
+            });
+            stream
+        }
+    }
+
+    fn summary_model(max_tokens: u32) -> tack_ai::Model {
+        tack_ai::Model {
+            id: "summary-model".into(),
+            name: "Summary model".into(),
+            api: "mock".into(),
+            provider: "mock".into(),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: Vec::new(),
+            cost: Default::default(),
+            context_window: 128_000,
+            max_tokens,
+            sampling_params: None,
+            headers: None,
+            compat: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn summarization_uses_model_output_limit_not_reserve_budget() {
+        let capture = Arc::new(CaptureProvider::default());
+        let provider: Arc<dyn Provider> = capture.clone();
+        let auth = tack_ai::oauth::ResolvedAuth::default();
+        let cancel = CancellationToken::new();
+        let model = summary_model(12_345);
+        complete_summarization(
+            &model,
+            &provider,
+            &Context::default(),
+            &auth,
+            None,
+            None,
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        let unlimited_output_model = summary_model(0);
+        complete_summarization(
+            &unlimited_output_model,
+            &provider,
+            &Context::default(),
+            &auth,
+            None,
+            None,
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        let options = capture.options.lock().unwrap();
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].max_tokens, Some(12_345));
+        assert_eq!(options[1].max_tokens, None);
     }
 
     /// Regression: an empty path used to panic indexing

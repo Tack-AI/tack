@@ -339,6 +339,28 @@ async fn bash_large_output_truncated_to_tail() {
 }
 
 #[tokio::test]
+async fn bash_long_line_before_blank_line_is_preserved() {
+    let dir = tempfile::tempdir().unwrap();
+    let services = services_in(&dir);
+    if services.shell.is_none() {
+        return;
+    }
+    let bash = BashTool::new(services);
+    let out = run_tool(
+        &bash,
+        json!({"command": r#"printf 'first line\n'; head -c 60000 /dev/zero | tr '\000' 'y'; printf 'END\n\n'"#}),
+    )
+    .await
+    .unwrap();
+    assert!(out.contains("END"), "lost long-line tail: {out}");
+    assert!(
+        out.contains("Showing last 50.0KB of line 2"),
+        "wrong partial-line footer: {out}"
+    );
+    assert!(!out.starts_with("(no output)"), "unexpected output: {out}");
+}
+
+#[tokio::test]
 async fn schema_validation_rejects_bad_params() {
     let dir = tempfile::tempdir().unwrap();
     let services = services_in(&dir);

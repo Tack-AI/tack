@@ -4,6 +4,53 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [Unreleased]
+
+### Fixed
+
+- **Upstream delta reports parse bilingual alignment baselines**:
+  `scripts/upstream-delta.sh` now accepts both the canonical English
+  `Aligned-to commit` row and the Chinese `对齐到的 commit` row, restoring
+  automatic report generation after the documentation split. An offline
+  regression test covers both languages.
+
+- **Bash output keeps an over-long line followed by blank lines**: tail
+  truncation now retains the useful end of that line instead of returning only
+  whitespace or `(no output)`, preserves the blank-line suffix, and names the
+  partial line correctly in the truncation footer. LF and CRLF inputs are
+  covered by regression tests (upstream #12350).
+
+- **Print mode reports output-token truncation**: a response ending with
+  `stopReason=length` still writes its partial text to stdout, now also emits
+  a warning on stderr, and exits 1 so one-shot scripts do not mistake an
+  incomplete answer for success (upstream #10799).
+
+- **Fullscreen editing keys reach their intended focus**: bare Home/End now
+  move within the editor while Ctrl+Home/Ctrl+End jump to transcript
+  boundaries. With autocomplete open, PageUp/PageDown move through completion
+  candidates instead of scrolling the transcript (upstream #10314 and the
+  autocomplete portion of #7629).
+
+- **OpenAI-compatible request compatibility is less surprising**: non-OpenAI
+  hosts now default instruction messages to `system` instead of `developer`;
+  requests with tools disabled omit `tools: []` even when history contains
+  tool calls; and two model `compat` overrides,
+  `requiresNonNullAssistantContent` and `requiresToolsWithToolHistory`, allow
+  explicit opt-in for proxies with the opposite requirements. This addresses
+  Groq/vLLM/LiteLLM-style 400 responses without removing escape hatches for
+  older Anthropic proxies.
+
+- **The `/resume` picker keeps its selection across refreshes**: renaming or
+  changing sort order preserves the selected session by path instead of
+  jumping to the first row. Deletion selects the next row, or the previous one
+  when the deleted session was last.
+
+- **Summary requests use the model's output limit**: compaction and abandoned
+  branch summaries no longer derive fixed caps from `reserveTokens` (or a
+  hard-coded branch limit). `reserveTokens` now only controls when compaction
+  starts; summaries explicitly use the active model's `maxTokens`, avoiding
+  reasoning exhaustion from an unrelated small budget (upstream #11036).
+
 ## [1.0.21] - 2026-11-22
 
 ### Added
