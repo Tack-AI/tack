@@ -51,9 +51,30 @@ pub enum SessionError {
     V4(#[from] crate::v4::V4Error),
 }
 
+static DEFAULT_AGENT_DIR_OVERRIDE: std::sync::RwLock<Option<PathBuf>> =
+    std::sync::RwLock::new(None);
+
+/// Process-wide CLI override for [`default_agent_dir`]. This avoids mutating
+/// the process environment on Rust 2024 while giving every subsystem the
+/// same agent directory (settings, credentials, providers, and sessions).
+pub fn set_default_agent_dir_override(path: Option<PathBuf>) {
+    let mut guard = DEFAULT_AGENT_DIR_OVERRIDE
+        .write()
+        .unwrap_or_else(|error| error.into_inner());
+    *guard = path;
+}
+
 /// Default agent dir: `~/.tack/agent` (separate from TS pi's `~/.pi/agent`
 /// to avoid concurrent-write corruption; the format is byte-compatible).
+/// Precedence: `--agent-dir`, then `TACK_AGENT_DIR`, then the home default.
 pub fn default_agent_dir() -> PathBuf {
+    if let Some(path) = DEFAULT_AGENT_DIR_OVERRIDE
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+    {
+        return path;
+    }
     if let Ok(dir) = std::env::var("TACK_AGENT_DIR") {
         return PathBuf::from(dir);
     }

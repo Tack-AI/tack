@@ -266,7 +266,7 @@ settings.json 的另外两个 MCP 开关：
 
 | 变量 | 说明 |
 |---|---|
-| `TACK_AGENT_DIR` | agent 目录覆盖（默认 `~/.tack/agent`） |
+| `TACK_AGENT_DIR` | agent 目录覆盖（默认 `~/.tack/agent`；`--agent-dir` 优先） |
 | `TACK_MANAGED_SETTINGS` | managed settings 文件路径覆盖（仅限开发/测试构建；release 构建忽略） |
 | `TACK_TRACE_FILE` | =1 开启 JSONL trace 导出 |
 | `TACK_TRACE_LEVEL` | trace 文件级别（默认 info） |
@@ -287,6 +287,7 @@ settings.json 的另外两个 MCP 开关：
 | `BRAVE_API_KEY` / `TAVILY_API_KEY` / `EXA_API_KEY` | 搜索后端 key |
 | 各 provider 标准 key | `ANTHROPIC_API_KEY`、`OPENAI_API_KEY`、`GEMINI_API_KEY` 等（见 providers 表） |
 | `LANG` | `zh*` 时 TUI 默认中文（`language` 设置优先） |
+| `HERDR_ENV` / `HERDR_PANE_ID` / `HERDR_BIN_PATH` / `HERDR_SOCKET_PATH` | Herdr pane 自动提供；启用内置 TUI 生命周期上报与会话恢复。用法及退出集成见 [herdr.md](herdr.zh-CN.md) |
 
 ## CLI 标志
 
@@ -296,6 +297,7 @@ settings.json 的另外两个 MCP 开关：
 |---|---|
 | `-p, --print <PROMPT>` | headless 单发模式 |
 | `--provider / --model / --api-key` | 覆盖 provider/模型/凭据 |
+| `--agent-dir <DIR>` | 覆盖 agent 目录（设置、凭据、provider 和会话）；优先于 `TACK_AGENT_DIR` |
 | `-c, --continue` / `-r, --resume` / `--session / --session-id / --fork` / `--name` / `--no-session` / `--session-dir` | 会话控制 |
 | `--models a,b,c` | ctrl+p 循环范围 |
 | `-t, --tools` / `--exclude-tools` / `--no-tools` / `--no-builtin-tools` | 工具过滤（与 features.* 取交集） |

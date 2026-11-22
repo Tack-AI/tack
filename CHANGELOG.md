@@ -4,6 +4,25 @@ All notable changes to Tack are documented here. The format follows
 `## [x.y.z]` version headers so `/changelog` and the startup "what's new"
 notice can parse entries (same convention as TS pi).
 
+## [1.0.21] - 2026-11-22
+
+### Added
+
+- **Built-in Herdr client**: the interactive TUI now reports `working`,
+  `idle`, and `blocked` lifecycle state when running in a Herdr pane, covers
+  permission and other agent-input dialogs, and releases the pane on exit.
+  Persistent sessions report their ID and a session- and model-aware resume
+  command that preserves the agent directory and replays the transcript, so
+  Herdr can reopen the current session with the same settings, credentials,
+  and visible history after a restart. The integration is automatic,
+  asynchronous, best-effort, and requires no plugin or Herdr-side
+  installation; see `docs/herdr.md`.
+
+- **`--agent-dir <DIR>` CLI flag**: overrides the agent directory used for
+  settings, credentials, providers, and sessions, taking precedence over
+  `TACK_AGENT_DIR`. Herdr uses the same flag to make restored sessions
+  self-contained across platforms.
+
 ## [1.0.20] - 2026-11-20
 
 ### Fixed

@@ -348,7 +348,7 @@ Two more MCP switches in settings.json:
 
 | Variable | Notes |
 |---|---|
-| `TACK_AGENT_DIR` | Agent directory override (default `~/.tack/agent`) |
+| `TACK_AGENT_DIR` | Agent directory override (default `~/.tack/agent`; `--agent-dir` takes precedence) |
 | `TACK_MANAGED_SETTINGS` | Managed settings file path override (development/test builds only; ignored in release builds) |
 | `TACK_TRACE_FILE` | =1 enables JSONL trace export |
 | `TACK_TRACE_LEVEL` | Trace file level (default info) |
@@ -369,6 +369,7 @@ Two more MCP switches in settings.json:
 | `BRAVE_API_KEY` / `TAVILY_API_KEY` / `EXA_API_KEY` | Search backend keys |
 | Standard per-provider keys | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, etc. (see the providers table) |
 | `LANG` | TUI defaults to Chinese when `zh*` (the `language` setting takes precedence) |
+| `HERDR_ENV` / `HERDR_PANE_ID` / `HERDR_BIN_PATH` / `HERDR_SOCKET_PATH` | Supplied automatically inside Herdr panes; enables built-in TUI lifecycle reporting and session restore. Usage and opt-out: [herdr.md](herdr.md) |
 
 ## CLI flags
 
@@ -378,6 +379,7 @@ Main command (`tack [flags] [prompt | @file …]`):
 |---|---|
 | `-p, --print <PROMPT>` | Headless one-shot mode |
 | `--provider / --model / --api-key` | Override provider/model/credential |
+| `--agent-dir <DIR>` | Override the agent directory (settings, credentials, providers, and sessions); takes precedence over `TACK_AGENT_DIR` |
 | `-c, --continue` / `-r, --resume` / `--session / --session-id / --fork` / `--name` / `--no-session` / `--session-dir` | Session control |
 | `--models a,b,c` | ctrl+p cycling scope |
 | `-t, --tools` / `--exclude-tools` / `--no-tools` / `--no-builtin-tools` | Tool filtering (intersected with features.*) |

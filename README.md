@@ -317,6 +317,7 @@ Chinese (language policy: [CONTRIBUTING.md](CONTRIBUTING.md)).
 | [docs/hooks.md](docs/hooks.md) | Lifecycle hooks (Claude Code compatible) |
 | [docs/codebuddy.md](docs/codebuddy.md) | CodeBuddy guide (install/login, `/model`, troubleshooting) |
 | [docs/intellij-idea-acp.md](docs/intellij-idea-acp.md) | JetBrains IDE setup via ACP |
+| [docs/herdr.md](docs/herdr.md) | Built-in Herdr lifecycle reporting and session restore |
 | [docs/telemetry.md](docs/telemetry.md) | Why there is no telemetry, and what exists instead |
 | [docs/upstream-alignment.md](docs/upstream-alignment.md) | TS pi → Tack sync tracking (weekly automated delta reports) |
 | [docs/release.md](docs/release.md) | Release process (tags, cross-platform builds, self-update) |

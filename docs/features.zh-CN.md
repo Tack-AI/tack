@@ -389,6 +389,14 @@ observability 的 JSONL 日志写盘前自动 redact：敏感字段名（token/k
 
 ## 生态互操作
 
+### Herdr 终端工作区
+
+在 Herdr pane 中运行交互式 TUI 时，会自动上报 `working` / `idle` /
+`blocked`，权限确认及其他等待 agent 输入的对话框也会体现为阻塞。
+持久化会话会携带 Herdr 服务重启后的恢复命令，会话切换也会被跟踪。
+无需插件或 Herdr 侧 integration 安装器；headless 模式保持静默。用法、
+恢复测试、退出集成的方法和实际上报数据见 [herdr.md](herdr.zh-CN.md)。
+
 ### Hooks（13 个事件）
 
 PreToolUse / PermissionRequest / PostToolUse / UserPromptSubmit / SessionStart /

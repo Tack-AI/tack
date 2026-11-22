@@ -72,6 +72,7 @@ impl TuiApp {
                 .unwrap_or_default()
         ));
 
+        self.sync_herdr();
         self.render(&mut out)?;
         // Rendering is dirty-gated: an unconditional redraw would yank the
         // terminal viewport back to the bottom, breaking scrollback browsing.
@@ -263,6 +264,7 @@ impl TuiApp {
                     }
                 }
             }
+            self.sync_herdr();
             match quit_grace_decision(self.should_quit, self.running, quit_grace_started) {
                 QuitGraceDecision::StartGrace => {
                     quit_grace_started = Some(Instant::now());
@@ -392,6 +394,44 @@ impl TuiApp {
             &[("status", &note.status)],
         );
         self.desktop_notify("background", &title, &command_summary);
+    }
+
+    /// Publish the state derived from the authoritative UI/run state. Doing
+    /// this once after each event batch avoids blocker-count leaks when a
+    /// dialog is cancelled, replaced, or followed by another question.
+    fn sync_herdr(&mut self) {
+        let blocked = matches!(self.dialog, Some(commands::Dialog::Permission(_)))
+            || !self.pending_permissions.is_empty()
+            || self.pending_elicitation.is_some()
+            || self.pending_ask_user.is_some()
+            || (self.running && self.pending_ext_ui.is_some());
+        let state = if blocked {
+            crate::herdr::HerdrState::Blocked
+        } else if self.running {
+            crate::herdr::HerdrState::Working
+        } else {
+            crate::herdr::HerdrState::Idle
+        };
+        self.herdr
+            .report_state(state, blocked.then_some("waiting for user input"));
+
+        // --no-session and the --resume picker placeholder have no restorable
+        // session yet. During a run the real session is temporarily parked;
+        // retain the last report until SessionBack returns it.
+        if let Some(session_file) = self.state.session.session_file() {
+            // Deriving the directory from the live file also covers /new,
+            // /resume and imports after a --session-dir override. SQLite's
+            // session_file is its database in the same session directory.
+            let session_dir = session_file.parent().unwrap_or(&self.session_dir);
+            self.herdr.report_session(
+                self.state.session.session_id(),
+                session_dir,
+                &self.agent_dir,
+                &self.state.model.provider,
+                &self.state.model.id,
+                self.state.thinking.map(|level| level.as_str()),
+            );
+        }
     }
 
     /// Open the permission dialog for one query (+ desktop notification

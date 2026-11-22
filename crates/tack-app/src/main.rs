@@ -28,6 +28,10 @@ struct Cli {
     #[arg(long)]
     api_key: Option<String>,
 
+    /// Override the agent directory (settings, credentials, and sessions)
+    #[arg(long, value_name = "DIR")]
+    agent_dir: Option<PathBuf>,
+
     /// Continue the most recent session for this directory
     #[arg(short = 'c', long = "continue")]
     continue_session: bool,
@@ -633,6 +637,9 @@ fn main() -> Result<()> {
 #[allow(clippy::needless_return)]
 async fn async_main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(agent_dir) = &cli.agent_dir {
+        tack_session::set_default_agent_dir_override(Some(agent_dir.clone()));
+    }
 
     // Remove a tack.old.exe remnant from a previous self-update (Windows).
     tack_app::self_update::cleanup_quarantine();
@@ -1909,6 +1916,16 @@ fn custom_provider_ready(agent_dir: &std::path::Path, provider_id: &str) -> bool
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod cli_tests {
+    #[test]
+    fn agent_dir_flag_parses() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from(["tack", "--agent-dir", "/tmp/tack-agent"]).unwrap();
+        assert_eq!(
+            cli.agent_dir,
+            Some(std::path::PathBuf::from("/tmp/tack-agent"))
+        );
+    }
+
     /// `tack stats`: flag parsing (YYYY-MM-DD / Nd / --json / --dir).
     #[test]
     fn stats_subcommand_parses_flags() {

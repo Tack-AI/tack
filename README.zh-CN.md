@@ -298,6 +298,7 @@ project（`<project>/.pi/settings.json`，受信任门控）—— 深度合并�
 | [docs/hooks.zh-CN.md](docs/hooks.zh-CN.md) | 生命周期 hooks（兼容 Claude Code） |
 | [docs/codebuddy.zh-CN.md](docs/codebuddy.zh-CN.md) | CodeBuddy 指南（安装/登录、`/model`、排障） |
 | [docs/intellij-idea-acp.zh-CN.md](docs/intellij-idea-acp.zh-CN.md) | JetBrains IDE 的 ACP 配置 |
+| [docs/herdr.zh-CN.md](docs/herdr.zh-CN.md) | 内置 Herdr 生命周期上报与会话恢复 |
 | [docs/telemetry.zh-CN.md](docs/telemetry.zh-CN.md) | 为什么没有遥测，以及替代方案 |
 | [docs/upstream-alignment.zh-CN.md](docs/upstream-alignment.zh-CN.md) | TS pi → Tack 同步跟踪（每周自动 delta 报告） |
 | [docs/release.zh-CN.md](docs/release.zh-CN.md) | 发布流程（tag、跨平台构建、自更新） |

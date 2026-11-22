@@ -508,6 +508,10 @@ pub struct TuiApp {
     mcp_connections: Vec<std::sync::Arc<tack_tools::mcp::McpConnection>>,
     /// CLI flags carried through the session (TS cli/args.ts parity).
     flags: crate::cli_flags::CliFlags,
+    /// Actual session storage directory, including a --session-dir override.
+    session_dir: PathBuf,
+    /// Built-in Herdr lifecycle reporter (disabled outside Herdr).
+    herdr: crate::herdr::HerdrReporter,
     /// Running tack-ext plugins (empty when none are installed).
     extensions: crate::extension_host::ExtensionManager,
     /// Late-bound LLM for MCP sampling (plugin MCP servers connect at
@@ -658,7 +662,7 @@ pub async fn run_tui(options: TuiOptions) -> Result<i32> {
     use futures_util::FutureExt;
 
     let mut app = TuiApp::new(options).await?;
-    match std::panic::AssertUnwindSafe(app.run()).catch_unwind().await {
+    let result = match std::panic::AssertUnwindSafe(app.run()).catch_unwind().await {
         Ok(result) => result,
         Err(panic) => {
             let payload = panic
@@ -678,7 +682,11 @@ pub async fn run_tui(options: TuiOptions) -> Result<i32> {
             );
             Ok(1)
         }
-    }
+    };
+    // Also runs after a TUI panic or an early terminal error. Herdr still
+    // has its shell-prompt safety net if this best-effort report fails.
+    app.herdr.release().await;
+    result
 }
 
 /// Display setup result (theme + terminal capability picks) assembled by
@@ -702,8 +710,12 @@ impl TuiApp {
         let provider: Arc<dyn Provider> = tack_ai::provider_for(&options.model)
             .with_context(|| format!("no adapter for api kind {}", options.model.api))?;
 
+        let session_dir = options
+            .session_dir
+            .clone()
+            .unwrap_or_else(|| tack_session::default_session_dir(&options.cwd, &agent_dir));
         let (session, resume_placeholder) =
-            Self::open_session(&options, &settings, &flags, &agent_dir)?;
+            Self::open_session(&options, &settings, &flags, &session_dir)?;
 
         let (event_tx, event_rx) = app_event_bus();
         let (permission_tx, permission_rx) = mpsc::unbounded_channel();
@@ -758,6 +770,7 @@ impl TuiApp {
             let _ = provider_event_tx.send(event);
         })));
         let lsp = settings.lsp_manager(&options.cwd);
+        let herdr = crate::herdr::HerdrReporter::from_env();
         let mut app = TuiApp {
             cwd: options.cwd.clone(),
             agent_dir: agent_dir.clone(),
@@ -826,6 +839,8 @@ impl TuiApp {
             thinking_expanded: false,
             mcp_connections: Vec::new(),
             flags: flags.clone(),
+            session_dir,
+            herdr,
             extensions,
             sampling_llm,
             pending_ext_ui: None,
@@ -952,12 +967,8 @@ impl TuiApp {
         options: &TuiOptions,
         settings: &Settings,
         flags: &crate::cli_flags::CliFlags,
-        agent_dir: &Path,
+        session_dir: &Path,
     ) -> Result<(SessionManager, bool)> {
-        let session_dir = options
-            .session_dir
-            .clone()
-            .unwrap_or_else(|| tack_session::default_session_dir(&options.cwd, agent_dir));
         // --resume: do NOT create an empty session file just to show the
         // picker (it pollutes the session list and sorts first by mtime).
         // Run on an in-memory placeholder until a session is picked;
@@ -973,7 +984,7 @@ impl TuiApp {
         } else {
             crate::cli_flags::open_session_for_flags(
                 &options.cwd,
-                Some(session_dir.clone()),
+                Some(session_dir.to_path_buf()),
                 options.continue_session,
                 flags,
                 tack_session::SessionBackend::from_setting(settings.session_backend.as_deref()),

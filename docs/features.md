@@ -625,6 +625,15 @@ values, and sensitive URL query parameters are all replaced with `***`.
 
 ## Ecosystem Interop
 
+### Herdr terminal workspaces
+
+The interactive TUI automatically reports `working` / `idle` / `blocked`
+when run in a Herdr pane, including permission and other agent-input dialogs.
+Persistent sessions include a resume command for Herdr server restarts, and
+session switches are tracked. No plugin or Herdr-side integration installer
+is needed; headless modes stay silent. See [herdr.md](herdr.md) for usage,
+restore testing, opting out, and the exact reported data.
+
 ### Hooks (13 events)
 
 PreToolUse / PermissionRequest / PostToolUse / UserPromptSubmit / SessionStart /
