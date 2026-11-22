@@ -281,6 +281,7 @@ async fn streaming_tool_args_rerender_header() {
         id: "t1".into(),
         name: "bash".into(),
         arguments: args,
+        arguments_error: None,
         thought_signature: None,
         namespace: None,
     };

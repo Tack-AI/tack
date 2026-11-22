@@ -57,11 +57,13 @@ scripts/upstream-delta.sh`，失败于 `无法解析基线 commit（得到 ''）
 `UPSTREAM_BASE`，因此其报告步骤有相同故障。这可能解释了对齐基线为何停止
 推进，但本次没有审计 workflow 运行历史，不能据此断定因果。
 
-双语解析修复已记入下方“首批小修落地”表。报告增加 `tui`、`mcp`、`codemode`、
-`chord`、`durable`、`apps/p2`、`apps/p3` 分组，以及“稳定主线 / 实验架构”
-视图仍待完成；当前五个分组会把多数新工作塞进“其他”。
+双语解析修复已记入下方“首批小修落地”表。扩展报告分组和“稳定主线 /
+实验架构”视图已在第三批落地表记录；离线测试使用真实的分目录 commit，
+而不是 mock 路径。
 
 ### 立即候选：正确性、安全性与 Provider 兼容
+
+下表保留审阅时的现状判断；已落地项目的当前实现以文末各落地表为准。
 
 | 上游 commit | 候选 | Tack 现状 / 实现注意点 | 成本 |
 | --- | --- | --- | --- |
@@ -166,7 +168,7 @@ scripts/upstream-delta.sh`，失败于 `无法解析基线 commit（得到 ''）
 
 | 上游 commit | Tack 落地 |
 | --- | --- |
-| delta 自动化阻塞点 | `scripts/upstream-delta.sh` 同时接受 `Aligned-to commit` 与 `对齐到的 commit`；新增离线 `scripts/upstream-delta.test.sh` 覆盖两种语言，并接入 `evals-selftest` CI job。扩展报告分组仍待完成。 |
+| delta 自动化阻塞点 | `scripts/upstream-delta.sh` 同时接受 `Aligned-to commit` 与 `对齐到的 commit`；新增离线 `scripts/upstream-delta.test.sh` 覆盖两种语言，并接入 `evals-selftest` CI job。扩展分组见第三批落地表。 |
 | `9e9609216` | `truncate_tail()` 在超长行后只有空行时保留该行尾部及空行后缀，并保持字节/行数元数据一致；bash footer 使用部分行真实的 `start_line`。单测覆盖 60 KB/219 KB、LF/CRLF，另有真实 bash 工具回归测试。 |
 | `441f5767c` | print 在 `StopReason::Length` 时保留部分 stdout，同时在 stderr 告警并退出 1，text/JSON 两种模式一致；Error 行为不变。独立的 `6fcb48670` 摘要预算项已记入下方第二批落地表。 |
 | `6100fe5a8` + `3bae85274` 的局部 | 裸 Home/End 交给 fullscreen 编辑器；Ctrl+Home/Ctrl+End 控制 transcript 首尾；autocomplete 打开时优先接收 PageUp/PageDown。dialog 本就有输入优先级。其余自定义 selector 工作与上游 `capturesViewportInput` 组件 API 未移植。 |
@@ -180,6 +182,19 @@ scripts/upstream-delta.sh`，失败于 `无法解析基线 commit（得到 ''）
 | `b82477b7b` + `7a6bd5a97` + `14b804d80` | OpenAI 官方 API 之外的 instruction 消息默认使用 `system`；只有 `requiresToolsWithToolHistory` 显式开启时才发送空 `tools: []`；`requiresNonNullAssistantContent` 独立控制工具调用 assistant 回放使用 `""`。显式 `supportsDeveloperRole` 仍覆盖自动探测。请求级测试覆盖 OpenAI/Groq/OpenRouter role、vLLM 风格空 tools、两个 opt-in，以及 null 与空字符串 assistant content。 |
 | `a635f390` 的局部 | `/resume` 刷新在 rename 和排序切换时按 path 保持选中会话；删除时选择下一行，末尾则选择前一行。Tack 是同步加载而非渐进加载，无需上游 pending-partial-list 机制。测试使用真实命名 session 文件。 |
 | `6fcb48670` | compaction history、split-turn prefix、abandoned-branch summary 直接使用 `model.max_tokens`；模型上限为 0 时省略覆盖。`reserveTokens` 仅保留为 compaction 触发阈值。测试捕获 provider options，验证使用模型上限而非 reserve 派生预算。 |
+
+### 第三批上游正确性修复落地（未发布）
+
+以下 provider 完整性、兼容性、重试和报告项已在当前工作树实现，并有离线或
+针对性测试覆盖。
+
+| 上游 commit | Tack 落地 |
+| --- | --- |
+| delta 报告分组后续 | 报告显式分组 `packages/tui`、`mcp`、`codemode`、`chord`、`durable`、`apps/p2`、`apps/p2-mac`、`apps/p3`。第二个互不重复的视图区分稳定主线与触及 p2/p3/Chord/Durable 实验路径的 commit；跨目录实验 commit 归实验侧。离线测试创建各组真实 commit 并验证数量。 |
+| `87f9a3641` + `1b2aa0ca0` | 流式参数继续作为容错预览；Anthropic、Bedrock、Mistral、OpenAI Completions、Responses 的已完成调用改为严格解析加字符串字面量修复。空/空白参数为 `{}`；非 object 和 malformed JSON 变为 `{}` 加可选 camelCase `argumentsError`，记录原因与原始文本。agent 在两种执行模式下均于参数准备、hooks、执行前把该错误返回为 ToolResult。Responses 在 `response.completed` 时若工具调用缺 `output_item.done`，现在返回带内 stream error。既有 length-stop 拒绝仍优先。 |
+| `406e719a6` + `4a6a58eb5` + `aa47cedce` | strict 转换拒绝同时缺 `type`、`anyOf`、`enum` 的节点；`prefer` 回退非 strict，`require` 保留明确错误，enum-only 节点仍受支持。Anthropic 非 strict 转换只额外保留受支持的根字段 `additionalProperties`、`$defs`、`definitions`，保留局部 `$ref` 目标及额外参数约束，不扩大 strict schema 范围。 |
+| `09f105957` + `0a4fad548` + `d3398f826` + `73f8de80b` + `3dd803d7e` | 共享 `streamSimple` 风格估算使用最近适用的 assistant usage 加尾部消息估算。Anthropic、Bedrock、Google、Mistral、OpenAI Completions、Responses 按 `max(4096, ceil(15% input))` 余量钳制调用方或模型输出上限，接近 context 上限时使用上游 32768 输出回退。overflow 新增 LiteLLM pre-call、Z.AI CN 文案及锚定 HTTP 413；正文仅提到 413 或数字 4130 不匹配，Cerebras 私有无正文规则收窄为 400。 |
+| `a00a5048d` + `25190b72c` + `4699b5b26` | retry 覆盖临时 provider/gateway 故障、精确 Anthropic `api_error`、不完整响应及独立 Node socket code。quota/billing/subscription-sharing 和 Z.AI 1308 排除优先；HTTP 数字状态和 socket code 使用 ASCII token 边界。`send_with_retry` 现在读取错误正文，并与 assistant error 共用分类器：永久 HTTP 429 quota 不重试，临时 provider 正文可以恢复。 |
 
 ## 2026-09-21 对齐批次（基线 4a6ed0194 → 10d1ad621）
 

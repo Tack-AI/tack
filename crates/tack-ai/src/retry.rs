@@ -3,8 +3,9 @@
 //! classifier) and a `RetryingProvider` decorator that applies the policy
 //! transparently at the stream level.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
+use regex::Regex;
 use tokio_util::sync::CancellationToken;
 
 use crate::provider::{Provider, StreamOptions};
@@ -62,12 +63,31 @@ const NON_RETRYABLE_PATTERNS: &[&str] = &[
     "out of budget",
     "quota exceeded",
     "billing",
+    // ChatGPT subscription and workspace limits reset after hours (or require
+    // an administrator), rather than after a short transient throttle.
+    "subscription_sharing_usage_limit_exceeded",
+    "subscription_sharing_workplace_individual_usage_limit_exceeded",
 ];
+
+/// Anthropic sends its temporary internal error as an HTTP 500 before a
+/// stream, but as an SSE event without an HTTP status once streaming begins.
+/// Match the exact JSON field so other Anthropic error types stay terminal.
+static ANTHROPIC_API_ERROR_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)"type"\s*:\s*"api_error""#).expect("Anthropic API error pattern compiles")
+});
+
+/// Z.ai's plan-level usage limit arrives as HTTP 429 with JSON code 1308.
+/// The final non-digit guard keeps code 13080 from matching.
+static ZAI_USAGE_LIMIT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)"code"\s*:\s*"?1308(?:[^0-9]|$)"#).expect("z.ai usage limit pattern compiles")
+});
 
 const RETRYABLE_PATTERNS: &[&str] = &[
     "overloaded",
     // Azure peak-load capacity errors (TS #9669).
     "currently experiencing high demand",
+    // Provider queue admission timeouts.
+    "admission ceiling",
     "ratelimit",
     "rate limit",
     "too many requests",
@@ -81,6 +101,10 @@ const RETRYABLE_PATTERNS: &[&str] = &[
     "524",
     "service unavailable",
     "serviceunavailable",
+    // "temporarily" is required: a lasting provider routing/region error
+    // must not be retried.
+    "provider is temporarily unavailable",
+    "provider temporarily unavailable",
     "server error",
     "servererror",
     "internal error",
@@ -95,6 +119,14 @@ const RETRYABLE_PATTERNS: &[&str] = &[
     "other side closed",
     "fetch failed",
     "getaddrinfo",
+    // Bare Node socket codes must be standalone tokens, not substrings of a
+    // longer identifier such as EXECONNRESET or ERR_EPIPE_ID.
+    "econnreset",
+    "econnaborted",
+    "econnrefused",
+    "etimedout",
+    "epipe",
+    "connection reset by peer",
     "enotfound",
     "eai_again",
     "upstream connect",
@@ -102,7 +134,6 @@ const RETRYABLE_PATTERNS: &[&str] = &[
     "socket hang up",
     "socket connection was closed",
     "timed out",
-    "timedout",
     "timeout",
     "terminated",
     "websocket closed",
@@ -111,10 +142,17 @@ const RETRYABLE_PATTERNS: &[&str] = &[
     "stream ended before message_stop",
     "stream ended before a terminal response event",
     "http2 request did not get a response",
+    "provider finish_reason: error",
+    "returned an empty response",
+    "stopped before completing the response",
+    "ended the response before it was complete",
+    "connection to the provider was reset",
+    "reported a failure while generating the response",
     "retry delay",
     "you can retry your request",
     "try your request again",
     "please retry your request",
+    "repeat the request later",
     "resourceexhausted",
     "transport closed",
     // Mid-stream transport failures: reqwest reports any response-body read
@@ -133,26 +171,40 @@ const RETRYABLE_PATTERNS: &[&str] = &[
     "channel closed",
 ];
 
-/// Substring search with digit-word boundaries: an all-digit pattern (an
-/// HTTP status like "500") must not match inside a longer digit run —
-/// "15000 tokens" is not a 500 error. The char before and after the match
-/// must not be ASCII digits.
+fn is_numeric_pattern(pattern: &str) -> bool {
+    !pattern.is_empty() && pattern.chars().all(|c| c.is_ascii_digit())
+}
+
+fn is_socket_error_code(pattern: &str) -> bool {
+    matches!(
+        pattern,
+        "econnreset" | "econnaborted" | "econnrefused" | "etimedout" | "epipe"
+    )
+}
+
+/// Substring search with token boundaries for numeric HTTP statuses and
+/// Node socket codes. A status must not be embedded in an ASCII alphanumeric
+/// word (so a request id containing `503` is not an HTTP status), while a
+/// socket code also treats `_` as a word character (`ERR_EPIPE_ID` is not
+/// `EPIPE`). Other phrases retain the existing substring behavior.
 fn contains_bounded(haystack: &str, needle: &str) -> bool {
-    let numeric = needle.chars().all(|c| c.is_ascii_digit());
-    if !numeric {
+    let numeric = is_numeric_pattern(needle);
+    let socket_code = is_socket_error_code(needle);
+    if !numeric && !socket_code {
         return haystack.contains(needle);
     }
     let mut start = 0;
     while let Some(pos) = haystack[start..].find(needle) {
         let abs = start + pos;
+        let is_word_char = |c: char| c.is_ascii_alphanumeric() || (socket_code && c == '_');
         let before_ok = haystack[..abs]
             .chars()
             .next_back()
-            .is_none_or(|c| !c.is_ascii_digit());
+            .is_none_or(|c| !is_word_char(c));
         let after_ok = haystack[abs + needle.len()..]
             .chars()
             .next()
-            .is_none_or(|c| !c.is_ascii_digit());
+            .is_none_or(|c| !is_word_char(c));
         if before_ok && after_ok {
             return true;
         }
@@ -168,9 +220,30 @@ fn contains_any(haystack: &str, patterns: &[&str]) -> bool {
         .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
         .collect();
     patterns.iter().any(|p| {
+        if contains_bounded(&lower, p) {
+            return true;
+        }
+        // Bounded tokens must occur verbatim in the original error. Removing
+        // separators first could manufacture a status ("50_0") or socket code
+        // ("E_PIPE") that was never present. Compacting "timed out" to
+        // "timedout" would likewise make ETIMEDOUTX look transient after its
+        // actual socket-code token guard rejects it.
+        if is_numeric_pattern(p) || is_socket_error_code(p) || *p == "timed out" {
+            return false;
+        }
         let pat = p.replace([' ', '-', '_'], "");
-        contains_bounded(&lower, p) || contains_bounded(&compact, &pat)
+        contains_bounded(&compact, &pat)
     })
+}
+
+/// Shared classifier for an initial HTTP failure body or an assistant error.
+pub(crate) fn is_retryable_error_message(error: &str) -> bool {
+    // Permanent account/plan limits always win over transient-looking HTTP
+    // statuses or transport wording in the same error.
+    if contains_any(error, NON_RETRYABLE_PATTERNS) || ZAI_USAGE_LIMIT_PATTERN.is_match(error) {
+        return false;
+    }
+    ANTHROPIC_API_ERROR_PATTERN.is_match(error) || contains_any(error, RETRYABLE_PATTERNS)
 }
 
 /// Classify whether a failed assistant message looks like a transient
@@ -182,10 +255,7 @@ pub fn is_retryable_assistant_error(message: &AssistantMessage) -> bool {
     let Some(error) = &message.error_message else {
         return false;
     };
-    if contains_any(error, NON_RETRYABLE_PATTERNS) {
-        return false;
-    }
-    contains_any(error, RETRYABLE_PATTERNS)
+    is_retryable_error_message(error)
 }
 
 /// (attempt, max_attempts, delay_ms, error_message) before each backoff.
@@ -467,5 +537,148 @@ impl Provider for RetryingProvider {
         });
 
         stream
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Model, StopReason};
+
+    fn error_message(text: &str) -> AssistantMessage {
+        let mut message = AssistantMessage::pending(&Model {
+            id: "m".into(),
+            name: "m".into(),
+            api: "anthropic-messages".into(),
+            provider: "anthropic".into(),
+            base_url: "http://x".into(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![],
+            cost: Default::default(),
+            context_window: 200_000,
+            max_tokens: 8192,
+            sampling_params: None,
+            headers: None,
+            compat: None,
+        });
+        message.stop_reason = StopReason::Error;
+        message.error_message = Some(text.into());
+        message
+    }
+
+    #[test]
+    fn retryable_table_covers_temporary_provider_and_socket_failures() {
+        let cases = [
+            "429 Too Many Requests",
+            "waited 73.4s in queue, reaching this model's admission ceiling of 60s; retry after the hinted delay",
+            "Provider finish_reason: error",
+            "Provider finish_reason:error",
+            "Provider returned an empty response",
+            "Upstream error from Relace: The model stopped before completing the response.",
+            "Unable to process request. Repeat the request later.",
+            r#"{"type":"error","error":{"details":null,"type":"api_error","message":"Unable to complete this request right now. Please try again."}}"#,
+            r#"{"type" : "api_error", "message":"temporary internal failure"}"#,
+            "The provider is temporarily unavailable. Retry shortly.",
+            "The upstream provider is temporarily unavailable. Try again shortly.",
+            "The provider ended the response before it was complete.",
+            "The connection to the provider was reset. Retry shortly.",
+            "The provider reported a failure while generating the response.",
+            "read ECONNRESET",
+            "ECONNABORTED",
+            "connect ECONNREFUSED 127.0.0.1:443",
+            "connect ETIMEDOUT 140.82.113.3:443",
+            "write EPIPE",
+            "read (econnreset), retry",
+            "Connection reset by peer",
+        ];
+
+        for error in cases {
+            assert!(
+                is_retryable_assistant_error(&error_message(error)),
+                "expected retryable: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_retryable_table_covers_limits_and_lookalike_identifiers() {
+        let cases = [
+            "The operation was aborted",
+            "400 invalid request",
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages: at least one message is required"}}"#,
+            r#"{"not_type":"api_error"}"#,
+            r#"{"type":"api_errorish"}"#,
+            "Provider finish_reason: content_filter",
+            "Provider unavailable for this model",
+            "The provider is unavailable in your region",
+            "429 insufficient_quota: add credit",
+            "503 quota exceeded for this month",
+            "500 billing account is closed",
+            "connection closed: available balance exhausted",
+            "429 out of budget",
+            r#"OpenAI API error (429): {"code":"subscription_sharing_usage_limit_exceeded","message":"Usage limit reached."}"#,
+            r#"OpenAI API error (429): {"code":"subscription_sharing_workplace_individual_usage_limit_exceeded","message":"Usage limit reached."}"#,
+            r#"429 {"code": 1308, "message":"Usage limit reached"}"#,
+            r#"429 {"error":{"code":"1308","message":"Usage limit reached"}}"#,
+            r#"{"type":"api_error","message":"Monthly quota exceeded"}"#,
+            "Invalid value EXECONNRESET",
+            "Unknown field ETIMEDOUTX",
+            "Invalid key ERR_EPIPE_ID",
+            "Invalid value E_PIPE",
+            "Invalid key ECONNABORTED_",
+            "Invalid key _ECONNREFUSED",
+            "Invalid value ECONNRESET1",
+        ];
+
+        for error in cases {
+            assert!(
+                !is_retryable_assistant_error(&error_message(error)),
+                "expected non-retryable: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_status_table_requires_ascii_alphanumeric_boundaries() {
+        let cases = [
+            ("HTTP 500", true),
+            ("upstream returned status=502.", true),
+            ("503", true),
+            ("429 ordinary transient throttle", true),
+            (r#"429 {"code":13080,"message":"transient throttle"}"#, true),
+            ("prompt too large: 15000 tokens exceeds limit", false),
+            ("request id 4293123456 failed validation", false),
+            (
+                r#"401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"},"request_id":"req_011CU503xyz"}"#,
+                false,
+            ),
+            ("request failed with code a503", false),
+            ("request failed with code 503a", false),
+            ("request failed with manufactured status 50_0", false),
+            (
+                "400 image exceeds 5 MB maximum: 5316784 bytes > 5242880 bytes",
+                false,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(
+                is_retryable_assistant_error(&error_message(error)),
+                expected,
+                "unexpected classification for: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifier_requires_an_error_with_a_message() {
+        let mut message = error_message("429 Too Many Requests");
+        message.stop_reason = StopReason::Stop;
+        assert!(!is_retryable_assistant_error(&message));
+
+        message.stop_reason = StopReason::Error;
+        message.error_message = None;
+        assert!(!is_retryable_assistant_error(&message));
     }
 }

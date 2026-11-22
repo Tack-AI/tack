@@ -71,11 +71,14 @@ stopped advancing, although the workflow history was not audited as part of
 this review.
 
 The bilingual parser fix is recorded in the landed table below. Expanded report
-groups for `tui`, `mcp`, `codemode`, `chord`, `durable`, `apps/p2`, and `apps/p3`,
-plus a stable-mainline versus experimental-architecture view, remain pending;
-the current five groups put most of the new work under "other".
+groups and the stable-mainline versus experimental-architecture view are
+implemented in the third landing table; the offline test uses real per-directory
+commits rather than mocked paths.
 
 ### Immediate correctness, safety, and provider-compatibility candidates
+
+The findings in this candidate table describe the review-time state. Their
+current implementations, where landed, are recorded in the landing tables below.
 
 | Upstream commit | Candidate | Tack finding / implementation note | Cost |
 | --- | --- | --- | --- |
@@ -192,7 +195,7 @@ focused regression tests. They are not yet in a tagged release.
 
 | Upstream commit | Tack landing |
 | --- | --- |
-| Delta automation blocker | `scripts/upstream-delta.sh` accepts both `Aligned-to commit` and `对齐到的 commit`; new offline `scripts/upstream-delta.test.sh` verifies both languages and runs in the `evals-selftest` CI job. Expanded report grouping remains pending. |
+| Delta automation blocker | `scripts/upstream-delta.sh` accepts both `Aligned-to commit` and `对齐到的 commit`; new offline `scripts/upstream-delta.test.sh` verifies both languages and runs in the `evals-selftest` CI job. Expanded grouping is recorded in the third landing table. |
 | `9e9609216` | `truncate_tail()` retains the end of an oversized line when only blank lines follow, preserves that suffix, and keeps byte/line metadata consistent; the bash footer uses the partial line's real `start_line`. Unit coverage includes 60 KB/219 KB and LF/CRLF cases, plus a real bash-tool regression test. |
 | `441f5767c` | Print mode warns on stderr and exits 1 for `StopReason::Length` in both text and JSON modes while retaining partial stdout. Error behavior is unchanged. The separate `6fcb48670` summary-budget item is recorded in the second landing table below. |
 | `6100fe5a8` + scoped portion of `3bae85274` | Bare Home/End reach the fullscreen editor; Ctrl+Home/Ctrl+End own transcript boundaries; open autocomplete receives PageUp/PageDown before transcript scrolling. Dialogs already had input priority. The remaining custom-selector work and upstream's `capturesViewportInput` component API are not ported. |
@@ -206,6 +209,19 @@ These follow-up items are also implemented and covered by focused tests.
 | `b82477b7b` + `7a6bd5a97` + `14b804d80` | OpenAI-compatible instruction messages default to `system` outside OpenAI's own API; empty `tools: []` is omitted unless `requiresToolsWithToolHistory` opts in; `requiresNonNullAssistantContent` independently selects `""` for tool-call-only assistant replay. Explicit `supportsDeveloperRole` still overrides detection. Request-level tests cover OpenAI/Groq/OpenRouter roles, vLLM-style empty tools, both opt-ins, and null versus empty-string assistant content. |
 | Scoped portion of `a635f390` | `/resume` refresh preserves the selected session path across rename and sort changes. Delete falls back to the next row, then the previous row at the end. Tack has synchronous rather than progressive loading, so upstream's pending-partial-list machinery is unnecessary. Tests use real named session files. |
 | `6fcb48670` | Compaction history, split-turn prefix, and abandoned-branch summaries use `model.max_tokens` directly; a zero model limit omits the override. `reserveTokens` remains only the compaction trigger. Tests capture provider options and verify the model limit instead of a reserve-derived cap. |
+
+### Third upstream correctness landing (Unreleased)
+
+These provider-integrity, compatibility, retry, and reporting items are
+implemented in the current working tree and covered by offline/focused tests.
+
+| Upstream commit | Tack landing |
+| --- | --- |
+| Delta report grouping follow-up | Reports now group `packages/tui`, `mcp`, `codemode`, `chord`, `durable`, `apps/p2`, `apps/p2-mac`, and `apps/p3` explicitly. A second, non-overlapping view separates stable-mainline commits from commits touching p2/p3/Chord/Durable experimental paths; cross-directory experimental commits stay on the experimental side. Offline tests create real commits for each group and verify counts. |
+| `87f9a3641` + `1b2aa0ca0` | Streaming arguments remain lenient previews, while completed Anthropic, Bedrock, Mistral, OpenAI Completions, and Responses calls use strict parsing plus string-literal repair. Empty/blank arguments become `{}`; non-objects and malformed JSON become `{}` plus optional camelCase `argumentsError` containing the cause and raw text. The agent returns that error as a ToolResult before preparation, hooks, or execution in both execution modes. Responses `response.completed` with a tool call missing `output_item.done` is now an in-band stream error. Existing length-stop rejection still takes precedence. |
+| `406e719a6` + `4a6a58eb5` + `aa47cedce` | Strict conversion rejects nodes lacking `type`, `anyOf`, and `enum`; `prefer` falls back to non-strict and `require` retains the explicit error, while enum-only nodes remain supported. Non-strict Anthropic conversion preserves only the additional supported root fields `additionalProperties`, `$defs`, and `definitions`, keeping local `$ref` targets and extra-argument constraints without widening strict schemas. |
+| `09f105957` + `0a4fad548` + `d3398f826` + `73f8de80b` + `3dd803d7e` | A shared `streamSimple`-style estimator uses the latest applicable assistant usage plus estimated trailing messages. Anthropic, Bedrock, Google, Mistral, OpenAI Completions, and Responses clamp the caller or model output cap with `max(4096, ceil(15% input))` headroom and the upstream 32768-output fallback near the context limit. Overflow detection adds LiteLLM pre-call wording, Z.AI CN wording, and anchored HTTP 413 forms; body-only 413 references and `4130` do not match, while Cerebras's private bodyless rule is limited to 400. |
+| `a00a5048d` + `25190b72c` + `4699b5b26` | Retry patterns cover temporary provider/gateway failures, exact Anthropic `api_error`, incomplete responses, and standalone Node socket codes. Quota/billing/subscription-sharing and Z.AI 1308 exclusions run first; HTTP numeric and socket-code matching use ASCII token boundaries. `send_with_retry` now reads the error body and uses the same classifier as assistant errors, so permanent HTTP 429 quota failures are not retried but temporary provider bodies can recover. |
 
 ## 2026-09-21 alignment batch (baseline 4a6ed0194 → 10d1ad621)
 

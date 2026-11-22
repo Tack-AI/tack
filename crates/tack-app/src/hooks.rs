@@ -1063,6 +1063,7 @@ mod tests {
             id: id.into(),
             name: "read".into(),
             arguments: serde_json::json!({ "path": path }),
+            arguments_error: None,
             thought_signature: None,
             namespace: None,
         });

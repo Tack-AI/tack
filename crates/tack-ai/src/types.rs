@@ -49,6 +49,15 @@ pub enum ContentBlock {
         id: String,
         name: String,
         arguments: Value,
+        /// Final-argument validation failure. Stream previews remain absent;
+        /// malformed completed calls carry the cause and raw argument text so
+        /// execution can be rejected instead of running a salvaged prefix.
+        #[serde(
+            rename = "argumentsError",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        arguments_error: Option<String>,
         #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
         thought_signature: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]

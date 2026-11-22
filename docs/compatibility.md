@@ -74,6 +74,12 @@ binary and its externally observable behavior.
   are preserved as v4 *custom* entries on migration rather than rejected
   or aborted — Tack's no-data-loss principle
   (`crates/tack-session/src/v4/migrate.rs`).
+- Assistant `toolCall` content blocks may carry the optional `argumentsError`
+  string when final provider arguments were not a valid JSON object. The field
+  records the parse cause and raw text; `arguments` is `{}` in that case. It is
+  an additive upstream-compatible field in both legacy and v4 message payloads:
+  readers default a missing field to `None`, so existing sessions need no
+  migration and the session format version does not change.
 - `crates/tack-session/src/sqlite_backend.rs` is an **experimental** backend
   (`sessionBackend: "sqlite"`), not covered by the guarantees below.
 

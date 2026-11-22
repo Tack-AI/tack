@@ -949,10 +949,26 @@ async fn run_loop(
             }
             new_messages.push(AgentMessage::Assistant(message.clone()));
 
-            // Check for tool calls.
-            let tool_calls: Vec<(String, String, Value)> = message
-                .tool_calls()
-                .map(|(id, name, args)| (id.to_string(), name.to_string(), args.clone()))
+            // Check for tool calls. Keep final parse failures alongside the
+            // (empty) arguments so execution can reject them in-band.
+            let tool_calls: Vec<PendingToolCall> = message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    tack_ai::ContentBlock::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                        arguments_error,
+                        ..
+                    } => Some((
+                        id.clone(),
+                        name.clone(),
+                        arguments.clone(),
+                        arguments_error.clone(),
+                    )),
+                    _ => None,
+                })
                 .collect();
 
             let mut tool_results: Vec<ToolResultMessage> = Vec::new();
@@ -1401,16 +1417,19 @@ async fn emit_tool_result_message(tx: &AgentEventTx, message: &ToolResultMessage
     emit(tx, AgentEvent::MessageEnd { message }).await;
 }
 
+/// A provider tool call plus its optional final-argument parse failure.
+type PendingToolCall = (String, String, Value, Option<String>);
+
 /// Fail all tool calls from an assistant message truncated by the output
 /// token limit. Streamed arguments are salvaged with a best-effort parser, so
 /// truncated calls can validate yet be silently incomplete — none are safe to
 /// execute.
 async fn fail_tool_calls_from_truncated_message(
-    tool_calls: &[(String, String, Value)],
+    tool_calls: &[PendingToolCall],
     tx: &AgentEventTx,
 ) -> ExecutedToolCallBatch {
     let mut messages = Vec::new();
-    for (id, name, args) in tool_calls {
+    for (id, name, args, _) in tool_calls {
         emit(
             tx,
             AgentEvent::ToolExecutionStart {
@@ -1461,21 +1480,11 @@ enum Preparation {
 async fn prepare_tool_call(
     context: &AgentContext,
     assistant_message: &AssistantMessage,
-    tool_call_id: &str,
-    tool_name: &str,
-    raw_args: &Value,
+    tool_call: &PendingToolCall,
     config: &AgentLoopConfig,
     cancel: &CancellationToken,
 ) -> Preparation {
-    let inner = prepare_tool_call_inner(
-        context,
-        assistant_message,
-        tool_call_id,
-        tool_name,
-        raw_args,
-        config,
-        cancel,
-    );
+    let inner = prepare_tool_call_inner(context, assistant_message, tool_call, config, cancel);
     match std::panic::AssertUnwindSafe(inner).catch_unwind().await {
         Ok(preparation) => preparation,
         Err(payload) => Preparation::Immediate {
@@ -1491,18 +1500,29 @@ async fn prepare_tool_call(
 async fn prepare_tool_call_inner(
     context: &AgentContext,
     assistant_message: &AssistantMessage,
-    tool_call_id: &str,
-    tool_name: &str,
-    raw_args: &Value,
+    tool_call: &PendingToolCall,
     config: &AgentLoopConfig,
     cancel: &CancellationToken,
 ) -> Preparation {
+    let (tool_call_id, tool_name, raw_args, arguments_error) = tool_call;
+    let tool_call_id = tool_call_id.as_str();
+    let tool_name = tool_name.as_str();
+    let arguments_error = arguments_error.as_deref();
     let Some(tool) = context.tools.iter().find(|t| t.name() == tool_name) else {
         return Preparation::Immediate {
             result: error_tool_result(format!("Tool {tool_name} not found")),
             is_error: true,
         };
     };
+
+    if let Some(error) = arguments_error {
+        return Preparation::Immediate {
+            result: error_tool_result(format!(
+                "Invalid arguments for tool \"{tool_name}\": {error}"
+            )),
+            is_error: true,
+        };
+    }
 
     let args = tool.prepare_arguments(raw_args.clone());
     if let Err(e) = tool.validate_arguments(&args) {
@@ -1680,12 +1700,12 @@ async fn execute_and_finalize(
 async fn execute_tool_calls(
     context: &AgentContext,
     assistant_message: &AssistantMessage,
-    tool_calls: &[(String, String, Value)],
+    tool_calls: &[PendingToolCall],
     config: &AgentLoopConfig,
     cancel: &CancellationToken,
     tx: &AgentEventTx,
 ) -> ExecutedToolCallBatch {
-    let has_sequential_tool = tool_calls.iter().any(|(_, name, _)| {
+    let has_sequential_tool = tool_calls.iter().any(|(_, name, _, _)| {
         context
             .tools
             .iter()
@@ -1704,7 +1724,7 @@ async fn execute_tool_calls(
 async fn execute_tool_calls_sequential(
     context: &AgentContext,
     assistant_message: &AssistantMessage,
-    tool_calls: &[(String, String, Value)],
+    tool_calls: &[PendingToolCall],
     config: &AgentLoopConfig,
     cancel: &CancellationToken,
     tx: &AgentEventTx,
@@ -1716,7 +1736,8 @@ async fn execute_tool_calls_sequential(
     // One shared context snapshot for the whole batch's after_tool_call
     // hooks (Arc: the history is cloned once, not once per tool call).
     let mut context_snapshot: Option<Arc<Vec<AgentMessage>>> = None;
-    for (id, name, args) in tool_calls {
+    for tool_call in tool_calls {
+        let (id, name, args, _) = tool_call;
         emit(
             tx,
             AgentEvent::ToolExecutionStart {
@@ -1728,7 +1749,7 @@ async fn execute_tool_calls_sequential(
         .await;
 
         let preparation =
-            prepare_tool_call(context, assistant_message, id, name, args, config, cancel).await;
+            prepare_tool_call(context, assistant_message, tool_call, config, cancel).await;
         let finalized = match preparation {
             Preparation::Immediate { result, is_error } => {
                 let f = FinalizedToolCall {
@@ -1775,7 +1796,7 @@ async fn execute_tool_calls_sequential(
     // Leaving them dangling means the assistant message in the resumed
     // context has tool calls with no matching result, which providers
     // reject (HTTP 400 on the next request).
-    for (id, name, args) in &tool_calls[processed..] {
+    for (id, name, args, _) in &tool_calls[processed..] {
         emit(
             tx,
             AgentEvent::ToolExecutionStart {
@@ -1808,7 +1829,7 @@ async fn execute_tool_calls_sequential(
 async fn execute_tool_calls_parallel(
     context: &AgentContext,
     assistant_message: &AssistantMessage,
-    tool_calls: &[(String, String, Value)],
+    tool_calls: &[PendingToolCall],
     config: &AgentLoopConfig,
     cancel: &CancellationToken,
     tx: &AgentEventTx,
@@ -1829,7 +1850,8 @@ async fn execute_tool_calls_parallel(
     let mut context_snapshot: Option<Arc<Vec<AgentMessage>>> = None;
 
     let mut started = 0;
-    for (id, name, args) in tool_calls {
+    for tool_call in tool_calls {
+        let (id, name, args, _) = tool_call;
         emit(
             tx,
             AgentEvent::ToolExecutionStart {
@@ -1841,7 +1863,7 @@ async fn execute_tool_calls_parallel(
         .await;
 
         let preparation =
-            prepare_tool_call(context, assistant_message, id, name, args, config, cancel).await;
+            prepare_tool_call(context, assistant_message, tool_call, config, cancel).await;
         match preparation {
             Preparation::Immediate { result, is_error } => {
                 let f = FinalizedToolCall {
@@ -1890,7 +1912,7 @@ async fn execute_tool_calls_parallel(
     // Cancel mid-preflight: the tool calls never started still need
     // results — a resumed context with unanswered tool calls is rejected
     // by providers (HTTP 400).
-    for (id, name, args) in &tool_calls[started..] {
+    for (id, name, args, _) in &tool_calls[started..] {
         emit(
             tx,
             AgentEvent::ToolExecutionStart {

@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::fail;
-use crate::json_repair::parse_streaming_json;
+use crate::json_repair::{parse_streaming_json, parse_tool_call_arguments};
 use crate::provider::StreamOptions;
 use crate::stream::{AssistantMessageEvent, AssistantMessageEventSender};
 use crate::transform::transform_messages;
@@ -300,9 +300,12 @@ fn build_payload(model: &Model, context: &Context, options: &StreamOptions) -> V
     if let Some(temperature) = options.temperature {
         payload["temperature"] = json!(temperature);
     }
-    if let Some(max_tokens) = options.max_tokens {
-        payload["max_tokens"] = json!(max_tokens);
-    }
+    let max_tokens = crate::simple_options::clamp_max_tokens_to_context(
+        model,
+        context,
+        options.max_tokens.unwrap_or(model.max_tokens),
+    );
+    payload["max_tokens"] = json!(max_tokens);
     if let Some(choice) = options.tool_choice {
         payload["tool_choice"] = json!(match choice {
             crate::provider::ToolChoice::Auto => "auto",
@@ -393,6 +396,7 @@ fn handle_tool_call_deltas(
                     .unwrap_or("")
                     .to_string(),
                 arguments: json!({}),
+                arguments_error: None,
                 thought_signature: None,
                 namespace: None,
             });
@@ -671,9 +675,19 @@ async fn run(
     }
 
     crate::api::close_current_block!(current_block, output, sender, coalescer);
+    let final_arguments = stream_error.is_none();
     for (idx, partial) in tool_blocks.values() {
-        if let Some(ContentBlock::ToolCall { arguments, .. }) = output.content.get_mut(*idx) {
-            *arguments = parse_streaming_json(partial);
+        if let Some(ContentBlock::ToolCall {
+            arguments,
+            arguments_error,
+            ..
+        }) = output.content.get_mut(*idx)
+        {
+            if final_arguments {
+                (*arguments, *arguments_error) = parse_tool_call_arguments(partial);
+            } else {
+                *arguments = parse_streaming_json(partial);
+            }
         }
         let tool_call = output.content[*idx].clone();
         coalescer.push(

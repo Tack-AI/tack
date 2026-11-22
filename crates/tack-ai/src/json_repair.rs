@@ -1,7 +1,7 @@
 //! Lenient JSON parsing for streamed tool-call arguments.
 //! Port of `packages/ai/src/utils/json-parse.ts` (repairJson + partial parse).
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 // 'u' is listed for completeness but never matched via this table: the
 // dedicated Some('u') arm runs first and validates the four hex digits.
@@ -209,6 +209,37 @@ pub fn parse_streaming_json(partial: &str) -> Value {
     Value::Object(serde_json::Map::new())
 }
 
+/// Parse a completed tool call without accepting a repaired JSON prefix.
+/// Streaming previews use [`parse_streaming_json`]; completed calls may only
+/// repair malformed-but-recoverable text, never silently truncate arguments.
+pub fn parse_tool_call_arguments(s: &str) -> (Value, Option<String>) {
+    if s.trim().is_empty() {
+        return (json!({}), None);
+    }
+    let value: Value = match serde_json::from_str(s) {
+        Ok(value) => value,
+        Err(error) => match serde_json::from_str(&repair_json(s)) {
+            Ok(value) => value,
+            Err(_) => {
+                return (
+                    json!({}),
+                    Some(format!("{error}\n\nReceived arguments:\n{s}")),
+                );
+            }
+        },
+    };
+    if value.is_object() {
+        (value, None)
+    } else {
+        (
+            json!({}),
+            Some(format!(
+                "Tool arguments must be a JSON object\n\nReceived arguments:\n{s}"
+            )),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +273,41 @@ mod tests {
     #[test]
     fn drops_dangling_key() {
         assert_eq!(parse_streaming_json(r#"{"a": 1, "b""#), json!({ "a": 1 }));
+    }
+
+    #[test]
+    fn final_tool_arguments_reject_salvaged_prefixes() {
+        let raw = r#"{"command":"rm -rf /","unexpected""#;
+        let (arguments, error) = parse_tool_call_arguments(raw);
+        assert_eq!(arguments, json!({}));
+        let error = error.expect("malformed final arguments must be rejected");
+        assert!(error.contains("Received arguments:"));
+        assert!(error.contains(raw));
+
+        assert_eq!(parse_tool_call_arguments(""), (json!({}), None));
+        assert_eq!(parse_tool_call_arguments("  \n"), (json!({}), None));
+        assert_eq!(
+            parse_tool_call_arguments(r#"{"path":"README.md"}"#),
+            (json!({ "path": "README.md" }), None)
+        );
+    }
+
+    #[test]
+    fn final_tool_arguments_keep_safe_repairs() {
+        assert_eq!(
+            parse_tool_call_arguments(r#"{"note":"\url"}"#),
+            (json!({ "note": "\\url" }), None)
+        );
+    }
+
+    #[test]
+    fn final_tool_arguments_require_an_object() {
+        let (arguments, error) = parse_tool_call_arguments("[1,2]");
+        assert_eq!(arguments, json!({}));
+        assert_eq!(
+            error.as_deref(),
+            Some("Tool arguments must be a JSON object\n\nReceived arguments:\n[1,2]")
+        );
     }
 
     #[test]

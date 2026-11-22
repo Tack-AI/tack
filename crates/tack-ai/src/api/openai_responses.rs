@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::fail;
-use crate::json_repair::parse_streaming_json;
+use crate::json_repair::{parse_streaming_json, parse_tool_call_arguments};
 use crate::provider::{CacheRetention, StreamOptions};
 use crate::stream::{AssistantMessageEvent, AssistantMessageEventSender};
 use crate::transform::transform_messages_with_source;
@@ -560,9 +560,12 @@ fn build_params(
         params["prompt_cache_key"] = json!(session_id.chars().take(64).collect::<String>());
     }
 
-    if let Some(max_tokens) = options.max_tokens {
-        params["max_output_tokens"] = json!(max_tokens.max(OPENAI_RESPONSES_MIN_OUTPUT_TOKENS));
-    }
+    let max_tokens = crate::simple_options::clamp_max_tokens_to_context(
+        model,
+        context,
+        options.max_tokens.unwrap_or(model.max_tokens),
+    );
+    params["max_output_tokens"] = json!(max_tokens.max(OPENAI_RESPONSES_MIN_OUTPUT_TOKENS));
     if let Some(temperature) = options.temperature {
         params["temperature"] = json!(temperature);
     }
@@ -719,6 +722,7 @@ fn create_slot(
                     .unwrap_or("")
                     .to_string(),
                 arguments: json!({}),
+                arguments_error: None,
                 thought_signature: None,
                 namespace: item
                     .get("namespace")
@@ -955,6 +959,8 @@ async fn run(
 
     // --- event consumption (WS or SSE, unified channel) ---
     let mut slots: std::collections::HashMap<u64, Slot> = std::collections::HashMap::new();
+    let mut finished_tool_calls: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
     let mut saw_terminal_event = false;
     let mut stream_error: Option<crate::api::ApiError> = None;
 
@@ -1254,18 +1260,16 @@ async fn run(
                             .and_then(Value::as_str)
                             .map(str::to_string)
                             .unwrap_or_else(|| slot.partial_json.clone());
-                        let parsed = parse_streaming_json(if args_str.is_empty() {
-                            "{}"
-                        } else {
-                            &args_str
-                        });
+                        let (parsed, arguments_error) = parse_tool_call_arguments(&args_str);
                         if let Some(ContentBlock::ToolCall {
                             arguments,
+                            arguments_error: block_error,
                             namespace,
                             ..
                         }) = output.content.get_mut(content_index)
                         {
                             *arguments = parsed;
+                            *block_error = arguments_error;
                             if let Some(ns) = item.get("namespace").and_then(Value::as_str) {
                                 *namespace = Some(ns.to_string());
                             }
@@ -1280,6 +1284,7 @@ async fn run(
                                 partial: output.clone(),
                             },
                         );
+                        finished_tool_calls.insert(content_index);
                         slots.remove(&index);
                     }
                     _ => {}
@@ -1403,6 +1408,23 @@ async fn run(
             false
         );
     }
+    if output.stop_reason == StopReason::ToolUse
+        && let Some(error) = output.content.iter().enumerate().find_map(
+            |(index, block)| match block {
+                ContentBlock::ToolCall { id, name, .. }
+                    if !finished_tool_calls.contains(&index) =>
+                {
+                    Some(format!(
+                        "OpenAI Responses stream ended with an unfinished tool call: {name} ({id})"
+                    ))
+                }
+                _ => None,
+            },
+        )
+    {
+        coalescer.flush_into(&sender, &output);
+        fail!(output, sender, error, false);
+    }
     if matches!(output.stop_reason, StopReason::Aborted | StopReason::Error) {
         let message = output
             .error_message
@@ -1456,6 +1478,7 @@ mod tests {
             id: id.to_string(),
             name: "read".to_string(),
             arguments: json!({ "path": "a.txt" }),
+            arguments_error: None,
             thought_signature: None,
             namespace: None,
         }

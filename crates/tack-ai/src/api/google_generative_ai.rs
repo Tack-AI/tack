@@ -397,9 +397,12 @@ pub(crate) fn build_params(model: &Model, context: &Context, options: &StreamOpt
     if let Some(temperature) = options.temperature {
         config["temperature"] = json!(temperature);
     }
-    if let Some(max_tokens) = options.max_tokens {
-        config["maxOutputTokens"] = json!(max_tokens);
-    }
+    let max_tokens = crate::simple_options::clamp_max_tokens_to_context(
+        model,
+        context,
+        options.max_tokens.unwrap_or(model.max_tokens),
+    );
+    config["maxOutputTokens"] = json!(max_tokens);
     if !context.tools.is_empty() {
         config["tools"] = convert_tools(&context.tools);
         if let Some(choice) = options.tool_choice {
@@ -725,6 +728,7 @@ pub(crate) async fn run_with_url(
                         id,
                         name,
                         arguments: arguments.clone(),
+                        arguments_error: None,
                         thought_signature: part
                             .get("thoughtSignature")
                             .and_then(Value::as_str)

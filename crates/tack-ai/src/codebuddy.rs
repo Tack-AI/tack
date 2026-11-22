@@ -1548,6 +1548,7 @@ async fn drive(
                                                 id,
                                                 name: short.to_string(),
                                                 arguments: seeded,
+                                                arguments_error: None,
                                                 thought_signature: None,
                                                 namespace: None,
                                             });
@@ -1913,6 +1914,7 @@ async fn drive(
                                             id: id.clone(),
                                             name: short.to_string(),
                                             arguments: input.clone(),
+                                            arguments_error: None,
                                             thought_signature: None,
                                             namespace: None,
                                         });
@@ -2755,6 +2757,7 @@ impl CodeBuddySession {
                 id: tool_use_id.clone(),
                 name: name.clone(),
                 arguments: arguments.clone(),
+                arguments_error: None,
                 thought_signature: None,
                 namespace: None,
             });

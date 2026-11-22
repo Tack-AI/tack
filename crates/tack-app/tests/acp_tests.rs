@@ -122,6 +122,7 @@ fn assistant_tool_call(id: &str, name: &str, args: Value) -> AssistantMessage {
         id: id.into(),
         name: name.into(),
         arguments: args,
+        arguments_error: None,
         thought_signature: None,
         namespace: None,
     }];

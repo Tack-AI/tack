@@ -21,6 +21,7 @@ pub mod provider;
 pub mod provider_bridge;
 pub mod providers;
 pub mod retry;
+pub mod simple_options;
 pub mod stream;
 pub mod tls;
 pub mod transcript;

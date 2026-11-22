@@ -104,11 +104,12 @@ head=$(git -C "$work" rev-parse "$headref")
 total=$(git -C "$work" rev-list --count "$base..$head")
 now=$(date -u '+%Y-%m-%d %H:%M UTC')
 
-# --- 4. 按顶层目录粗分组 ---------------------------------------------------
-# 单次 git log --name-only 取出每个 commit 触及的文件，再归并到
-# packages/ai、packages/agent、packages/coding-agent、docs、其他 五组
-# （一个 commit 触及多组时按上面优先级归入第一组，行内仍列出全部触及目录）。
-mkdir -p "$tmp/groups"
+# --- 4. 按目录和架构视图分组 ----------------------------------------------
+# 单次 git log --name-only 取出每个 commit 触及的文件。目录组保留原有
+# packages/ai、agent、coding-agent、docs 优先级，并展开较新的独立包和
+# apps/p2、p3，避免它们全部落入「其他」。一个 commit 触及多组时按优先级
+# 归入第一组，行内仍列出全部触及目录。
+mkdir -p "$tmp/groups" "$tmp/views"
 group_file() {
     printf '%s/%s' "$tmp/groups" "$(printf '%s' "$1" | tr '/ ' '__')"
 }
@@ -120,14 +121,16 @@ flush_commit() {
     [ -n "$short" ] || return 0
     if [ -n "$paths" ]; then
         dirlist=$(printf '%s\n' "$paths" | awk -F/ '
-            $1 == "packages" && NF >= 2 { print $1 "/" $2; next }
+            ($1 == "packages" || $1 == "apps") && NF >= 2 { print $1 "/" $2; next }
             NF >= 2 { print $1; next }
             { print "(根目录)" }' | sort -u)
     else
         dirlist="(无文件变更/合并提交)"
     fi
     group="其他"
-    for want in packages/ai packages/agent packages/coding-agent docs; do
+    for want in packages/ai packages/agent packages/coding-agent packages/tui \
+        packages/mcp packages/codemode packages/chord packages/durable \
+        apps/p2 apps/p2-mac apps/p3 docs; do
         if printf '%s\n' "$dirlist" | grep -qx "$want"; then
             group=$want
             break
@@ -147,8 +150,21 @@ flush_commit() {
             *) pr="（${pr}）" ;;
         esac
     fi
-    printf -- '- `%s` %s%s — 触及：%s\n' "$short" "$subj" "$pr" "$summary" \
-        >> "$(group_file "$group")"
+    entry=$(printf -- '- `%s` %s%s — 触及：%s' "$short" "$subj" "$pr" "$summary")
+    printf '%s\n' "$entry" >> "$(group_file "$group")"
+
+    # p2/p3 及其同步/持久化底座属于实验架构。触及任一实验路径的 commit
+    # 在架构视图中归入实验侧（即使目录组因优先级落在 packages/ai），
+    # 这样稳定主线视图不会被跨目录实验改动淹没，且两个视图互不重复。
+    view=stable
+    for experimental in apps/p2 apps/p2-mac apps/p3 packages/chord packages/durable; do
+        if printf '%s\n' "$dirlist" | grep -qx "$experimental"; then
+            view=experimental
+            break
+        fi
+    done
+    printf '%s\n' "$entry" >> "$tmp/views/$view"
+
     short=
     subj=
     paths=
@@ -187,7 +203,9 @@ render() {
     fi
     echo "## 按上游目录分组"
     echo
-    for g in packages/ai packages/agent packages/coding-agent docs "其他"; do
+    for g in packages/ai packages/agent packages/coding-agent packages/tui \
+        packages/mcp packages/codemode packages/chord packages/durable \
+        apps/p2 apps/p2-mac apps/p3 docs "其他"; do
         f=$(group_file "$g")
         if [ -s "$f" ]; then
             n=$(wc -l < "$f" | tr -d ' ')
@@ -196,6 +214,32 @@ render() {
             cat "$f"
             echo
         fi
+    done
+    echo "## 稳定主线 / 实验架构视图"
+    echo
+    echo "实验架构路径：\`apps/p2\`、\`apps/p2-mac\`、\`apps/p3\`、\`packages/chord\`、\`packages/durable\`。"
+    echo "触及任一实验路径的跨目录 commit 归入实验侧；两个视图互不重复。"
+    echo
+    for view in stable experimental; do
+        f="$tmp/views/$view"
+        if [ "$view" = stable ]; then
+            label="稳定主线"
+        else
+            label="实验架构"
+        fi
+        if [ -s "$f" ]; then
+            n=$(wc -l < "$f" | tr -d ' ')
+        else
+            n=0
+        fi
+        echo "### ${label}（$n 个 commit）"
+        echo
+        if [ "$n" -gt 0 ]; then
+            cat "$f"
+        else
+            echo "_本轮无此类 commit。_"
+        fi
+        echo
     done
     echo "## 全部 commit 清单"
     echo

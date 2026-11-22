@@ -208,6 +208,7 @@ async fn main() {
                     id: format!("mcp__tack__bash_{i}_33cc44dd"),
                     name: "bash".into(),
                     arguments: json!({"command": cmd}),
+                    arguments_error: None,
                     thought_signature: None,
                     namespace: None,
                 },

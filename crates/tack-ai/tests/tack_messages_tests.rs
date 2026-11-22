@@ -65,6 +65,26 @@ async fn serve_once(
     (format!("http://{addr}"), rx)
 }
 
+/// Serve the same response for a fixed number of requests (initial attempt
+/// plus retries); returns the base URL after installing the accept loop.
+async fn serve_repeated(
+    status: &'static str,
+    content_type: &'static str,
+    body: &'static str,
+    attempts: usize,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        for _ in 0..attempts {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            respond(&mut socket, status, content_type, body).await;
+        }
+    });
+    format!("http://{addr}")
+}
+
 fn make_model(base_url: &str) -> Model {
     Model {
         id: "test-model".to_string(),
@@ -179,10 +199,13 @@ async fn tack_messages_sse_replay() {
 
 #[tokio::test]
 async fn tack_messages_error_body_formatting() {
-    let (base_url, _) = serve_once(
+    // rate_limited is transient, so the initial HTTP layer makes three
+    // retries before preserving the final provider error body.
+    let base_url = serve_repeated(
         "400 Bad Request",
         "application/json",
         "{\"error\":{\"message\":\"slow down\",\"code\":\"rate_limited\"}}",
+        4,
     )
     .await;
     let model = make_model(&base_url);

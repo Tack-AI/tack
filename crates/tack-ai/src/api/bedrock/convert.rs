@@ -138,9 +138,12 @@ pub fn build_request_body(model: &Model, context: &Context, options: &StreamOpti
     }
 
     let mut inference = serde_json::Map::new();
-    if let Some(max_tokens) = options.max_tokens {
-        inference.insert("maxTokens".into(), json!(max_tokens));
-    }
+    let max_tokens = crate::simple_options::clamp_max_tokens_to_context(
+        model,
+        context,
+        options.max_tokens.unwrap_or(model.max_tokens),
+    );
+    inference.insert("maxTokens".into(), json!(max_tokens));
     if let Some(temperature) = options.temperature {
         inference.insert("temperature".into(), json!(temperature));
     }
@@ -338,6 +341,7 @@ mod tests {
                 id: "tool-1".into(),
                 name: "read".into(),
                 arguments: json!({ "path": "/tmp/a.txt" }),
+                arguments_error: None,
                 thought_signature: None,
                 namespace: None,
             },

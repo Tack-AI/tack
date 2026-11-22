@@ -8,11 +8,48 @@ notice can parse entries (same convention as TS pi).
 
 ### Fixed
 
-- **Upstream delta reports parse bilingual alignment baselines**:
-  `scripts/upstream-delta.sh` now accepts both the canonical English
-  `Aligned-to commit` row and the Chinese `对齐到的 commit` row, restoring
-  automatic report generation after the documentation split. An offline
-  regression test covers both languages.
+- **Upstream delta reports parse bilingual baselines and separate new
+  architecture work**: `scripts/upstream-delta.sh` accepts both the canonical
+  English `Aligned-to commit` row and the Chinese `对齐到的 commit` row. Reports
+  now have dedicated `tui`, `mcp`, `codemode`, `chord`, `durable`, `apps/p2`,
+  `apps/p2-mac`, and `apps/p3` groups, plus a non-overlapping stable-mainline
+  versus experimental-architecture view. Offline tests cover both languages,
+  real per-directory commits, and cross-directory classification.
+
+- **Malformed final tool arguments can no longer execute a salvaged prefix**:
+  streaming previews remain tolerant, but completed Anthropic, Bedrock,
+  Mistral, OpenAI Completions, and OpenAI Responses calls require a JSON object
+  after strict parsing and safe string repair. Failures preserve the cause and
+  raw text in the additive optional `toolCall.argumentsError` session field;
+  the agent returns an error ToolResult without running the tool in either
+  sequential or parallel mode. Responses streams that complete without a
+  tool call's `output_item.done` now fail instead of exposing a runnable
+  partial call.
+
+- **Strict-schema fallback and Anthropic schema replay handle real MCP tools**:
+  untyped schema nodes disable strict conversion in `prefer` mode and produce
+  the declared error in `require` mode, while enum-only nodes remain valid.
+  Non-strict Anthropic tool schemas retain root `additionalProperties`,
+  `$defs`, and `definitions`, including local `$ref` targets, without widening
+  the strict-schema subset.
+
+- **Output limits leave context headroom and overflow detection covers more
+  gateways**: provider requests clamp the explicit or model-default output
+  limit against usage-anchored context estimates, reserving the greater of
+  4096 tokens or 15% of estimated input, with a bounded 32768-output fallback
+  near the window limit. This accommodates OpenRouter input overcounts.
+  LiteLLM pre-call errors, Z.AI CN wording, and genuine HTTP 413 status
+  prefixes are recognized as context/request overflow without matching `4130`
+  or a status mentioned only in a response body.
+
+- **Retry policy distinguishes transient failures from permanent limits at
+  both request layers**: initial HTTP failures and in-band assistant errors
+  now share one classifier. It covers temporary provider/gateway failures,
+  exact Anthropic `api_error` events, incomplete responses, and standalone
+  Node socket codes, while quota, billing, subscription-sharing, and Z.AI
+  1308 limits remain non-retryable. Numeric HTTP statuses and socket codes
+  require token boundaries so request IDs and lookalike identifiers do not
+  trigger retries.
 
 - **Bash output keeps an over-long line followed by blank lines**: tail
   truncation now retains the useful end of that line instead of returning only

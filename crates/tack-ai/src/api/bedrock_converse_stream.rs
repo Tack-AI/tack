@@ -230,6 +230,7 @@ impl StreamState {
                 id: String::new(),
                 name: String::new(),
                 arguments: Value::Null,
+                arguments_error: None,
                 thought_signature: None,
                 namespace: None,
             },
@@ -260,6 +261,18 @@ impl StreamState {
     }
 
     fn close_block(&mut self, index: usize) -> Option<AssistantMessageEvent> {
+        self.close_block_impl(index, false)
+    }
+
+    fn close_completed_block(&mut self, index: usize) -> Option<AssistantMessageEvent> {
+        self.close_block_impl(index, true)
+    }
+
+    fn close_block_impl(
+        &mut self,
+        index: usize,
+        final_arguments: bool,
+    ) -> Option<AssistantMessageEvent> {
         let kind = self.blocks.remove(&index)?;
         match (kind, self.output.content.get_mut(index)) {
             (BlockKind::Text, Some(ContentBlock::Text { text, .. })) => {
@@ -297,9 +310,21 @@ impl StreamState {
                     partial,
                 })
             }
-            (BlockKind::Tool, Some(ContentBlock::ToolCall { arguments, .. })) => {
+            (
+                BlockKind::Tool,
+                Some(ContentBlock::ToolCall {
+                    arguments,
+                    arguments_error,
+                    ..
+                }),
+            ) => {
                 if let Some(json) = self.tool_json.remove(&index) {
-                    *arguments = crate::json_repair::parse_streaming_json(&json);
+                    if final_arguments {
+                        (*arguments, *arguments_error) =
+                            crate::json_repair::parse_tool_call_arguments(&json);
+                    } else {
+                        *arguments = crate::json_repair::parse_streaming_json(&json);
+                    }
                 }
                 let tool_call = self.output.content[index].clone();
                 let partial = self.output.clone();
@@ -484,7 +509,7 @@ impl StreamState {
                     .get("contentBlockIndex")
                     .and_then(Value::as_u64)
                     .unwrap_or(0) as usize;
-                if let Some(event) = self.close_block(index) {
+                if let Some(event) = self.close_completed_block(index) {
                     self.flush_pending(&mut events);
                     events.push(event);
                 }
@@ -873,6 +898,60 @@ mod tests {
             }
             other => panic!("expected tool call: {other:?}"),
         }
+    }
+
+    #[test]
+    fn malformed_completed_tool_input_is_marked_not_salvaged() {
+        let raw = r#"{"path":"README.md","content":"updated","mode":.5}"#;
+        let mut state = StreamState::new(&test_model());
+        for frame in [
+            event_frame(
+                "contentBlockStart",
+                r#"{"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"tu_1","name":"read"}}}"#,
+            ),
+            event_frame(
+                "contentBlockDelta",
+                r#"{"contentBlockIndex":0,"delta":{"toolUse":{"input":"{\"path\":\"README.md\",\"content\":\"updated\",\"mode\":.5}"}}}"#,
+            ),
+            event_frame("contentBlockStop", r#"{"contentBlockIndex":0}"#),
+        ] {
+            state.handle_frame(&frame).unwrap();
+        }
+        let ContentBlock::ToolCall {
+            arguments,
+            arguments_error,
+            ..
+        } = &state.output.content[0]
+        else {
+            panic!("expected tool call")
+        };
+        assert_eq!(*arguments, serde_json::json!({}));
+        assert!(arguments_error.as_deref().is_some_and(|e| e.ends_with(raw)));
+    }
+
+    #[test]
+    fn incomplete_tool_input_at_eof_keeps_preview_without_final_error() {
+        let mut state = StreamState::new(&test_model());
+        for frame in [
+            event_frame(
+                "contentBlockStart",
+                r#"{"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"tu_1","name":"read"}}}"#,
+            ),
+            event_frame(
+                "contentBlockDelta",
+                r#"{"contentBlockIndex":0,"delta":{"toolUse":{"input":"{\"path\":\"README.md\"}"}}}"#,
+            ),
+        ] {
+            state.handle_frame(&frame).unwrap();
+        }
+        state.close_block(0);
+        let ContentBlock::ToolCall {
+            arguments_error, ..
+        } = &state.output.content[0]
+        else {
+            panic!("expected tool call")
+        };
+        assert_eq!(*arguments_error, None);
     }
 
     /// Regression for TS #8314: encrypted reasoning from non-Anthropic

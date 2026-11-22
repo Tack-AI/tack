@@ -22,6 +22,8 @@ static OVERFLOW_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     [
         // Anthropic and z.ai token overflow.
         r"prompt (?:is )?too long",
+        // z.ai CN endpoint token overflow.
+        r"prompt exceeds max length",
         // Anthropic request byte-size overflow (HTTP 413).
         r"request_too_large",
         // Amazon Bedrock.
@@ -30,6 +32,8 @@ static OVERFLOW_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         r"exceeds the context window",
         // OpenAI-compatible proxies (LiteLLM).
         r"exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))",
+        // LiteLLM pre-call ContextWindowExceededError.
+        r"context window exceeded",
         // Google (Gemini).
         r"input token count.*exceeds the maximum",
         // xAI (Grok).
@@ -66,17 +70,22 @@ static OVERFLOW_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         r"context[_ ]length[_ ]exceeded",
         r"too many tokens",
         r"token limit exceeded",
+        // HTTP 413 is a request-size overflow regardless of provider or body.
+        // Only match a real status prefix: either formatProviderError's
+        // `<provider> API error (413):` or a raw status at the start. A 413
+        // mentioned in a JSON body, later prose, or the number 4130 is not one.
+        r"^(?:[\w -]+ API error \(413\):|413(?:\s|:|$))",
     ]
     .iter()
     .map(|p| Regex::new(&format!("(?i){p}")).expect("overflow pattern compiles"))
     .collect()
 });
 
-/// Cerebras reports overflow as a bare status with no body (TS `661619e87`
-/// scoped this pattern to Cerebras — other providers emit 400/413 for
-/// non-overflow reasons).
+/// Cerebras reports overflow as a bodyless HTTP 400 (TS `661619e87` scoped
+/// this private rule to Cerebras — other providers emit 400 for many reasons).
+/// Bodyless HTTP 413 is handled by the provider-independent status rule above.
 static CEREBRAS_BODYLESS_OVERFLOW_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^4(?:00|13)\s*(?:status code)?\s*\(no body\)")
+    Regex::new(r"(?i)^400\s*(?:status code)?\s*\(no body\)")
         .expect("cerebras overflow pattern compiles")
 });
 
@@ -233,20 +242,97 @@ mod tests {
     }
 
     #[test]
+    fn new_provider_wording_table_matches_token_overflow() {
+        let cases = [
+            (
+                "zai",
+                r#"400 {"code":"1261","message":"Prompt exceeds max length"}"#,
+            ),
+            (
+                "litellm",
+                r#"400: {"message":"litellm.ContextWindowExceededError: litellm.BadRequestError: litellm._pre_call_checks: Context Window exceeded for given call. Max Input Tokens=262144, Got=265262"}"#,
+            ),
+        ];
+
+        for (provider, error) in cases {
+            assert!(
+                is_context_overflow(&error_msg(provider, error), None),
+                "expected overflow for {provider}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_413_table_requires_a_real_status_prefix() {
+        let cases = [
+            (
+                r#"github-copilot API error (413): {"message":"failed to parse request","code":""}"#,
+                true,
+            ),
+            ("custom-provider API error (413): Payload Too Large", true),
+            (
+                r#"413 {"error":{"message":"failed to parse request","code":""}}"#,
+                true,
+            ),
+            ("413: Payload Too Large", true),
+            ("413", true),
+            (
+                r#"github-copilot API error (400): {"message":"failed to parse request","code":""}"#,
+                false,
+            ),
+            (
+                r#"github-copilot API error (400): {"message":"failed to parse request: invalid value 413"}"#,
+                false,
+            ),
+            (
+                "custom-provider API error (400): upstream mentioned OpenAI API error (413): invalid input",
+                false,
+            ),
+            ("custom-provider API error (4130): invalid input", false),
+            ("4130 failed to parse request", false),
+            ("request failed with HTTP 413", false),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(
+                is_context_overflow(&error_msg("custom-provider", error), None),
+                expected,
+                "unexpected overflow classification for: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_413_requires_an_error_stop_reason() {
+        let mut message = error_msg(
+            "github-copilot",
+            r#"github-copilot API error (413): {"message":"failed to parse request"}"#,
+        );
+        for stop_reason in [StopReason::Stop, StopReason::Aborted] {
+            message.stop_reason = stop_reason;
+            assert!(!is_context_overflow(&message, None));
+        }
+    }
+
+    #[test]
     fn cerebras_bodyless_overflow_is_scoped_to_cerebras() {
-        // TS `661619e87`: 400/413 (no body) only means overflow for Cerebras.
-        assert!(is_context_overflow(
-            &error_msg("cerebras", "400 (no body)"),
-            None
-        ));
-        assert!(is_context_overflow(
-            &error_msg("cerebras", "413 status code (no body)"),
-            None
-        ));
-        assert!(!is_context_overflow(
-            &error_msg("groq", "400 (no body)"),
-            None
-        ));
+        // Only bodyless 400 uses Cerebras's private rule. Bodyless 413 is
+        // overflow for every provider through the real-status-prefix rule.
+        let cases = [
+            ("cerebras", "400 (no body)", true),
+            ("cerebras", "400 status code (no body)", true),
+            ("cerebras", "413 status code (no body)", true),
+            ("groq", "400 (no body)", false),
+            ("groq", "413 status code (no body)", true),
+        ];
+
+        for (provider, error, expected) in cases {
+            assert_eq!(
+                is_context_overflow(&error_msg(provider, error), None),
+                expected,
+                "unexpected bodyless-status classification for {provider}: {error}"
+            );
+        }
     }
 
     #[test]

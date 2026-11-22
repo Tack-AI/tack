@@ -2383,6 +2383,7 @@ pub(crate) mod subagent_tool_test_support {
                     id: "call-1".into(),
                     name: "bash".into(),
                     arguments: serde_json::json!({ "command": "echo probe-bypass" }),
+                    arguments_error: None,
                     thought_signature: None,
                     namespace: None,
                 }];
@@ -2462,6 +2463,7 @@ pub(crate) mod subagent_tool_test_support {
                     id: "call-1".into(),
                     name: self.tool_name.into(),
                     arguments: self.arguments.clone(),
+                    arguments_error: None,
                     thought_signature: None,
                     namespace: None,
                 }];
@@ -2546,6 +2548,7 @@ pub(crate) mod subagent_tool_test_support {
                     id: "call-1".into(),
                     name: "read".into(),
                     arguments: json!({ "path": "a.txt" }),
+                    arguments_error: None,
                     thought_signature: None,
                     namespace: None,
                 }];

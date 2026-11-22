@@ -175,6 +175,7 @@ fn assistant_with_tool_calls(calls: &[(&str, &str, Value)]) -> AssistantMessage 
             id: id.to_string(),
             name: name.to_string(),
             arguments: args.clone(),
+            arguments_error: None,
             thought_signature: None,
             namespace: None,
         })
@@ -349,6 +350,61 @@ async fn truncated_message_tool_calls_are_failed_not_executed() {
     assert!(
         matches!(&messages[3], AgentMessage::Assistant(a) if a.stop_reason == StopReason::Stop)
     );
+}
+
+#[tokio::test]
+async fn malformed_final_tool_arguments_are_returned_without_execution() {
+    let raw = r#"{"command":"rm -rf /","unexpected""#;
+    for mode in [ToolExecutionMode::Parallel, ToolExecutionMode::Sequential] {
+        let mut malformed = assistant_with_tool_calls(&[("t1", "mock", json!({}))]);
+        let ContentBlock::ToolCall {
+            arguments_error, ..
+        } = &mut malformed.content[0]
+        else {
+            panic!("expected tool call")
+        };
+        *arguments_error = Some(format!(
+            "Failed to parse tool call arguments: expected a value\nRaw arguments: {raw}"
+        ));
+        let provider = ScriptedProvider::with_scripts(vec![malformed, assistant_text("recovered")]);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let tool = Arc::new(MockTool {
+            name: "mock",
+            delay: Duration::ZERO,
+            calls: calls.clone(),
+            terminate: false,
+        });
+        let mut config = make_config(provider, Arc::new(NoopHooks));
+        config.tool_execution = mode;
+
+        let stream = agent_loop(
+            vec![AgentMessage::user("go")],
+            AgentContext {
+                system_prompt: None,
+                messages: vec![],
+                tools: vec![tool],
+            },
+            config,
+            CancellationToken::new(),
+        );
+        let (_, messages) = collect_events(stream).await;
+
+        assert!(calls.lock().unwrap().is_empty(), "{mode:?}: tool executed");
+        let messages = without_system(&messages);
+        let AgentMessage::ToolResult(result) = &messages[2] else {
+            panic!("{mode:?}: expected tool result")
+        };
+        assert!(result.is_error);
+        let InputContentBlock::Text { text, .. } = &result.content[0] else {
+            panic!("expected text result")
+        };
+        assert!(text.contains("Invalid arguments for tool \"mock\""));
+        assert!(text.contains("expected a value"));
+        assert!(text.contains(raw), "raw arguments missing: {text}");
+        assert!(
+            matches!(&messages[3], AgentMessage::Assistant(a) if a.stop_reason == StopReason::Stop)
+        );
+    }
 }
 
 #[tokio::test]

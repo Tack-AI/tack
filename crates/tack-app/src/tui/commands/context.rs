@@ -738,6 +738,7 @@ mod tests {
                 id: "call-1".into(),
                 name: "write".into(),
                 arguments: big_args.clone(),
+                arguments_error: None,
                 thought_signature: None,
                 namespace: None,
             },

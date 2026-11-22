@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::fail;
-use crate::json_repair::parse_streaming_json;
+use crate::json_repair::{parse_streaming_json, parse_tool_call_arguments};
 use crate::provider::{CacheRetention, StreamOptions};
 use crate::stream::{AssistantMessageEvent, AssistantMessageEventSender};
 use crate::transform::transform_messages;
@@ -416,6 +416,15 @@ fn convert_tools(
                         }
                     }
                 }
+            } else if let (Value::Object(schema), Value::Object(out)) = (&schema, &mut input_schema)
+            {
+                // Anthropic accepts these root fields even without strict tools.
+                // Other fields (title, anyOf, etc.) remain outside its schema subset.
+                for key in ["additionalProperties", "$defs", "definitions"] {
+                    if let Some(value) = schema.get(key) {
+                        out.insert(key.to_string(), value.clone());
+                    }
+                }
             }
             let mut out = json!({
                 "name": tool.name,
@@ -461,7 +470,11 @@ fn build_params(
         Some(&normalize_tool_call_id),
     );
 
-    let max_tokens = options.max_tokens.unwrap_or(model.max_tokens);
+    let max_tokens = crate::simple_options::clamp_max_tokens_to_context(
+        model,
+        context,
+        options.max_tokens.unwrap_or(model.max_tokens),
+    );
 
     // Deferred tools: only engaged when some tool opts in AND the model
     // supports tool references (defer_loading flag on declarations).
@@ -901,6 +914,7 @@ async fn run(
                             id,
                             name,
                             arguments: input,
+                            arguments_error: None,
                             thought_signature: None,
                             namespace: None,
                         });
@@ -1037,8 +1051,16 @@ async fn run(
                             },
                         );
                     }
-                    Some(ContentBlock::ToolCall { arguments, .. }) => {
-                        *arguments = parse_streaming_json(&blocks[pos].partial_json);
+                    Some(ContentBlock::ToolCall {
+                        arguments,
+                        arguments_error,
+                        ..
+                    }) => {
+                        (*arguments, *arguments_error) =
+                            parse_tool_call_arguments(&blocks[pos].partial_json);
+                        // A completed block must not be overwritten by the
+                        // tolerant end-of-stream preview fallback.
+                        blocks[pos].partial_json.clear();
                         let tool_call = output.content[pos].clone();
                         coalescer.push(
                             &sender,
@@ -1357,6 +1379,62 @@ mod tests {
         // Without provider support, strict is not emitted.
         let out = convert_tools(&tools, None, false, &AnthropicCompat::default()).unwrap();
         assert!(out[0].get("strict").is_none());
+    }
+
+    #[test]
+    fn convert_tools_non_strict_preserves_only_supported_root_schema_fields() {
+        let parameters = json!({
+            "type": "object",
+            "title": "drop me",
+            "anyOf": [{ "type": "object" }],
+            "$defs": { "value": { "type": "string" } },
+            "definitions": { "legacy": { "type": "integer" } },
+            "properties": {
+                "value": { "$ref": "#/$defs/value" },
+                "legacy": { "$ref": "#/definitions/legacy" },
+            },
+            "required": ["value", "legacy"],
+        });
+        let tools = [json!(false), json!({ "type": "string" })]
+            .into_iter()
+            .enumerate()
+            .map(|(index, additional_properties)| {
+                let mut parameters = parameters.clone();
+                parameters["additionalProperties"] = additional_properties;
+                ToolDefinition {
+                    name: format!("read-{index}"),
+                    description: "d".to_string(),
+                    parameters,
+                    defer_loading: false,
+                    constrained_sampling: None,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let out = convert_tools(&tools, None, false, &AnthropicCompat::default()).unwrap();
+        assert_eq!(out[0]["input_schema"]["additionalProperties"], json!(false));
+        assert_eq!(
+            out[1]["input_schema"]["additionalProperties"],
+            json!({ "type": "string" })
+        );
+        for tool in &out {
+            let schema = &tool["input_schema"];
+            assert_eq!(schema["$defs"], json!({ "value": { "type": "string" } }));
+            assert_eq!(
+                schema["definitions"],
+                json!({ "legacy": { "type": "integer" } })
+            );
+            assert_eq!(
+                schema["properties"]["value"]["$ref"],
+                json!("#/$defs/value")
+            );
+            assert_eq!(
+                schema["properties"]["legacy"]["$ref"],
+                json!("#/definitions/legacy")
+            );
+            assert!(schema.get("title").is_none());
+            assert!(schema.get("anyOf").is_none());
+        }
     }
 
     #[test]

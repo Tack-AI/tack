@@ -8,7 +8,7 @@ use super::params::{
     build_params, grammar_constraint_map, has_auth_header, resolve_cache_retention,
 };
 use crate::api::fail;
-use crate::json_repair::parse_streaming_json;
+use crate::json_repair::{parse_streaming_json, parse_tool_call_arguments};
 use crate::provider::StreamOptions;
 use crate::stream::{AssistantMessageEvent, AssistantMessageEventSender};
 use crate::types::{AssistantMessage, ContentBlock, Context, Model, StopReason, calculate_cost};
@@ -172,6 +172,10 @@ pub(crate) async fn run(
         std::collections::HashMap::new();
     let mut tool_calls_by_id: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new(); // id -> content_pos
+    // Providers that omit both index and id still need their raw final text
+    // retained for strict validation (normally such calls arrive in one delta).
+    let mut unindexed_tool_args: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
     let mut has_finish_reason = false;
     let mut stream_error: Option<crate::api::ApiError> = None;
     // `reasoning_details` are replay metadata, not user-visible deltas. Keep
@@ -382,6 +386,7 @@ pub(crate) async fn run(
                             id: id.unwrap_or("").to_string(),
                             name: name.unwrap_or("").to_string(),
                             arguments: json!({}),
+                            arguments_error: None,
                             thought_signature: None,
                             namespace: None,
                         });
@@ -495,7 +500,9 @@ pub(crate) async fn run(
                             }
                         }
                     } else {
-                        let parsed = parse_streaming_json(args);
+                        let accumulated = unindexed_tool_args.entry(content_pos).or_default();
+                        accumulated.push_str(args);
+                        let parsed = parse_streaming_json(accumulated);
                         if let Some(ContentBlock::ToolCall { arguments, .. }) =
                             output.content.get_mut(content_pos)
                         {
@@ -573,14 +580,27 @@ pub(crate) async fn run(
         }
         if matches!(output.content.get(pos), Some(ContentBlock::ToolCall { .. })) {
             let state = tool_calls_by_index.values().find(|s| s.content_pos == pos);
-            let final_args = state.map(|s| match &s.grammar_property {
-                Some(property) => json!({ property: s.partial_args }),
-                None => parse_streaming_json(&s.partial_args),
-            });
-            if let Some(ContentBlock::ToolCall { arguments, .. }) = output.content.get_mut(pos)
-                && let Some(parsed) = final_args
+            let final_args = if let Some(state) = state {
+                match &state.grammar_property {
+                    Some(property) => (json!({ property: state.partial_args.clone() }), None),
+                    None => parse_tool_call_arguments(&state.partial_args),
+                }
+            } else {
+                parse_tool_call_arguments(
+                    unindexed_tool_args
+                        .get(&pos)
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                )
+            };
+            if let Some(ContentBlock::ToolCall {
+                arguments,
+                arguments_error,
+                ..
+            }) = output.content.get_mut(pos)
             {
-                *arguments = parsed;
+                *arguments = final_args.0;
+                *arguments_error = final_args.1;
             }
             let tool_call = output.content[pos].clone();
             coalescer.push(

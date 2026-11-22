@@ -560,12 +560,22 @@ pub(crate) async fn send_with_retry(
         match result {
             Ok(response) => {
                 let status = response.status();
-                let retryable = status.as_u16() == 429 || status.is_server_error();
                 if status.is_success() {
                     return Ok(response);
                 }
+                // Read the provider body before classifying. Status-only
+                // retries both repeat permanent 429 quota failures and miss
+                // temporary failures relayed as JSON without a 5xx status.
+                let delay = retry_delay(&response, attempt);
+                let body = tokio::select! {
+                    _ = cancel.cancelled() => return Err(ApiError::Aborted),
+                    result = response.text() => result.unwrap_or_default(),
+                };
+                let retryable =
+                    crate::retry::is_retryable_error_message(&format!("{status}: {body}"));
+                let body = truncate_for_error(&body);
+                let error_message = format!("{status}: {body}");
                 if retryable && attempt < MAX_RETRIES {
-                    let delay = retry_delay(&response, attempt);
                     tracing::debug!(%status, ?delay, "retrying provider request");
                     tokio::select! {
                         _ = cancel.cancelled() => return Err(ApiError::Aborted),
@@ -573,8 +583,6 @@ pub(crate) async fn send_with_retry(
                     }
                     continue;
                 }
-                let body = response.text().await.unwrap_or_default();
-                let body = truncate_for_error(&body);
                 if std::env::var("TACK_DEBUG").is_ok_and(|v| v == "1") {
                     let dump = serde_json::json!({
                         "status": status.as_u16(),
@@ -588,7 +596,7 @@ pub(crate) async fn send_with_retry(
                     );
                     tracing::warn!("TACK_DEBUG: wrote failing request to {}", path.display());
                 }
-                return Err(ApiError::Failed(format!("{status}: {body}")));
+                return Err(ApiError::Failed(error_message));
             }
             Err(e) => {
                 let retryable = is_retryable_transport_error(&e);
@@ -749,6 +757,79 @@ mod tests {
         assert!(matches!(result, Err(ApiError::Failed(_))));
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_does_not_retry_permanent_http_quota_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                server_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                // The permanent code is beyond the 4000-char display cap;
+                // classification must still see the complete response body.
+                let body = format!(
+                    "{{\"message\":\"{}\",\"code\":\"insufficient_quota\"}}",
+                    "x".repeat(4500)
+                );
+                let response = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let client = http_client();
+        let url = format!("http://{addr}/");
+        let build = move || client.post(&url).body("{}".to_string());
+        let body = serde_json::json!({});
+        let start = std::time::Instant::now();
+        let result = send_with_retry(build, &cancel, &body).await;
+        assert!(matches!(result, Err(ApiError::Failed(_))));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_uses_temporary_provider_error_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let attempt = server_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let (status, body) = if attempt == 0 {
+                    ("400 Bad Request", "The provider is temporarily unavailable")
+                } else {
+                    ("200 OK", "")
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let client = http_client();
+        let url = format!("http://{addr}/");
+        let build = move || client.post(&url).body("{}".to_string());
+        let body = serde_json::json!({});
+        let result = send_with_retry(build, &cancel, &body).await;
+        assert!(result.is_ok(), "temporary provider body was not retried");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.abort();
     }
 
     // --- DeltaCoalescer ---

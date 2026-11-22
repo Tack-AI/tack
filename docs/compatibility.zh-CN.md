@@ -69,6 +69,10 @@ Rust workspace 的各个 crate **不发布到 crates.io**，也不提供 semver
   保留记录（未知消息角色、缺失字段）—— 会被保留为 v4 *custom* 条目，
   而不是被拒绝或中止 —— 这是 Tack 的"不丢数据"原则
   （`crates/tack-session/src/v4/migrate.rs`）。
+- assistant 的 `toolCall` 内容块可以携带可选的 `argumentsError` 字符串，
+  表示 provider 的最终参数不是合法 JSON object。该字段记录解析原因和原始文本，
+  此时 `arguments` 为 `{}`。它是旧版与 v4 消息载荷中的只增、上游兼容字段：
+  读取方把缺失字段默认作 `None`，因此既有 session 无需迁移，session 格式版本不变。
 - `crates/tack-session/src/sqlite_backend.rs` 是一个**实验性**后端
   （`sessionBackend: "sqlite"`），不在下述保证范围内。
 

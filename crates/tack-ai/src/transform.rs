@@ -177,6 +177,7 @@ pub fn transform_messages_with_source(
                             id,
                             name,
                             arguments,
+                            arguments_error,
                             thought_signature,
                             namespace,
                         } => {
@@ -197,6 +198,7 @@ pub fn transform_messages_with_source(
                                 id,
                                 name,
                                 arguments,
+                                arguments_error,
                                 thought_signature,
                                 namespace,
                             });
@@ -361,6 +363,7 @@ mod tests {
             id: "toolu_1".to_string(),
             name: "read".to_string(),
             arguments: serde_json::json!({}),
+            arguments_error: None,
             thought_signature: None,
             namespace: None,
         };
@@ -391,6 +394,7 @@ mod tests {
             id: "toolu_1".to_string(),
             name: "read".to_string(),
             arguments: serde_json::json!({}),
+            arguments_error: None,
             thought_signature: None,
             namespace: None,
         }];
@@ -416,6 +420,7 @@ mod tests {
             id: "call_1|fc_x".to_string(),
             name: "read".to_string(),
             arguments: serde_json::json!({}),
+            arguments_error: None,
             thought_signature: None,
             namespace: None,
         };

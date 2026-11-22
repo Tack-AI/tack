@@ -52,6 +52,31 @@ fn assistant_message_matches_ts_shape() {
 }
 
 #[test]
+fn tool_call_arguments_error_is_optional_and_camel_case() {
+    let value = json!({
+        "type": "toolCall",
+        "id": "call_1",
+        "name": "bash",
+        "arguments": {},
+        "argumentsError": "Failed to parse tool call arguments\nRaw arguments: {broken",
+        "thoughtSignature": "sig123"
+    });
+    let block: ContentBlock = serde_json::from_value(value.clone()).unwrap();
+    let ContentBlock::ToolCall {
+        arguments_error, ..
+    } = &block
+    else {
+        panic!("expected tool call")
+    };
+    assert!(
+        arguments_error
+            .as_deref()
+            .is_some_and(|e| e.contains("{broken"))
+    );
+    assert_eq!(serde_json::to_value(block).unwrap(), value);
+}
+
+#[test]
 fn tool_result_message_matches_ts_shape() {
     let ts_json = json!({
         "role": "toolResult",

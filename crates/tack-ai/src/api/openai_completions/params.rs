@@ -560,9 +560,12 @@ pub(crate) fn build_params(
     if compat.supports_store {
         params["store"] = json!(false);
     }
-    if let Some(max_tokens) = options.max_tokens {
-        params[compat.max_tokens_field.as_str()] = json!(max_tokens);
-    }
+    let max_tokens = crate::simple_options::clamp_max_tokens_to_context(
+        model,
+        context,
+        options.max_tokens.unwrap_or(model.max_tokens),
+    );
+    params[compat.max_tokens_field.as_str()] = json!(max_tokens);
     if let Some(temperature) = options.temperature {
         params["temperature"] = json!(temperature);
     }
@@ -1113,6 +1116,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn openrouter_output_limit_leaves_context_headroom() {
+        let mut model = generic_model("openrouter", "https://openrouter.ai/api/v1");
+        model.context_window = 1_048_576;
+        model.max_tokens = 943_718;
+        let compat = get_compat(&model);
+        let mut assistant = crate::types::AssistantMessage::pending(&model);
+        assistant.stop_reason = crate::types::StopReason::Stop;
+        assistant.usage.input = 220_815;
+        assistant.usage.total_tokens = 220_815;
+        let context = Context {
+            system_prompt: None,
+            messages: vec![crate::types::Message::Assistant(assistant)],
+            tools: vec![],
+        };
+        let options = StreamOptions {
+            max_tokens: Some(943_718),
+            ..Default::default()
+        };
+        let params = build_params(&model, &context, &options, &compat, CacheRetention::None);
+        assert_eq!(
+            params[compat.max_tokens_field.as_str()],
+            json!(1_048_576 - 220_815 - 33_123)
+        );
+    }
+
     /// Legacy sessions stored one encrypted entry on the tool call's
     /// thoughtSignature; it must replay as reasoning_details too.
     #[test]
@@ -1128,6 +1157,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "read".into(),
                 arguments: json!({ "path": "a.txt" }),
+                arguments_error: None,
                 thought_signature: Some(serde_json::to_string(&detail).unwrap()),
                 namespace: None,
             },
@@ -1155,6 +1185,7 @@ mod tests {
             id: "call_1".into(),
             name: "read".into(),
             arguments: json!({ "path": "a.txt" }),
+            arguments_error: None,
             thought_signature: None,
             namespace: None,
         }];

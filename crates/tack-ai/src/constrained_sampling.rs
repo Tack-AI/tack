@@ -94,6 +94,9 @@ fn make_node_strict(schema: &mut Value) -> Result<(), String> {
             return Err(format!("{key} schemas are unsupported"));
         }
     }
+    if !obj.contains_key("type") && !obj.contains_key("anyOf") && !obj.contains_key("enum") {
+        return Err("schemas without a type are unsupported".to_string());
+    }
 
     if let Some(any_of) = obj.get_mut("anyOf") {
         let Some(variants) = any_of.as_array_mut() else {
@@ -436,6 +439,72 @@ mod tests {
         let schema =
             json!({ "type": "object", "properties": { "x": { "anyOf": [{ "type": "object" }] } } });
         assert!(make_strict_json_schema(&schema).is_err());
+    }
+
+    #[test]
+    fn strict_conversion_accepts_enum_only_nodes() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "mode": { "enum": ["read", "write"] } },
+            "required": ["mode"],
+        });
+        let strict = make_strict_json_schema(&schema).unwrap();
+        assert_eq!(
+            strict["properties"]["mode"],
+            json!({ "enum": ["read", "write"] })
+        );
+    }
+
+    #[test]
+    fn strict_conversion_rejects_nodes_without_a_type() {
+        let array_with_empty_items = json!({
+            "type": "object",
+            "properties": { "values": { "type": "array", "items": {} } },
+        });
+        assert_eq!(
+            make_strict_json_schema(&array_with_empty_items).unwrap_err(),
+            "schemas without a type are unsupported"
+        );
+
+        let description_only = json!({
+            "type": "object",
+            "properties": { "value": { "description": "no type" } },
+        });
+        assert_eq!(
+            make_strict_json_schema(&description_only).unwrap_err(),
+            "schemas without a type are unsupported"
+        );
+    }
+
+    #[test]
+    fn const_only_nodes_fall_back_for_prefer_and_error_for_require() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "value": { "const": "fixed" } },
+            "required": ["value"],
+        });
+        assert_eq!(
+            make_strict_json_schema(&schema).unwrap_err(),
+            "schemas without a type are unsupported"
+        );
+
+        let tool = |strict: &str| crate::types::ToolDefinition {
+            name: "constant".to_string(),
+            description: "constant".to_string(),
+            parameters: schema.clone(),
+            defer_loading: false,
+            constrained_sampling: Some(ConstrainedSampling::JsonSchema {
+                strict: Some(strict.to_string()),
+            }),
+        };
+        assert_eq!(
+            resolve_json_schema_strict(&tool("prefer"), true).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_json_schema_strict(&tool("require"), true).unwrap_err(),
+            "Tool \"constant\" requires JSON-schema constrained sampling, but schemas without a type are unsupported."
+        );
     }
 
     #[test]

@@ -2129,6 +2129,7 @@ mod tests {
             id: id.into(),
             name: name.into(),
             arguments: args,
+            arguments_error: None,
             thought_signature: None,
             namespace: None,
         }];

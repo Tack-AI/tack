@@ -730,6 +730,7 @@ async fn codebuddy_jsonl_rebuild_on_divergence() {
                 id: "call-1".into(),
                 name: "echo".into(),
                 arguments: json!({"text": "hi"}),
+                arguments_error: None,
                 thought_signature: None,
                 namespace: None,
             },

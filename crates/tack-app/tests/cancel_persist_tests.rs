@@ -98,6 +98,7 @@ fn assistant_with_tool_calls(calls: &[(&str, &str, Value)]) -> AssistantMessage 
             id: id.to_string(),
             name: name.to_string(),
             arguments: args.clone(),
+            arguments_error: None,
             thought_signature: None,
             namespace: None,
         })

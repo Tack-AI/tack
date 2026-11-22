@@ -112,6 +112,19 @@ fn test_options() -> StreamOptions {
     }
 }
 
+async fn replay_message(api: &str, provider_name: &str, body: &'static str) -> AssistantMessage {
+    let (base_url, _request_rx) = serve_once(body).await;
+    let model = make_model(api, provider_name, &base_url);
+    let provider = provider_for(&model).unwrap();
+    let mut stream = provider.stream(&model, &test_context(), test_options());
+    while let Some(event) = stream.next().await {
+        if event.is_terminal() {
+            break;
+        }
+    }
+    stream.result().await
+}
+
 // ---------------------------------------------------------------------------
 // OpenAI Responses
 // ---------------------------------------------------------------------------
@@ -174,10 +187,58 @@ async fn openai_responses_sse_replay() {
     assert_eq!(body["input"][0]["role"], json!("system")); // reasoning: false → system role
 }
 
+#[tokio::test]
+async fn openai_responses_malformed_final_arguments_are_marked() {
+    let raw = r#"{"path":"README.md","content":"updated","mode":.5}"#;
+    let message = replay_message(
+        "openai-responses",
+        "openai",
+        concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"read\",\"arguments\":\"\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\\\"README.md\\\",\\\"content\\\":\\\"updated\\\",\\\"mode\\\":.5}\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\",\\\"content\\\":\\\"updated\\\",\\\"mode\\\":.5}\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}\n\n",
+        ),
+    )
+    .await;
+
+    assert_eq!(message.stop_reason, StopReason::ToolUse);
+    let ContentBlock::ToolCall {
+        arguments,
+        arguments_error,
+        ..
+    } = &message.content[0]
+    else {
+        panic!("expected tool call")
+    };
+    assert_eq!(*arguments, json!({}));
+    let error = arguments_error.as_deref().expect("arguments error");
+    assert!(error.contains("Received arguments:"));
+    assert!(error.ends_with(raw), "{error}");
+}
+
+#[tokio::test]
+async fn openai_responses_unfinished_tool_call_is_a_stream_error() {
+    let message = replay_message(
+        "openai-responses",
+        "openai",
+        concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"read\",\"arguments\":\"\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\\\"README.md\\\"}\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}\n\n",
+        ),
+    )
+    .await;
+
+    assert_eq!(message.stop_reason, StopReason::Error);
+    let error = message.error_message.as_deref().unwrap_or_default();
+    assert!(error.contains("unfinished tool call: read"), "{error}");
+    assert!(error.contains("call_1|fc_1"), "{error}");
+}
+
 // ---------------------------------------------------------------------------
 // Google Generative AI
 // ---------------------------------------------------------------------------
-
 const GOOGLE_SSE: &str = concat!(
     "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello\"}]}}],\"responseId\":\"resp-g1\"}\n\n",
     "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\" world\"}]}}]}\n\n",
@@ -239,6 +300,33 @@ const MISTRAL_SSE: &str = concat!(
     "data: {\"id\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":18,\"completion_tokens\":9,\"total_tokens\":27}}\n\n",
     "data: [DONE]\n\n",
 );
+
+#[tokio::test]
+async fn mistral_malformed_final_arguments_are_marked() {
+    let raw = r#"{"path":"README.md","content":"updated","mode":.5}"#;
+    let message = replay_message(
+        "mistral-conversations",
+        "mistral",
+        concat!(
+            "data: {\"id\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"call123ab\",\"index\":0,\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\",\\\"content\\\":\\\"updated\\\",\\\"mode\\\":.5}\"}}]}}]}\n\n",
+            "data: {\"id\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ),
+    )
+    .await;
+
+    assert_eq!(message.stop_reason, StopReason::ToolUse);
+    let ContentBlock::ToolCall {
+        arguments,
+        arguments_error,
+        ..
+    } = &message.content[0]
+    else {
+        panic!("expected tool call")
+    };
+    assert_eq!(*arguments, json!({}));
+    assert!(arguments_error.as_deref().is_some_and(|e| e.ends_with(raw)));
+}
 
 #[tokio::test]
 async fn mistral_sse_replay() {

@@ -391,6 +391,7 @@ impl Converter {
                             .unwrap_or("")
                             .to_string(),
                         arguments: json!({}),
+                        arguments_error: None,
                         thought_signature: None,
                         namespace: None,
                     },
@@ -439,16 +440,22 @@ impl Converter {
                         .get("arguments")
                         .cloned()
                         .unwrap_or_else(|| json!({}));
+                    let arguments_error = tool_call
+                        .get("argumentsError")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
                     if let Some(ContentBlock::ToolCall {
                         id: bid,
                         name: bname,
                         arguments: bargs,
+                        arguments_error: block_error,
                         ..
                     }) = self.partial.content.get_mut(i)
                     {
                         *bid = id.to_string();
                         *bname = name.to_string();
                         *bargs = arguments;
+                        *block_error = arguments_error;
                     }
                 }
                 self.tool_json.remove(&i);

@@ -568,6 +568,7 @@ mod tests {
                     id: call_id.into(),
                     name: "bash".into(),
                     arguments: json!({"command": "ls"}),
+                    arguments_error: None,
                     thought_signature: None,
                     namespace: None,
                 },

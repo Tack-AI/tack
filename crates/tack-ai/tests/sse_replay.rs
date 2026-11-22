@@ -312,6 +312,50 @@ async fn anthropic_sse_replay_produces_pi_events() {
     );
 }
 
+#[tokio::test]
+async fn anthropic_malformed_final_arguments_are_marked() {
+    let raw = r#"{"path":"README.md","content":"updated","mode":.5}"#;
+    let base_url = serve_once(
+        "text/event-stream",
+        concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"README.md\\\",\\\"content\\\":\\\"updated\\\",\\\"mode\\\":.5}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":2}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        ),
+    )
+    .await;
+    let model = anthropic_model(&base_url);
+    let provider = provider_for(&model).unwrap();
+    let mut stream = provider.stream(&model, &test_context(), test_options());
+    while let Some(event) = stream.next().await {
+        if event.is_terminal() {
+            break;
+        }
+    }
+    let message = stream.result().await;
+
+    assert_eq!(message.stop_reason, StopReason::ToolUse);
+    let ContentBlock::ToolCall {
+        arguments,
+        arguments_error,
+        ..
+    } = &message.content[0]
+    else {
+        panic!("expected tool call")
+    };
+    assert_eq!(*arguments, json!({}));
+    assert!(arguments_error.as_deref().is_some_and(|e| e.ends_with(raw)));
+}
+
 const OPENAI_SSE: &str = concat!(
     "data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
     "data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n",
@@ -368,6 +412,41 @@ async fn openai_sse_replay_produces_pi_events() {
     assert_eq!(body["messages"][0]["role"], json!("system"));
     assert_eq!(body["messages"][1]["role"], json!("user"));
     assert_eq!(body["tools"][0]["function"]["name"], json!("read"));
+}
+
+#[tokio::test]
+async fn openai_malformed_final_arguments_are_marked() {
+    let raw = r#"{"path":"README.md","content":"updated","mode":.5}"#;
+    let base_url = serve_once(
+        "text/event-stream",
+        concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\",\\\"content\\\":\\\"updated\\\",\\\"mode\\\":.5}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ),
+    )
+    .await;
+    let model = openai_model(&base_url);
+    let provider = provider_for(&model).unwrap();
+    let mut stream = provider.stream(&model, &test_context(), test_options());
+    while let Some(event) = stream.next().await {
+        if event.is_terminal() {
+            break;
+        }
+    }
+    let message = stream.result().await;
+
+    assert_eq!(message.stop_reason, StopReason::ToolUse);
+    let ContentBlock::ToolCall {
+        arguments,
+        arguments_error,
+        ..
+    } = &message.content[0]
+    else {
+        panic!("expected tool call")
+    };
+    assert_eq!(*arguments, json!({}));
+    assert!(arguments_error.as_deref().is_some_and(|e| e.ends_with(raw)));
 }
 
 #[tokio::test]
