@@ -7,9 +7,9 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::fail;
-use crate::json_repair::{parse_streaming_json, parse_tool_call_arguments};
 use crate::provider::StreamOptions;
 use crate::stream::{AssistantMessageEvent, AssistantMessageEventSender};
+use crate::streaming_json::ToolCallArgumentsStream;
 use crate::transform::transform_messages;
 use crate::types::{
     AssistantMessage, ContentBlock, Context, InputContentBlock, Message, Model, StopReason,
@@ -372,7 +372,7 @@ fn map_stop_reason(reason: &str) -> (StopReason, Option<String>) {
 /// split one logical call into two blocks.
 fn handle_tool_call_deltas(
     output: &mut AssistantMessage,
-    tool_blocks: &mut HashMap<String, (usize, String)>,
+    tool_blocks: &mut HashMap<String, (usize, ToolCallArgumentsStream)>,
     tool_calls: &[Value],
     sender: &AssistantMessageEventSender,
     coalescer: &mut crate::api::DeltaCoalescer,
@@ -401,7 +401,7 @@ fn handle_tool_call_deltas(
                 namespace: None,
             });
             let idx = output.content.len() - 1;
-            tool_blocks.insert(key.clone(), (idx, String::new()));
+            tool_blocks.insert(key.clone(), (idx, ToolCallArgumentsStream::new()));
             coalescer.push(
                 sender,
                 output,
@@ -419,20 +419,52 @@ fn handle_tool_call_deltas(
         };
         let (idx, partial) = tool_blocks.get_mut(&key).expect("block exists");
         partial.push_str(&args_delta);
-        // Defer the O(accumulated) streaming re-parse to the coalescer
-        // window: parse only when a merged delta event is about to go out
-        // (the finish path below re-parses the final arguments), not per
-        // tiny delta.
-        if coalescer.would_flush(crate::api::DeltaKind::ToolCall, *idx, args_delta.len()) {
-            let parsed = parse_streaming_json(partial);
-            if let Some(ContentBlock::ToolCall { arguments, .. }) = output.content.get_mut(*idx) {
-                *arguments = parsed;
-            }
+        // Publish a fresh preview only when a merged delta event is about
+        // to go out (the finish path below handles the trailing arguments);
+        // push_str above feeds every delta to the incremental parser.
+        if coalescer.would_flush(crate::api::DeltaKind::ToolCall, *idx, args_delta.len())
+            && let Some(parsed) = partial.preview()
+            && let Some(ContentBlock::ToolCall { arguments, .. }) = output.content.get_mut(*idx)
+        {
+            *arguments = parsed;
         }
         if let Some(ev) = coalescer.offer(crate::api::DeltaKind::ToolCall, *idx, args_delta, output)
         {
             let _ = sender.push(ev);
         }
+    }
+}
+
+fn finalize_tool_calls(
+    output: &mut AssistantMessage,
+    tool_blocks: &mut HashMap<String, (usize, ToolCallArgumentsStream)>,
+    final_arguments: bool,
+    sender: &AssistantMessageEventSender,
+    coalescer: &mut crate::api::DeltaCoalescer,
+) {
+    for (idx, partial) in tool_blocks.values_mut() {
+        if let Some(ContentBlock::ToolCall {
+            arguments,
+            arguments_error,
+            ..
+        }) = output.content.get_mut(*idx)
+        {
+            if final_arguments {
+                (*arguments, *arguments_error) = partial.finish();
+            } else if let Some(preview) = partial.preview_final() {
+                *arguments = preview;
+            }
+        }
+        let tool_call = output.content[*idx].clone();
+        coalescer.push(
+            sender,
+            output,
+            AssistantMessageEvent::ToolCallEnd {
+                content_index: *idx,
+                tool_call,
+                partial: output.clone(),
+            },
+        );
     }
 }
 
@@ -500,7 +532,7 @@ async fn run(
 
     let mut sse = crate::api::SseStream::new(response.bytes_stream(), cancel.clone());
     let mut current_block: Option<(usize, bool)> = None; // (index, is_thinking)
-    let mut tool_blocks: HashMap<String, (usize, String)> = HashMap::new(); // key -> (index, partial_args)
+    let mut tool_blocks: HashMap<String, (usize, ToolCallArgumentsStream)> = HashMap::new(); // key -> (index, partial_args)
     let mut stream_error: Option<crate::api::ApiError> = None;
 
     loop {
@@ -676,30 +708,13 @@ async fn run(
 
     crate::api::close_current_block!(current_block, output, sender, coalescer);
     let final_arguments = stream_error.is_none();
-    for (idx, partial) in tool_blocks.values() {
-        if let Some(ContentBlock::ToolCall {
-            arguments,
-            arguments_error,
-            ..
-        }) = output.content.get_mut(*idx)
-        {
-            if final_arguments {
-                (*arguments, *arguments_error) = parse_tool_call_arguments(partial);
-            } else {
-                *arguments = parse_streaming_json(partial);
-            }
-        }
-        let tool_call = output.content[*idx].clone();
-        coalescer.push(
-            &sender,
-            &output,
-            AssistantMessageEvent::ToolCallEnd {
-                content_index: *idx,
-                tool_call,
-                partial: output.clone(),
-            },
-        );
-    }
+    finalize_tool_calls(
+        &mut output,
+        &mut tool_blocks,
+        final_arguments,
+        &sender,
+        &mut coalescer,
+    );
 
     if let Some(error) = stream_error {
         let aborted = cancel.is_cancelled() || error.is_aborted();
@@ -778,7 +793,7 @@ mod tests {
     fn tool_call_chunks_without_id_merge_by_index() {
         let model = test_model();
         let mut output = AssistantMessage::pending(&model);
-        let mut tool_blocks: HashMap<String, (usize, String)> = HashMap::new();
+        let mut tool_blocks: HashMap<String, (usize, ToolCallArgumentsStream)> = HashMap::new();
         let (sender, _stream) = crate::stream::event_stream();
 
         let chunks = [
@@ -799,6 +814,7 @@ mod tests {
                 &mut coalescer,
             );
         }
+        finalize_tool_calls(&mut output, &mut tool_blocks, true, &sender, &mut coalescer);
 
         assert_eq!(
             output.content.len(),
@@ -824,7 +840,7 @@ mod tests {
     fn parallel_tool_calls_accumulate_independently() {
         let model = test_model();
         let mut output = AssistantMessage::pending(&model);
-        let mut tool_blocks: HashMap<String, (usize, String)> = HashMap::new();
+        let mut tool_blocks: HashMap<String, (usize, ToolCallArgumentsStream)> = HashMap::new();
         let (sender, _stream) = crate::stream::event_stream();
 
         let chunks = [
@@ -851,6 +867,7 @@ mod tests {
                 &mut coalescer,
             );
         }
+        finalize_tool_calls(&mut output, &mut tool_blocks, true, &sender, &mut coalescer);
 
         assert_eq!(output.content.len(), 2);
         let args: Vec<&Value> = output
@@ -865,13 +882,60 @@ mod tests {
         assert_eq!(*args[1], json!({ "y": 2 }));
     }
 
+    #[test]
+    fn trailing_delta_is_previewed_at_eof_without_strict_error() {
+        let model = test_model();
+        let mut output = AssistantMessage::pending(&model);
+        let mut tool_blocks: HashMap<String, (usize, ToolCallArgumentsStream)> = HashMap::new();
+        let (sender, _stream) = crate::stream::event_stream();
+        // Keep the only argument delta inside the coalescer window. EOF must
+        // nevertheless publish its trailing tolerant preview.
+        let mut coalescer =
+            crate::api::DeltaCoalescer::with_limits(std::time::Duration::from_secs(60), 1 << 20);
+        let chunk = json!([{
+            "index": 0,
+            "id": "abc123xyz",
+            "function": { "name": "read", "arguments": "{\"path\":\"README.md\"" }
+        }]);
+        handle_tool_call_deltas(
+            &mut output,
+            &mut tool_blocks,
+            chunk.as_array().unwrap(),
+            &sender,
+            &mut coalescer,
+        );
+        assert_eq!(
+            tool_blocks.values().next().unwrap().1.text(),
+            r#"{"path":"README.md""#
+        );
+
+        finalize_tool_calls(
+            &mut output,
+            &mut tool_blocks,
+            false,
+            &sender,
+            &mut coalescer,
+        );
+
+        let ContentBlock::ToolCall {
+            arguments,
+            arguments_error,
+            ..
+        } = &output.content[0]
+        else {
+            panic!("expected tool call")
+        };
+        assert_eq!(*arguments, json!({ "path": "README.md" }));
+        assert_eq!(*arguments_error, None);
+    }
+
     /// Id-less chunks (some proxies omit both id and index on later chunks is
     /// not expected, but entirely id-less calls get a deterministic derived id).
     #[test]
     fn idless_tool_call_gets_deterministic_id() {
         let model = test_model();
         let mut output = AssistantMessage::pending(&model);
-        let mut tool_blocks: HashMap<String, (usize, String)> = HashMap::new();
+        let mut tool_blocks: HashMap<String, (usize, ToolCallArgumentsStream)> = HashMap::new();
         let (sender, _stream) = crate::stream::event_stream();
 
         let chunks = [

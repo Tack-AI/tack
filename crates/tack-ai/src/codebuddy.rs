@@ -1622,23 +1622,20 @@ async fn drive(
                                             .and_then(Value::as_str)
                                             .unwrap_or("");
                                         blocks[pos].partial_json.push_str(chunk);
-                                        // F13: defer the O(accumulated)
-                                        // streaming re-parse to the coalescer
-                                        // window (final parse at block stop).
+                                        // F13: snapshot only when the
+                                        // coalescer emits; every delta still
+                                        // feeds the incremental parser.
                                         if coalescer.would_flush(
                                             crate::api::DeltaKind::ToolCall,
                                             pos,
                                             chunk.len(),
-                                        ) {
-                                            let parsed = crate::json_repair::parse_streaming_json(
-                                                &blocks[pos].partial_json,
-                                            );
-                                            if let Some(ContentBlock::ToolCall {
+                                        ) && let Some(parsed) =
+                                            blocks[pos].partial_json.preview()
+                                            && let Some(ContentBlock::ToolCall {
                                                 arguments, ..
                                             }) = partial.content.get_mut(pos)
-                                            {
-                                                *arguments = parsed;
-                                            }
+                                        {
+                                            *arguments = parsed;
                                         }
                                         if let Some(ev) = coalescer.offer(
                                             crate::api::DeltaKind::ToolCall,
@@ -1690,8 +1687,7 @@ async fn drive(
                                 }
                                 for pos in positions {
                                     blocks[pos].api_index = None;
-                                    let partial_json =
-                                        std::mem::take(&mut blocks[pos].partial_json);
+                                    let partial_json = blocks[pos].partial_json.take_text();
                                     match partial.content.get_mut(pos) {
                                         Some(ContentBlock::Text { text, .. }) => {
                                             let content = text.clone();
@@ -2105,14 +2101,14 @@ async fn drive(
 /// reverse-scan, stops first-match — reference: processStreamEvent).
 struct CliBlock {
     api_index: Option<usize>,
-    partial_json: String,
+    partial_json: crate::streaming_json::ToolCallArgumentsStream,
 }
 
 impl CliBlock {
     fn new(api_index: usize) -> Self {
         CliBlock {
             api_index: Some(api_index),
-            partial_json: String::new(),
+            partial_json: crate::streaming_json::ToolCallArgumentsStream::new(),
         }
     }
 }
@@ -2151,7 +2147,7 @@ fn finalize_tool_arguments(partial: &mut AssistantMessage, blocks: &[CliBlock]) 
             name, arguments, ..
         }) = partial.content.get_mut(pos)
         {
-            *arguments = map_tool_args(name, parse_tool_json(&block.partial_json, arguments));
+            *arguments = map_tool_args(name, parse_tool_json(block.partial_json.text(), arguments));
         }
     }
 }

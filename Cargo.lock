@@ -4457,6 +4457,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "crc32fast",
+ "criterion",
  "ctor",
  "dirs",
  "eventsource-stream",

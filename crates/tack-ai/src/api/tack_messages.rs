@@ -14,9 +14,9 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::fail;
-use crate::json_repair::parse_streaming_json;
 use crate::provider::StreamOptions;
 use crate::stream::{AssistantMessageEvent, AssistantMessageEventSender};
+use crate::streaming_json::ToolCallArgumentsStream;
 use crate::types::{AssistantMessage, ContentBlock, Context, Model, StopReason, Usage};
 
 const TACK_USER_AGENT: &str = concat!("tack/", env!("CARGO_PKG_VERSION"));
@@ -189,7 +189,7 @@ fn map_done_reason(reason: &str) -> StopReason {
 /// protocol, so this mostly mutates the partial message.
 struct Converter {
     partial: AssistantMessage,
-    tool_json: HashMap<usize, String>,
+    tool_json: HashMap<usize, ToolCallArgumentsStream>,
     coalescer: crate::api::DeltaCoalescer,
 }
 
@@ -396,7 +396,7 @@ impl Converter {
                         namespace: None,
                     },
                 );
-                self.tool_json.insert(i, String::new());
+                self.tool_json.insert(i, ToolCallArgumentsStream::new());
                 self.emit(AssistantMessageEvent::ToolCallStart {
                     content_index: i,
                     partial: self.partial.clone(),
@@ -411,20 +411,16 @@ impl Converter {
                     .to_string();
                 let accumulated = self.tool_json.entry(i).or_default();
                 accumulated.push_str(&delta);
-                // Defer the O(accumulated) streaming re-parse to the
-                // coalescer window: parse only when a merged delta event is
-                // about to go out (toolcall_end supplies the final
-                // arguments), not per tiny delta.
+                // Snapshot only when a merged delta event is about to go
+                // out; the incremental parser still consumes every delta.
                 if self
                     .coalescer
                     .would_flush(crate::api::DeltaKind::ToolCall, i, delta.len())
-                {
-                    let parsed = parse_streaming_json(accumulated);
-                    if let Some(ContentBlock::ToolCall { arguments, .. }) =
+                    && let Some(parsed) = accumulated.preview()
+                    && let Some(ContentBlock::ToolCall { arguments, .. }) =
                         self.partial.content.get_mut(i)
-                    {
-                        *arguments = parsed;
-                    }
+                {
+                    *arguments = parsed;
                 }
                 self.coalescer
                     .offer(crate::api::DeltaKind::ToolCall, i, delta, &self.partial)

@@ -15,9 +15,9 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::fail;
-use crate::json_repair::{parse_streaming_json, parse_tool_call_arguments};
 use crate::provider::{CacheRetention, StreamOptions};
 use crate::stream::{AssistantMessageEvent, AssistantMessageEventSender};
+use crate::streaming_json::ToolCallArgumentsStream;
 use crate::transform::transform_messages;
 use crate::types::{
     AssistantMessage, ContentBlock, Context, InputContentBlock, Message, Model, StopReason,
@@ -616,7 +616,20 @@ fn map_stop_reason(
 #[derive(Debug)]
 struct BlockState {
     api_index: usize,
-    partial_json: String,
+    partial_json: ToolCallArgumentsStream,
+}
+
+fn preview_unfinished_tool_arguments(blocks: &mut [BlockState], output: &mut AssistantMessage) {
+    for (pos, block) in blocks.iter_mut().enumerate() {
+        if block.partial_json.is_empty() {
+            continue;
+        }
+        if let Some(preview) = block.partial_json.preview_final()
+            && let Some(ContentBlock::ToolCall { arguments, .. }) = output.content.get_mut(pos)
+        {
+            *arguments = preview;
+        }
+    }
 }
 
 fn update_usage_from_json(usage_json: &Value, output: &mut AssistantMessage, model: &Model) {
@@ -834,7 +847,7 @@ async fn run(
                         });
                         blocks.push(BlockState {
                             api_index: index,
-                            partial_json: String::new(),
+                            partial_json: ToolCallArgumentsStream::new(),
                         });
                         coalescer.push(
                             &sender,
@@ -863,7 +876,7 @@ async fn run(
                         });
                         blocks.push(BlockState {
                             api_index: index,
-                            partial_json: String::new(),
+                            partial_json: ToolCallArgumentsStream::new(),
                         });
                         coalescer.push(
                             &sender,
@@ -887,7 +900,7 @@ async fn run(
                         });
                         blocks.push(BlockState {
                             api_index: index,
-                            partial_json: String::new(),
+                            partial_json: ToolCallArgumentsStream::new(),
                         });
                         coalescer.push(
                             &sender,
@@ -920,7 +933,7 @@ async fn run(
                         });
                         blocks.push(BlockState {
                             api_index: index,
-                            partial_json: String::new(),
+                            partial_json: ToolCallArgumentsStream::new(),
                         });
                         coalescer.push(
                             &sender,
@@ -982,21 +995,19 @@ async fn run(
                             .and_then(Value::as_str)
                             .unwrap_or("");
                         blocks[pos].partial_json.push_str(partial);
-                        // Defer the O(accumulated) streaming re-parse to the
-                        // coalescer window: parse only when a merged delta
+                        // Publish a fresh preview only when a merged delta
                         // event is about to go out (and once more at block
-                        // stop below), not per tiny delta.
+                        // stop below); push_str above still feeds every delta
+                        // to the incremental parser.
                         if coalescer.would_flush(
                             crate::api::DeltaKind::ToolCall,
                             pos,
                             partial.len(),
-                        ) {
-                            let parsed = parse_streaming_json(&blocks[pos].partial_json);
-                            if let Some(ContentBlock::ToolCall { arguments, .. }) =
+                        ) && let Some(parsed) = blocks[pos].partial_json.preview()
+                            && let Some(ContentBlock::ToolCall { arguments, .. }) =
                                 output.content.get_mut(pos)
-                            {
-                                *arguments = parsed;
-                            }
+                        {
+                            *arguments = parsed;
                         }
                         if let Some(ev) = coalescer.offer(
                             crate::api::DeltaKind::ToolCall,
@@ -1056,8 +1067,7 @@ async fn run(
                         arguments_error,
                         ..
                     }) => {
-                        (*arguments, *arguments_error) =
-                            parse_tool_call_arguments(&blocks[pos].partial_json);
+                        (*arguments, *arguments_error) = blocks[pos].partial_json.finish();
                         // A completed block must not be overwritten by the
                         // tolerant end-of-stream preview fallback.
                         blocks[pos].partial_json.clear();
@@ -1105,18 +1115,12 @@ async fn run(
     }
 
     // --- termination ---
-    // Final parse fallback (F13): the per-delta re-parse was throttled to
+    // Final preview fallback (F13): per-delta previews are throttled to
     // coalescer flushes and block stop, so a proxy that omits
     // content_block_stop would leave the terminal message's tool
-    // arguments short of the trailing deltas. Re-parse every accumulated
+    // arguments short of the trailing deltas. Preview every unfinished
     // partial_json once here — covers clean, abort and error exits alike.
-    for (pos, block) in blocks.iter().enumerate() {
-        if !block.partial_json.is_empty()
-            && let Some(ContentBlock::ToolCall { arguments, .. }) = output.content.get_mut(pos)
-        {
-            *arguments = parse_streaming_json(&block.partial_json);
-        }
-    }
+    preview_unfinished_tool_arguments(&mut blocks, &mut output);
     let aborted =
         cancel.is_cancelled() || matches!(stream_error, Some(crate::api::ApiError::Aborted));
     if let Some(error) = stream_error {
@@ -1478,6 +1482,60 @@ mod tests {
         )
         .unwrap();
         assert!(params.get("temperature").is_none());
+    }
+
+    #[test]
+    fn eof_previews_trailing_tool_delta_without_overwriting_completed_error() {
+        let m = model("claude-sonnet-4-5");
+        let mut output = AssistantMessage::pending(&m);
+
+        let mut trailing = ToolCallArgumentsStream::new();
+        trailing.push_str(r#"{"path":"README.md""#);
+        let mut completed = ToolCallArgumentsStream::new();
+        completed.push_str(r#"{"mode":.5}"#);
+        let (completed_arguments, completed_error) = completed.finish();
+        assert!(completed_error.is_some());
+        // This is the content_block_stop lifecycle: strict finalization,
+        // then clear so the tolerant EOF pass cannot revisit the block.
+        completed.clear();
+
+        output.content = vec![
+            ContentBlock::ToolCall {
+                id: "open".into(),
+                name: "read".into(),
+                arguments: json!({}),
+                arguments_error: None,
+                thought_signature: None,
+                namespace: None,
+            },
+            ContentBlock::ToolCall {
+                id: "done".into(),
+                name: "write".into(),
+                arguments: completed_arguments,
+                arguments_error: completed_error,
+                thought_signature: None,
+                namespace: None,
+            },
+        ];
+        let completed_snapshot = output.content[1].clone();
+        let mut blocks = vec![
+            BlockState {
+                api_index: 7,
+                partial_json: trailing,
+            },
+            BlockState {
+                api_index: 8,
+                partial_json: completed,
+            },
+        ];
+
+        preview_unfinished_tool_arguments(&mut blocks, &mut output);
+
+        let ContentBlock::ToolCall { arguments, .. } = &output.content[0] else {
+            panic!("expected open tool call")
+        };
+        assert_eq!(*arguments, json!({ "path": "README.md" }));
+        assert_eq!(output.content[1], completed_snapshot);
     }
 
     #[test]

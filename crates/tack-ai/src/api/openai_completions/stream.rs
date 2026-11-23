@@ -8,9 +8,9 @@ use super::params::{
     build_params, grammar_constraint_map, has_auth_header, resolve_cache_retention,
 };
 use crate::api::fail;
-use crate::json_repair::{parse_streaming_json, parse_tool_call_arguments};
 use crate::provider::StreamOptions;
 use crate::stream::{AssistantMessageEvent, AssistantMessageEventSender};
+use crate::streaming_json::ToolCallArgumentsStream;
 use crate::types::{AssistantMessage, ContentBlock, Context, Model, StopReason, calculate_cost};
 
 const TACK_USER_AGENT: &str = concat!("tack/", env!("CARGO_PKG_VERSION"));
@@ -73,7 +73,7 @@ fn map_stop_reason(reason: &str) -> (StopReason, Option<String>) {
 struct ToolCallState {
     /// Position in `output.content`.
     content_pos: usize,
-    partial_args: String,
+    partial_args: ToolCallArgumentsStream,
     /// Grammar tool: the single string property the raw input maps to, and
     /// the input_json re-packager (TS GrammarToolInputJsonBuffer).
     grammar_property: Option<String>,
@@ -84,9 +84,18 @@ impl ToolCallState {
     fn new(content_pos: usize) -> Self {
         ToolCallState {
             content_pos,
-            partial_args: String::new(),
+            partial_args: ToolCallArgumentsStream::new(),
             grammar_property: None,
             grammar_buffer: Default::default(),
+        }
+    }
+
+    fn finish_arguments(&mut self) -> (Value, Option<String>) {
+        match &self.grammar_property {
+            // Grammar input is plain text, never JSON to preview or strictly
+            // finish. Re-package the untouched raw text.
+            Some(property) => (json!({ property: self.partial_args.text() }), None),
+            None => self.partial_args.finish(),
         }
     }
 }
@@ -174,7 +183,7 @@ pub(crate) async fn run(
         std::collections::HashMap::new(); // id -> content_pos
     // Providers that omit both index and id still need their raw final text
     // retained for strict validation (normally such calls arrive in one delta).
-    let mut unindexed_tool_args: std::collections::HashMap<usize, String> =
+    let mut unindexed_tool_args: std::collections::HashMap<usize, ToolCallArgumentsStream> =
         std::collections::HashMap::new();
     let mut has_finish_reason = false;
     let mut stream_error: Option<crate::api::ApiError> = None;
@@ -440,14 +449,14 @@ pub(crate) async fn run(
                         if state.grammar_property.is_none() {
                             state.grammar_property = property;
                         }
-                        state.partial_args.push_str(args);
                         if let Some(property) = state.grammar_property.clone() {
+                            state.partial_args.push_raw(args);
                             // Grammar tool: raw input becomes the single
                             // string property; deltas are re-packaged as
                             // input_json deltas.
                             let delta = state
                                 .grammar_buffer
-                                .append_delta(&property, &state.partial_args, false)
+                                .append_delta(&property, state.partial_args.text(), false)
                                 .ok()
                                 .flatten()
                                 .unwrap_or_default();
@@ -462,7 +471,7 @@ pub(crate) async fn run(
                                     output.content.get_mut(content_pos)
                                 {
                                     *arguments =
-                                        json!({ property.clone(): state.partial_args.clone() });
+                                        json!({ property.clone(): state.partial_args.text() });
                                 }
                                 if let Some(ev) = coalescer.offer(
                                     crate::api::DeltaKind::ToolCall,
@@ -474,21 +483,19 @@ pub(crate) async fn run(
                                 }
                             }
                         } else {
-                            // Defer the O(accumulated) streaming re-parse to
-                            // the coalescer window: parse only when a merged
-                            // delta event is about to go out (and once more
-                            // at stream end below), not per tiny delta.
+                            state.partial_args.push_str(args);
+                            // Feed every delta to the incremental parser,
+                            // but snapshot only when a merged delta event is
+                            // about to go out (and strict-finish at stream end).
                             if coalescer.would_flush(
                                 crate::api::DeltaKind::ToolCall,
                                 content_pos,
                                 args.len(),
-                            ) {
-                                let parsed = parse_streaming_json(&state.partial_args);
-                                if let Some(ContentBlock::ToolCall { arguments, .. }) =
+                            ) && let Some(parsed) = state.partial_args.preview()
+                                && let Some(ContentBlock::ToolCall { arguments, .. }) =
                                     output.content.get_mut(content_pos)
-                                {
-                                    *arguments = parsed;
-                                }
+                            {
+                                *arguments = parsed;
                             }
                             if let Some(ev) = coalescer.offer(
                                 crate::api::DeltaKind::ToolCall,
@@ -502,9 +509,13 @@ pub(crate) async fn run(
                     } else {
                         let accumulated = unindexed_tool_args.entry(content_pos).or_default();
                         accumulated.push_str(args);
-                        let parsed = parse_streaming_json(accumulated);
-                        if let Some(ContentBlock::ToolCall { arguments, .. }) =
-                            output.content.get_mut(content_pos)
+                        if coalescer.would_flush(
+                            crate::api::DeltaKind::ToolCall,
+                            content_pos,
+                            args.len(),
+                        ) && let Some(parsed) = accumulated.preview()
+                            && let Some(ContentBlock::ToolCall { arguments, .. }) =
+                                output.content.get_mut(content_pos)
                         {
                             *arguments = parsed;
                         }
@@ -579,19 +590,15 @@ pub(crate) async fn run(
             _ => {}
         }
         if matches!(output.content.get(pos), Some(ContentBlock::ToolCall { .. })) {
-            let state = tool_calls_by_index.values().find(|s| s.content_pos == pos);
+            let state = tool_calls_by_index
+                .values_mut()
+                .find(|s| s.content_pos == pos);
             let final_args = if let Some(state) = state {
-                match &state.grammar_property {
-                    Some(property) => (json!({ property: state.partial_args.clone() }), None),
-                    None => parse_tool_call_arguments(&state.partial_args),
-                }
+                state.finish_arguments()
+            } else if let Some(arguments) = unindexed_tool_args.get_mut(&pos) {
+                arguments.finish()
             } else {
-                parse_tool_call_arguments(
-                    unindexed_tool_args
-                        .get(&pos)
-                        .map(String::as_str)
-                        .unwrap_or(""),
-                )
+                ToolCallArgumentsStream::new().finish()
             };
             if let Some(ContentBlock::ToolCall {
                 arguments,
@@ -671,5 +678,21 @@ mod tests {
         assert_eq!(usage.cache_read, 40);
         assert_eq!(usage.input, 60);
         assert_eq!(usage.total_tokens, 110);
+    }
+
+    /// Grammar/custom input is plain text. Finalization must preserve it
+    /// verbatim instead of routing it through JSON preview or strict finish.
+    #[test]
+    fn grammar_tool_finish_preserves_raw_non_json_input() {
+        let raw = "SELECT * FROM logs WHERE message = '{unterminated";
+        let mut state = ToolCallState::new(0);
+        state.grammar_property = Some("input".to_string());
+        state.partial_args.push_raw(raw);
+
+        let (arguments, error) = state.finish_arguments();
+
+        assert_eq!(arguments, json!({ "input": raw }));
+        assert_eq!(error, None);
+        assert_eq!(state.partial_args.text(), raw);
     }
 }

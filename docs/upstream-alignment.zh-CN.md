@@ -208,6 +208,14 @@ scripts/upstream-delta.sh`，失败于 `无法解析基线 commit（得到 ''）
 | `5806068c2` + `d850edee9` + `e529a82c9` + `9ffd27cfa` | `mcp-tokens.json` 从旧 server 名 key 原子迁移为规范化 name+URL key，不让旧授权失效。`oauth.authServerMetadataUrl` 替代发现（除 loopback 外要求 HTTPS）；回调/手动粘贴的 `iss` 传给 rmcp 的 RFC 9207 校验；刷新/step-up 保留 granted scopes；授权 endpoint 仅允许 HTTP(S)。 |
 | `31b407dc6` | SIGHUP/SIGTERM 与 Windows `CTRL_CLOSE_EVENT` 进入有界 TUI/print/RPC 清理，并有独立四秒兜底；终端恢复失败不再跳过扩展清理。RPC bash executor 与 prompt pump 在 teardown 前取消并排空，避免进程树逃逸与迟到写入。Unix 子进程测试验证优雅 129/143 退出、活动进程树清理和 stdin-EOF 0；真实 Windows console 验证仍是平台后续项。 |
 
+### 第五批增量流式 JSON 落地（未发布）
+
+共享解析器与 adapter 迁移已实现，不改变 session、RPC、ACP 或插件 wire 格式。
+
+| 上游 commit | Tack 落地 |
+| --- | --- |
+| `f715a15c1` | `ToolCallArgumentsStream` 每个工具参数 delta 只消费一次，同时保留未修复原文供既有严格 final 解析。owned snapshot 以拷贝预算约束深拷贝工作量，EOF/错误收尾则强制刷新，避免尾部 delta 滞留。Anthropic、Bedrock、Mistral、OpenAI Completions/Responses、tack-messages、CodeBuddy 均接入该路径；Responses 的权威替换在非前缀时重置全部状态，延续时只发缺失后缀；grammar/custom 工具保留非 JSON 原文。测试覆盖完整文档与逐前缀差分、chunk/转义/Unicode 边界、并行调用、替换/重置、畸形 final 拒绝与尾部预览。新增 criterion bench 对比旧的累计前缀重解析与增量解析，既有 fuzz target 同时覆盖任意 UTF-8 分割点和严格 finish。 |
+
 ## 2026-09-21 对齐批次（基线 4a6ed0194 → 10d1ad621）
 
 160 个上游 commit 经逐条审阅（报告由 `scripts/upstream-delta.sh` 生成）。

@@ -8,6 +8,14 @@ notice can parse entries (same convention as TS pi).
 
 ### Fixed
 
+- **Large streamed tool arguments no longer reparse every accumulated prefix**:
+  a shared incremental JSON parser feeds every delta once for Anthropic,
+  Bedrock, Mistral, OpenAI Completions/Responses, tack-messages, and CodeBuddy,
+  with bounded snapshot copying and forced EOF/error catch-up. Raw arguments
+  are still validated by the strict final parser before execution; Responses
+  authoritative replacement, grammar/custom plain-text input, concurrent tool
+  calls, and existing session/wire formats retain their previous semantics.
+
 - **OAuth refreshes preserve rotating credentials across processes and
   cancellation**: provider and MCP refreshes serialize the complete
   reload/request/persist cycle with mandatory cross-process locks, while

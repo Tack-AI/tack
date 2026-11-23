@@ -10,9 +10,9 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::fail;
-use crate::json_repair::{parse_streaming_json, parse_tool_call_arguments};
 use crate::provider::{CacheRetention, StreamOptions};
 use crate::stream::{AssistantMessageEvent, AssistantMessageEventSender};
+use crate::streaming_json::ToolCallArgumentsStream;
 use crate::transform::transform_messages_with_source;
 use crate::types::{
     AssistantMessage, ContentBlock, Context, InputContentBlock, Message, Model, StopReason,
@@ -644,8 +644,8 @@ enum SlotKind {
 struct Slot {
     kind: SlotKind,
     content_index: usize,
-    /// Scratch partial JSON for tool calls.
-    partial_json: String,
+    /// Incrementally parsed raw arguments for tool calls.
+    partial_json: ToolCallArgumentsStream,
 }
 
 /// Create a streaming slot for an output item (TS createSlot). Also used to
@@ -673,7 +673,7 @@ fn create_slot(
                 Slot {
                     kind: SlotKind::Thinking,
                     content_index: idx,
-                    partial_json: String::new(),
+                    partial_json: ToolCallArgumentsStream::new(),
                 },
             );
             coalescer.push(
@@ -699,7 +699,7 @@ fn create_slot(
                 Slot {
                     kind: SlotKind::Text,
                     content_index: idx,
-                    partial_json: String::new(),
+                    partial_json: ToolCallArgumentsStream::new(),
                 },
             );
             coalescer.push(
@@ -730,11 +730,8 @@ fn create_slot(
                     .map(str::to_string),
             });
             let idx = output.content.len() - 1;
-            let partial = item
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            let mut partial = ToolCallArgumentsStream::new();
+            partial.push_str(item.get("arguments").and_then(Value::as_str).unwrap_or(""));
             slots.insert(
                 index,
                 Slot {
@@ -754,6 +751,24 @@ fn create_slot(
         }
         _ => {}
     }
+}
+
+/// Apply the authoritative buffer carried by `function_call_arguments.done`.
+/// A prefix continuation emits only its missing suffix. Any other replacement
+/// resets the parser/raw buffer and emits no fabricated tool-call delta.
+fn replace_tool_call_arguments(
+    slot: &mut Slot,
+    arguments: &str,
+    output: &mut AssistantMessage,
+) -> Option<String> {
+    let replacement = slot.partial_json.replace(arguments);
+    if let Some(parsed) = replacement.preview
+        && let Some(ContentBlock::ToolCall { arguments, .. }) =
+            output.content.get_mut(slot.content_index)
+    {
+        *arguments = parsed;
+    }
+    replacement.delta
 }
 
 fn map_stop_reason(
@@ -1075,21 +1090,17 @@ async fn run(
                     && matches!(slot.kind, SlotKind::ToolCall)
                 {
                     slot.partial_json.push_str(delta);
-                    // Defer the O(accumulated) streaming re-parse to the
-                    // coalescer window: parse only when a merged delta event
-                    // is about to go out (the ".done" event below re-parses
-                    // the final arguments), not per tiny delta.
+                    // Feed every delta to the incremental parser, but only
+                    // snapshot when a merged delta event is about to go out.
                     if coalescer.would_flush(
                         crate::api::DeltaKind::ToolCall,
                         slot.content_index,
                         delta.len(),
-                    ) {
-                        let parsed = parse_streaming_json(&slot.partial_json);
-                        if let Some(ContentBlock::ToolCall { arguments, .. }) =
+                    ) && let Some(parsed) = slot.partial_json.preview()
+                        && let Some(ContentBlock::ToolCall { arguments, .. }) =
                             output.content.get_mut(slot.content_index)
-                        {
-                            *arguments = parsed;
-                        }
+                    {
+                        *arguments = parsed;
                     }
                     if let Some(ev) = coalescer.offer(
                         crate::api::DeltaKind::ToolCall,
@@ -1107,27 +1118,16 @@ async fn run(
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
                 let arguments = data.get("arguments").and_then(Value::as_str).unwrap_or("");
-                if let Some(slot) = slots.get_mut(&index) {
-                    let previous = slot.partial_json.clone();
-                    slot.partial_json = arguments.to_string();
-                    let parsed = parse_streaming_json(&slot.partial_json);
-                    if let Some(ContentBlock::ToolCall {
-                        arguments: args, ..
-                    }) = output.content.get_mut(slot.content_index)
-                    {
-                        *args = parsed;
-                    }
-                    if arguments.starts_with(&previous) && arguments.len() > previous.len() {
-                        let delta = &arguments[previous.len()..];
-                        if let Some(ev) = coalescer.offer(
-                            crate::api::DeltaKind::ToolCall,
-                            slot.content_index,
-                            delta.to_string(),
-                            &output,
-                        ) {
-                            let _ = sender.push(ev);
-                        }
-                    }
+                if let Some(slot) = slots.get_mut(&index)
+                    && let Some(delta) = replace_tool_call_arguments(slot, arguments, &mut output)
+                    && let Some(ev) = coalescer.offer(
+                        crate::api::DeltaKind::ToolCall,
+                        slot.content_index,
+                        delta,
+                        &output,
+                    )
+                {
+                    let _ = sender.push(ev);
                 }
             }
             "response.output_item.done" => {
@@ -1155,7 +1155,7 @@ async fn run(
                         item,
                     );
                 }
-                let Some(slot) = slots.get(&index) else {
+                let Some(slot) = slots.get_mut(&index) else {
                     continue;
                 };
                 let content_index = slot.content_index;
@@ -1255,12 +1255,14 @@ async fn run(
                         slots.remove(&index);
                     }
                     "function_call" if matches!(slot.kind, SlotKind::ToolCall) => {
-                        let args_str = item
-                            .get("arguments")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                            .unwrap_or_else(|| slot.partial_json.clone());
-                        let (parsed, arguments_error) = parse_tool_call_arguments(&args_str);
+                        let (parsed, arguments_error) = {
+                            // An item-level arguments field is authoritative,
+                            // including when it replaces a non-prefix buffer.
+                            if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
+                                let _ = slot.partial_json.replace(arguments);
+                            }
+                            slot.partial_json.finish()
+                        };
                         if let Some(ContentBlock::ToolCall {
                             arguments,
                             arguments_error: block_error,
@@ -1370,19 +1372,21 @@ async fn run(
     }
 
     // --- termination ---
-    // Final parse fallback (F13): the per-delta re-parse was throttled to
-    // coalescer flushes and ".done" events, so a proxy that omits
-    // function_call_arguments.done would leave the terminal message's
-    // tool arguments short of the trailing deltas. Re-parse every
-    // accumulated partial_json once here — covers clean, abort and error
-    // exits alike.
-    for slot in slots.values() {
+    // Final preview fallback (F13): the incremental parser is snapshotted
+    // only at coalescer flushes and ".done" events, so a proxy that omits
+    // function_call_arguments.done could leave the terminal message's tool
+    // arguments short of the trailing deltas. Preview every accumulated
+    // buffer once here — covers clean, abort and error exits alike. This is
+    // deliberately not a strict finish: missing output_item.done remains an
+    // unfinished-tool-call failure below.
+    for slot in slots.values_mut() {
         if matches!(slot.kind, SlotKind::ToolCall)
             && !slot.partial_json.is_empty()
+            && let Some(parsed) = slot.partial_json.preview_final()
             && let Some(ContentBlock::ToolCall { arguments, .. }) =
                 output.content.get_mut(slot.content_index)
         {
-            *arguments = parse_streaming_json(&slot.partial_json);
+            *arguments = parsed;
         }
     }
     if let Some(error) = stream_error {
@@ -1481,6 +1485,79 @@ mod tests {
             arguments_error: None,
             thought_signature: None,
             namespace: None,
+        }
+    }
+
+    fn tool_slot(raw: &str) -> (Slot, AssistantMessage) {
+        let model = model("gpt-5", "openai", "openai-responses");
+        let mut output = AssistantMessage::pending(&model);
+        let mut block = tool_call("call_1|fc_1");
+        if let ContentBlock::ToolCall { arguments, .. } = &mut block {
+            *arguments = json!({});
+        }
+        output.content.push(block);
+        let mut slot = Slot {
+            kind: SlotKind::ToolCall,
+            content_index: 0,
+            partial_json: ToolCallArgumentsStream::new(),
+        };
+        slot.partial_json.push_str(raw);
+        (slot, output)
+    }
+
+    fn tool_arguments(output: &AssistantMessage) -> &Value {
+        match &output.content[0] {
+            ContentBlock::ToolCall { arguments, .. } => arguments,
+            _ => panic!("expected tool call"),
+        }
+    }
+
+    #[test]
+    fn arguments_done_equal_emits_no_delta_and_previews() {
+        let raw = "{\"a\":1}";
+        let (mut slot, mut output) = tool_slot(raw);
+
+        let delta = replace_tool_call_arguments(&mut slot, raw, &mut output);
+
+        assert_eq!(delta, None);
+        assert_eq!(slot.partial_json.text(), raw);
+        assert_eq!(tool_arguments(&output), &json!({ "a": 1 }));
+    }
+
+    #[test]
+    fn arguments_done_suffix_emits_only_missing_text() {
+        let (mut slot, mut output) = tool_slot("{\"a\":");
+
+        let delta = replace_tool_call_arguments(&mut slot, "{\"a\":1}", &mut output);
+
+        assert_eq!(delta.as_deref(), Some("1}"));
+        assert_eq!(slot.partial_json.text(), "{\"a\":1}");
+        assert_eq!(tool_arguments(&output), &json!({ "a": 1 }));
+    }
+
+    #[test]
+    fn arguments_done_nonprefix_resets_without_delta() {
+        let (mut slot, mut output) = tool_slot("{\"a\":1");
+
+        let delta = replace_tool_call_arguments(&mut slot, "{\"b\":2}", &mut output);
+
+        assert_eq!(delta, None);
+        assert_eq!(slot.partial_json.text(), "{\"b\":2}");
+        assert_eq!(tool_arguments(&output), &json!({ "b": 2 }));
+    }
+
+    #[test]
+    fn arguments_done_empty_replacement_clears_preview() {
+        for replacement in ["", "  \n\t"] {
+            let (mut slot, mut output) = tool_slot("{\"a\":1");
+            let _ = replace_tool_call_arguments(&mut slot, "{\"a\":1}", &mut output);
+            assert_eq!(tool_arguments(&output), &json!({ "a": 1 }));
+
+            let delta = replace_tool_call_arguments(&mut slot, replacement, &mut output);
+
+            assert_eq!(delta, None);
+            assert_eq!(slot.partial_json.text(), replacement);
+            assert_eq!(tool_arguments(&output), &json!({}));
         }
     }
 

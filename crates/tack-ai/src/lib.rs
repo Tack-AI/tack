@@ -23,6 +23,7 @@ pub mod providers;
 pub mod retry;
 pub mod simple_options;
 pub mod stream;
+pub mod streaming_json;
 pub mod tls;
 pub mod transcript;
 pub mod transform;

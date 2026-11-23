@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::api::fail;
 use crate::provider::StreamOptions;
 use crate::stream::{AssistantMessageEvent, AssistantMessageEventSender};
+use crate::streaming_json::ToolCallArgumentsStream;
 use crate::types::{AssistantMessage, ContentBlock, Context, Model, StopReason, calculate_cost};
 
 use super::bedrock::convert::build_request_body;
@@ -167,7 +168,7 @@ enum BlockKind {
 struct StreamState {
     output: AssistantMessage,
     blocks: HashMap<usize, BlockKind>,
-    tool_json: HashMap<usize, String>,
+    tool_json: HashMap<usize, ToolCallArgumentsStream>,
     thinking_signatures: HashMap<usize, String>,
     /// Scratch buffers for encrypted reasoning deltas (`redactedContent`),
     /// joined into `thinking_signature` when the block closes.
@@ -318,12 +319,11 @@ impl StreamState {
                     ..
                 }),
             ) => {
-                if let Some(json) = self.tool_json.remove(&index) {
+                if let Some(mut json) = self.tool_json.remove(&index) {
                     if final_arguments {
-                        (*arguments, *arguments_error) =
-                            crate::json_repair::parse_tool_call_arguments(&json);
-                    } else {
-                        *arguments = crate::json_repair::parse_streaming_json(&json);
+                        (*arguments, *arguments_error) = json.finish();
+                    } else if let Some(preview) = json.preview_final() {
+                        *arguments = preview;
                     }
                 }
                 let tool_call = self.output.content[index].clone();
@@ -386,7 +386,7 @@ impl StreamState {
                             .unwrap_or("")
                             .to_string();
                     }
-                    self.tool_json.insert(index, String::new());
+                    self.tool_json.insert(index, ToolCallArgumentsStream::new());
                 }
             }
             Some("contentBlockDelta") => {
@@ -420,21 +420,21 @@ impl StreamState {
                     {
                         events.push(event);
                     }
-                    self.tool_json.entry(index).or_default().push_str(input);
-                    // Defer the O(accumulated) streaming re-parse to the
-                    // coalescer window: parse only when a merged delta event
-                    // is about to go out (close_block re-parses the final
-                    // arguments), not per tiny delta.
+                    let accumulated = self.tool_json.entry(index).or_default();
+                    accumulated.push_str(input);
+                    // Publish a fresh preview only when a merged delta event
+                    // is about to go out (close_block finishes or previews the
+                    // trailing arguments); push_str above feeds every delta to
+                    // the incremental parser.
                     if self.coalescer.would_flush(
                         crate::api::DeltaKind::ToolCall,
                         index,
                         input.len(),
-                    ) && let Some(ContentBlock::ToolCall { arguments, .. }) =
-                        self.output.content.get_mut(index)
+                    ) && let Some(parsed) = accumulated.preview()
+                        && let Some(ContentBlock::ToolCall { arguments, .. }) =
+                            self.output.content.get_mut(index)
                     {
-                        *arguments = crate::json_repair::parse_streaming_json(
-                            self.tool_json.get(&index).map(String::as_str).unwrap_or(""),
-                        );
+                        *arguments = parsed;
                     }
                     self.offer_delta(
                         &mut events,
@@ -901,6 +901,49 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_tool_inputs_keep_independent_buffers() {
+        let mut state = StreamState::new(&test_model());
+        for frame in [
+            event_frame(
+                "contentBlockStart",
+                r#"{"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"tu_0","name":"a"}}}"#,
+            ),
+            event_frame(
+                "contentBlockStart",
+                r#"{"contentBlockIndex":1,"start":{"toolUse":{"toolUseId":"tu_1","name":"b"}}}"#,
+            ),
+            event_frame(
+                "contentBlockDelta",
+                r#"{"contentBlockIndex":0,"delta":{"toolUse":{"input":"{\"x\":"}}}"#,
+            ),
+            event_frame(
+                "contentBlockDelta",
+                r#"{"contentBlockIndex":1,"delta":{"toolUse":{"input":"{\"y\":"}}}"#,
+            ),
+            event_frame(
+                "contentBlockDelta",
+                r#"{"contentBlockIndex":0,"delta":{"toolUse":{"input":"1}"}}}"#,
+            ),
+            event_frame(
+                "contentBlockDelta",
+                r#"{"contentBlockIndex":1,"delta":{"toolUse":{"input":"2}"}}}"#,
+            ),
+        ] {
+            state.handle_frame(&frame).unwrap();
+        }
+        state.close_completed_block(0);
+        state.close_completed_block(1);
+
+        for (index, key, value) in [(0, "x", 1), (1, "y", 2)] {
+            let ContentBlock::ToolCall { arguments, .. } = &state.output.content[index] else {
+                panic!("expected tool call")
+            };
+            assert_eq!(arguments[key], Value::from(value));
+            assert_eq!(arguments.as_object().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
     fn malformed_completed_tool_input_is_marked_not_salvaged() {
         let raw = r#"{"path":"README.md","content":"updated","mode":.5}"#;
         let mut state = StreamState::new(&test_model());
@@ -946,11 +989,14 @@ mod tests {
         }
         state.close_block(0);
         let ContentBlock::ToolCall {
-            arguments_error, ..
+            arguments,
+            arguments_error,
+            ..
         } = &state.output.content[0]
         else {
             panic!("expected tool call")
         };
+        assert_eq!(*arguments, serde_json::json!({ "path": "README.md" }));
         assert_eq!(*arguments_error, None);
     }
 
