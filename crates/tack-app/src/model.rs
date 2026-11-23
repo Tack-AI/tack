@@ -423,10 +423,7 @@ async fn resolve_oauth(
     let flow = tack_ai::oauth::oauth_flow(provider)
         .ok_or_else(|| format!("no OAuth flow for provider {provider}"))?;
     // Credential reads/writes do synchronous keychain/libsecret IPC and
-    // file I/O; a hung credential service (e.g. a macOS Keychain access
-    // prompt nobody answers) must not park an async worker thread — that
-    // wedges every timeout/cancellation scheduled on it. Run them on the
-    // blocking pool instead.
+    // file I/O; keep them off async workers.
     async fn read_credential(
         agent_dir: &Path,
         provider: &str,
@@ -451,33 +448,103 @@ async fn resolve_oauth(
 
     let mut credential = read_credential(agent_dir, provider).await?;
     if near_expiry(&credential) {
+        let lock_key = format!("{}:{provider}", agent_dir.display());
         let lock = {
             oauth_locks()
                 .lock()
                 .expect("oauth locks poisoned")
-                .entry(provider.to_string())
+                .entry(lock_key)
                 .or_default()
                 .clone()
         };
-        let _guard = lock.lock().await;
-        // Re-read under the lock: another process/request may have refreshed.
+        let _local_guard = lock.lock().await;
+
+        // Serialize the complete reload → refresh → save cycle across real
+        // processes. Acquisition remains caller-cancellable: if this future
+        // is dropped, the blocking acquisition returns and drops its guard
+        // without ever starting a token request.
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        provider.hash(&mut hasher);
+        let lock_target = agent_dir.join(format!(".oauth-refresh-{:x}", hasher.finish()));
+        let refresh_guard = tokio::task::spawn_blocking(move || {
+            crate::file_lock::strict_lock(
+                &lock_target,
+                std::time::Duration::from_secs(20),
+                std::time::Duration::from_secs(30),
+            )
+        })
+        .await
+        .map_err(|e| format!("OAuth refresh lock task failed: {e}"))?
+        .map_err(|e| format!("could not lock OAuth credentials for {provider}: {e}"))?;
+
+        // Another request/process may already have rotated the grant.
         credential = read_credential(agent_dir, provider).await?;
         if near_expiry(&credential) {
-            let client = reqwest::Client::new();
-            let fresh = tokio::time::timeout(OAUTH_REFRESH_TIMEOUT, flow.refresh(&client, &credential))
+            let expected = credential.clone();
+            let task_provider = provider.to_string();
+            let task_agent_dir = agent_dir.to_path_buf();
+            let refresh = crate::oauth_lifecycle::spawn_tracked(async move {
+                // Owned by the detached task: neither caller cancellation nor
+                // a session shutdown may drop the lock before persistence.
+                let _refresh_guard = refresh_guard;
+                let result = async {
+                    let client = reqwest::Client::new();
+                    let fresh = tokio::time::timeout(
+                        OAUTH_REFRESH_TIMEOUT,
+                        flow.refresh(&client, &expected),
+                    )
+                    .await
+                    .map_err(|_| format!("OAuth refresh for {task_provider} timed out"))?
+                    .map_err(|e| {
+                        format!(
+                            "OAuth refresh for {task_provider} failed: {e}; run `tack login --provider {task_provider}`"
+                        )
+                    })?;
+
+                    let write_provider = task_provider.clone();
+                    let write_dir = task_agent_dir.clone();
+                    let write_expected = expected.clone();
+                    let write_fresh = fresh.clone();
+                    let persisted = tokio::task::spawn_blocking(move || {
+                        crate::auth::set_oauth_if_current(
+                            &write_dir,
+                            &write_provider,
+                            &write_expected,
+                            &write_fresh,
+                        )
+                    })
+                    .await
+                    .map_err(|e| format!("credential write task failed: {e}"))?
+                    .map_err(|e| format!("failed to persist refreshed credential: {e}"))?;
+                    if persisted {
+                        return Ok(fresh);
+                    }
+
+                    // A concurrent login/logout won the commit race. Prefer
+                    // its credential; never overwrite it with our stale grant.
+                    let read_dir = task_agent_dir.clone();
+                    let read_provider = task_provider.clone();
+                    let current = tokio::task::spawn_blocking(move || {
+                        crate::auth::get_oauth(&read_dir, &read_provider)
+                    })
+                    .await
+                    .map_err(|e| format!("credential read task failed: {e}"))?;
+                    current.ok_or_else(|| {
+                        format!(
+                            "OAuth credential for {task_provider} changed during refresh; run `tack login --provider {task_provider}`"
+                        )
+                    })
+                }
+                .await;
+                if let Err(error) = &result {
+                    tracing::warn!(provider = %task_provider, %error, "background OAuth refresh failed");
+                }
+                result
+            });
+            credential = refresh
                 .await
-                .map_err(|_| format!("OAuth refresh for {provider} timed out"))?
-                .map_err(|e| format!("OAuth refresh for {provider} failed: {e}; run `tack login --provider {provider}`"))?;
-            let agent_dir = agent_dir.to_path_buf();
-            let provider_owned = provider.to_string();
-            let fresh_for_write = fresh.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::auth::set_oauth(&agent_dir, &provider_owned, &fresh_for_write)
-            })
-            .await
-            .map_err(|e| format!("credential write task failed: {e}"))?
-            .map_err(|e| format!("failed to persist refreshed credential: {e}"))?;
-            credential = fresh;
+                .map_err(|e| format!("OAuth refresh task failed for {provider}: {e}"))??;
         }
     }
     Ok(flow.to_auth(&credential))

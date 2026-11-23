@@ -63,6 +63,7 @@ pub mod mcp_plugin;
 pub mod mcp_sampling;
 pub mod mcp_serve;
 pub mod model;
+pub mod oauth_lifecycle;
 pub mod oauth_login;
 pub mod observability;
 pub mod permissions;
@@ -71,6 +72,7 @@ pub mod plugin_metrics;
 #[cfg(feature = "ext")]
 pub mod plugin_policy;
 pub mod print_mode;
+pub mod process_shutdown;
 pub mod project_trust;
 pub mod prompt_templates;
 pub mod remote;

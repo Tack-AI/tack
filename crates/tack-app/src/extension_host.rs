@@ -4655,7 +4655,7 @@ mod tests {
     }
 
     /// Lockfile mutations are atomic (intact JSON under concurrent
-    /// writers) and the cross-process guard is released on drop.
+    /// writers), and the OS guard remains reacquirable after each mutation.
     #[test]
     fn lock_record_install_is_atomic_and_releases_the_guard() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4674,12 +4674,12 @@ mod tests {
         let lock = read_lock(&agent_dir).unwrap();
         assert!(lock.plugins.contains_key("demo@user"));
         assert!(
-            !lock_path(&agent_dir).with_extension("guard").exists(),
-            "the guard file is released when the mutation returns"
+            lock_path(&agent_dir).with_extension("guard").exists(),
+            "the OS lock file stays in place while its handle is released"
         );
         lock_remove(&agent_dir, "demo@user").unwrap();
         assert!(read_lock(&agent_dir).unwrap().plugins.is_empty());
-        assert!(!lock_path(&agent_dir).with_extension("guard").exists());
+        assert!(lock_path(&agent_dir).with_extension("guard").exists());
     }
 
     /// Concurrent same-process installs share one PID; the staging and

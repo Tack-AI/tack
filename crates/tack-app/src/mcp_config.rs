@@ -139,6 +139,10 @@ fn parse_oauth(
                     .get("callbackUrl")
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
+                auth_server_metadata_url: map
+                    .get("authServerMetadataUrl")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
             })
         }
         _ => None,

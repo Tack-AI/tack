@@ -176,7 +176,7 @@ flowchart LR
 
     subgraph Auth["Credentials"]
         AK[API key resolution<br/>--api-key → models.json → env]
-        OA[AuthResolver<br/>proactive refresh on expiry<br/>in-process double-checked lock]
+        OA[AuthResolver<br/>proactive refresh on expiry<br/>cross-process detached refresh lock]
     end
 
     M --> Adapters

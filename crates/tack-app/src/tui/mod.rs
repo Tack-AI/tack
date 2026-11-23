@@ -661,8 +661,12 @@ pub(crate) fn lock_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGu
 pub async fn run_tui(options: TuiOptions) -> Result<i32> {
     use futures_util::FutureExt;
 
+    let process_shutdown = crate::process_shutdown::ProcessShutdown::new();
     let mut app = TuiApp::new(options).await?;
-    let result = match std::panic::AssertUnwindSafe(app.run()).catch_unwind().await {
+    let result = match std::panic::AssertUnwindSafe(app.run(&process_shutdown))
+        .catch_unwind()
+        .await
+    {
         Ok(result) => result,
         Err(panic) => {
             let payload = panic

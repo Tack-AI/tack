@@ -336,6 +336,7 @@ pub fn process_file_args(
 }
 
 pub async fn run_print(options: PrintOptions) -> Result<i32> {
+    let process_shutdown = crate::process_shutdown::ProcessShutdown::new();
     let flags = &options.flags;
     let agent_dir = tack_session::default_agent_dir();
     let mut settings = Settings::load(&options.cwd, &agent_dir);
@@ -675,6 +676,7 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
     };
 
     let cancel = tokio_util::sync::CancellationToken::new();
+    let shutdown_token = process_shutdown.token();
     {
         let cancel = cancel.clone();
         tokio::spawn(async move {
@@ -742,7 +744,21 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
     use crate::cli_output::print_out;
 
     let mut exit_code = 0;
-    while let Some(event) = stream.next().await {
+    loop {
+        let next = tokio::select! {
+            _ = shutdown_token.cancelled() => {
+                cancel.cancel();
+                None
+            }
+            event = stream.next() => Some(event),
+        };
+        let next = match next {
+            Some(event) => event,
+            None => stream.next().await,
+        };
+        let Some(event) = next else {
+            break;
+        };
         if flags.mode_json {
             // --mode json: one JSON event per line (TS --mode json).
             let line = crate::rpc::event_to_json(&event);
@@ -810,10 +826,19 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
     let messages = stream.result().await;
     let _ = messages;
     if let Some(target) = &flags.export {
-        let guard = session.lock().await;
-        crate::cli_flags::export_session_file(&guard, target)?;
-        drop(guard);
-        eprintln!("[session exported to {}]", target.display());
+        let export_result = {
+            let guard = session.lock().await;
+            crate::cli_flags::export_session_file(&guard, target)
+        };
+        if let Err(error) = export_result {
+            if process_shutdown.reason().is_some() {
+                tracing::warn!(%error, "session export failed during signal shutdown");
+            } else {
+                return Err(error);
+            }
+        } else {
+            eprintln!("[session exported to {}]", target.display());
+        }
     }
     // tack-ext: session_end lifecycle event, then stop all plugins.
     let session_id = session.lock().await.session_id().to_string();
@@ -824,7 +849,7 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
         .notify("session_end", serde_json::json!({"sessionId": session_id}))
         .await;
     extensions.shutdown().await;
-    Ok(exit_code)
+    Ok(process_shutdown.exit_code().unwrap_or(exit_code))
 }
 
 fn print_stop_exit_code(reason: tack_ai::StopReason) -> i32 {

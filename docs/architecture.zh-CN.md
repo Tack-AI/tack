@@ -169,7 +169,7 @@ flowchart LR
 
     subgraph Auth["凭据"]
         AK[API key 解析<br/>--api-key → models.json → env]
-        OA[AuthResolver<br/>过期主动刷新<br/>进程内双检锁]
+        OA[AuthResolver<br/>过期主动刷新<br/>跨进程分离式刷新锁]
     end
 
     M --> Adapters

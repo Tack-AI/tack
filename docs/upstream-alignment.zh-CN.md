@@ -196,6 +196,18 @@ scripts/upstream-delta.sh`，失败于 `无法解析基线 commit（得到 ''）
 | `09f105957` + `0a4fad548` + `d3398f826` + `73f8de80b` + `3dd803d7e` | 共享 `streamSimple` 风格估算使用最近适用的 assistant usage 加尾部消息估算。Anthropic、Bedrock、Google、Mistral、OpenAI Completions、Responses 按 `max(4096, ceil(15% input))` 余量钳制调用方或模型输出上限，接近 context 上限时使用上游 32768 输出回退。overflow 新增 LiteLLM pre-call、Z.AI CN 文案及锚定 HTTP 413；正文仅提到 413 或数字 4130 不匹配，Cerebras 私有无正文规则收窄为 400。 |
 | `a00a5048d` + `25190b72c` + `4699b5b26` | retry 覆盖临时 provider/gateway 故障、精确 Anthropic `api_error`、不完整响应及独立 Node socket code。quota/billing/subscription-sharing 和 Z.AI 1308 排除优先；HTTP 数字状态和 socket code 使用 ASCII token 边界。`send_with_retry` 现在读取错误正文，并与 assistant error 共用分类器：永久 HTTP 429 quota 不重试，临时 provider 正文可以恢复。 |
 
+### 第四批 OAuth 与退出清理落地（未发布）
+
+以下生命周期、凭据隔离、授权加固与退出清理项已实现，并配有离线 fixture
+和进程级信号测试。
+
+| 上游 commit | Tack 落地 |
+| --- | --- |
+| `bde882c74` + `b2cb62923` | provider OAuth 在跨进程锁与重读后分离执行刷新，调用方取消不会丢失轮换授权。条件提交避免旧响应覆盖重新登录或复活注销；命令正常退出会等待已跟踪刷新。回归测试取消真实进行中的请求并验证落盘，也验证迟到刷新不会复活注销。 |
+| `1d74741e1` + `f10993bc7` | MCP 刷新以每 server 的进程内/跨进程锁覆盖重读 → 请求 → 保存，复用其他进程已更换的授权；被拒绝的 token 先刷新再回退浏览器；关闭时等待持久化。交互式发现、注册、回调与手动粘贴均可取消；`tack mcp login --timeout` 限制整个流程（默认 300 秒）。 |
+| `5806068c2` + `d850edee9` + `e529a82c9` + `9ffd27cfa` | `mcp-tokens.json` 从旧 server 名 key 原子迁移为规范化 name+URL key，不让旧授权失效。`oauth.authServerMetadataUrl` 替代发现（除 loopback 外要求 HTTPS）；回调/手动粘贴的 `iss` 传给 rmcp 的 RFC 9207 校验；刷新/step-up 保留 granted scopes；授权 endpoint 仅允许 HTTP(S)。 |
+| `31b407dc6` | SIGHUP/SIGTERM 与 Windows `CTRL_CLOSE_EVENT` 进入有界 TUI/print/RPC 清理，并有独立四秒兜底；终端恢复失败不再跳过扩展清理。RPC bash executor 与 prompt pump 在 teardown 前取消并排空，避免进程树逃逸与迟到写入。Unix 子进程测试验证优雅 129/143 退出、活动进程树清理和 stdin-EOF 0；真实 Windows console 验证仍是平台后续项。 |
+
 ## 2026-09-21 对齐批次（基线 4a6ed0194 → 10d1ad621）
 
 160 个上游 commit 经逐条审阅（报告由 `scripts/upstream-delta.sh` 生成）。

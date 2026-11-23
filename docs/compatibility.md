@@ -367,14 +367,18 @@ follow the upstream-tracking policy in §5.
 
 **Current state (evidence).** MCP client and server support lives in
 `crates/tack-app/src/mcp_config.rs`, `mcp_serve.rs`, `mcp_elicitation.rs`,
-`mcp_oauth.rs`, `mcp_sampling.rs`, built on the `rmcp` crate at **3.1.4**
+`mcp_oauth.rs`, `mcp_sampling.rs`, built on the `rmcp` crate at **3.9.0**
 (root `Cargo.toml`). Transport support references spec **2024-11-05**
 (legacy SSE) and streamable HTTP (`mcp_config.rs`); the wire protocol
 version is negotiated per the MCP spec by the upstream crate.
+OAuth token cache entries are keyed by normalized server name + URL. Legacy
+name-only `mcp-tokens.json` entries are migrated atomically on first read;
+their token, refresh token, client id, expiry, and granted scope are retained.
 
 **Commitment.** Same as ACP: follow stable upstream `rmcp`/MCP spec
 releases, negotiate versions per spec, note upgrades in the CHANGELOG and
-`docs/upstream-alignment.md`.
+`docs/upstream-alignment.md`. Credential-cache key evolution must include an
+in-place migration path and must never silently invalidate a legacy grant.
 
 ### 2.8 `settings.json` keys (tier: stable / append-only)
 

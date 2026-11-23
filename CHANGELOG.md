@@ -8,6 +8,30 @@ notice can parse entries (same convention as TS pi).
 
 ### Fixed
 
+- **OAuth refreshes preserve rotating credentials across processes and
+  cancellation**: provider and MCP refreshes serialize the complete
+  reload/request/persist cycle with mandatory cross-process locks, while
+  store-wide locks protect unrelated entries. Once started, refreshes are
+  detached from caller cancellation and awaited during graceful exit; commit
+  checks prevent late responses from overwriting a newer sign-in or restoring
+  a logged-out credential.
+
+- **MCP OAuth storage and authorization are isolated and hardened**: token
+  entries are keyed by server name + normalized URL, with atomic migration of
+  legacy name-only entries. `oauth.authServerMetadataUrl` replaces broken
+  discovery metadata, RFC 9207 `iss` binds authorization responses to the
+  expected server, step-up retains granted scopes, and authorization URLs are
+  restricted to HTTP(S). Interactive sign-in is cancellable, rejected tokens
+  refresh before browser fallback, and `tack mcp login --timeout <seconds>`
+  bounds the whole flow (default 300).
+
+- **Console close and termination signals run bounded cleanup**: SIGHUP and
+  SIGTERM on Unix and `CTRL_CLOSE_EVENT` on Windows now enter the existing
+  TUI/print/RPC cancellation, session, extension, and OAuth-persistence
+  cleanup, with a four-second forced-exit backstop. RPC bash and prompt work
+  are cancelled and drained before lifecycle teardown, preventing descendant
+  processes and late session writes from escaping shutdown.
+
 - **Upstream delta reports parse bilingual baselines and separate new
   architecture work**: `scripts/upstream-delta.sh` accepts both the canonical
   English `Aligned-to commit` row and the Chinese `对齐到的 commit` row. Reports

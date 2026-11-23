@@ -37,10 +37,14 @@ machines can always paste the redirect URL/code, or use `--device-code`.
 
 Credentials are stored in `auth.json` as
 `{ "type": "oauth", access, refresh, expires, ... }` (compatible with TS
-pi). Expired tokens are proactively refreshed: a per-process
-double-checked lock re-reads after acquiring, so concurrent processes share
-one refresh; 15-second timeout; persisted back after refresh.
-`tack auth-status` shows each provider's credential type and expiry.
+pi). Expired tokens are proactively refreshed under a per-provider
+**cross-process** lock covering the reload → refresh → persist cycle; a
+separate store-wide lock prevents unrelated credential writes from being lost.
+Once started, the 15-second-bounded refresh is detached from the caller, so a
+cancelled request cannot lose a rotated refresh token. Graceful exits wait for
+started refreshes, and the commit check never overwrites a newer login or
+resurrects a logout. `tack auth-status` shows each provider's credential type
+and expiry.
 
 ## Custom providers (models.json)
 

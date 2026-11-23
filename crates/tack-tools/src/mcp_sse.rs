@@ -93,6 +93,15 @@ impl SseClientTransport {
     }
 }
 
+fn auth_challenge_suffix(response: &reqwest::Response) -> String {
+    response
+        .headers()
+        .get(reqwest::header::WWW_AUTHENTICATE)
+        .and_then(|value| value.to_str().ok())
+        .map(|header| format!("; WWW-Authenticate: {header}"))
+        .unwrap_or_default()
+}
+
 async fn read_loop(
     client: reqwest::Client,
     url: String,
@@ -107,7 +116,11 @@ async fn read_loop(
             .await
             .map_err(|e| format!("SSE connect: {e}"))?;
         if !response.status().is_success() {
-            return Err(format!("SSE connect rejected: {}", response.status()));
+            return Err(format!(
+                "SSE connect rejected: {}{}",
+                response.status(),
+                auth_challenge_suffix(&response)
+            ));
         }
         let base = reqwest::Url::parse(&url).map_err(|e| format!("bad SSE url: {e}"))?;
         let mut stream = response.bytes_stream();
@@ -260,7 +273,11 @@ impl Transport<RoleClient> for SseClientTransport {
                 .await
                 .map_err(|e| err(format!("SSE POST: {e}")))?;
             if !response.status().is_success() {
-                return Err(err(format!("SSE POST rejected: {}", response.status())));
+                return Err(err(format!(
+                    "SSE POST rejected: {}{}",
+                    response.status(),
+                    auth_challenge_suffix(&response)
+                )));
             }
             Ok(())
         }

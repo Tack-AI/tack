@@ -36,8 +36,11 @@ provider 的适配器特性。registry 总览与模型目录见根目录
 URL/code，或使用 `--device-code`。
 
 凭据以 `{ "type": "oauth", access, refresh, expires, ... }` 存入
-`auth.json`（与 TS pi 兼容）。过期 token 主动刷新：每进程双重检查锁，
-获取锁后重读，使并发进程共享一次刷新，15 秒超时，刷新后持久化回去。
+`auth.json`（与 TS pi 兼容）。过期 token 主动刷新：每个 provider 的
+**跨进程锁**覆盖「重读 → 刷新 → 持久化」完整周期，独立的 store 级锁避免
+无关凭据写入互相丢失。刷新请求以 15 秒为限，开始后就与调用方分离，调用方
+取消也不会丢掉轮换后的 refresh token；正常退出会等待已启动的刷新。提交前
+再次比较当前凭据，绝不覆盖更新的登录结果，也不会在注销后复活旧授权。
 `tack auth-status` 显示每个 provider 的凭据类型和过期时间。
 
 ## 自定义 provider（models.json）

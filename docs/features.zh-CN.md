@@ -496,7 +496,9 @@ verdict 拒绝启动（工具返回错误、零 token 消耗，后台子代理�
 
 ### MCP client OAuth 2.1
 
-mcp.json 的远程（HTTP）server 加 `"oauth": true` 或 `{"clientId": "…", "scopes": […]}` 即启用：元数据发现 → 动态客户端注册（或配置的 clientId）→ PKCE 浏览器授权（loopback 回调，支持手动粘贴）。`clientSecret`、`callbackPort` 与 `callbackUrl`（回环校验）覆盖预注册客户端与固定重定向 URI。令牌缓存 `~/.tack/agent/mcp-tokens.json`（0600），过期自动用 refresh_token 续期。缓存按 **server 名**（mcp.json 里的键名）索引——TUI 里授权过的 server，同名配置在 print/rpc/serve 等 headless 模式直接命中缓存。TUI 交互授权；print/rpc/serve 只用缓存/续期令牌，绝不弹浏览器。
+mcp.json 的远程（HTTP）server 加 `"oauth": true` 或 `{"clientId": "…", "scopes": […]}` 即启用：元数据发现 → 动态客户端注册（或配置的 clientId）→ PKCE 浏览器授权（loopback 回调，支持手动粘贴）。`clientSecret`、`callbackPort`、`callbackUrl`（回环校验）与 `authServerMetadataUrl` 覆盖预注册客户端、固定重定向 URI，以及发现元数据缺失或错误的服务器。显式 metadata URL 除 loopback 外必须使用 HTTPS；授权响应通过 RFC 9207 `iss` 绑定授权服务器，step-up 保留已授予 scopes，授权 endpoint 仅允许 HTTP(S)，token endpoint 除 loopback 外必须 HTTPS。
+
+令牌缓存 `~/.tack/agent/mcp-tokens.json`（0600），过期或被拒绝时自动用 refresh_token 续期。缓存按 **server 名 + 规范化 URL** 索引，同一 URL 下的不同名称保留独立账号；旧版仅按名称的条目首次读取时原子迁移。每个 server 的跨进程锁合并刷新；已启动的刷新即使调用方取消或 session 正在关闭，也会把轮换后的 token 落盘。TUI 授权可取消；`tack mcp login <name> --timeout <秒>` 限制整个登录流程（默认 300 秒）。print/rpc/serve 只用缓存/续期令牌，绝不弹浏览器。
 
 ### MCP sampling 与 elicitation（server 反向请求）
 

@@ -210,7 +210,10 @@ pub fn logout(name: &str, agent_dir: &Path) -> Result<()> {
 
 /// `tack mcp login`: run the interactive OAuth flow for a remote server.
 /// The resulting token is cached; the next session/connect picks it up.
-pub async fn login(name: &str, cwd: &Path, agent_dir: &Path) -> Result<()> {
+pub async fn login(name: &str, cwd: &Path, agent_dir: &Path, timeout_secs: f64) -> Result<()> {
+    if !timeout_secs.is_finite() || timeout_secs <= 0.0 {
+        bail!("--timeout must be a finite positive number of seconds");
+    }
     let specs = crate::mcp_config::configured_servers(cwd, agent_dir);
     let spec = specs
         .iter()
@@ -220,14 +223,36 @@ pub async fn login(name: &str, cwd: &Path, agent_dir: &Path) -> Result<()> {
         bail!("MCP server {name:?} is a stdio server; OAuth applies to remote (url) servers");
     };
     let oauth = crate::mcp_oauth::spec_oauth(spec);
-    let token = crate::mcp_oauth::authorize(agent_dir, name, url, &oauth).await?;
+    let timeout = std::time::Duration::try_from_secs_f64(timeout_secs)
+        .context("--timeout is outside the supported duration range")?;
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .context("--timeout is outside the supported deadline range")?;
+    let token = tokio::time::timeout_at(
+        deadline,
+        crate::mcp_oauth::authorize_cancellable(
+            agent_dir,
+            name,
+            url,
+            &oauth,
+            tokio_util::sync::CancellationToken::new(),
+        ),
+    )
+    .await
+    .with_context(|| format!("MCP OAuth sign-in timed out after {timeout_secs} seconds"))??;
     // Verify immediately: a failed connect after a successful sign-in
     // means the problem is the server, not the credentials.
     let verify = spec.clone().with_extra_headers(vec![(
         "authorization".to_string(),
         format!("Bearer {token}"),
     )]);
-    match tack_tools::mcp::connect_with(&verify, Default::default()).await {
+    let verification = tokio::time::timeout_at(
+        deadline,
+        tack_tools::mcp::connect_with(&verify, Default::default()),
+    )
+    .await
+    .with_context(|| format!("MCP server verification timed out after {timeout_secs} seconds"))?;
+    match verification {
         Ok(conn) => {
             let tools = conn.tools().len();
             conn.cancel();

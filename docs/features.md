@@ -749,15 +749,24 @@ See [plugin-system.md](plugin-system.md), [extensions.md](extensions.md),
 Add `"oauth": true` or `{"clientId": "…", "scopes": […]}` to a remote (HTTP)
 server in mcp.json to enable: metadata discovery → dynamic client
 registration (or the configured clientId) → PKCE browser authorization
-(loopback callback, manual paste supported). `clientSecret`, `callbackPort`
-and `callbackUrl` (loopback-validated) cover pre-registered clients and
-fixed redirect URIs. Tokens are cached in
-`~/.tack/agent/mcp-tokens.json` (0600), auto-renewed with refresh_token when
-expired. The cache is indexed by **server name** (the key in mcp.json) — a
-server authorized in the TUI hits the cache directly under the same-name
-config in print/rpc/serve and other headless modes. The TUI authorizes
-interactively; print/rpc/serve only use cached/renewed tokens and never pop
-a browser.
+(loopback callback, manual paste supported). `clientSecret`, `callbackPort`,
+`callbackUrl` (loopback-validated), and `authServerMetadataUrl` cover
+pre-registered clients, fixed redirect URIs, and servers whose discovery
+metadata is missing or wrong. A configured metadata URL uses HTTPS except on
+loopback. Authorization responses are bound to the authorization server with
+RFC 9207 `iss`, step-up retains already granted scopes, authorization
+endpoints are restricted to HTTP(S), and token endpoints require HTTPS except
+on loopback.
+
+Tokens are cached in `~/.tack/agent/mcp-tokens.json` (0600), auto-renewed
+with refresh_token when expired or rejected. The cache is indexed by **server
+name + normalized URL**, so two names sharing one URL keep separate accounts;
+legacy name-only entries migrate atomically on first read. Per-server
+cross-process locks coalesce refreshes, and started refreshes persist rotated
+tokens even if their caller is cancelled or the session is closing. TUI
+authorization is cancellable; `tack mcp login <name> --timeout <seconds>`
+bounds the whole sign-in (default 300). Print/rpc/serve only use
+cached/renewed tokens and never pop a browser.
 
 ### MCP sampling and elicitation (server-initiated requests)
 

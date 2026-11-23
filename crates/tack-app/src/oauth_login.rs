@@ -50,6 +50,40 @@ fn browser_command() -> (&'static str, Vec<&'static str>) {
     }
 }
 
+/// Authorization response including the optional RFC 9207 issuer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OAuthAuthorizationResponse {
+    pub code: String,
+    pub state: Option<String>,
+    pub issuer: Option<String>,
+}
+
+/// Parse manual input without discarding the authorization response `iss`.
+pub fn parse_manual_response(input: &str) -> Option<OAuthAuthorizationResponse> {
+    let (code, state) = parse_manual_input(input)?;
+    let trimmed = input.trim();
+    let issuer = if trimmed.contains("code=") {
+        let query = trimmed
+            .split_once('?')
+            .map(|(_, q)| q)
+            .unwrap_or(trimmed)
+            .split('#')
+            .next()
+            .unwrap_or(trimmed);
+        query.split('&').find_map(|pair| {
+            pair.split_once('=')
+                .and_then(|(key, value)| (key == "iss").then(|| percent_decode(value)))
+        })
+    } else {
+        None
+    };
+    Some(OAuthAuthorizationResponse {
+        code,
+        state,
+        issuer,
+    })
+}
+
 /// Parse a manual paste into an authorization code. Accepts a full redirect
 /// URL, a `code#state` pair, a query string, or a bare code (TS
 /// `parseManualInput`). Returns (code, optional state).
@@ -159,6 +193,37 @@ pub async fn await_callback_pair(
     result
 }
 
+/// One-shot loopback callback server retaining the RFC 9207 `iss` parameter.
+pub async fn await_callback_response(
+    listener: tokio::net::TcpListener,
+    path: &str,
+) -> Result<OAuthAuthorizationResponse> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut socket, _) = listener
+        .accept()
+        .await
+        .context("callback listener accept failed")?;
+    let mut buf = vec![0u8; 16384];
+    let n = socket
+        .read(&mut buf)
+        .await
+        .context("callback read failed")?;
+    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+    let request_line = request.lines().next().unwrap_or("").to_string();
+    let result = parse_callback_response(&request_line, path);
+    let html = if result.is_ok() {
+        "<html><body><h2>Login successful</h2><p>You can close this tab and return to the terminal.</p></body></html>"
+    } else {
+        "<html><body><h2>Login failed</h2><p>Malformed callback; see the terminal.</p></body></html>"
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{html}",
+        html.len()
+    );
+    let _ = socket.write_all(response.as_bytes()).await;
+    result
+}
+
 pub fn parse_callback_request(
     request_line: &str,
     path: &str,
@@ -177,6 +242,16 @@ pub fn parse_callback_request(
 /// Extract (code, state) from a callback GET without validating state
 /// (callers that need the state value itself, e.g. MCP OAuth).
 pub fn parse_callback_pair(request_line: &str, path: &str) -> Result<(String, Option<String>)> {
+    let response = parse_callback_response(request_line, path)?;
+    Ok((response.code, response.state))
+}
+
+/// Extract an authorization response without validating its state. The
+/// caller passes `issuer` to rmcp's RFC 9207 validation before code exchange.
+pub fn parse_callback_response(
+    request_line: &str,
+    path: &str,
+) -> Result<OAuthAuthorizationResponse> {
     let target = request_line
         .strip_prefix("GET ")
         .and_then(|rest| rest.rsplit_once(" HTTP/").map(|(t, _)| t))
@@ -185,18 +260,23 @@ pub fn parse_callback_pair(request_line: &str, path: &str) -> Result<(String, Op
     if !path.is_empty() && req_path != path {
         bail!("unexpected callback path {req_path}");
     }
-    let (mut code, mut state) = (None, None);
+    let (mut code, mut state, mut issuer) = (None, None, None);
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             match k {
                 "code" => code = Some(percent_decode(v)),
                 "state" => state = Some(percent_decode(v)),
+                "iss" => issuer = Some(percent_decode(v)),
                 _ => {}
             }
         }
     }
     let code = code.context("callback has no code")?;
-    Ok((code, state))
+    Ok(OAuthAuthorizationResponse {
+        code,
+        state,
+        issuer,
+    })
 }
 
 fn percent_decode(value: &str) -> String {
@@ -416,5 +496,23 @@ mod tests {
         // Truncated sequences at the end stay literal.
         assert_eq!(percent_decode("x%a"), "x%a");
         assert_eq!(percent_decode("x%"), "x%");
+    }
+
+    #[test]
+    fn callback_and_manual_input_retain_rfc9207_issuer() {
+        let response = super::parse_callback_response(
+            "GET /callback?code=abc&state=xyz&iss=https%3A%2F%2Fauth.example.com HTTP/1.1",
+            "/callback",
+        )
+        .unwrap();
+        assert_eq!(response.code, "abc");
+        assert_eq!(response.state.as_deref(), Some("xyz"));
+        assert_eq!(response.issuer.as_deref(), Some("https://auth.example.com"));
+
+        let pasted = super::parse_manual_response(
+            "http://127.0.0.1/callback?code=abc&state=xyz&iss=https%3A%2F%2Fauth.example.com",
+        )
+        .unwrap();
+        assert_eq!(pasted.issuer.as_deref(), Some("https://auth.example.com"));
     }
 }

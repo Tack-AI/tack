@@ -308,7 +308,7 @@ Each server entry, besides `command`/`args`/`env` (stdio) or
 | `timeout` | Per-request timeout in seconds for tool/resource/prompt calls (default 60; `0` disables). Progress notifications reset the clock — a long call that streams progress is not stuck |
 | `exposure` | How the server's tools reach the model: `"direct"` (default — declared like built-ins), `"deferred"` (NOT declared; `tool_search` loads matches on demand, the system prompt's "Deferred MCP tools" section names these servers), `"hidden"` (registered nowhere). pi's `"codemode"`/`"codemode-deferred"` are accepted and map to `"deferred"` (tack has no codemode tool) |
 | `toolExposure` | Per-tool overrides of `exposure`: keys are exact server tool names or `*` patterns (e.g. `{"search_code": "direct", "delete_*": "hidden"}`). Exact names win; among patterns the longest (most specific) wins — a deliberate upgrade of pi's first-match rule (JSON object order is not preserved) |
-| `oauth` | `true` or an object — OAuth 2.1 authorization for remote servers (PKCE + dynamic registration, tokens cached in `mcp-tokens.json` and auto-renewed). Object keys: `clientId`, `clientSecret` (for pre-registered clients), `scopes` (array), `callbackPort` (fixed loopback port for providers with a fixed redirect URI), `callbackUrl` (full redirect URI override; must be plain HTTP on `localhost`/`127.0.0.1`/`[::1]`) |
+| `oauth` | `true` or an object — OAuth 2.1 authorization for remote servers (PKCE + dynamic registration, tokens cached in `mcp-tokens.json` and auto-renewed). Object keys: `clientId`, `clientSecret` (for pre-registered clients), `scopes` (array), `callbackPort` (fixed loopback port for providers with a fixed redirect URI), `callbackUrl` (full redirect URI override; must be plain HTTP on `localhost`/`127.0.0.1`/`[::1]`), `authServerMetadataUrl` (metadata document replacing discovery; HTTPS except on loopback) |
 
 `env` and `headers` values (and `oauth.clientSecret`) interpolate
 `${VAR}` from the process environment — the syntax other MCP clients
@@ -319,8 +319,9 @@ Servers are managed from the shell without a session: `tack mcp list`
 an entry is invalid or an enabled server is not connected), `tack mcp
 add <name> [--local] [--env K=V]... [--header K=V]... [--url URL
 [--transport sse] [--bearer-token-env-var VAR]] [-- command args...]`,
-`tack mcp remove <name> [--local]`, `tack mcp login <name>` (interactive
-OAuth) and `tack mcp logout <name>` (drops the cached token).
+`tack mcp remove <name> [--local]`, `tack mcp login <name> [--timeout
+<seconds>]` (interactive OAuth; the whole sign-in defaults to a 300-second
+bound) and `tack mcp logout <name>` (drops the cached token).
 
 Connection resilience: a tool call that finds its connection closed
 reconnects (re-spawning stdio children / re-dialing HTTP) before

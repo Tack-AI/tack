@@ -53,6 +53,9 @@ pub struct McpOAuthConfig {
     /// Full redirect URI override; must be HTTP on a loopback host
     /// (`localhost`, `127.0.0.1`, `[::1]`) — validated at flow start.
     pub callback_url: Option<String>,
+    /// Authorization-server metadata document that replaces discovery.
+    /// HTTPS is required except for loopback development servers.
+    pub auth_server_metadata_url: Option<String>,
 }
 
 /// How to reach an MCP server.
@@ -937,11 +940,16 @@ async fn connect_spec_transport(
                 );
             config.custom_headers = custom_headers;
             let transport = StreamableHttpClientTransport::from_config(config);
-            handler
-                .clone()
-                .serve(transport)
-                .await
-                .map_err(|e| format!("MCP initialize failed for {} (HTTP): {e}", spec.name))?
+            handler.clone().serve(transport).await.map_err(|e| {
+                let challenge = e
+                    .auth_challenge()
+                    .map(|header| format!("; WWW-Authenticate: {header}"))
+                    .unwrap_or_default();
+                format!(
+                    "MCP initialize failed for {} (HTTP): {e}{challenge}",
+                    spec.name
+                )
+            })?
         }
         McpTransport::Sse { url, headers } => {
             let headers: std::collections::HashMap<String, String> =

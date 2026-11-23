@@ -24,6 +24,15 @@ pub(crate) fn quit_grace_decision(
     running: bool,
     grace_started: Option<Instant>,
 ) -> QuitGraceDecision {
+    quit_grace_decision_within(should_quit, running, grace_started, QUIT_GRACE_WINDOW)
+}
+
+fn quit_grace_decision_within(
+    should_quit: bool,
+    running: bool,
+    grace_started: Option<Instant>,
+    grace_window: std::time::Duration,
+) -> QuitGraceDecision {
     if should_quit {
         if running && grace_started.is_none() {
             return QuitGraceDecision::StartGrace;
@@ -31,7 +40,7 @@ pub(crate) fn quit_grace_decision(
         return QuitGraceDecision::Break;
     }
     if let Some(started) = grace_started
-        && (!running || started.elapsed() >= QUIT_GRACE_WINDOW)
+        && (!running || started.elapsed() >= grace_window)
     {
         return QuitGraceDecision::Break;
     }
@@ -51,7 +60,11 @@ fn todo_fingerprint(state: &tack_tools::todo::TodoState) -> u64 {
 
 impl TuiApp {
     /// The main loop: terminal input + agent events + spinner ticks.
-    pub(crate) async fn run(&mut self) -> Result<i32> {
+    pub(crate) async fn run(
+        &mut self,
+        process_shutdown: &crate::process_shutdown::ProcessShutdown,
+    ) -> Result<i32> {
+        let shutdown_token = process_shutdown.token();
         let _guard = tack_tui::terminal::TerminalGuard::enter(self.fullscreen, self.fullscreen)?;
         let mut events = tack_tui::terminal::TerminalEvents::new();
         let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -85,8 +98,21 @@ impl TuiApp {
         // an in-flight tool call is orphaned in the session (no result is
         // ever persisted). A second quit request forces an immediate exit.
         let mut quit_grace_started: Option<Instant> = None;
+        let mut termination_started = false;
         loop {
             tokio::select! {
+                _ = shutdown_token.cancelled(), if !termination_started => {
+                    termination_started = true;
+                    self.should_quit = true;
+                    self.cancel.cancel();
+                    for (_, token) in self.bang_cancel.drain() {
+                        token.cancel();
+                    }
+                    if let Some(token) = self.branch_summary_cancel.take() {
+                        token.cancel();
+                    }
+                    dirty = true;
+                }
                 input = events.next() => {
                     match input {
                         Some(InputEvent::Resize { width, height }) => {
@@ -265,7 +291,17 @@ impl TuiApp {
                 }
             }
             self.sync_herdr();
-            match quit_grace_decision(self.should_quit, self.running, quit_grace_started) {
+            let quit_decision = if process_shutdown.reason().is_some() {
+                quit_grace_decision_within(
+                    self.should_quit,
+                    self.running,
+                    quit_grace_started,
+                    std::time::Duration::from_secs(1),
+                )
+            } else {
+                quit_grace_decision(self.should_quit, self.running, quit_grace_started)
+            };
+            match quit_decision {
                 QuitGraceDecision::StartGrace => {
                     quit_grace_started = Some(Instant::now());
                     self.should_quit = false;
@@ -293,10 +329,16 @@ impl TuiApp {
                 dirty = false;
             }
         }
-        self.tui.stop(&mut out)?;
-        // The TerminalGuard's Drop also drains; do it here too so the
-        // SessionEnd hooks below run after the final frame is out.
-        tack_tui::terminal::drain_frames();
+        self.background_tasks.cancel_all();
+        if !self.background_tasks.settle(Duration::from_secs(1)).await {
+            tracing::warn!("background tasks did not settle before TUI shutdown");
+        }
+        let terminal_result = self.tui.stop(&mut out);
+        // Console close has a small OS budget: skip the optional final-frame
+        // drain here (the watchdog still bounds TerminalGuard::drop).
+        if process_shutdown.reason().is_none() {
+            tack_tui::terminal::drain_frames();
+        }
         // SessionEnd hooks (fire-and-forget), then tack-ext session_shutdown.
         {
             let groups = self
@@ -323,7 +365,9 @@ impl TuiApp {
         self.extensions.shutdown().await;
         // fullscreenExitOutput=transcript: print the transcript back into
         // scrollback when leaving fullscreen (TS stopInteractiveTui).
-        if self.fullscreen && self.settings.fullscreen_exit_output.as_deref() == Some("transcript")
+        if process_shutdown.reason().is_none()
+            && self.fullscreen
+            && self.settings.fullscreen_exit_output.as_deref() == Some("transcript")
         {
             use std::io::Write as _;
             let (width, _) = self.tui.size();
@@ -356,7 +400,15 @@ impl TuiApp {
         {
             eprintln!("export failed: {e}");
         }
-        Ok(0)
+        let exit_code = process_shutdown.exit_code().unwrap_or(0);
+        if process_shutdown.reason().is_some() {
+            if let Err(error) = terminal_result {
+                tracing::warn!(%error, "terminal restoration failed during signal shutdown");
+            }
+        } else {
+            terminal_result?;
+        }
+        Ok(exit_code)
     }
 
     /// Background task finished: surface in the transcript; steer a running
@@ -1017,7 +1069,14 @@ impl TuiApp {
                             tx_work.clone(),
                         )),
                     );
-                    crate::mcp_oauth::connect_all_oauth(specs, &agent_dir, true, callbacks).await
+                    crate::mcp_oauth::connect_all_oauth_cancellable(
+                        specs,
+                        &agent_dir,
+                        true,
+                        callbacks,
+                        cancel.clone(),
+                    )
+                    .await
                 };
                 tools.extend(tack_tools::mcp::mcp_tools_with(
                     &connections,

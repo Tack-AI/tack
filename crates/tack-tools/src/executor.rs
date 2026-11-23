@@ -19,6 +19,28 @@ pub struct BashExecOutcome {
     pub timed_out: bool,
 }
 
+/// Last-resort process-tree cleanup when an executor future is dropped before
+/// it can observe cancellation. Normal shell completion disarms the guard so
+/// intentionally detached descendants retain their historical lifetime.
+struct ChildTreeGuard {
+    pid: u32,
+    armed: bool,
+}
+
+impl ChildTreeGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ChildTreeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            kill_process_tree(self.pid);
+        }
+    }
+}
+
 /// Raw command execution. Output bytes stream through `on_output` (stdout and
 /// stderr merged, arrival order).
 #[async_trait]
@@ -139,10 +161,13 @@ impl BashExecutor for LocalBashExecutor {
             .spawn()
             .map_err(|e| format!("Failed to spawn {spawn_label}: {e}"))?;
         let pid = child.id().unwrap_or(0);
+        let mut process_guard = ChildTreeGuard { pid, armed: true };
 
         // Windows sandbox: attach the process tree to a Job Object (resource
         // containment + reliable tree-kill). Best-effort: on failure the
-        // command runs with plain taskkill semantics.
+        // command runs with plain taskkill semantics. Unsandboxed commands
+        // keep their historical lifetime: detached descendants may outlive a
+        // successfully completed foreground shell.
         #[cfg(windows)]
         let job = match &self.sandbox {
             Some((crate::sandbox::SandboxBackend::WindowsJob, spec)) => {
@@ -221,6 +246,7 @@ impl BashExecutor for LocalBashExecutor {
                     }
                     kill_process_tree(pid);
                     let _ = wait.await;
+                    process_guard.disarm();
                     break None;
                 }
                 _ = async {
@@ -236,6 +262,7 @@ impl BashExecutor for LocalBashExecutor {
                     }
                     kill_process_tree(pid);
                     let _ = wait.await;
+                    process_guard.disarm();
                     break None;
                 }
                 chunk = chunk_rx.recv(), if out_open => {
@@ -252,6 +279,17 @@ impl BashExecutor for LocalBashExecutor {
                 }
             }
         };
+
+        // Shell reaping is a normal completion, not cancellation: preserve
+        // detached descendants. If the future is dropped before this point,
+        // ChildTreeGuard still performs last-resort cleanup.
+        if exit_status.is_some()
+            && !outcome.cancelled
+            && !outcome.timed_out
+            && !cancel.is_cancelled()
+        {
+            process_guard.disarm();
+        }
 
         // Drain output still queued behind a slow consumer: `wait` can win
         // the select race while the reader tasks have already forwarded the
@@ -449,6 +487,40 @@ mod tests {
         );
         let out = collected.lock().unwrap();
         assert!(out.windows(4).any(|w| w == b"done"), "lost output: {out:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_exec_future_kills_the_process_tree() {
+        let executor = executor();
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("child.pid");
+        let command = format!("sleep 30 & echo $! > {}; sleep 30", pid_path.display());
+        let cwd = exec_cwd();
+        let mut future =
+            Box::pin(executor.exec(&command, &cwd, None, CancellationToken::new(), &|_| {}));
+        for _ in 0..50 {
+            if pid_path.exists() {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                result = &mut future => panic!("executor finished before the test drop: {result:?}"),
+            }
+        }
+        let pid: i32 = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        drop(future);
+        for _ in 0..50 {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("descendant {pid} survived executor-future drop");
     }
 
     #[tokio::test]

@@ -52,6 +52,9 @@ pub(crate) struct RpcState {
     /// current, so a cancelled run's trailing events never land in the
     /// replacement session nor clobber a newer run's streaming flag.
     pub(crate) generation: u64,
+    /// Detached prompt pumps, retained so termination can cancel and drain
+    /// persistence before session/plugin teardown.
+    pub(crate) prompt_tasks: Vec<tokio::task::JoinHandle<()>>,
     /// Background bash tasks persist across prompts in one RPC session.
     pub(crate) background: tack_tools::background::BackgroundTaskManager,
     /// LSP registry (language servers stay warm across prompts).
@@ -232,7 +235,8 @@ pub async fn run_rpc(
     thinking: Option<tack_ai::ThinkingLevel>,
     cwd: PathBuf,
     continue_session: bool,
-) -> Result<()> {
+) -> Result<i32> {
+    let process_shutdown = crate::process_shutdown::ProcessShutdown::new();
     let agent_dir = tack_session::default_agent_dir();
     let settings = Settings::load(&cwd, &agent_dir);
 
@@ -318,6 +322,7 @@ pub async fn run_rpc(
         is_streaming: false,
         is_compacting: false,
         generation: 0,
+        prompt_tasks: Vec::new(),
         background: {
             let manager = tack_tools::background::BackgroundTaskManager::new();
             // Background task completion notifications -> out-of-band JSONL.
@@ -382,9 +387,14 @@ pub async fn run_rpc(
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
     let mut line_buf = Vec::new();
+    let shutdown_token = process_shutdown.token();
 
     loop {
-        let line = match read_line_bounded(&mut stdin, &mut line_buf).await {
+        let read = tokio::select! {
+            _ = shutdown_token.cancelled() => break,
+            result = read_line_bounded(&mut stdin, &mut line_buf) => result,
+        };
+        let line = match read {
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
@@ -418,10 +428,66 @@ pub async fn run_rpc(
             .and_then(Value::as_str)
             .map(str::to_string);
         let command_type = command.get("type").and_then(Value::as_str).unwrap_or("");
-        let response = handle_command(command_type, &command, &state, &settings).await;
+        let command_future = handle_command(command_type, &command, &state, &settings);
+        tokio::pin!(command_future);
+        let response = tokio::select! {
+            _ = shutdown_token.cancelled() => {
+                {
+                    let state = state.lock().await;
+                    state.cancel.cancel();
+                    state.bash_cancel.cancel();
+                    state.retry_cancel.cancel();
+                }
+                // Drain the command after cancellation instead of dropping
+                // its executor future: bash observes the token and kills the
+                // whole process tree before lifecycle teardown.
+                command_future.await
+            }
+            response = &mut command_future => response,
+        };
 
+        if process_shutdown.reason().is_some() {
+            break;
+        }
         stdout.write_all(format!("{response}\n").as_bytes()).await?;
         stdout.flush().await?;
+    }
+    {
+        let state = state.lock().await;
+        state.cancel.cancel();
+        state.bash_cancel.cancel();
+        state.retry_cancel.cancel();
+        state.background.cancel_all();
+    }
+    let background = state.lock().await.background.clone();
+    if !background.settle(std::time::Duration::from_secs(1)).await {
+        tracing::warn!("background tasks did not settle before RPC shutdown");
+    }
+    let prompt_tasks = {
+        let mut state = state.lock().await;
+        std::mem::take(&mut state.prompt_tasks)
+    };
+    for mut task in prompt_tasks {
+        let settled = tokio::select! {
+            _ = shutdown_token.cancelled() => None,
+            result = &mut task => Some(result),
+        };
+        let settled = match settled {
+            Some(result) => result,
+            None => {
+                {
+                    let state = state.lock().await;
+                    state.cancel.cancel();
+                    state.bash_cancel.cancel();
+                    state.retry_cancel.cancel();
+                    state.background.cancel_all();
+                }
+                task.await
+            }
+        };
+        if let Err(error) = settled {
+            tracing::warn!(%error, "RPC prompt pump did not settle cleanly");
+        }
     }
     // tack-ext: session_end lifecycle event, then stop all plugins.
     {
@@ -439,7 +505,7 @@ pub async fn run_rpc(
             .await;
         extensions.shutdown().await;
     }
-    Ok(())
+    Ok(process_shutdown.exit_code().unwrap_or(0))
 }
 
 /// Rebind the provider adapter (+ request auth) after `set_model` changed
@@ -1462,6 +1528,7 @@ mod tests {
             is_streaming: false,
             is_compacting: false,
             generation: 0,
+            prompt_tasks: Vec::new(),
             background: tack_tools::background::BackgroundTaskManager::new(),
             lsp: Settings::default().lsp_manager(cwd),
             extensions: Arc::new(Mutex::new(

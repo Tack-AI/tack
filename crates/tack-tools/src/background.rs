@@ -346,6 +346,52 @@ impl BackgroundTaskManager {
         }
     }
 
+    /// Signal every running background task. The executor's own RAII guard
+    /// remains the fallback if the host runtime is dropped before tasks settle.
+    pub fn cancel_all(&self) {
+        let tokens: Vec<CancellationToken> = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner
+                .tasks
+                .values()
+                .filter(|task| task.status == TaskStatus::Running)
+                .map(|task| task.cancel.clone())
+                .collect()
+        };
+        for token in tokens {
+            token.cancel();
+        }
+    }
+
+    /// Wait until every running task reaches a terminal state, returning
+    /// `false` when the bound expires. Completion is observed through the same
+    /// watch generation as `bash_wait`, so no finish notification is missed.
+    pub async fn settle(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, async {
+            let mut completions = {
+                let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                inner.completion_tx.subscribe()
+            };
+            loop {
+                let running = {
+                    let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    inner
+                        .tasks
+                        .values()
+                        .any(|task| task.status == TaskStatus::Running)
+                };
+                if !running {
+                    return;
+                }
+                if completions.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
+
     /// Spawn a command as a background task. Returns the task id.
     pub fn spawn(&self, command: String, services: &ToolServices) -> Result<String, String> {
         let shell = services
@@ -1180,6 +1226,21 @@ mod tests {
 
         let unknown = manager.kill("nope");
         assert!(unknown.unknown());
+    }
+
+    #[tokio::test]
+    async fn cancel_all_and_settle_cover_running_tasks() {
+        let manager = BackgroundTaskManager::new();
+        let handle = manager.register("t".to_string());
+        let cancel = handle.cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            handle.finish(TaskStatus::Killed, None);
+        });
+        manager.cancel_all();
+        assert!(cancel.is_cancelled());
+        assert!(manager.settle(Duration::from_secs(1)).await);
+        assert!(!manager.has_running());
     }
 
     /// A TaskHandle dropped without finish() (driver bug / aborted spawner)

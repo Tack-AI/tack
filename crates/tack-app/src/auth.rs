@@ -34,12 +34,18 @@ fn write_store(agent_dir: &Path, store: &BTreeMap<String, Value>) -> std::io::Re
     crate::atomic_write::atomic_write_private(&auth_path(agent_dir), &content, 0o600)
 }
 
-/// In-process serializer for read-modify-write cycles on auth.json: two
-/// concurrent logins in one process must not lose each other's entry.
-/// NOTE: this is only a process-local mutex — two tack PROCESSES writing
-/// concurrently still race (last writer wins); the atomic write keeps the
-/// file intact either way.
+/// In-process serializer for read-modify-write cycles on auth.json. The
+/// companion mandatory file guard serializes other processes; neither lock is
+/// held while an OAuth network request is running.
 static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_store(agent_dir: &Path) -> std::io::Result<crate::file_lock::Guard> {
+    crate::file_lock::strict_lock(
+        &auth_path(agent_dir),
+        std::time::Duration::from_secs(20),
+        std::time::Duration::from_secs(30),
+    )
+}
 
 // ---------------------------------------------------------------------
 // OS keyring
@@ -105,6 +111,19 @@ fn set_credential_with_service(
     credential: Value,
     service: &str,
 ) -> std::io::Result<()> {
+    let _local = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = lock_store(agent_dir)?;
+    set_credential_unlocked(agent_dir, provider, credential, service)
+}
+
+/// Caller holds both store locks. Keeping keyring and placeholder mutations in
+/// one critical section prevents a file-only writer from slipping between them.
+fn set_credential_unlocked(
+    agent_dir: &Path,
+    provider: &str,
+    credential: Value,
+    service: &str,
+) -> std::io::Result<()> {
     match credential_store_setting(agent_dir) {
         CredentialStore::File => return write_file_entry(agent_dir, provider, &credential),
         CredentialStore::Keyring => {
@@ -122,7 +141,6 @@ fn set_credential_with_service(
 }
 
 fn write_file_entry(agent_dir: &Path, provider: &str, credential: &Value) -> std::io::Result<()> {
-    let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut store = read_store(agent_dir);
     store.insert(provider.to_string(), credential.clone());
     write_store(agent_dir, &store)
@@ -159,12 +177,13 @@ pub fn login(agent_dir: &Path, provider: &str, api_key: &str) -> std::io::Result
 
 /// Remove a provider's stored credential. Returns true if one existed.
 pub fn logout(agent_dir: &Path, provider: &str) -> std::io::Result<bool> {
+    let _local = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = lock_store(agent_dir)?;
     // File mode never touches the OS keyring — skip the delete (it would
     // prompt/keychain-access for nothing; also keeps tests hermetic).
     if credential_store_setting(agent_dir) != CredentialStore::File {
         keyring_delete("tack", provider);
     }
-    let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut store = read_store(agent_dir);
     let existed = store.remove(provider).is_some();
     write_store(agent_dir, &store)?;
@@ -205,6 +224,32 @@ pub fn set_oauth(
         .expect("credential is an object")
         .insert("type".to_string(), Value::String("oauth".to_string()));
     set_credential(agent_dir, provider, value)
+}
+
+/// Persist a refreshed OAuth credential only if the expected credential is
+/// still current. Returns `false` after a concurrent login/logout/refresh so a
+/// detached request can never resurrect or overwrite that newer state.
+pub fn set_oauth_if_current(
+    agent_dir: &Path,
+    provider: &str,
+    expected: &tack_ai::oauth::OAuthCredential,
+    fresh: &tack_ai::oauth::OAuthCredential,
+) -> std::io::Result<bool> {
+    let _local = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = lock_store(agent_dir)?;
+    let current = get_credential_with_service(agent_dir, provider, "tack")
+        .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("oauth"))
+        .and_then(|entry| serde_json::from_value::<tack_ai::oauth::OAuthCredential>(entry).ok());
+    if current.as_ref() != Some(expected) {
+        return Ok(false);
+    }
+    let mut value = serde_json::to_value(fresh)?;
+    value
+        .as_object_mut()
+        .expect("credential is an object")
+        .insert("type".to_string(), Value::String("oauth".to_string()));
+    set_credential_unlocked(agent_dir, provider, value, "tack")?;
+    Ok(true)
 }
 
 #[cfg(test)]

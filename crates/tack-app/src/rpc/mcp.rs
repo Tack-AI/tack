@@ -42,18 +42,23 @@ pub(crate) fn effective_specs(
 /// Resolution is cheap (token-store read; a network refresh only when
 /// expired). Hashed, never embedded, so tokens cannot leak via logs/debug
 /// output.
-async fn oauth_fingerprint_suffix(specs: &[McpServerSpec], agent_dir: &std::path::Path) -> String {
+async fn oauth_fingerprint_suffix(
+    specs: &[McpServerSpec],
+    agent_dir: &std::path::Path,
+    cancel: tokio_util::sync::CancellationToken,
+) -> String {
     let mut suffix = String::new();
     for spec in specs {
         if spec.oauth.is_some()
             && let Some(url) = spec.url()
         {
-            let token = crate::mcp_oauth::access_token(
+            let token = crate::mcp_oauth::access_token_with_cancel(
                 agent_dir,
                 &spec.name,
                 url,
                 &crate::mcp_oauth::spec_oauth(spec),
                 false,
+                cancel.clone(),
             )
             .await
             .ok()
@@ -84,7 +89,10 @@ pub(crate) async fn ensure_mcp_pool(
     agent_dir: &std::path::Path,
     ext_specs: Vec<McpServerSpec>,
 ) -> McpPoolOutcome {
-    let session_specs = state.lock().await.session_mcp_servers.clone();
+    let (session_specs, cancel) = {
+        let state = state.lock().await;
+        (state.session_mcp_servers.clone(), state.cancel.clone())
+    };
     let specs = effective_specs(&session_specs, ext_specs, cwd, agent_dir);
     if specs.is_empty() {
         // No servers configured (anymore): drop the pool — replacing
@@ -97,7 +105,7 @@ pub(crate) async fn ensure_mcp_pool(
         };
     }
     let mut fingerprint = super::mcp_cache_fingerprint(cwd, agent_dir, &specs, model);
-    fingerprint.push_str(&oauth_fingerprint_suffix(&specs, agent_dir).await);
+    fingerprint.push_str(&oauth_fingerprint_suffix(&specs, agent_dir, cancel.clone()).await);
     // Disabled specs never connect: completeness is measured against the
     // ENABLED set, or a disabled entry would keep the pool uncacheable.
     let enabled_count = specs.iter().filter(|s| s.enabled).count();
@@ -129,11 +137,12 @@ pub(crate) async fn ensure_mcp_pool(
                 crate::mcp_elicitation::InteractionMode::Headless,
                 None,
             );
-            let outcomes = crate::mcp_oauth::connect_all_oauth_reporting(
+            let outcomes = crate::mcp_oauth::connect_all_oauth_reporting_cancellable(
                 specs.clone(),
                 agent_dir,
                 false,
                 callbacks,
+                cancel,
             )
             .await;
             let mut connections = Vec::new();

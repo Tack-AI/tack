@@ -401,7 +401,12 @@ enum McpCommand {
     },
     /// Sign in to an OAuth-protected remote MCP server (browser flow with
     /// manual-paste fallback)
-    Login { name: String },
+    Login {
+        name: String,
+        /// Bound the whole OAuth sign-in flow, in seconds
+        #[arg(long, default_value_t = 300.0)]
+        timeout: f64,
+    },
     /// Sign out of a remote MCP server (delete the cached OAuth token)
     Logout { name: String },
 }
@@ -626,7 +631,21 @@ fn main() -> Result<()> {
     std::thread::Builder::new()
         .name("tack-main".into())
         .stack_size(8 * 1024 * 1024)
-        .spawn(move || runtime.block_on(async_main()))
+        .spawn(move || {
+            let result = runtime.block_on(async {
+                let result = async_main().await;
+                // Rotated OAuth tokens must reach the credential store even
+                // when the command that started the refresh has returned.
+                tack_app::oauth_lifecycle::settled().await;
+                result
+            });
+            // Tokio's stdin adapter uses an uncancellable blocking read. A
+            // cancelled/timed-out MCP manual-paste prompt may therefore still
+            // have a reader when the command returns; do not let runtime drop
+            // wait forever for it. The process is exiting and the OS reaps it.
+            runtime.shutdown_background();
+            result
+        })
         .context("failed to spawn the driver thread")?
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
@@ -658,7 +677,8 @@ async fn async_main() -> Result<()> {
 
     // --mode rpc is an alias for the rpc subcommand.
     if cli.command.is_none() && cli.mode.as_deref() == Some("rpc") {
-        return close_codebuddy_after(run_rpc(&cli)).await;
+        let code = close_codebuddy_after(run_rpc(&cli)).await?;
+        std::process::exit(code);
     }
 
     match &cli.command {
@@ -672,7 +692,8 @@ async fn async_main() -> Result<()> {
             return close_codebuddy_after(tack_app::acp::serve(&overrides)).await;
         }
         Some(Command::Rpc) => {
-            return close_codebuddy_after(run_rpc(&cli)).await;
+            let code = close_codebuddy_after(run_rpc(&cli)).await?;
+            std::process::exit(code);
         }
         Some(Command::McpServe) => {
             return close_codebuddy_after(cmd_mcp_serve(&cli)).await;
@@ -973,7 +994,7 @@ fn parse_thinking(cli: &Cli) -> Result<Option<tack_ai::ThinkingLevel>> {
 
 /// `tack rpc` (also the `--mode rpc` alias): JSONL commands on stdin,
 /// events on stdout.
-async fn run_rpc(cli: &Cli) -> Result<()> {
+async fn run_rpc(cli: &Cli) -> Result<i32> {
     let SubcommandContext {
         cwd, model, auth, ..
     } = subcommand_context(cli)?;
@@ -1018,7 +1039,9 @@ async fn cmd_mcp(command: &McpCommand) -> Result<()> {
         McpCommand::Remove { name, local } => {
             tack_app::mcp_cli::remove(name, *local, &cwd, &agent_dir)
         }
-        McpCommand::Login { name } => tack_app::mcp_cli::login(name, &cwd, &agent_dir).await,
+        McpCommand::Login { name, timeout } => {
+            tack_app::mcp_cli::login(name, &cwd, &agent_dir, *timeout).await
+        }
         McpCommand::Logout { name } => tack_app::mcp_cli::logout(name, &agent_dir),
     }
 }
@@ -1594,7 +1617,12 @@ async fn run_default(cli: &Cli, flags: tack_app::cli_flags::CliFlags) -> Result<
             // Reap codebuddy CLI children before exit — `std::process::exit`
             // runs no destructors and the session registry is a static, so
             // without this sweep quitting the TUI orphans the CLI process.
+            let outer_shutdown = tack_app::process_shutdown::ProcessShutdown::new();
             tack_ai::codebuddy::close_all_sessions().await;
+            tack_app::oauth_lifecycle::settled().await;
+            if let Some(code) = outer_shutdown.exit_code() {
+                std::process::exit(code);
+            }
             let code = result?;
             std::process::exit(code);
         }
@@ -1695,7 +1723,12 @@ async fn run_default(cli: &Cli, flags: tack_app::cli_flags::CliFlags) -> Result<
     // Reap codebuddy CLI children before exit (same static-registry /
     // no-destructors trap as the TUI path above; run_print already closes
     // its own session on the happy path, this covers early-error exits).
+    let outer_shutdown = tack_app::process_shutdown::ProcessShutdown::new();
     tack_ai::codebuddy::close_all_sessions().await;
+    tack_app::oauth_lifecycle::settled().await;
+    if let Some(code) = outer_shutdown.exit_code() {
+        std::process::exit(code);
+    }
     let code = result?;
     std::process::exit(code);
 }
@@ -1705,9 +1738,14 @@ async fn run_default(cli: &Cli, flags: tack_app::cli_flags::CliFlags) -> Result<
 /// (never dropped), so without this sweep a mode exit orphans the CLI
 /// child processes (they only die later on their own stdin-EOF/idle
 /// handling, if at all).
-async fn close_codebuddy_after(run: impl std::future::Future<Output = Result<()>>) -> Result<()> {
+async fn close_codebuddy_after<T>(run: impl std::future::Future<Output = Result<T>>) -> Result<T> {
     let result = run.await;
+    let process_shutdown = tack_app::process_shutdown::ProcessShutdown::new();
     tack_ai::codebuddy::close_all_sessions().await;
+    tack_app::oauth_lifecycle::settled().await;
+    if let Some(code) = process_shutdown.exit_code() {
+        std::process::exit(code);
+    }
     result
 }
 

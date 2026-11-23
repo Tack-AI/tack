@@ -496,9 +496,11 @@ pub(crate) async fn spawn_prompt(
         })
         .collect();
 
+    let run_cancel = cancel.clone();
     let mut stream = agent_loop(prompt_messages, context, config, cancel);
-    let state = state.clone();
-    tokio::spawn(async move {
+    let task_state = state.clone();
+    let state = task_state.clone();
+    let task = tokio::spawn(async move {
         use futures_util::FutureExt as _;
 
         let pump = async {
@@ -534,7 +536,9 @@ pub(crate) async fn spawn_prompt(
                 }
             }
             let _ = stream.result().await;
-            if let Some((engine, groups, session_id, model_id, cwd)) = stop_plan {
+            if !run_cancel.is_cancelled()
+                && let Some((engine, groups, session_id, model_id, cwd)) = stop_plan
+            {
                 let (last_text, totals, stop_hook_active) = {
                     let st = state.lock().await;
                     let last_text = st
@@ -601,6 +605,9 @@ pub(crate) async fn spawn_prompt(
             state.is_streaming = false;
         }
     });
+    let mut state = task_state.lock().await;
+    state.prompt_tasks.retain(|task| !task.is_finished());
+    state.prompt_tasks.push(task);
 }
 
 /// Write one out-of-band event line to stdout (same one-write-per-record

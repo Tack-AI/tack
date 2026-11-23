@@ -245,11 +245,11 @@ Tack 从四级读取配置，**后加载的层级覆盖先加载的**（部分�
 | `timeout` | 工具/资源/prompt 调用的单次请求超时（秒，默认 60；`0` 表示不限）。progress 通知会重置计时——持续上报进度的长调用不算卡死 |
 | `exposure` | 服务器工具到达模型的方式：`"direct"`（默认——像内置工具一样声明）、`"deferred"`（不声明；`tool_search` 按需加载，系统提示的 “Deferred MCP tools” 段会列出这些服务器）、`"hidden"`（完全不可达）。兼容 pi 的 `"codemode"`/`"codemode-deferred"`，映射为 `"deferred"`（tack 没有 codemode 工具） |
 | `toolExposure` | 按工具覆盖 `exposure`：键为精确工具名或 `*` 通配（如 `{"search_code": "direct", "delete_*": "hidden"}`）。精确名优先；多个通配匹配时最长（最具体）者胜——这是对 pi “首个匹配”规则的有意改进（JSON 对象不保序） |
-| `oauth` | `true` 或对象——远程 server 的 OAuth 2.1 授权（PKCE + 动态注册，令牌缓存 `mcp-tokens.json` 并自动续期）。对象键：`clientId`、`clientSecret`（预注册客户端）、`scopes`（数组）、`callbackPort`（固定回环端口，用于重定向 URI 固定的提供商）、`callbackUrl`（完整重定向 URI 覆盖；必须是 `localhost`/`127.0.0.1`/`[::1]` 上的纯 HTTP） |
+| `oauth` | `true` 或对象——远程 server 的 OAuth 2.1 授权（PKCE + 动态注册，令牌缓存 `mcp-tokens.json` 并自动续期）。对象键：`clientId`、`clientSecret`（预注册客户端）、`scopes`（数组）、`callbackPort`（固定回环端口，用于重定向 URI 固定的提供商）、`callbackUrl`（完整重定向 URI 覆盖；必须是 `localhost`/`127.0.0.1`/`[::1]` 上的纯 HTTP）、`authServerMetadataUrl`（替代发现流程的 metadata 文档；除 loopback 外必须 HTTPS） |
 
 `env`、`headers` 的值（以及 `oauth.clientSecret`）支持 `${VAR}` 环境变量插值——与其他 MCP 客户端相同的语法；未设置的变量展开为空并给出警告。
 
-无需会话即可从 shell 管理服务器：`tack mcp list`（连接每个 enabled 服务器并打印状态/工具/错误；条目无效或 enabled 服务器未连上时退出码为 1）、`tack mcp add <name> [--local] [--env K=V]... [--header K=V]... [--url URL [--transport sse] [--bearer-token-env-var VAR]] [-- command args...]`、`tack mcp remove <name> [--local]`、`tack mcp login <name>`（交互式 OAuth）、`tack mcp logout <name>`（删除缓存令牌）。
+无需会话即可从 shell 管理服务器：`tack mcp list`（连接每个 enabled 服务器并打印状态/工具/错误；条目无效或 enabled 服务器未连上时退出码为 1）、`tack mcp add <name> [--local] [--env K=V]... [--header K=V]... [--url URL [--transport sse] [--bearer-token-env-var VAR]] [-- command args...]`、`tack mcp remove <name> [--local]`、`tack mcp login <name> [--timeout <秒>]`（交互式 OAuth，整个登录默认限时 300 秒）、`tack mcp logout <name>`（删除缓存令牌）。
 
 连接韧性：工具调用发现连接已断开时先重连（stdio 子进程重启 / HTTP 重拨）再报错；`tools|resources|prompts/list_changed` 通知会就地刷新缓存的能力列表。服务器声明的工具注解（`readOnlyHint` 等）进入权限系统——声明只读的 MCP 工具像内置读工具一样免提示（与 `destructiveHint` 矛盾时按不安全处理）——并作为证据传给审批链插件。
 

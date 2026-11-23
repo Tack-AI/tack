@@ -323,13 +323,16 @@ I/O 契约和 settings 形状）。Tack 跟随上游 Claude Code schema 的演�
 
 **当前状态（证据）。** MCP client 和 server 支持位于
 `crates/tack-app/src/mcp_config.rs`、`mcp_serve.rs`、`mcp_elicitation.rs`、
-`mcp_oauth.rs`、`mcp_sampling.rs`，构建于 `rmcp` crate（版本 **3.1.4**，
+`mcp_oauth.rs`、`mcp_sampling.rs`，构建于 `rmcp` crate（版本 **3.9.0**，
 根 `Cargo.toml`）之上。传输支持引用规范 **2024-11-05**（旧版 SSE）
 和 streamable HTTP（`mcp_config.rs`）；线上协议版本由上游 crate 按
-MCP 规范协商。
+MCP 规范协商。OAuth token 缓存按规范化 server 名 + URL 索引；旧版仅按
+名称的 `mcp-tokens.json` 条目首次读取时原子迁移，保留 access/refresh
+token、client id、过期时间与已授予 scope。
 
 **承诺。** 与 ACP 相同：跟随上游 `rmcp`/MCP 规范的稳定版本，按规范
 协商版本，升级记录在 CHANGELOG 和 `docs/upstream-alignment.md` 中。
+凭据缓存 key 演进必须提供原地迁移路径，不得让旧授权静默失效。
 
 ### 2.8 `settings.json` keys（级别：稳定 / 只增不改）
 

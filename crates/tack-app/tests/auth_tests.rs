@@ -114,6 +114,79 @@ async fn concurrent_resolves_share_one_refresh() {
 }
 
 #[tokio::test]
+async fn cancelling_the_caller_does_not_lose_a_rotated_grant() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let agent_dir = tempfile::tempdir().unwrap();
+    write_expired_kimi_credential(agent_dir.path());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let host = format!("http://{}", listener.local_addr().unwrap());
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let _ = socket.read(&mut buf).await.unwrap();
+        let _ = started_tx.send(());
+        let _ = release_rx.await;
+        let body = "{\"access_token\":\"rotated-token\",\"refresh_token\":\"rotated-refresh\",\"expires_in\":3600}";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    });
+    unsafe { std::env::set_var("KIMI_CODE_OAUTH_HOST", &host) };
+
+    let auth = tack_app::model::resolve_auth("kimi-coding", None, agent_dir.path());
+    let caller = tokio::spawn(async move { auth.resolve().await });
+    started_rx.await.unwrap();
+    caller.abort();
+    let _ = caller.await;
+    release_tx.send(()).unwrap();
+    tack_app::oauth_lifecycle::settled().await;
+
+    let stored = tack_app::auth::get_oauth(agent_dir.path(), "kimi-coding").unwrap();
+    assert_eq!(stored.access, "rotated-token");
+    assert_eq!(stored.refresh, "rotated-refresh");
+    unsafe { std::env::remove_var("KIMI_CODE_OAUTH_HOST") };
+}
+
+#[tokio::test]
+async fn late_refresh_does_not_resurrect_a_logout() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let agent_dir = tempfile::tempdir().unwrap();
+    write_expired_kimi_credential(agent_dir.path());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let host = format!("http://{}", listener.local_addr().unwrap());
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let _ = socket.read(&mut buf).await.unwrap();
+        let _ = started_tx.send(());
+        let _ = release_rx.await;
+        let body = "{\"access_token\":\"late-token\",\"expires_in\":3600}";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    });
+    unsafe { std::env::set_var("KIMI_CODE_OAUTH_HOST", &host) };
+
+    let auth = tack_app::model::resolve_auth("kimi-coding", None, agent_dir.path());
+    let caller = tokio::spawn(async move { auth.resolve().await });
+    started_rx.await.unwrap();
+    assert!(tack_app::auth::logout(agent_dir.path(), "kimi-coding").unwrap());
+    release_tx.send(()).unwrap();
+    tack_app::oauth_lifecycle::settled().await;
+    assert!(caller.await.unwrap().is_err());
+    assert!(tack_app::auth::get_oauth(agent_dir.path(), "kimi-coding").is_none());
+    unsafe { std::env::remove_var("KIMI_CODE_OAUTH_HOST") };
+}
+
+#[tokio::test]
 async fn static_auth_passthrough_and_api_key_login() {
     let agent_dir = tempfile::tempdir().unwrap();
     // Pin file storage: otherwise CredentialStore::Auto writes the login to
