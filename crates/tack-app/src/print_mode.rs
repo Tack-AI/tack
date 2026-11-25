@@ -464,7 +464,7 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
     // permissions.deny applies in headless mode too (CI safety net) — to
     // the parent loop's hooks AND to every spawned sub-agent child loop.
     let deny_rules = crate::permissions::PermissionRules::load(&settings, &agent_dir);
-    let (tools, _mcp_connections) = {
+    let (tools, _mcp_connections, _mcp_manager) = {
         let mut tools = tack_tools::create_coding_tools(&services);
         tools.push(Arc::new(
             crate::session_search_tool::SessionSearchTool::new(agent_dir.clone()),
@@ -514,10 +514,14 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
         // MCP servers from mcp.json (global + project) + extension bundles.
         // Connections are held for the whole run — dropping them kills the
         // server processes.
-        let mut specs = crate::mcp_config::configured_servers(&options.cwd, &agent_dir);
-        specs.extend(extensions.bundle_mcp_servers.iter().cloned());
-        let connections = if specs.is_empty() {
+        let mut specs = if flags.no_mcp {
             Vec::new()
+        } else {
+            crate::mcp_config::configured_servers(&options.cwd, &agent_dir)
+        };
+        specs.extend(extensions.bundle_mcp_servers.iter().cloned());
+        let manager = if specs.is_empty() {
+            None
         } else {
             let callbacks = crate::mcp_config::client_callbacks(
                 &settings,
@@ -526,8 +530,26 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
                 crate::mcp_elicitation::InteractionMode::Headless,
                 None,
             );
-            crate::mcp_oauth::connect_all_oauth(specs, &agent_dir, false, callbacks).await
+            let manager = crate::mcp_startup::McpStartupManager::start(
+                specs,
+                &agent_dir,
+                false,
+                callbacks,
+                tokio_util::sync::CancellationToken::new(),
+                Some(services.untrusted_seen.clone()),
+            );
+            manager
+                .wait_direct(
+                    crate::mcp_startup::DEFAULT_STARTUP_WAIT,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            Some(manager)
         };
+        let connections = manager
+            .as_ref()
+            .map(crate::mcp_startup::McpStartupManager::ready_connections)
+            .unwrap_or_default();
         tools.extend(tack_tools::mcp::mcp_tools_with(
             &connections,
             Some(services.untrusted_seen.clone()),
@@ -541,11 +563,24 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
         // unaffected) + optional powershell tool opt-in.
         let filtered =
             crate::cli_flags::apply_default_tools(filtered, &settings.default_tools, &services);
-        (filtered, connections)
+        let filtered = crate::cli_flags::apply_cli_tool_modifiers(filtered, flags, &services);
+        (filtered, connections, manager)
     };
-    // Client-side tool search: defer MCP tools beyond the threshold.
-    let (mut tools, mut tool_pool) =
-        crate::cli_flags::split_for_tool_search(tools, settings.mcp_defer_threshold);
+    // Client-side tool search: defer MCP tools beyond the threshold. A live
+    // source lets tool_search await deferred servers on demand.
+    let deferred_source: Option<Arc<dyn tack_tools::tool_search::DeferredPoolSource>> =
+        _mcp_manager
+            .as_ref()
+            .filter(|manager| manager.has_deferred_servers())
+            .map(|manager| {
+                Arc::new(manager.clone()) as Arc<dyn tack_tools::tool_search::DeferredPoolSource>
+            });
+    let ((mut tools, mut tool_pool), dynamic_tool_pool) =
+        crate::cli_flags::split_for_tool_search_dynamic(
+            tools,
+            settings.mcp_defer_threshold,
+            deferred_source,
+        );
     let selected_tools: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
 
     let mut system_prompt = assemble_system_prompt(
@@ -557,7 +592,13 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
         flags,
     );
     // Deferred MCP servers must be discoverable (see deferred_mcp_prompt_section).
-    system_prompt.push_str(&crate::cli_flags::deferred_mcp_prompt_section(&tool_pool));
+    system_prompt.push_str(&crate::cli_flags::deferred_mcp_prompt_section_with_servers(
+        &tool_pool,
+        &_mcp_manager
+            .as_ref()
+            .map(crate::mcp_startup::McpStartupManager::deferred_server_names)
+            .unwrap_or_default(),
+    ));
 
     let existing = session.build_session_context().messages;
     // Transcript-declared tool state (upstream #9548): re-activate pool
@@ -667,6 +708,7 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
             &agent_dir,
         ),
         tool_pool,
+        dynamic_tool_pool,
         retry_cancel: None,
     };
     let context = AgentContext {
@@ -976,12 +1018,8 @@ pub async fn run_compact(cwd: PathBuf) -> Result<i32> {
     }
 
     // Materialize the retained tail as a self-contained checkpoint.
-    let kept_entries = &path[path
-        .iter()
-        .position(|e| e.id() == result.first_kept_entry_id)
-        .unwrap_or(path.len())..];
     let retained_tail: Vec<AgentMessage> =
-        tack_session::retained_tail_from_kept_entries(kept_entries);
+        tack_session::retained_tail_from_path_entries(&path, &result.first_kept_entry_id);
 
     session.append_compaction(
         &result.summary,

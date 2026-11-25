@@ -45,11 +45,24 @@ impl crate::provider::Provider for GoogleGenerativeAiProvider {
 
 fn gemini_major_version(model_id: &str) -> Option<u32> {
     let id = model_id.to_lowercase();
-    let rest = id
-        .strip_prefix("gemini-")
-        .or_else(|| id.strip_prefix("gemini-live-"))?;
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
+    // Hosts may prefix catalog ids (for example randomprefix-gemini-4-argon).
+    // Match the same unanchored gemini(?:-live)?-(\d+) form as TS.
+    for (index, _) in id.match_indices("gemini") {
+        let candidate = &id[index..];
+        let rest = candidate
+            .strip_prefix("gemini-live-")
+            .or_else(|| candidate.strip_prefix("gemini-"));
+        let Some(rest) = rest else {
+            continue;
+        };
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(major) = digits.parse()
+            && !digits.is_empty()
+        {
+            return Some(major);
+        }
+    }
+    None
 }
 
 fn requires_tool_call_id(model_id: &str) -> bool {
@@ -337,6 +350,13 @@ fn is_gemma4(model_id: &str) -> bool {
     model_id.to_lowercase().contains("gemma-4") || model_id.to_lowercase().contains("gemma4")
 }
 
+fn uses_google_thinking_level(model_id: &str) -> bool {
+    is_gemini3_pro(model_id)
+        || is_gemini3_flash(model_id)
+        || gemini_major_version(model_id).is_some_and(|major| major >= 4)
+        || is_gemma4(model_id)
+}
+
 fn thinking_level_for(model: &Model, level: ThinkingLevel) -> &'static str {
     let mapped = model.thinking_level_value(level).cloned().flatten();
     let resolved = mapped.unwrap_or_else(|| level.clamped().as_str().to_string());
@@ -421,10 +441,7 @@ pub(crate) fn build_params(model: &Model, context: &Context, options: &StreamOpt
         match options.reasoning {
             Some(level) => {
                 let mut thinking = json!({ "includeThoughts": true });
-                if is_gemini3_pro(model.id.as_str())
-                    || is_gemini3_flash(model.id.as_str())
-                    || is_gemma4(model.id.as_str())
-                {
+                if uses_google_thinking_level(model.id.as_str()) {
                     thinking["thinkingLevel"] = json!(thinking_level_for(model, level));
                 } else {
                     thinking["thinkingBudget"] =
@@ -437,7 +454,7 @@ pub(crate) fn build_params(model: &Model, context: &Context, options: &StreamOpt
                 // without includeThoughts. Gemini 2.x: budget 0.
                 let level = if is_gemini3_pro(model.id.as_str()) {
                     Some("LOW")
-                } else if is_gemini3_flash(model.id.as_str()) || is_gemma4(model.id.as_str()) {
+                } else if uses_google_thinking_level(model.id.as_str()) {
                     Some("MINIMAL")
                 } else {
                     None
@@ -909,6 +926,48 @@ mod tests {
         assert_eq!(t_model("tunedModels/x"), "tunedModels/x");
     }
 
+    #[test]
+    fn gemini_major_version_is_unanchored() {
+        assert_eq!(gemini_major_version("gemini-3.8-flash"), Some(3));
+        assert_eq!(gemini_major_version("randomprefix-gemini-4-argon"), Some(4));
+        assert_eq!(
+            gemini_major_version("vendor/GEMINI-LIVE-10-preview"),
+            Some(10)
+        );
+        assert_eq!(gemini_major_version("randomprefix-gemini-pro"), None);
+        assert_eq!(gemini_major_version("not-gemini"), None);
+    }
+
+    #[test]
+    fn gemini4_uses_thinking_level_instead_of_budget() {
+        let mut model = model("randomprefix-gemini-4-argon");
+        model.reasoning = true;
+        let context = Context {
+            messages: vec![Message::user("Hello")],
+            ..Default::default()
+        };
+        let params = build_params(
+            &model,
+            &context,
+            &StreamOptions {
+                reasoning: Some(ThinkingLevel::Medium),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            params["thinkingConfig"],
+            json!({ "includeThoughts": true, "thinkingLevel": "MEDIUM" })
+        );
+        assert!(params["thinkingConfig"].get("thinkingBudget").is_none());
+
+        let disabled = build_params(&model, &context, &StreamOptions::default());
+        assert_eq!(
+            disabled["thinkingConfig"],
+            json!({ "thinkingLevel": "MINIMAL" })
+        );
+        assert!(disabled["thinkingConfig"].get("thinkingBudget").is_none());
+    }
+
     /// Regression: the output/error payload must be nested under a `response`
     /// key inside functionResponse (TS google-shared convertMessages), not
     /// flat alongside `name`.
@@ -956,6 +1015,17 @@ mod tests {
             parts[0]["functionResponse"]["response"],
             json!({ "output": "one" })
         );
+    }
+
+    #[test]
+    fn prefixed_gemini4_tool_results_carry_ids() {
+        let context = Context {
+            messages: vec![tool_result("call:4", "read", "done", false)],
+            ..Default::default()
+        };
+        let contents = convert_messages(&model("randomprefix-gemini-4-argon"), &context);
+        let response = &contents[0]["parts"][0]["functionResponse"];
+        assert_eq!(response["id"], "call:4");
     }
 
     #[test]

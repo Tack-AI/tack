@@ -34,7 +34,7 @@ flowchart TB
         MSG[unified message model<br/>types / transform]
         ADAPTERS[API adapters<br/>Anthropic / OpenAI Completions /<br/>OpenAI Responses / Azure / Codex /<br/>Google / Vertex / Mistral / Bedrock / tack-messages]
         OAUTH[oauth<br/>PKCE / device flow<br/>AuthResolver proactive refresh]
-        REG[providers registry<br/>40 providers / 1130-model catalog]
+        REG[providers registry<br/>40 providers / 1179-model catalog]
     end
 
     subgraph Infra["Infrastructure layer"]

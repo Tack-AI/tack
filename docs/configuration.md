@@ -247,7 +247,7 @@ attempt *with a warning* instead of presenting it as an answer. Configure `brave
 | `showCacheMissNotices` | bool | `false` | Prompt-cache miss notifications |
 | `cacheRetention` | `"short"` \| `"long"` \| `"off"` | `"short"` | Prompt cache retention: `short`=5-minute writes (provider default; Kimi Messages sends an explicit `ttl:"5m"`); `long`=1-hour writes (24h for OpenAI, higher write fees; Kimi/Anthropic protocols send `ttl:"1h"`, Moonshot OpenAI protocol sends `prompt_cache_options`); `off`=no cache markers sent (read-only where supported). When unset, falls back to the `TACK_CACHE_RETENTION` env var (`long` takes effect), then to `short`. Note: Kimi's cache TTL locks in after the first write; switching mid-flight takes effect only after old entries expire |
 | `enableSkillCommands` | bool | `true` | `/skill:<name>` completion |
-| `defaultTools` | string[] | `[]` (all) | Built-in tool allowlist (intersected with features.*). The optional `powershell` tool (Windows) is off by default and registered only when explicitly listed here — e.g. `["read", "powershell", "edit", "write"]` replaces bash, or list both. Prefers `pwsh.exe`, falls back to `powershell.exe`, launched with `-NoProfile -NonInteractive -ExecutionPolicy Bypass`; registering it on non-Windows platforms errors at execution. Permission rules are written `PowerShell(...)` with the same wildcard semantics as `Bash(...)` |
+| `defaultTools` | string[] | `[]` (all) | Built-in tool allowlist (intersected with features.*), or a pure `+name`/`-name` modifier list that amends the inherited selection across settings layers. The optional `powershell` tool (Windows) is off by default and registered only when explicitly listed here — e.g. `["read", "powershell", "edit", "write"]` replaces bash, `["+powershell"]` adds it, and `["-bash"]` removes it. Prefers `pwsh.exe`, falls back to `powershell.exe`, launched with `-NoProfile -NonInteractive -ExecutionPolicy Bypass`; registering it on non-Windows platforms errors at execution. Permission rules are written `PowerShell(...)` with the same wildcard semantics as `Bash(...)` |
 | `updateRepo` | string | `"Tack-AI/tack"` | Self-update GitHub repo |
 | `updateCheck` | bool | `true` | Background new-version check at TUI startup (result cached in `update-check.json`, 24h TTL); update hints appear in the footer and chat area. Skipped under `--offline`/`TACK_OFFLINE`; checks only, never installs |
 | `notifications` | bool | `true` | Desktop notifications (OSC 9 / OSC 777 escape): permission popups, agent run completion/errors, background task completion (5s throttle per event source). Silently inert if the terminal doesn't support them |
@@ -332,6 +332,14 @@ read-only MCP tool skips prompts like the built-in read tools (a
 contradictory `destructiveHint` wins) — and are passed to approval-chain
 plugins as evidence.
 
+Startup is layered too: all enabled servers begin connecting in the
+background, but the first prompt waits (bounded at 10 seconds) only for
+servers configured with direct tools. Deferred servers are awaited by
+`tool_search` when their capabilities are needed; newly connected tools
+join the live deferred pool, and reconnecting rebuilds the same proxies.
+The prompt section names deferred servers even while they are still
+connecting. This behavior is shared by TUI, print, RPC, and ACP modes.
+
 settings.json also has `mcpDeferThreshold` (number, default 0=off): when the
 total tool count exceeds the threshold, MCP tools are lazily loaded and the
 agent activates them on demand via `tool_search` (see the features doc).
@@ -383,7 +391,7 @@ Main command (`tack [flags] [prompt | @file …]`):
 | `--agent-dir <DIR>` | Override the agent directory (settings, credentials, providers, and sessions); takes precedence over `TACK_AGENT_DIR` |
 | `-c, --continue` / `-r, --resume` / `--session / --session-id / --fork` / `--name` / `--no-session` / `--session-dir` | Session control |
 | `--models a,b,c` | ctrl+p cycling scope |
-| `-t, --tools` / `--exclude-tools` / `--no-tools` / `--no-builtin-tools` | Tool filtering (intersected with features.*) |
+| `-t, --tools` / `--exclude-tools` / `--no-tools` / `--no-builtin-tools` / `--no-mcp` | Tool filtering (intersected with features.*). `--tools` and `--exclude-tools` accept `*` patterns. A pure `+name`/`-name` `--tools` list modifies the effective set instead of replacing it (mixing forms or using `*` in modifiers is rejected). A non-MCP allowlist preserves unnamed MCP tools as search-only rather than clearing them; `--exclude-tools` applies to every tool, and `--no-mcp` disables configured MCP servers for the run |
 | `--no-skills` / `--no-context-files` / `--no-prompt-templates` / `--no-themes` | Resource switches |
 | `--skill <dir>` / `--add-dir <dir>` | Extra skills directory / extra working directory (repeatable) |
 | `--mode text\|json\|rpc` | Output mode |

@@ -69,6 +69,15 @@ Rust workspace 的各个 crate **不发布到 crates.io**，也不提供 semver
   保留记录（未知消息角色、缺失字段）—— 会被保留为 v4 *custom* 条目，
   而不是被拒绝或中止 —— 这是 Tack 的"不丢数据"原则
   （`crates/tack-session/src/v4/migrate.rs`）。
+- 上游 v3 的 `context_edit` 条目会被显式解码。它们是分支相对的只增投影：
+  当前分支上最新的一次编辑可以隐藏较早的 user/assistant/tool-result/custom
+  消息，或只替换其内容；原始历史、角色、元数据、usage 和导出保持不变。
+  compaction、branch summary、token 估算及所有 agent 界面共用同一投影。
+  Tack 目前不会主动产生这些条目，但会正确执行导入条目。迁移到 v4 时，
+  它们保留为载荷兼容的 `custom` 条目并重映射 `targetId`；重建的
+  compaction checkpoint 还会在实现自定义的
+  `details.tackRetainedTailSourceIds` 中记录每条消息的源条目 id，
+  因此 compaction 之后的编辑仍能作用于已经物化的保留尾部。
 - assistant 的 `toolCall` 内容块可以携带可选的 `argumentsError` 字符串，
   表示 provider 的最终参数不是合法 JSON object。该字段记录解析原因和原始文本，
   此时 `arguments` 为 `{}`。它是旧版与 v4 消息载荷中的只增、上游兼容字段：

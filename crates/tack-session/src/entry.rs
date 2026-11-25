@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tack_agent_core::AgentMessage;
-use tack_ai::Usage;
+use tack_ai::{ContentBlock, InputContentBlock, Usage};
 
 pub const CURRENT_SESSION_VERSION: u32 = 3;
 
@@ -33,6 +33,24 @@ impl SessionHeader {
             parent_session,
         }
     }
+}
+
+/// Content that a context edit may substitute for a target message's content.
+/// The array forms intentionally accept both input blocks (user/tool result)
+/// and assistant blocks; projection rejects combinations that are invalid for
+/// the target role instead of manufacturing an invalid provider message.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum ContextEditContent {
+    Text(String),
+    InputBlocks(Vec<InputContentBlock>),
+    AssistantBlocks(Vec<ContentBlock>),
+}
+
+/// Non-null `replacement` payload of a `context_edit` entry.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ContextEditReplacement {
+    pub content: ContextEditContent,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -154,6 +172,18 @@ pub enum SessionEntry {
         #[serde(skip_serializing_if = "Option::is_none")]
         details: Option<Value>,
     },
+    #[serde(rename = "context_edit")]
+    ContextEdit {
+        #[serde(default)]
+        id: String,
+        #[serde(rename = "parentId")]
+        parent_id: Option<String>,
+        timestamp: String,
+        #[serde(rename = "targetId")]
+        target_id: String,
+        /// `None` (JSON null) omits the target from future model context.
+        replacement: Option<ContextEditReplacement>,
+    },
     #[serde(rename = "label")]
     Label {
         #[serde(default)]
@@ -188,6 +218,7 @@ impl SessionEntry {
             | SessionEntry::BranchSummary { id, .. }
             | SessionEntry::Custom { id, .. }
             | SessionEntry::CustomMessage { id, .. }
+            | SessionEntry::ContextEdit { id, .. }
             | SessionEntry::Label { id, .. }
             | SessionEntry::SessionInfo { id, .. } => id,
         }
@@ -202,6 +233,7 @@ impl SessionEntry {
             | SessionEntry::BranchSummary { parent_id, .. }
             | SessionEntry::Custom { parent_id, .. }
             | SessionEntry::CustomMessage { parent_id, .. }
+            | SessionEntry::ContextEdit { parent_id, .. }
             | SessionEntry::Label { parent_id, .. }
             | SessionEntry::SessionInfo { parent_id, .. } => parent_id.as_deref(),
         }
@@ -216,6 +248,7 @@ impl SessionEntry {
             | SessionEntry::BranchSummary { id, .. }
             | SessionEntry::Custom { id, .. }
             | SessionEntry::CustomMessage { id, .. }
+            | SessionEntry::ContextEdit { id, .. }
             | SessionEntry::Label { id, .. }
             | SessionEntry::SessionInfo { id, .. } => *id = new_id,
         }
@@ -230,6 +263,7 @@ impl SessionEntry {
             | SessionEntry::BranchSummary { parent_id, .. }
             | SessionEntry::Custom { parent_id, .. }
             | SessionEntry::CustomMessage { parent_id, .. }
+            | SessionEntry::ContextEdit { parent_id, .. }
             | SessionEntry::Label { parent_id, .. }
             | SessionEntry::SessionInfo { parent_id, .. } => *parent_id = new_parent,
         }
@@ -244,6 +278,7 @@ impl SessionEntry {
             | SessionEntry::BranchSummary { timestamp, .. }
             | SessionEntry::Custom { timestamp, .. }
             | SessionEntry::CustomMessage { timestamp, .. }
+            | SessionEntry::ContextEdit { timestamp, .. }
             | SessionEntry::Label { timestamp, .. }
             | SessionEntry::SessionInfo { timestamp, .. } => timestamp,
         }
@@ -258,6 +293,7 @@ impl SessionEntry {
             SessionEntry::BranchSummary { .. } => "branch_summary",
             SessionEntry::Custom { .. } => "custom",
             SessionEntry::CustomMessage { .. } => "custom_message",
+            SessionEntry::ContextEdit { .. } => "context_edit",
             SessionEntry::Label { .. } => "label",
             SessionEntry::SessionInfo { .. } => "session_info",
         }

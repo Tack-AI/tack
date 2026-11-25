@@ -925,7 +925,7 @@ async fn connect_cancellable(
     }
 }
 
-async fn connect_one_oauth(
+pub(crate) async fn connect_one_oauth(
     spec: &tack_tools::mcp::McpServerSpec,
     agent_dir: &Path,
     interactive: bool,

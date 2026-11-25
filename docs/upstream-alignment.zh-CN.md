@@ -216,6 +216,18 @@ scripts/upstream-delta.sh`，失败于 `无法解析基线 commit（得到 ''）
 | --- | --- |
 | `f715a15c1` | `ToolCallArgumentsStream` 每个工具参数 delta 只消费一次，同时保留未修复原文供既有严格 final 解析。owned snapshot 以拷贝预算约束深拷贝工作量，EOF/错误收尾则强制刷新，避免尾部 delta 滞留。Anthropic、Bedrock、Mistral、OpenAI Completions/Responses、tack-messages、CodeBuddy 均接入该路径；Responses 的权威替换在非前缀时重置全部状态，延续时只发缺失后缀；grammar/custom 工具保留非 JSON 原文。测试覆盖完整文档与逐前缀差分、chunk/转义/Unicode 边界、并行调用、替换/重置、畸形 final 拒绝与尾部预览。新增 criterion bench 对比旧的累计前缀重解析与增量解析，既有 fuzz target 同时覆盖任意 UTF-8 分割点和严格 finish。 |
 
+### 第六批上下文投影、MCP 启动与 provider 迁移落地（未发布）
+
+存储兼容、启动延迟和当前 provider 批次已实现，并配有离线 fixture 与 mock
+provider 请求。context edit 目前只实现读取/投影：Tack 尚不会主动写入
+`context_edit`，也尚未拆分扩展的 `context` 与 `context_with_system` 事件。
+
+| 上游 commit / 来源 | Tack 落地 |
+| --- | --- |
+| `466db0fec` + `d0fe21308` | `context_edit` 在 v3 中是类型化条目，在 v4 中是载荷兼容的 custom 条目。分支内最新的 omit/replace 投影不改原始历史与消息元数据，并兼容导入的 assistant/toolResult 字符串替换。compaction 切点、投影 token 估算、branch summary 及所有 prompt 界面共用该投影。v3→v4 迁移会重映射 target id，并在 `details.tackRetainedTailSourceIds` 中记录重建尾部的源条目 id，因此 compaction 后的编辑仍然有效。测试覆盖 latest-wins、分支相对性、数组型 role、旧 usage 失效、compaction/summary 输入和 checkpoint 迁移。 |
+| `e029c3ed0` + `30a1d1849` + `ddaa0a034` + `04b97ef00` | 所有 enabled MCP server 都在后台连接；只有 direct server 会阻塞首个 prompt（最多 10 秒），`tool_search` 则按需等待 deferred server 并把工具合并进实时池，TUI/print/RPC/ACP 共用该路径。重连会重建代理。`--tools`/`--exclude-tools` 支持 `*` 通配，纯 `+name`/`-name` 修饰符适用于 CLI 和分层 `defaultTools`，非 MCP allowlist 会把未命名 MCP 工具保留为仅搜索可达，`--no-mcp` 禁用配置的 server。覆盖动态池激活、direct 有界等待、CLI 过滤、ACP/RPC 冒烟和 agent-loop 激活路径。 |
+| `a37306d43` + `a3f265b1c` + `139707002` + `3e4f87265` + `1692bba63` + `fe8a6f5dc` + `86918f9ee` | Azure provider 同时覆盖 Responses 与 Foundry Completions，共享端点规范化、部署名载荷映射及旧会话回放兼容。Kimi Coding 改为 `/coding/v1` 的 OpenAI Completions；四个 Qwen 套餐使用新网关与套餐优先的凭据回退；Gemini 4+/带前缀 id 使用 `thinkingLevel`；Copilot reasoning usage 接受顶层 `reasoning_tokens`。内嵌的 1179 模型目录已更新 Azure/Kimi/Qwen/Copilot 切片。由于本地上游 clone 没有物化生成后的 provider-data 文件，离线无法做全量生成式目录刷新；其他 provider 快照保持不变。 |
+
 ## 2026-09-21 对齐批次（基线 4a6ed0194 → 10d1ad621）
 
 160 个上游 commit 经逐条审阅（报告由 `scripts/upstream-delta.sh` 生成）。

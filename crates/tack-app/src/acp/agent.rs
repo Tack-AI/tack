@@ -45,6 +45,7 @@ pub struct TackAcpAgent {
     auth: Arc<dyn tack_ai::oauth::AuthResolver>,
     thinking: Option<tack_ai::ThinkingLevel>,
     settings: Settings,
+    no_mcp: bool,
 }
 
 impl std::fmt::Debug for TackAcpAgent {
@@ -63,6 +64,7 @@ pub struct AcpOverrides {
     pub model: Option<String>,
     pub api_key: Option<String>,
     pub thinking: Option<tack_ai::ThinkingLevel>,
+    pub no_mcp: bool,
 }
 
 impl TackAcpAgent {
@@ -122,14 +124,10 @@ impl TackAcpAgent {
             .flatten();
         let thinking = overrides.thinking.or(env_thinking);
 
-        Ok(Self::with_dependencies(
-            shared_conn,
-            model,
-            provider,
-            auth,
-            settings,
-            thinking,
-        ))
+        let mut agent =
+            Self::with_dependencies(shared_conn, model, provider, auth, settings, thinking);
+        agent.no_mcp = overrides.no_mcp;
+        Ok(agent)
     }
 
     /// Handle to the live sessions map, for connection-end teardown in
@@ -172,6 +170,7 @@ impl TackAcpAgent {
             auth,
             thinking,
             settings,
+            no_mcp: false,
         }
     }
 
@@ -382,12 +381,11 @@ impl TackAcpAgent {
                 .await;
                 match result {
                     Ok(result) => {
-                        let kept = &path[path
-                            .iter()
-                            .position(|e| e.id() == result.first_kept_entry_id)
-                            .unwrap_or(path.len())..];
                         let retained_tail: Vec<AgentMessage> =
-                            tack_session::retained_tail_from_kept_entries(kept);
+                            tack_session::retained_tail_from_path_entries(
+                                &path,
+                                &result.first_kept_entry_id,
+                            );
                         let mut session = state.session.lock().await;
                         match session.append_compaction(
                             &result.summary,
@@ -719,20 +717,32 @@ impl Agent for TackAcpAgent {
 
         // MCP servers: config files (global + project) first, then the
         // client's session-scoped servers (name conflicts deduped, client wins).
-        let mut specs =
-            crate::mcp_config::configured_servers(&cwd, &tack_session::default_agent_dir());
+        let mut specs = if self.no_mcp {
+            Vec::new()
+        } else {
+            crate::mcp_config::configured_servers(&cwd, &tack_session::default_agent_dir())
+        };
         specs.extend(extensions.bundle_mcp_servers.iter().cloned());
         for spec in crate::mcp_config::specs_from_acp(&args.mcp_servers) {
             specs.retain(|s| s.name != spec.name);
             specs.push(spec);
         }
-        let connections = crate::mcp_oauth::connect_all_oauth(
-            specs,
-            &tack_session::default_agent_dir(),
-            false,
-            self.mcp_client_callbacks(&sampling_llm),
-        )
-        .await;
+        let manager = if specs.is_empty() {
+            None
+        } else {
+            Some(crate::mcp_startup::McpStartupManager::start(
+                specs,
+                &tack_session::default_agent_dir(),
+                false,
+                self.mcp_client_callbacks(&sampling_llm),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ))
+        };
+        let connections = manager
+            .as_ref()
+            .map(crate::mcp_startup::McpStartupManager::ready_connections)
+            .unwrap_or_default();
 
         let session = SessionManager::create(&cwd, None)
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
@@ -743,6 +753,7 @@ impl Agent for TackAcpAgent {
             self.shared_conn.clone(),
             SessionId::new(session_id.clone()),
             connections,
+            manager,
             self.model.clone(),
             self.thinking,
             extensions,
@@ -832,22 +843,35 @@ impl Agent for TackAcpAgent {
                     bridge_state,
                 )
                 .await;
-                let mut specs =
-                    crate::mcp_config::configured_servers(&cwd, &tack_session::default_agent_dir());
+                let mut specs = if self.no_mcp {
+                    Vec::new()
+                } else {
+                    crate::mcp_config::configured_servers(&cwd, &agent_dir)
+                };
                 specs.extend(extensions.bundle_mcp_servers.iter().cloned());
-                let connections = crate::mcp_oauth::connect_all_oauth(
-                    specs,
-                    &tack_session::default_agent_dir(),
-                    false,
-                    self.mcp_client_callbacks(&sampling_llm),
-                )
-                .await;
+                let manager = if specs.is_empty() {
+                    None
+                } else {
+                    Some(crate::mcp_startup::McpStartupManager::start(
+                        specs,
+                        &agent_dir,
+                        false,
+                        self.mcp_client_callbacks(&sampling_llm),
+                        tokio_util::sync::CancellationToken::new(),
+                        None,
+                    ))
+                };
+                let connections = manager
+                    .as_ref()
+                    .map(crate::mcp_startup::McpStartupManager::ready_connections)
+                    .unwrap_or_default();
 
                 let state = create_session_state(
                     session,
                     self.shared_conn.clone(),
                     SessionId::new(session_key.clone()),
                     connections,
+                    manager,
                     self.model.clone(),
                     self.thinking,
                     extensions,
@@ -919,7 +943,13 @@ impl Agent for TackAcpAgent {
             slot.clone()
         };
 
-        let system_prompt = {
+        if let Some(manager) = &state.mcp_startup {
+            manager
+                .wait_direct(crate::mcp_startup::DEFAULT_STARTUP_WAIT, cancel.clone())
+                .await;
+        }
+
+        let mut system_prompt = {
             let session = state.session.lock().await;
             let cwd = session.cwd().to_path_buf();
             drop(session);
@@ -965,7 +995,15 @@ impl Agent for TackAcpAgent {
                     tack_session::default_agent_dir(),
                 ),
             ));
-            tools.extend(state.mcp_tools.iter().cloned());
+            if let Some(manager) = &state.mcp_startup {
+                let connections = manager.ready_connections();
+                tools.extend(tack_tools::mcp::mcp_tools_with(
+                    &connections,
+                    Some(state.untrusted_seen.clone()),
+                ));
+            } else {
+                tools.extend(state.mcp_tools.iter().cloned());
+            }
             // tack-ext plugin tools (ext__<plugin>__<tool>); MCP-carrier
             // plugin output is untrusted and gets wrapped + flagged.
             tools.extend(
@@ -978,6 +1016,28 @@ impl Agent for TackAcpAgent {
             let tools = crate::cli_flags::filter_feature_tools(tools, &self.settings.features);
             (tools, session.build_session_context().messages)
         };
+
+        let deferred_source: Option<Arc<dyn tack_tools::tool_search::DeferredPoolSource>> = state
+            .mcp_startup
+            .as_ref()
+            .filter(|manager| manager.has_deferred_servers())
+            .map(|manager| {
+                Arc::new(manager.clone()) as Arc<dyn tack_tools::tool_search::DeferredPoolSource>
+            });
+        let ((tools, tool_pool), dynamic_tool_pool) =
+            crate::cli_flags::split_for_tool_search_dynamic(
+                tools,
+                self.settings.mcp_defer_threshold,
+                deferred_source,
+            );
+        system_prompt.push_str(&crate::cli_flags::deferred_mcp_prompt_section_with_servers(
+            &tool_pool,
+            &state
+                .mcp_startup
+                .as_ref()
+                .map(crate::mcp_startup::McpStartupManager::deferred_server_names)
+                .unwrap_or_default(),
+        ));
 
         // tack-ext: plugin hooks + provider-boundary event sink for this turn.
         let (ext_hooks, ext_sink, approval_chain) = {
@@ -1083,7 +1143,8 @@ impl Agent for TackAcpAgent {
                 &turn_model,
                 &tack_session::default_agent_dir(),
             ),
-            tool_pool: Vec::new(),
+            tool_pool,
+            dynamic_tool_pool,
             retry_cancel: None,
         };
 
@@ -1526,6 +1587,7 @@ mod tests {
                     shared_conn,
                     SessionId::new("s1"),
                     Vec::new(),
+                    None,
                     test_model(),
                     None,
                     crate::extension_host::ExtensionManager::default(),

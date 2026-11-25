@@ -513,6 +513,10 @@ mcp.json 的远程（HTTP）server 加 `"oauth": true` 或 `{"clientId": "…", 
 
 mcp.json 里的按服务器控制（pi 风格）更精细：`"exposure": "deferred"` 把单个服务器的工具放入延迟池（与阈值无关），`"hidden"` 使其不可达，`"direct"`（默认）照常声明；`toolExposure` 按工具覆盖（精确名或 `*` 通配；精确名优先，通配取最长者）。兼容 pi 的 `"codemode"`，映射为 `"deferred"`（tack 没有 codemode 工具）。延迟服务器会在系统提示的 "Deferred MCP tools" 段中列名，让模型知道可用 `tool_search` 触达；任一服务器配置 `exposure` 后阈值兜底规则失效。
 
+连接启动与 schema 暴露彼此独立：所有 enabled server 立即开始连接，但只有含 direct 工具的服务器会阻塞首个 prompt（最多 10 秒）。`tool_search` 在需要时等待 deferred server，并把新得到的工具合并进实时池；重连会重建代理，不会使会话工具集失效。schema 尚未可知时，deferred server 名称已出现在系统提示中。TUI、print、RPC、ACP 共用这条路径。
+
+工具选择也遵循同样的分层语义：`--tools` 与 `--exclude-tools` 支持 `*` 通配；纯 `--tools +name,-name` 列表修改有效集合而非替换它。如果 allowlist 没有指定任何 `mcp__` 工具，未命名 MCP 工具会以仅搜索可达的形式保留，而不是直接消失。`--no-mcp` 禁用本次运行配置的 MCP 服务器。
+
 ### Eval 回归评测
 
 ```

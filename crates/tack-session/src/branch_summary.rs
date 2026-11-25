@@ -15,7 +15,7 @@ use crate::compaction::{
     FileOperations, build_summarization_context, complete_summarization, compute_file_lists,
     estimate_tokens, extract_file_ops_from_message, format_file_operations, serialize_conversation,
 };
-use crate::context::session_entry_to_context_messages;
+use crate::context::project_context_entry;
 use crate::entry::SessionEntry;
 use crate::manager::SessionManager;
 
@@ -121,9 +121,10 @@ pub fn collect_entries_for_branch_summary(
 }
 
 /// Entry → messages for summarization (tool results skipped; tool-call
-/// context lives in the assistant message).
-fn messages_from_entry(entry: &SessionEntry) -> Vec<AgentMessage> {
-    session_entry_to_context_messages(entry)
+/// context lives in the assistant message). `edit` is the latest branch-local
+/// context edit targeting this entry.
+fn messages_from_entry(entry: &SessionEntry, edit: Option<&SessionEntry>) -> Vec<AgentMessage> {
+    project_context_entry(entry, edit)
         .into_iter()
         .filter(|m| !matches!(m, AgentMessage::ToolResult(_)))
         .collect()
@@ -161,13 +162,22 @@ fn prepare_branch_entries(
         }
     }
 
+    // Context edits hide or replace earlier entries in model context; the
+    // latest edit on the abandoned branch wins.
+    let mut edits: HashMap<String, &SessionEntry> = HashMap::new();
+    for entry in entries {
+        if let SessionEntry::ContextEdit { target_id, .. } = entry {
+            edits.insert(target_id.clone(), entry);
+        }
+    }
+
     // Entries are walked newest-first and the result must be chronological,
     // so messages are PUSHED in exact reverse output order (newest entry
     // first, each entry's messages newest-first) and the Vec is reversed
     // once at the end. (Was `insert(0, ...)` per message: O(n²) on long
     // branches because every insert shifts the whole Vec.)
     for entry in entries.iter().rev() {
-        let entry_messages = messages_from_entry(entry);
+        let entry_messages = messages_from_entry(entry, edits.get(entry.id()).copied());
         if entry_messages.is_empty() {
             continue;
         }
@@ -296,6 +306,46 @@ mod tests {
         let (entries, common) = collect_entries_for_branch_summary(&session, Some(&tip_a), &leaf_b);
         assert_eq!(common.as_deref(), Some(root.as_str()));
         assert_eq!(entries.len(), 2, "a1 and the new tip are abandoned");
+    }
+
+    #[test]
+    fn branch_summary_uses_context_edited_projection() {
+        let entries = vec![
+            SessionEntry::Message {
+                id: "replace".to_string(),
+                parent_id: None,
+                timestamp: "2026-01-01T00:00:00.000Z".to_string(),
+                message: AgentMessage::user("original"),
+            },
+            SessionEntry::ContextEdit {
+                id: "edit-1".to_string(),
+                parent_id: Some("replace".to_string()),
+                timestamp: "2026-01-01T00:00:01.000Z".to_string(),
+                target_id: "replace".to_string(),
+                replacement: Some(crate::ContextEditReplacement {
+                    content: crate::ContextEditContent::Text("edited".to_string()),
+                }),
+            },
+            SessionEntry::Message {
+                id: "omit".to_string(),
+                parent_id: Some("edit-1".to_string()),
+                timestamp: "2026-01-01T00:00:02.000Z".to_string(),
+                message: AgentMessage::user("hidden attempt"),
+            },
+            SessionEntry::ContextEdit {
+                id: "edit-2".to_string(),
+                parent_id: Some("omit".to_string()),
+                timestamp: "2026-01-01T00:00:03.000Z".to_string(),
+                target_id: "omit".to_string(),
+                replacement: None,
+            },
+        ];
+
+        let (messages, _) = prepare_branch_entries(&entries, 0);
+        let serialized = serde_json::to_string(&messages).unwrap();
+        assert!(serialized.contains("edited"), "{serialized}");
+        assert!(!serialized.contains("original"), "{serialized}");
+        assert!(!serialized.contains("hidden attempt"), "{serialized}");
     }
 
     #[test]

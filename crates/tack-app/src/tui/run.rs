@@ -860,7 +860,11 @@ impl TuiApp {
         // connections themselves are established INSIDE the spawned run
         // task (see below) — subprocess spawn + handshake + OAuth on a
         // slow server would otherwise freeze every prompt submission.
-        let mut specs = crate::mcp_config::configured_servers(&self.cwd, &self.agent_dir);
+        let mut specs = if self.flags.no_mcp {
+            Vec::new()
+        } else {
+            crate::mcp_config::configured_servers(&self.cwd, &self.agent_dir)
+        };
         specs.extend(self.extensions.bundle_mcp_servers.clone());
 
         // Plan mode: the exit_plan_mode tool + plan-mode prompt section
@@ -1057,8 +1061,8 @@ impl TuiApp {
             let work = async {
                 // MCP servers connect here, off the UI loop; the status
                 // spinner (working) stays visible meanwhile.
-                let connections = if specs.is_empty() {
-                    Vec::new()
+                let manager = if specs.is_empty() {
+                    None
                 } else {
                     let callbacks = crate::mcp_config::client_callbacks(
                         &settings,
@@ -1069,15 +1073,23 @@ impl TuiApp {
                             tx_work.clone(),
                         )),
                     );
-                    crate::mcp_oauth::connect_all_oauth_cancellable(
+                    let manager = crate::mcp_startup::McpStartupManager::start(
                         specs,
                         &agent_dir,
                         true,
                         callbacks,
                         cancel.clone(),
-                    )
-                    .await
+                        Some(services.untrusted_seen.clone()),
+                    );
+                    manager
+                        .wait_direct(crate::mcp_startup::DEFAULT_STARTUP_WAIT, cancel.clone())
+                        .await;
+                    Some(manager)
                 };
+                let connections = manager
+                    .as_ref()
+                    .map(crate::mcp_startup::McpStartupManager::ready_connections)
+                    .unwrap_or_default();
                 tools.extend(tack_tools::mcp::mcp_tools_with(
                     &connections,
                     Some(services.untrusted_seen.clone()),
@@ -1092,11 +1104,24 @@ impl TuiApp {
                     &settings.default_tools,
                     &services,
                 );
+                let tools = crate::cli_flags::apply_cli_tool_modifiers(tools, &flags, &services);
 
                 // Client-side tool search: MCP tools beyond mcpDeferThreshold
-                // defer to a pool; tool_search activates them on demand.
-                let (tools, mut tool_pool) =
-                    crate::cli_flags::split_for_tool_search(tools, settings.mcp_defer_threshold);
+                // defer to a pool; tool_search awaits deferred connections on demand.
+                let deferred_source: Option<Arc<dyn tack_tools::tool_search::DeferredPoolSource>> =
+                    manager
+                        .as_ref()
+                        .filter(|manager| manager.has_deferred_servers())
+                        .map(|manager| {
+                            Arc::new(manager.clone())
+                                as Arc<dyn tack_tools::tool_search::DeferredPoolSource>
+                        });
+                let ((tools, mut tool_pool), dynamic_tool_pool) =
+                    crate::cli_flags::split_for_tool_search_dynamic(
+                        tools,
+                        settings.mcp_defer_threshold,
+                        deferred_source,
+                    );
                 // Plan mode: the exit_plan_mode tool + plan-mode prompt section.
                 let mut tools = if in_plan_mode {
                     let mut tools = tools;
@@ -1126,7 +1151,15 @@ impl TuiApp {
                 );
                 // Deferred MCP servers must be discoverable: name them and
                 // point at tool_search (pi's mcp_servers prompt section).
-                system_prompt.push_str(&crate::cli_flags::deferred_mcp_prompt_section(&tool_pool));
+                system_prompt.push_str(
+                    &crate::cli_flags::deferred_mcp_prompt_section_with_servers(
+                        &tool_pool,
+                        &manager
+                            .as_ref()
+                            .map(crate::mcp_startup::McpStartupManager::deferred_server_names)
+                            .unwrap_or_default(),
+                    ),
+                );
                 if in_plan_mode {
                     system_prompt.push_str(plan_mode::PLAN_MODE_PROMPT);
                 }
@@ -1164,6 +1197,7 @@ impl TuiApp {
                     cache_retention: settings.cache_retention_mode(),
                     fallback_models,
                     tool_pool,
+                    dynamic_tool_pool,
                     retry_cancel: None,
                 };
                 let context = AgentContext {

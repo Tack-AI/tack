@@ -158,10 +158,23 @@ pub fn get_credential(agent_dir: &Path, provider: &str) -> Option<Value> {
 }
 
 fn get_credential_with_service(agent_dir: &Path, provider: &str, service: &str) -> Option<Value> {
-    let entry = read_store(agent_dir).get(provider).cloned()?;
+    let store = read_store(agent_dir);
+    // Azure's registry rename must not strand existing auth.json/keyring
+    // entries. New `azure` entries win; the pre-Completions id is a fallback.
+    let (entry, stored_provider) = match store.get(provider) {
+        Some(entry) => (Some(entry.clone()), provider),
+        None if provider == "azure" => (
+            store
+                .get(tack_ai::providers::LEGACY_AZURE_PROVIDER_ID)
+                .cloned(),
+            tack_ai::providers::LEGACY_AZURE_PROVIDER_ID,
+        ),
+        None => (None, provider),
+    };
+    let entry = entry?;
     // Placeholder → resolve from the keyring.
     if entry.get("type").and_then(Value::as_str) == Some("keyring") {
-        return keyring_read(service, provider);
+        return keyring_read(service, stored_provider);
     }
     Some(entry)
 }

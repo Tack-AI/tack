@@ -70,7 +70,7 @@ pub(crate) async fn spawn_prompt(
         )
     };
     let shell_config;
-    let (tools, untrusted_seen) = {
+    let (tools, untrusted_seen, mcp_startup) = {
         let checkpoints = tack_tools::checkpoint::CheckpointManager::new();
         if settings.features.checkpoints {
             checkpoints.enable(agent_dir.join("checkpoints").join(&session_id));
@@ -164,7 +164,7 @@ pub(crate) async fn spawn_prompt(
             model: model.clone(),
             auth: auth.clone(),
         });
-        let connections = super::mcp::ensure_mcp_pool(
+        let mcp_pool = super::mcp::ensure_mcp_pool(
             state,
             settings,
             &sampling_llm,
@@ -172,9 +172,11 @@ pub(crate) async fn spawn_prompt(
             &cwd,
             &agent_dir,
             ext_mcp_servers,
+            Some(services.untrusted_seen.clone()),
         )
-        .await
-        .connections;
+        .await;
+        let connections = mcp_pool.connections;
+        let mcp_startup = mcp_pool.startup;
         // Tool SNAPSHOTS are rebuilt every prompt (cheap; they borrow the
         // reused connections) so tool-list/config changes take effect.
         tools.extend(tack_tools::mcp::mcp_tools_with(
@@ -194,10 +196,20 @@ pub(crate) async fn spawn_prompt(
         (
             crate::cli_flags::filter_feature_tools(tools, &settings.features),
             untrusted_seen,
+            mcp_startup,
         )
     };
-    let (tools, tool_pool) =
-        crate::cli_flags::split_for_tool_search(tools, settings.mcp_defer_threshold);
+    let deferred_source: Option<Arc<dyn tack_tools::tool_search::DeferredPoolSource>> = mcp_startup
+        .as_ref()
+        .filter(|manager| manager.has_deferred_servers())
+        .map(|manager| {
+            Arc::new(manager.clone()) as Arc<dyn tack_tools::tool_search::DeferredPoolSource>
+        });
+    let ((tools, tool_pool), dynamic_tool_pool) = crate::cli_flags::split_for_tool_search_dynamic(
+        tools,
+        settings.mcp_defer_threshold,
+        deferred_source,
+    );
     let selected_tools: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
 
     // settings.json hooks + extension bundle hooks + host session hooks
@@ -293,7 +305,13 @@ pub(crate) async fn spawn_prompt(
         &crate::cli_flags::CliFlags::default(),
     );
     // Deferred MCP servers must be discoverable (see deferred_mcp_prompt_section).
-    system_prompt.push_str(&crate::cli_flags::deferred_mcp_prompt_section(&tool_pool));
+    system_prompt.push_str(&crate::cli_flags::deferred_mcp_prompt_section_with_servers(
+        &tool_pool,
+        &mcp_startup
+            .as_ref()
+            .map(crate::mcp_startup::McpStartupManager::deferred_server_names)
+            .unwrap_or_default(),
+    ));
     {
         let st = state.lock().await;
         if let Some(context) = &st.session_hook_context
@@ -467,6 +485,7 @@ pub(crate) async fn spawn_prompt(
         session_id: Some(session_id),
         cache_retention: settings.cache_retention_mode(),
         tool_pool,
+        dynamic_tool_pool,
         retry_cancel: Some(retry_cancel),
     };
     let context = AgentContext {

@@ -78,6 +78,34 @@ For `openai-completions` models, these compatibility overrides are available:
 | `requiresNonNullAssistantContent` | `false` | Send `""` instead of `null` for replayed assistant messages with no text, such as tool-call-only messages. Enable for proxies that reject null assistant content. |
 | `requiresToolsWithToolHistory` | `false` | Send `"tools": []` when tools are disabled but history contains tool calls/results. Only enable for older proxies (for example, older LiteLLM in front of Anthropic) that require the field; vLLM and other servers reject an empty array. |
 
+## Current catalog/provider migrations
+
+- **Azure** uses provider id `azure` for both Responses and Foundry Chat
+  Completions models. `azure-openai-responses` remains the Responses **API**
+  id and is still accepted when replaying older sessions; new
+  `auth.json`/`models.json` entries should use `azure`, while the legacy
+  provider id and its stored credentials remain compatible aliases. Endpoint resolution
+  honors `AZURE_OPENAI_BASE_URL`, `AZURE_OPENAI_RESOURCE_NAME`, and
+  `AZURE_OPENAI_API_VERSION`, normalizing Azure hosts to `/openai/v1`.
+  `AZURE_OPENAI_DEPLOYMENT_NAME_MAP=model=deployment,...` changes only the
+  request payload's deployment name, not the catalog model id.
+- **Kimi Coding** now uses OpenAI Completions at
+  `https://api.kimi.com/coding/v1` (device-flow OAuth is unchanged). Custom
+  `models.json` entries must use `openai-completions` and include `/v1` in
+  `baseUrl`; K3 reasoning-content replay and prompt-cache behavior follow
+  the embedded model metadata.
+- **Qwen Token Plan** has Team, Team CN, Individual, and Individual CN
+  providers. Team/Individual use
+  `https://token-plan.maas.qwencloudapi.com/compatible-mode/v1`; CN uses
+  `https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1`. Per-plan
+  keys take priority over shared regional keys:
+  `QWEN_TOKEN_PLAN_TEAM[_CN]_API_KEY` and
+  `QWEN_TOKEN_PLAN_INDIVIDUAL[_CN]_API_KEY` before
+  `QWEN_TOKEN_PLAN[_CN]_API_KEY`.
+- **Gemini** version detection also works for prefixed ids; Gemini 4+
+  sends `thinkingLevel` instead of `thinkingBudget`. Copilot usage accepts
+  top-level `usage.reasoning_tokens` as well as nested completion details.
+
 ## Amazon Bedrock (`bedrock-converse-stream`)
 
 Implemented without the AWS SDK:
@@ -146,7 +174,7 @@ overridable per model in models.json. No login or API key needed.
 
 ## Model catalog
 
-The embedded catalog (build-time snapshot, 1130 models) is converted from
+The embedded catalog (build-time snapshot, 1179 models) is converted from
 the published `@earendil-works/pi-ai` package data: context windows, max
 tokens, reasoning flags, costs, and per-model `compat` quirks all come from
 the catalog. `/models refresh` can pull the latest catalog from npm

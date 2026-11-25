@@ -558,6 +558,70 @@ fn fork_of_migrated_store_applies_policy() {
 /// (compaction without a materialized checkpoint tail): the tail is
 /// rebuilt from ancestry, then the system message leads it.
 #[test]
+fn v3_context_edit_survives_v4_migration_and_projects_checkpoint_tail() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = concat!(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"ctx-edit\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work\"}\n",
+        "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"discarded\",\"timestamp\":1}}\n",
+        "{\"type\":\"message\",\"id\":\"m2\",\"parentId\":\"m1\",\"timestamp\":\"2026-01-01T00:00:02.000Z\",\"message\":{\"role\":\"user\",\"content\":\"original retained\",\"timestamp\":2}}\n",
+        "{\"type\":\"compaction\",\"id\":\"c1\",\"parentId\":\"m2\",\"timestamp\":\"2026-01-01T00:00:03.000Z\",\"summary\":\"summary\",\"firstKeptEntryId\":\"m2\",\"tokensBefore\":100}\n",
+        "{\"type\":\"context_edit\",\"id\":\"e1\",\"parentId\":\"c1\",\"timestamp\":\"2026-01-01T00:00:04.000Z\",\"targetId\":\"m2\",\"replacement\":{\"content\":\"edited retained\"}}\n",
+        "{\"type\":\"message\",\"id\":\"m3\",\"parentId\":\"e1\",\"timestamp\":\"2026-01-01T00:00:05.000Z\",\"message\":{\"role\":\"user\",\"content\":\"omitted after compaction\",\"timestamp\":3}}\n",
+        "{\"type\":\"context_edit\",\"id\":\"e2\",\"parentId\":\"m3\",\"timestamp\":\"2026-01-01T00:00:06.000Z\",\"targetId\":\"m3\",\"replacement\":null}\n",
+    );
+    let path = write_v3(&tmp, "ctx-edit.jsonl", fixture);
+
+    let manager = SessionManager::open(&path, None).unwrap();
+    let context = manager.build_session_context();
+    let texts: Vec<String> = context
+        .messages
+        .iter()
+        .filter_map(|message| {
+            let AgentMessage::User(user) = message else {
+                return None;
+            };
+            let tack_ai::UserContent::Text(text) = &user.content else {
+                return None;
+            };
+            Some(text.clone())
+        })
+        .collect();
+    assert_eq!(texts, vec!["edited retained".to_string()]);
+
+    // The raw source entry remains unchanged even though the checkpoint
+    // projection uses the post-compaction edit.
+    assert!(manager.entries().iter().any(|entry| {
+        matches!(
+            entry,
+            tack_session::SessionEntry::Message { message, .. }
+                if matches!(
+                    message,
+                    AgentMessage::User(user)
+                        if user.content == tack_ai::UserContent::Text("original retained".to_string())
+                )
+        )
+    }));
+    assert!(manager.entries().iter().any(|entry| {
+        matches!(
+            entry,
+            tack_session::SessionEntry::ContextEdit {
+                replacement: Some(_),
+                ..
+            }
+        )
+    }));
+    assert!(manager.entries().iter().any(|entry| {
+        matches!(
+            entry,
+            tack_session::SessionEntry::ContextEdit {
+                replacement: None,
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
 fn v3_migration_preserves_system_message_on_rebuilt_tail() {
     let tmp = tempfile::tempdir().unwrap();
     let content = concat!(

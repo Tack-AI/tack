@@ -62,6 +62,7 @@ pub mod mcp_oauth;
 pub mod mcp_plugin;
 pub mod mcp_sampling;
 pub mod mcp_serve;
+pub mod mcp_startup;
 pub mod model;
 pub mod oauth_lifecycle;
 pub mod oauth_login;

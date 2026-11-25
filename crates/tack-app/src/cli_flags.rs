@@ -49,10 +49,12 @@ pub struct CliFlags {
     pub no_session: bool,
     /// Scoped-models list for ctrl+p cycling.
     pub models: Vec<String>,
-    /// Tool allowlist (empty = all).
+    /// Tool allowlist or `+name`/`-name` modifiers (empty = all).
     pub tools: Vec<String>,
     pub exclude_tools: Vec<String>,
     pub no_tools: bool,
+    /// Disable config-file MCP servers for this run.
+    pub no_mcp: bool,
     pub no_builtin_tools: bool,
     pub no_skills: bool,
     pub no_context_files: bool,
@@ -210,20 +212,59 @@ pub fn split_for_tool_search(tools: Vec<Arc<dyn AgentTool>>, threshold: usize) -
     (active, deferred)
 }
 
+pub type SharedToolPool = Arc<std::sync::Mutex<Vec<Arc<dyn AgentTool>>>>;
+
+/// Variant of [`split_for_tool_search`] with a live deferred source. The
+/// source is awaited by tool_search itself; the returned shared pool is
+/// replaced after each snapshot and is what `AgentLoopConfig` activates from.
+pub fn split_for_tool_search_dynamic(
+    tools: Vec<Arc<dyn AgentTool>>,
+    threshold: usize,
+    source: Option<Arc<dyn tack_tools::tool_search::DeferredPoolSource>>,
+) -> (ToolSplit, Option<SharedToolPool>) {
+    let (mut active, pool) = split_for_tool_search(tools, threshold);
+    let Some(source) = source else {
+        return ((active, pool), None);
+    };
+    let shared = Arc::new(std::sync::Mutex::new(pool.clone()));
+    active.retain(|tool| tool.name() != "tool_search");
+    active.push(Arc::new(
+        tack_tools::tool_search::ToolSearchTool::new_dynamic(
+            pool.iter()
+                .map(|tool| tack_tools::tool_search::PoolEntry {
+                    name: tool.name().to_string(),
+                    description: tool.description().to_string(),
+                })
+                .collect(),
+            source,
+            shared.clone(),
+        ),
+    ));
+    ((active, pool), Some(shared))
+}
+
 /// System-prompt section listing deferred MCP servers (pi's `mcp_servers`
 /// section): the model must know these servers exist and that
 /// `tool_search` reaches their tools, or deferred tools are
 /// undiscoverable. Appended to the system prompt whenever the pool is
 /// non-empty.
 pub fn deferred_mcp_prompt_section(tool_pool: &[Arc<dyn AgentTool>]) -> String {
-    if tool_pool.is_empty() {
+    deferred_mcp_prompt_section_with_servers(tool_pool, &[])
+}
+
+/// Config-aware form of [`deferred_mcp_prompt_section`]. `pending_servers`
+/// lists deferred servers that have not finished connecting yet, so they are
+/// still discoverable without fabricating tool names or schemas.
+pub fn deferred_mcp_prompt_section_with_servers(
+    tool_pool: &[Arc<dyn AgentTool>],
+    pending_servers: &[String],
+) -> String {
+    if tool_pool.is_empty() && pending_servers.is_empty() {
         return String::new();
     }
     let mut by_server: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     for tool in tool_pool {
-        // Pool tools are mcp__<server>__<tool> by construction (plugin
-        // tools never defer); anything else groups under a generic label.
         let server = tool
             .name()
             .strip_prefix("mcp__")
@@ -233,13 +274,19 @@ pub fn deferred_mcp_prompt_section(tool_pool: &[Arc<dyn AgentTool>]) -> String {
     }
     let mut section = String::from(
         "\n\n# Deferred MCP tools\n\
-         The MCP servers below are connected, but their tools are NOT declared in your \
+         The MCP servers below are configured, but their tools are NOT declared in your \
          tool set. When a task needs them, call the `tool_search` tool with what you \
-         want to do (e.g. \"create an issue\"); matching tools become callable \
-         immediately after it returns.\n",
+         want to do (e.g. \"create an issue\"). tool_search waits for any deferred \
+         server still connecting; matching tools become callable immediately after \
+         it returns.\n",
     );
-    for (server, count) in by_server {
+    for (server, count) in &by_server {
         section.push_str(&format!("- {server} ({count} tools)\n"));
+    }
+    for server in pending_servers {
+        if !by_server.contains_key(server) {
+            section.push_str(&format!("- {server} (connecting on demand)\n"));
+        }
     }
     section
 }
@@ -262,24 +309,206 @@ pub fn filter_feature_tools(
         .collect()
 }
 
-/// Apply --no-tools/--no-builtin-tools/--tools/--exclude-tools to a tool set.
+/// Is this tool selection entry a `+name`/`-name` modifier?
+pub fn is_tool_modifier(entry: &str) -> bool {
+    entry.len() > 1 && (entry.starts_with('+') || entry.starts_with('-'))
+}
+
+/// pi's CLI validation for `--tools`: a list is either an allowlist or a
+/// pure modifier list; `*` belongs to allowlists, never to modifiers.
+pub fn tool_list_error(entries: &[String]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let modifiers = entries.iter().any(|entry| is_tool_modifier(entry));
+    let plain = entries.iter().any(|entry| !is_tool_modifier(entry));
+    if modifiers && plain {
+        return Some(
+            "tool names cannot be mixed with +name/-name modifiers; use one form".to_string(),
+        );
+    }
+    if modifiers && entries.iter().any(|entry| entry.contains('*')) {
+        return Some("+name/-name modifiers take exact tool names, not patterns".to_string());
+    }
+    None
+}
+
+fn pure_tool_modifiers(entries: &[String]) -> bool {
+    !entries.is_empty() && entries.iter().all(|entry| is_tool_modifier(entry))
+}
+
+fn tool_name_matches(pattern: &str, name: &str) -> bool {
+    tack_tools::mcp::star_match(pattern, name)
+}
+
+fn is_mcp_tool_name(name: &str) -> bool {
+    name.starts_with("mcp__")
+}
+
+/// Mark an MCP tool preserved by a non-MCP `--tools` allowlist as
+/// search-only. Registration keeps it reachable for tool_search, but it is
+/// not declared directly to the model (pi's `_isActivatable` distinction).
+struct ForcedDeferredTool {
+    inner: Arc<dyn AgentTool>,
+}
+
+#[async_trait::async_trait]
+impl AgentTool for ForcedDeferredTool {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn label(&self) -> &str {
+        self.inner.label()
+    }
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.inner.parameters_schema()
+    }
+    fn execution_mode(&self) -> tack_agent_core::ToolExecutionMode {
+        self.inner.execution_mode()
+    }
+    fn constrained_sampling(&self) -> Option<tack_ai::constrained_sampling::ConstrainedSampling> {
+        self.inner.constrained_sampling()
+    }
+    fn prepare_arguments(&self, args: serde_json::Value) -> serde_json::Value {
+        self.inner.prepare_arguments(args)
+    }
+    fn available_for_provider(&self, provider: &str) -> bool {
+        self.inner.available_for_provider(provider)
+    }
+    fn starts_deferred(&self) -> bool {
+        true
+    }
+    fn validate_arguments(&self, args: &serde_json::Value) -> Result<(), String> {
+        self.inner.validate_arguments(args)
+    }
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        params: serde_json::Value,
+        cancel: tokio_util::sync::CancellationToken,
+        on_update: &(dyn Fn(tack_agent_core::AgentToolResult) + Send + Sync),
+    ) -> Result<tack_agent_core::AgentToolResult, String> {
+        self.inner
+            .execute(tool_call_id, params, cancel, on_update)
+            .await
+    }
+}
+
+/// Apply --no-tools/--no-builtin-tools/--no-mcp/--tools/--exclude-tools to a
+/// tool set. Allowlists and exclusions accept `*` patterns. A non-MCP
+/// allowlist preserves MCP registrations as deferred tools instead of
+/// accidentally clearing every configured server (upstream #04b97ef00).
 pub fn filter_tools(tools: Vec<Arc<dyn AgentTool>>, flags: &CliFlags) -> Vec<Arc<dyn AgentTool>> {
     if flags.no_tools {
         return Vec::new();
     }
+    let modifier_mode = pure_tool_modifiers(&flags.tools);
+    let removed_modifiers: std::collections::HashSet<&str> = if modifier_mode {
+        flags
+            .tools
+            .iter()
+            .filter_map(|entry| entry.strip_prefix('-'))
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    let allowlist_filters_mcp = flags.tools.is_empty()
+        || flags
+            .tools
+            .iter()
+            .any(|pattern| pattern.starts_with("mcp__"));
+
     tools
         .into_iter()
-        .filter(|tool| {
+        .filter_map(|tool| {
             let name = tool.name();
+            if flags.no_mcp && is_mcp_tool_name(name) {
+                return None;
+            }
             if flags.no_builtin_tools && BUILTIN_TOOL_NAMES.contains(&name) {
-                return false;
+                return None;
             }
-            if !flags.tools.is_empty() && !flags.tools.iter().any(|t| t == name) {
-                return false;
+            if flags
+                .exclude_tools
+                .iter()
+                .any(|pattern| tool_name_matches(pattern, name))
+            {
+                return None;
             }
-            !flags.exclude_tools.iter().any(|t| t == name)
+            if modifier_mode {
+                return (!removed_modifiers.contains(name)).then_some(tool);
+            }
+            if flags.tools.is_empty()
+                || flags
+                    .tools
+                    .iter()
+                    .any(|pattern| tool_name_matches(pattern, name))
+            {
+                return Some(tool);
+            }
+            if is_mcp_tool_name(name) && !allowlist_filters_mcp {
+                return Some(Arc::new(ForcedDeferredTool { inner: tool }) as Arc<dyn AgentTool>);
+            }
+            None
         })
         .collect()
+}
+
+fn apply_tool_modifiers(
+    mut tools: Vec<Arc<dyn AgentTool>>,
+    modifiers: &[String],
+    services: &tack_tools::ToolServices,
+) -> Vec<Arc<dyn AgentTool>> {
+    let mut builtin_catalog: Option<Vec<Arc<dyn AgentTool>>> = None;
+    for modifier in modifiers {
+        let Some((sign, name)) = modifier.split_at_checked(1) else {
+            continue;
+        };
+        match sign {
+            "-" => tools.retain(|tool| tool.name() != name),
+            "+" => {
+                if tools.iter().any(|tool| tool.name() == name) {
+                    continue;
+                }
+                if name == "powershell" {
+                    tools.push(Arc::new(tack_tools::powershell::PowerShellTool::new(
+                        services.clone(),
+                    )));
+                    continue;
+                }
+                if BUILTIN_TOOL_NAMES.contains(&name) {
+                    let catalog = builtin_catalog
+                        .get_or_insert_with(|| tack_tools::create_coding_tools(services));
+                    if let Some(tool) = catalog.iter().find(|tool| tool.name() == name) {
+                        tools.push(tool.clone());
+                        continue;
+                    }
+                }
+                tracing::warn!("unknown +{name} tool modifier ignored");
+            }
+            _ => {}
+        }
+    }
+    tools
+}
+
+/// Apply CLI `+name`/`-name` modifiers after settings defaults. Pure
+/// modifiers amend the effective set instead of replacing it (upstream
+/// `--tools +name` semantics); plain allowlists were already handled by
+/// [`filter_tools`].
+pub fn apply_cli_tool_modifiers(
+    tools: Vec<Arc<dyn AgentTool>>,
+    flags: &CliFlags,
+    services: &tack_tools::ToolServices,
+) -> Vec<Arc<dyn AgentTool>> {
+    if pure_tool_modifiers(&flags.tools) {
+        apply_tool_modifiers(tools, &flags.tools, services)
+    } else {
+        tools
+    }
 }
 
 /// settings.defaultTools: built-in tool allowlist (MCP/extension tools
@@ -297,6 +526,9 @@ pub fn apply_default_tools(
 ) -> Vec<Arc<dyn AgentTool>> {
     if default_tools.is_empty() {
         return tools;
+    }
+    if pure_tool_modifiers(default_tools) {
+        return apply_tool_modifiers(tools, default_tools, services);
     }
     let mut tools: Vec<Arc<dyn AgentTool>> = tools
         .into_iter()
@@ -511,6 +743,105 @@ mod tests {
 
     fn stub(name: &'static str, deferred: bool) -> Arc<dyn AgentTool> {
         Arc::new(StubTool { name, deferred })
+    }
+
+    #[test]
+    fn tool_selection_supports_patterns_modifiers_and_mcp_preservation() {
+        assert!(tool_list_error(&[]).is_none());
+        assert!(tool_list_error(&["read".to_string(), "+bash".to_string()]).is_some());
+        assert!(tool_list_error(&["+mcp__*".to_string()]).is_some());
+        assert!(tool_list_error(&["+powershell".to_string(), "-bash".to_string()]).is_none());
+
+        let flags = CliFlags {
+            tools: vec!["read".to_string()],
+            ..Default::default()
+        };
+        let out = filter_tools(
+            vec![stub("read", false), stub("mcp__github__search", false)],
+            &flags,
+        );
+        assert_eq!(names(&out), ["read", "mcp__github__search"]);
+        assert!(
+            out.iter()
+                .find(|tool| tool.name() == "mcp__github__search")
+                .is_some_and(|tool| tool.starts_deferred()),
+            "unnamed MCP tool is registered but search-only"
+        );
+
+        let flags = CliFlags {
+            tools: vec!["mcp__github__*".to_string()],
+            ..Default::default()
+        };
+        let out = filter_tools(
+            vec![
+                stub("read", false),
+                stub("mcp__github__search", false),
+                stub("mcp__linear__issue", false),
+            ],
+            &flags,
+        );
+        assert_eq!(names(&out), ["mcp__github__search"]);
+        assert!(!out[0].starts_deferred());
+
+        let flags = CliFlags {
+            exclude_tools: vec!["mcp__*".to_string()],
+            ..Default::default()
+        };
+        let out = filter_tools(
+            vec![stub("read", false), stub("mcp__github__search", false)],
+            &flags,
+        );
+        assert_eq!(names(&out), ["read"]);
+
+        let flags = CliFlags {
+            no_mcp: true,
+            ..Default::default()
+        };
+        let out = filter_tools(
+            vec![stub("read", false), stub("mcp__github__search", false)],
+            &flags,
+        );
+        assert_eq!(names(&out), ["read"]);
+    }
+
+    #[test]
+    fn pure_modifiers_amend_instead_of_replacing() {
+        let services = tack_tools::default_services(std::env::current_dir().unwrap());
+        let flags = CliFlags {
+            tools: vec!["-bash".to_string(), "+powershell".to_string()],
+            ..Default::default()
+        };
+        let filtered = filter_tools(tack_tools::create_coding_tools(&services), &flags);
+        let out = apply_cli_tool_modifiers(filtered, &flags, &services);
+        let selected = names(&out);
+        assert!(!selected.contains(&"bash"), "{selected:?}");
+        assert!(selected.contains(&"powershell"), "{selected:?}");
+        assert!(selected.contains(&"read"), "{selected:?}");
+
+        let out = apply_default_tools(
+            tack_tools::create_coding_tools(&services),
+            &["-bash".to_string(), "+powershell".to_string()],
+            &services,
+        );
+        let selected = names(&out);
+        assert!(!selected.contains(&"bash"), "{selected:?}");
+        assert!(selected.contains(&"powershell"), "{selected:?}");
+        assert!(selected.contains(&"read"), "{selected:?}");
+
+        // A modifier can also re-add a built-in excluded by settings.
+        let filtered = apply_default_tools(
+            tack_tools::create_coding_tools(&services),
+            &["read".to_string()],
+            &services,
+        );
+        let flags = CliFlags {
+            tools: vec!["+bash".to_string()],
+            ..Default::default()
+        };
+        let out = apply_cli_tool_modifiers(filtered, &flags, &services);
+        let selected = names(&out);
+        assert!(selected.contains(&"bash"), "{selected:?}");
+        assert!(selected.contains(&"read"), "{selected:?}");
     }
 
     /// mcp.json `exposure: "deferred"` tools pool even with the threshold

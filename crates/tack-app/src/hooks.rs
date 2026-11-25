@@ -640,12 +640,8 @@ impl SessionHooks {
 
         // Materialize the retained tail (kept messages after the cut point)
         // so the compaction entry is a self-contained checkpoint.
-        let kept_entries = &path[path
-            .iter()
-            .position(|e| e.id() == result.first_kept_entry_id)
-            .unwrap_or(path.len())..];
         let retained_tail: Vec<AgentMessage> =
-            tack_session::retained_tail_from_kept_entries(kept_entries);
+            tack_session::retained_tail_from_path_entries(&path, &result.first_kept_entry_id);
 
         // Re-acquire the lock briefly to persist the compaction and build
         // the post-compaction context from the CURRENT session state.

@@ -273,6 +273,7 @@ impl TackMcpServer {
                 &tack_session::default_agent_dir(),
             ),
             tool_pool: Vec::new(),
+            dynamic_tool_pool: None,
             retry_cancel: None,
         };
         let context = AgentContext {

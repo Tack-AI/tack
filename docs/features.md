@@ -815,6 +815,20 @@ win, then the longest pattern). pi's `"codemode"` values map to `"deferred"`
 tools" system-prompt section so the model knows `tool_search` reaches them;
 configuring any `exposure` opts out of the blanket threshold rule.
 
+Connection startup is independent of schema exposure: all enabled servers
+start connecting immediately, but only servers with direct tools gate the
+first prompt (10-second bound). `tool_search` waits for deferred servers on
+demand and merges the resulting tools into the live pool; a reconnect rebuilds
+the proxies without invalidating the session's tool set. Deferred server names
+are visible in the system prompt before their schemas are known. TUI, print,
+RPC, and ACP all use this path.
+
+Tool selection follows the same layering. `--tools` and `--exclude-tools`
+accept `*` patterns; a pure `--tools +name,-name` list modifies rather than
+replaces the effective set. If an allowlist names no `mcp__` tool, unnamed MCP
+tools remain registered as search-only instead of disappearing. `--no-mcp`
+disables configured MCP servers for the run.
+
 ### Eval regression testing
 
 ```

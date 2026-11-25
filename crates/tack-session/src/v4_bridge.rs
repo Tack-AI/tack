@@ -32,6 +32,7 @@ pub(crate) const CT_MODEL_CHANGE: &str = "model_change";
 pub(crate) const CT_THINKING_LEVEL_CHANGE: &str = "thinking_level_change";
 pub(crate) const CT_SESSION_INFO: &str = "session_info";
 pub(crate) const CT_LABEL: &str = "label";
+pub(crate) const CT_CONTEXT_EDIT: &str = "context_edit";
 
 /// The branch every SessionManager-driven session writes to.
 pub(crate) const MAIN_BRANCH: &str = "main";
@@ -109,6 +110,15 @@ pub(crate) fn session_entry_to_v4(entry: &SessionEntry) -> V4Entry {
             base,
             custom_type: custom_type.clone(),
             data: data.clone(),
+        },
+        SessionEntry::ContextEdit {
+            target_id,
+            replacement,
+            ..
+        } => V4Entry::Custom {
+            base,
+            custom_type: CT_CONTEXT_EDIT.to_string(),
+            data: Some(json!({ "targetId": target_id, "replacement": replacement })),
         },
         SessionEntry::ModelChange {
             provider, model_id, ..
@@ -295,6 +305,26 @@ fn custom_back(
             },
             None => fallback(),
         },
+        CT_CONTEXT_EDIT => {
+            let Some(target_id) = data.get("targetId").and_then(Value::as_str) else {
+                return fallback();
+            };
+            let replacement = match data.get("replacement") {
+                Some(Value::Null) => None,
+                Some(value) => match serde_json::from_value(value.clone()) {
+                    Ok(replacement) => Some(replacement),
+                    Err(_) => return fallback(),
+                },
+                None => return fallback(),
+            };
+            SessionEntry::ContextEdit {
+                id,
+                parent_id,
+                timestamp,
+                target_id: target_id.to_string(),
+                replacement,
+            }
+        }
         _ => fallback(),
     }
 }

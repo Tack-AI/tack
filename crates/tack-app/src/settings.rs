@@ -392,6 +392,51 @@ fn deep_merge(base: &mut serde_json::Value, overlay: &serde_json::Value) {
     }
 }
 
+/// Resolve `defaultTools` across settings layers. A normal list replaces the
+/// inherited selection; a pure `+name`/`-name` list amends it in layer order
+/// (pi's mergeDefaultTools/resolveDefaultTools).
+fn layered_default_tools(layers: &[&Option<serde_json::Value>]) -> Vec<String> {
+    let mut selection: Vec<String> = Vec::new();
+    for layer in layers.iter().filter_map(|layer| layer.as_ref()) {
+        let Some(entries) = layer.get("defaultTools").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let entries: Vec<String> = entries
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        if entries.is_empty() {
+            selection.clear();
+            continue;
+        }
+        if entries
+            .iter()
+            .all(|entry| crate::cli_flags::is_tool_modifier(entry))
+        {
+            for entry in entries {
+                if let Some(name) = entry.strip_prefix('+') {
+                    if !selection.contains(&name.to_string()) {
+                        selection.push(name.to_string());
+                    }
+                } else if let Some(name) = entry.strip_prefix('-') {
+                    selection.retain(|tool| tool != name);
+                }
+            }
+        } else {
+            if entries
+                .iter()
+                .any(|entry| crate::cli_flags::is_tool_modifier(entry))
+            {
+                tracing::warn!(
+                    "defaultTools mixes tool names with +name/-name modifiers; treating it as a replacement list"
+                );
+            }
+            selection = entries;
+        }
+    }
+    selection
+}
+
 /// Which parts of the session's active plugin set sub-agent child loops
 /// inherit (settings `subagents.inheritPlugins`).
 ///
@@ -635,6 +680,7 @@ impl Settings {
             deep_merge(&mut raw, layer);
         }
         let mut settings = Self::from_raw(raw);
+        settings.default_tools = layered_default_tools(&[&global_raw, &project_raw, &managed_raw]);
 
         // `updateRepo` steers BINARY downloads for `tack update`: a
         // project layer must not redirect self-updates to an attacker
@@ -1346,6 +1392,39 @@ mod tests {
         .unwrap();
         let settings = Settings::load(project.path(), agent.path());
         assert_eq!(settings.update_repo.as_deref(), Some("org/pi"));
+    }
+
+    #[test]
+    fn default_tools_modifiers_merge_across_layers() {
+        let agent = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".pi")).unwrap();
+        std::fs::write(
+            agent.path().join("settings.json"),
+            r#"{"defaultTools": ["read", "bash", "edit", "write"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join(".pi").join("settings.json"),
+            r#"{"defaultTools": ["-bash", "+powershell"]}"#,
+        )
+        .unwrap();
+        crate::project_trust::set_decision(agent.path(), project.path(), true, false);
+
+        let settings = Settings::load(project.path(), agent.path());
+        assert_eq!(
+            settings.default_tools,
+            vec!["read", "edit", "write", "powershell"]
+        );
+
+        // A later plain list replaces the inherited selection.
+        std::fs::write(
+            project.path().join(".pi").join("settings.json"),
+            r#"{"defaultTools": ["read"]}"#,
+        )
+        .unwrap();
+        let settings = Settings::load(project.path(), agent.path());
+        assert_eq!(settings.default_tools, vec!["read"]);
     }
 
     #[test]

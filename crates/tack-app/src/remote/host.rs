@@ -1014,6 +1014,7 @@ impl SessionHost {
             session_id: Some(session_id.clone()),
             cache_retention: settings.cache_retention_mode(),
             tool_pool: Vec::new(),
+            dynamic_tool_pool: None,
             retry_cancel: None,
         };
         let context = AgentContext {

@@ -30,6 +30,8 @@ use crate::tool::{AgentTool, AgentToolResult, ToolExecutionMode, tool_definition
 /// upstream pi session resumed in tack — are nulled by the next update.
 pub const SYSTEM_PROMPT_SECTION: &str = "system-prompt";
 
+pub type SharedDeferredToolPool = Arc<std::sync::Mutex<Vec<Arc<dyn AgentTool>>>>;
+
 #[derive(Clone)]
 pub struct AgentLoopConfig {
     pub model: Model,
@@ -58,6 +60,10 @@ pub struct AgentLoopConfig {
     /// (set by tool_search); the loadout change is then recorded as a
     /// transcript system message.
     pub tool_pool: Vec<Arc<dyn AgentTool>>,
+    /// Live deferred pool used by asynchronous MCP startup. `tool_search`
+    /// may replace this snapshot while a run is in flight; activation takes
+    /// from the shared pool first. Ordinary callers leave it `None`.
+    pub dynamic_tool_pool: Option<SharedDeferredToolPool>,
     /// Retry-scope cancellation: aborts an in-progress retry backoff without
     /// aborting the run (TS abortRetry). None = no separate retry scope.
     pub retry_cancel: Option<tokio_util::sync::CancellationToken>,
@@ -989,13 +995,25 @@ async fn run_loop(
                 // Activated tools join the context for subsequent LLM calls,
                 // and the next declare_tool_changes records the delta as a
                 // transcript system message (upstream #9548 semantics).
-                if !config.tool_pool.is_empty() {
+                if !config.tool_pool.is_empty() || config.dynamic_tool_pool.is_some() {
                     for name in &batch.activated_tool_names {
                         if context.tools.iter().any(|t| t.name() == name) {
                             continue;
                         }
-                        if let Some(pos) = config.tool_pool.iter().position(|t| t.name() == name) {
-                            context.tools.push(config.tool_pool.remove(pos));
+                        let activated = if let Some(shared) = &config.dynamic_tool_pool {
+                            let mut pool = shared.lock().expect("dynamic tool pool poisoned");
+                            pool.iter()
+                                .position(|tool| tool.name() == name)
+                                .map(|pos| pool.remove(pos))
+                        } else if let Some(pos) =
+                            config.tool_pool.iter().position(|t| t.name() == name)
+                        {
+                            Some(config.tool_pool.remove(pos))
+                        } else {
+                            None
+                        };
+                        if let Some(tool) = activated {
+                            context.tools.push(tool);
                             tracing::debug!("tool activated via tool_search: {name}");
                         }
                     }

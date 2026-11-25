@@ -23,7 +23,7 @@ an embedded browser client. Wire- and storage-compatible with the TypeScript pi.
   *and* server, eval framework, and more: **[docs/features.md](docs/features.md)**.
 - **42 built-in providers** — 40 mirroring TS pi's registry, plus zero-config
   local **ollama** and **llama.cpp** — with the full model catalog embedded
-  (1130 models: context windows, costs, reasoning flags, compat quirks).
+  (1179 models: context windows, costs, reasoning flags, compat quirks).
 - **Extensible** — tack-RPC v3 plugins with Rust/TypeScript/Python SDKs
   (process, sandboxed WASM, or MCP-server carriers), plus
   Claude-Code-compatible lifecycle hooks.

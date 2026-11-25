@@ -161,6 +161,7 @@ impl LlmEvaluator {
             cache_retention: None,
             fallback_models: Vec::new(),
             tool_pool: Vec::new(),
+            dynamic_tool_pool: None,
             retry_cancel: None,
         };
         let context = tack_agent_core::AgentContext {

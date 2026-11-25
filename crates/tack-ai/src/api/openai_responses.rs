@@ -40,6 +40,8 @@ impl ResponsesFlavor {
                 "openai",
                 "openai-codex",
                 "opencode",
+                "azure",
+                // Sessions written before the provider rename retain this id.
                 "azure-openai-responses",
             ],
         }
@@ -443,7 +445,7 @@ fn resolve_cache_retention(options: &StreamOptions) -> CacheRetention {
 
 /// TS `normalizeAzureBaseUrl`: real URL parsing — azure-host detection is a
 /// hostname suffix match, and the /openai/v1 rewrite drops any query.
-fn normalize_azure_base_url(base_url: &str) -> Result<String, String> {
+pub(crate) fn normalize_azure_base_url(base_url: &str) -> Result<String, String> {
     let trimmed = base_url.trim().trim_end_matches('/');
     let mut url = reqwest::Url::parse(trimmed)
         .map_err(|_| format!("Invalid Azure OpenAI base URL: {base_url}"))?;
@@ -482,7 +484,7 @@ pub(crate) fn resolve_codex_url(base_url: &str) -> String {
     }
 }
 
-fn resolve_azure_base_url(model: &Model) -> Result<String, String> {
+pub(crate) fn resolve_azure_base_url(model: &Model) -> Result<String, String> {
     // TS treats empty env values as unset (`||` chains).
     let base = std::env::var("AZURE_OPENAI_BASE_URL")
         .ok()
@@ -504,7 +506,7 @@ fn resolve_azure_base_url(model: &Model) -> Result<String, String> {
     }
 }
 
-fn resolve_azure_deployment_name(model: &Model) -> String {
+pub(crate) fn resolve_azure_deployment_name(model: &Model) -> String {
     if let Ok(map) = std::env::var("AZURE_OPENAI_DEPLOYMENT_NAME_MAP") {
         for entry in map.split(',') {
             // TS `pair.split("=", 2)`: a second `=` ends the value, and
@@ -1581,6 +1583,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn azure_tool_call_replay_accepts_current_and_legacy_provider_ids() {
+        for provider in ["azure", "azure-openai-responses"] {
+            let m = model("gpt-5", provider, "azure-openai-responses");
+            let context = Context {
+                system_prompt: None,
+                messages: vec![assistant_from(&m, vec![tool_call("call_abc|fc_xyz123")])],
+                tools: vec![],
+            };
+            let out = convert_responses_messages(&m, &context, ResponsesFlavor::Azure);
+            let call = out
+                .iter()
+                .find(|item| item["type"] == "function_call")
+                .unwrap();
+            assert_eq!(call["call_id"], "call_abc", "provider {provider}");
+            assert_eq!(call["id"], "fc_xyz123", "provider {provider}");
+        }
+    }
+
     /// Foreign (cross-provider) tool calls get a normalized fc_ item id, and
     /// the tool result keeps the full normalized call_id mapping.
     #[test]
@@ -1675,11 +1696,7 @@ mod tests {
     /// preserving tool definitions (TS #8614-adjacent, 0.84.3 fixed list).
     #[test]
     fn azure_forwards_tool_choice() {
-        let m = model(
-            "test-deployment",
-            "azure-openai-responses",
-            "azure-openai-responses",
-        );
+        let m = model("test-deployment", "azure", "azure-openai-responses");
         let context = Context {
             system_prompt: None,
             messages: vec![Message::user("Summarize this")],

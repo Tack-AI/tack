@@ -71,6 +71,7 @@ enum IndexKind {
     Message,
     Custom,
     CustomMessage,
+    ContextEdit,
     BranchSummary,
     Compaction {
         first_kept_entry_id: Option<String>,
@@ -219,6 +220,9 @@ fn index_kind(record_type: &str, value: &Value) -> IndexKind {
         "message" => IndexKind::Message,
         "custom" => IndexKind::Custom,
         "custom_message" => IndexKind::CustomMessage,
+        "context_edit" if json_str(value, "targetId").is_some_and(|id| !id.is_empty()) => {
+            IndexKind::ContextEdit
+        }
         "branch_summary" => IndexKind::BranchSummary,
         "compaction" => IndexKind::Compaction {
             first_kept_entry_id: json_opt_string(value, "firstKeptEntryId"),
@@ -268,6 +272,7 @@ fn is_retained(kind: &IndexKind) -> bool {
         IndexKind::Message
             | IndexKind::Custom
             | IndexKind::CustomMessage
+            | IndexKind::ContextEdit
             | IndexKind::BranchSummary
             | IndexKind::Compaction { .. }
             | IndexKind::ModelChange { .. }
@@ -734,26 +739,33 @@ fn materialize_entry(
             system_message,
             ..
         } => {
-            let tail = match retained_tail {
-                // v3 checkpoint form: the tail is materialized already.
-                Some(tail) => crate::v4_bridge::compaction_tail_with_system(
-                    system_message,
-                    &Some(tail.clone()),
+            let (tail, details) = match retained_tail {
+                // v3 checkpoint form: the tail is materialized already, but
+                // has no per-message source provenance to preserve.
+                Some(tail) => (
+                    crate::v4_bridge::compaction_tail_with_system(
+                        system_message,
+                        &Some(tail.clone()),
+                    ),
+                    details.clone(),
                 ),
-                // Rebuilt tail: the replayed system message leads it too
-                // (preserving `systemMessage` is unconditional — see
-                // compaction_tail_with_system).
-                None => crate::v4_bridge::compaction_tail_with_system(
-                    system_message,
-                    &Some(rebuild_retained_tail(indexed, index, tail_cache)?),
-                ),
+                // Rebuilt tail: record the v4 source entry id behind every
+                // materialized message so later context edits can project
+                // the checkpoint without exposing the raw history.
+                None => {
+                    let (tail, source_ids) = rebuild_retained_tail(indexed, index, tail_cache)?;
+                    (
+                        crate::v4_bridge::compaction_tail_with_system(system_message, &Some(tail)),
+                        compaction_details_with_tail_sources(details, source_ids),
+                    )
+                }
             };
             V4Entry::Compaction {
                 base,
                 summary: summary.clone(),
                 retained_tail: tail,
                 tokens_before: *tokens_before,
-                details: details.clone(),
+                details,
                 usage: usage.clone(),
                 from_hook: from_hook.unwrap_or(false),
             }
@@ -764,6 +776,18 @@ fn materialize_entry(
             base,
             custom_type: custom_type.clone(),
             data: data.clone(),
+        },
+        SessionEntry::ContextEdit {
+            target_id,
+            replacement,
+            ..
+        } => V4Entry::Custom {
+            base,
+            custom_type: crate::v4_bridge::CT_CONTEXT_EDIT.to_string(),
+            data: Some(serde_json::json!({
+                "targetId": index.resolve(Some(target_id))?,
+                "replacement": replacement,
+            })),
         },
         // Change records are kept as custom entries (same shapes the live
         // v4 write path produces — see v4_bridge), so migrated and
@@ -798,16 +822,35 @@ fn materialize_entry(
     })
 }
 
+/// Add v4-only provenance for a rebuilt compaction tail. `details` is an
+/// extension payload, so keep non-object payloads untouched rather than
+/// changing their meaning; normal pi details objects gain one namespaced key.
+fn compaction_details_with_tail_sources(
+    details: &Option<Value>,
+    source_ids: Vec<String>,
+) -> Option<Value> {
+    if source_ids.is_empty() {
+        return details.clone();
+    }
+    let mut value = details.clone().unwrap_or_else(|| serde_json::json!({}));
+    let object = value.as_object_mut()?;
+    object.insert(
+        "tackRetainedTailSourceIds".to_string(),
+        serde_json::json!(source_ids),
+    );
+    Some(value)
+}
+
 /// Rebuild a compaction's retained tail from the pass-2 message cache,
-/// oldest first (upstream `retainedTailStructure` + reverse). Boundary
-/// validation already happened in pass 1
-/// ([`collect_required_tail_message_ids`]); the error arms here are
-/// defensive.
+/// oldest first, together with the v4 entry id that produced each message
+/// (upstream `retainedTailStructure` + reverse). Boundary validation already
+/// happened in pass 1 ([`collect_required_tail_message_ids`]); the error arms
+/// here are defensive.
 fn rebuild_retained_tail(
     compaction: &IndexEntry,
     index: &MigrationIndex,
     tail_cache: &HashMap<String, AgentMessage>,
-) -> Result<Vec<AgentMessage>, V4Error> {
+) -> Result<(Vec<AgentMessage>, Vec<String>), V4Error> {
     let IndexKind::Compaction {
         first_kept_entry_id: Some(first_kept),
         ..
@@ -818,11 +861,18 @@ fn rebuild_retained_tail(
         });
     };
     let mut tail = Vec::new();
+    let mut source_ids = Vec::new();
     let mut current = compaction.parent_id.clone();
     while let Some(id) = current {
         let ancestor = index.get(&id)?;
         if let Some(message) = tail_cache.get(&id) {
             tail.push(message.clone());
+            source_ids.push(
+                ancestor
+                    .mapped_id
+                    .clone()
+                    .ok_or_else(|| V4Error::MissingLegacyReference(id.clone()))?,
+            );
         }
         if id == *first_kept {
             break;
@@ -836,7 +886,8 @@ fn rebuild_retained_tail(
         }
     }
     tail.reverse();
-    Ok(tail)
+    source_ids.reverse();
+    Ok((tail, source_ids))
 }
 
 /// Normalize the v3 header into a v4 one (upstream

@@ -48,9 +48,11 @@ pub const BUILTIN_PROVIDERS: &[BuiltinProviderDef] = &[
         env_keys: &["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
     },
     BuiltinProviderDef {
-        id: "azure-openai-responses",
-        name: "Azure OpenAI Responses",
+        id: "azure",
+        name: "Azure",
         base_url: "",
+        // The provider was renamed when it gained Chat Completions models;
+        // the Responses API id remains stable for session compatibility.
         api: "azure-openai-responses",
         env_keys: &["AZURE_OPENAI_API_KEY"],
     },
@@ -142,10 +144,10 @@ pub const BUILTIN_PROVIDERS: &[BuiltinProviderDef] = &[
     BuiltinProviderDef {
         id: "kimi-coding",
         name: "Kimi For Coding",
-        base_url: "https://api.kimi.com/coding",
-        api: "anthropic-messages",
-        // Moonshot-hosted despite the Anthropic wire format: no
-        // ANTHROPIC_API_KEY fallback (it would leak the key to api.kimi.com).
+        base_url: "https://api.kimi.com/coding/v1",
+        api: "openai-completions",
+        // Moonshot-hosted: no ANTHROPIC_API_KEY fallback (it would leak the
+        // key to api.kimi.com).
         env_keys: &["KIMI_API_KEY"],
     },
     BuiltinProviderDef {
@@ -241,24 +243,40 @@ pub const BUILTIN_PROVIDERS: &[BuiltinProviderDef] = &[
     },
     BuiltinProviderDef {
         id: "qwen-token-plan",
-        name: "Qwen Token Plan",
-        base_url: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+        name: "Qwen Token Plan Team",
+        base_url: "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1",
         api: "openai-completions",
-        env_keys: &["QWEN_TOKEN_PLAN_API_KEY"],
+        env_keys: &["QWEN_TOKEN_PLAN_TEAM_API_KEY", "QWEN_TOKEN_PLAN_API_KEY"],
     },
     BuiltinProviderDef {
         id: "qwen-token-plan-cn",
-        name: "Qwen Token Plan (China)",
-        base_url: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        name: "Qwen Token Plan Team CN",
+        base_url: "https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1",
         api: "openai-completions",
-        env_keys: &["QWEN_TOKEN_PLAN_CN_API_KEY"],
+        env_keys: &[
+            "QWEN_TOKEN_PLAN_TEAM_CN_API_KEY",
+            "QWEN_TOKEN_PLAN_CN_API_KEY",
+        ],
     },
     BuiltinProviderDef {
         id: "qwen-token-plan-individual",
-        name: "Qwen Token Plan (Individual)",
-        base_url: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+        name: "Qwen Token Plan Individual",
+        base_url: "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1",
         api: "openai-completions",
-        env_keys: &["QWEN_TOKEN_PLAN_API_KEY"],
+        env_keys: &[
+            "QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY",
+            "QWEN_TOKEN_PLAN_API_KEY",
+        ],
+    },
+    BuiltinProviderDef {
+        id: "qwen-token-plan-individual-cn",
+        name: "Qwen Token Plan Individual CN",
+        base_url: "https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1",
+        api: "openai-completions",
+        env_keys: &[
+            "QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY",
+            "QWEN_TOKEN_PLAN_CN_API_KEY",
+        ],
     },
     BuiltinProviderDef {
         id: "radius",
@@ -332,8 +350,17 @@ pub const BUILTIN_PROVIDERS: &[BuiltinProviderDef] = &[
     },
 ];
 
+/// Provider id used before Azure gained Chat Completions. Keep it as a
+/// registry/auth alias even though new sessions use `azure`.
+pub const LEGACY_AZURE_PROVIDER_ID: &str = "azure-openai-responses";
+
 /// Look up a built-in provider definition by id.
 pub fn builtin_provider(id: &str) -> Option<&'static BuiltinProviderDef> {
+    let id = if id == LEGACY_AZURE_PROVIDER_ID {
+        "azure"
+    } else {
+        id
+    };
     BUILTIN_PROVIDERS.iter().find(|p| p.id == id)
 }
 

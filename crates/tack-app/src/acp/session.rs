@@ -93,6 +93,8 @@ pub struct AcpSessionState {
     pub mcp_tools: Vec<Arc<dyn tack_agent_core::AgentTool>>,
     /// Keep-alive handles: dropping a connection kills the server process.
     pub mcp_connections: Vec<Arc<tack_tools::mcp::McpConnection>>,
+    /// Background connection manager for deferred tool_search activation.
+    pub mcp_startup: Option<crate::mcp_startup::McpStartupManager>,
     /// Permission mode: "ask" (default), "auto" (no prompts), "plan" (read-only).
     pub mode: Arc<std::sync::Mutex<String>>,
     /// Model used for the next prompt turn (session/set_model).
@@ -168,6 +170,7 @@ pub fn create_session_state(
     shared_conn: SharedConn,
     session_id: SessionId,
     mcp_connections: Vec<Arc<tack_tools::mcp::McpConnection>>,
+    mcp_startup: Option<crate::mcp_startup::McpStartupManager>,
     model: tack_ai::Model,
     thinking: Option<tack_ai::ThinkingLevel>,
     extensions: crate::extension_host::ExtensionManager,
@@ -194,6 +197,7 @@ pub fn create_session_state(
     // (same treatment as TUI/print/rpc; plugin tools are wrapped per turn
     // in agent.rs via `tools_with_untrusted`).
     let untrusted_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mcp_startup = mcp_startup.map(|manager| manager.with_untrusted(untrusted_seen.clone()));
     let mcp_tools = tack_tools::mcp::mcp_tools_with(&mcp_connections, Some(untrusted_seen.clone()));
     Rc::new(AcpSessionState {
         session: Arc::new(Mutex::new(session)),
@@ -202,6 +206,7 @@ pub fn create_session_state(
         allow_always: Arc::new(std::sync::Mutex::new(HashSet::new())),
         mcp_tools,
         mcp_connections,
+        mcp_startup,
         mode: Arc::new(std::sync::Mutex::new(DEFAULT_MODE.to_string())),
         model: Arc::new(std::sync::Mutex::new(model)),
         thinking: Arc::new(std::sync::Mutex::new(thinking)),

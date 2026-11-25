@@ -7,7 +7,24 @@ fn env_var_names(provider: &str) -> Vec<&'static str> {
         "anthropic" => vec!["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
         "openai" => vec!["OPENAI_API_KEY"],
         "openai-codex" | "openai-codex-responses" => vec!["OPENAI_API_KEY", "CODEX_API_KEY"],
-        "azure-openai-responses" => vec!["AZURE_OPENAI_API_KEY"],
+        "azure" | "azure-openai-responses" => vec!["AZURE_OPENAI_API_KEY"],
+        // Per-plan keys come first so Individual credentials never select a
+        // Team-only catalog; the regional shared keys remain fallbacks.
+        "qwen-token-plan" => vec!["QWEN_TOKEN_PLAN_TEAM_API_KEY", "QWEN_TOKEN_PLAN_API_KEY"],
+        "qwen-token-plan-cn" => {
+            vec![
+                "QWEN_TOKEN_PLAN_TEAM_CN_API_KEY",
+                "QWEN_TOKEN_PLAN_CN_API_KEY",
+            ]
+        }
+        "qwen-token-plan-individual" => vec![
+            "QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY",
+            "QWEN_TOKEN_PLAN_API_KEY",
+        ],
+        "qwen-token-plan-individual-cn" => vec![
+            "QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY",
+            "QWEN_TOKEN_PLAN_CN_API_KEY",
+        ],
         "google" => vec!["GEMINI_API_KEY"],
         "google-vertex" => vec!["GOOGLE_CLOUD_API_KEY"],
         "deepseek" => vec!["DEEPSEEK_API_KEY"],
@@ -71,9 +88,7 @@ pub fn get_env_api_key(provider: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Regression: kimi-coding is Moonshot-hosted (api.kimi.com) despite
-    /// speaking the Anthropic wire protocol — falling back to
-    /// ANTHROPIC_API_KEY would send the user's Anthropic key to Moonshot.
+    /// Kimi Coding is Moonshot-hosted; never use another vendor's key here.
     #[test]
     fn kimi_coding_never_falls_back_to_anthropic_key() {
         let names = env_var_names("kimi-coding");
@@ -91,6 +106,36 @@ mod tests {
         assert_eq!(
             env_var_names("openai-codex"),
             vec!["OPENAI_API_KEY", "CODEX_API_KEY"]
+        );
+    }
+
+    #[test]
+    fn azure_and_qwen_env_key_priorities_match_upstream() {
+        assert_eq!(env_var_names("azure"), vec!["AZURE_OPENAI_API_KEY"]);
+        assert_eq!(
+            env_var_names("qwen-token-plan"),
+            vec!["QWEN_TOKEN_PLAN_TEAM_API_KEY", "QWEN_TOKEN_PLAN_API_KEY"]
+        );
+        assert_eq!(
+            env_var_names("qwen-token-plan-cn"),
+            vec![
+                "QWEN_TOKEN_PLAN_TEAM_CN_API_KEY",
+                "QWEN_TOKEN_PLAN_CN_API_KEY"
+            ]
+        );
+        assert_eq!(
+            env_var_names("qwen-token-plan-individual"),
+            vec![
+                "QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY",
+                "QWEN_TOKEN_PLAN_API_KEY"
+            ]
+        );
+        assert_eq!(
+            env_var_names("qwen-token-plan-individual-cn"),
+            vec![
+                "QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY",
+                "QWEN_TOKEN_PLAN_CN_API_KEY"
+            ]
         );
     }
 

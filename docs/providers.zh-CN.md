@@ -74,6 +74,32 @@ TS pi 行为一致）。本地 provider 探测到的目录与 models.json 的
 | `requiresNonNullAssistantContent` | `false` | 回放无正文的 assistant 消息（例如只有工具调用）时发送 `""` 而不是 `null`。用于拒绝 null assistant content 的代理。 |
 | `requiresToolsWithToolHistory` | `false` | 工具已禁用但历史含 tool call/result 时发送 `"tools": []`。仅用于要求该字段的旧代理（例如 Anthropic 前的旧版 LiteLLM）；vLLM 等服务会拒绝空数组。 |
 
+## 当前目录与 provider 迁移
+
+- **Azure** 的 provider id 统一为 `azure`，同时覆盖 Responses 与 Foundry
+  Chat Completions 模型。`azure-openai-responses` 保留为 Responses 的
+  **API** id，并继续兼容旧会话回放；新 `auth.json`/`models.json` 条目应使用
+  `azure`，旧 provider id 及其已存凭据仍作为兼容别名接受。端点解析支持
+  `AZURE_OPENAI_BASE_URL`、`AZURE_OPENAI_RESOURCE_NAME`、
+  `AZURE_OPENAI_API_VERSION`，并把 Azure host 规范化到 `/openai/v1`。
+  `AZURE_OPENAI_DEPLOYMENT_NAME_MAP=model=deployment,...` 只替换请求载荷中的
+  部署名，不改变目录模型 id。
+- **Kimi Coding** 现在通过 OpenAI Completions 访问
+  `https://api.kimi.com/coding/v1`（device-flow OAuth 不变）。自定义
+  `models.json` 条目必须使用 `openai-completions`，且 `baseUrl` 必须带
+  `/v1`；K3 的 reasoning-content 回放与提示词缓存行为跟随内嵌模型元数据。
+- **Qwen Token Plan** 分为 Team、Team CN、Individual、Individual CN。
+  Team/Individual 使用
+  `https://token-plan.maas.qwencloudapi.com/compatible-mode/v1`；CN 使用
+  `https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1`。套餐专属 key
+  优先于区域共享 key：先读
+  `QWEN_TOKEN_PLAN_TEAM[_CN]_API_KEY` 与
+  `QWEN_TOKEN_PLAN_INDIVIDUAL[_CN]_API_KEY`，再回退
+  `QWEN_TOKEN_PLAN[_CN]_API_KEY`。
+- **Gemini** 的版本检测也支持带前缀的模型 id；Gemini 4+ 发送
+  `thinkingLevel` 而不是 `thinkingBudget`。Copilot usage 同时接受顶层
+  `usage.reasoning_tokens` 与嵌套的 completion details。
+
 ## Amazon Bedrock（`bedrock-converse-stream`）
 
 不依赖 AWS SDK 实现：
@@ -137,7 +163,7 @@ TS pi 一致。metadata server 的 base URL 可用 `TACK_GCE_METADATA_URL`
 
 ## 模型目录
 
-内嵌目录（构建时快照，1130 个模型）转换自已发布的
+内嵌目录（构建时快照，1179 个模型）转换自已发布的
 `@earendil-works/pi-ai` 包数据：上下文窗口、max tokens、推理标志、成本、
 逐模型 `compat` 怪癖全部来自目录。`/models refresh` 可从 npm 拉取最新目录
 （详见 [features.md](features.zh-CN.md) §模型目录在线刷新）。

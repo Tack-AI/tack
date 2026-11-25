@@ -22,13 +22,59 @@ pub struct PoolEntry {
     pub description: String,
 }
 
+/// Deferred search metadata plus the executable tools that back it. An
+/// asynchronous MCP startup manager produces this snapshot after its
+/// deferred servers become ready.
+#[derive(Clone)]
+pub struct DeferredPoolSnapshot {
+    pub entries: Vec<PoolEntry>,
+    pub tools: Vec<std::sync::Arc<dyn AgentTool>>,
+}
+
+impl std::fmt::Debug for DeferredPoolSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeferredPoolSnapshot")
+            .field("entries", &self.entries)
+            .field("tools", &self.tools.len())
+            .finish()
+    }
+}
+
+/// Source of a live deferred pool. Implemented by the app-layer MCP startup
+/// manager so tool_search can wait for on-demand connections without making
+/// the first prompt wait for every server.
+#[async_trait]
+pub trait DeferredPoolSource: Send + Sync + std::fmt::Debug {
+    async fn snapshot(&self, cancel: CancellationToken) -> Result<DeferredPoolSnapshot, String>;
+}
+
 pub struct ToolSearchTool {
     pool: Vec<PoolEntry>,
+    source: Option<std::sync::Arc<dyn DeferredPoolSource>>,
+    shared_pool: Option<tack_agent_core::agent_loop::SharedDeferredToolPool>,
 }
 
 impl ToolSearchTool {
     pub fn new(pool: Vec<PoolEntry>) -> Self {
-        ToolSearchTool { pool }
+        ToolSearchTool {
+            pool,
+            source: None,
+            shared_pool: None,
+        }
+    }
+
+    /// Build a tool_search backed by a live source. A successful snapshot
+    /// merges into the agent loop's shared deferred tool pool.
+    pub fn new_dynamic(
+        pool: Vec<PoolEntry>,
+        source: std::sync::Arc<dyn DeferredPoolSource>,
+        shared_pool: tack_agent_core::agent_loop::SharedDeferredToolPool,
+    ) -> Self {
+        ToolSearchTool {
+            pool,
+            source: Some(source),
+            shared_pool: Some(shared_pool),
+        }
     }
 }
 
@@ -84,7 +130,7 @@ impl AgentTool for ToolSearchTool {
         &self,
         _tool_call_id: &str,
         params: Value,
-        _cancel: CancellationToken,
+        _cancel: tokio_util::sync::CancellationToken,
         _on_update: &(dyn Fn(AgentToolResult) + Send + Sync),
     ) -> Result<AgentToolResult, String> {
         let params: SearchParams = serde_json::from_value(params)
@@ -95,8 +141,28 @@ impl AgentTool for ToolSearchTool {
             return Err("query must not be empty".to_string());
         }
 
-        let mut scored: Vec<(&PoolEntry, usize)> = self
-            .pool
+        let pool = if let Some(source) = &self.source {
+            let snapshot = source.snapshot(_cancel).await?;
+            let mut pool = self.pool.clone();
+            for entry in snapshot.entries {
+                if !pool.iter().any(|existing| existing.name == entry.name) {
+                    pool.push(entry);
+                }
+            }
+            if let Some(shared) = &self.shared_pool {
+                let mut shared = shared.lock().expect("dynamic tool pool poisoned");
+                for tool in snapshot.tools {
+                    if !shared.iter().any(|existing| existing.name() == tool.name()) {
+                        shared.push(tool);
+                    }
+                }
+            }
+            pool
+        } else {
+            self.pool.clone()
+        };
+
+        let mut scored: Vec<(&PoolEntry, usize)> = pool
             .iter()
             .filter_map(|e| {
                 let s = score(e, &tokens);
@@ -110,7 +176,7 @@ impl AgentTool for ToolSearchTool {
             return Ok(AgentToolResult::text(format!(
                 "No tools match {:?} ({} tools in the deferred pool).",
                 params.query,
-                self.pool.len()
+                pool.len()
             )));
         }
 
@@ -167,6 +233,80 @@ mod tests {
             .await
             .unwrap();
         assert!(result.added_tool_names.is_none());
+    }
+
+    #[derive(Debug)]
+    struct StaticSource;
+
+    #[async_trait]
+    impl DeferredPoolSource for StaticSource {
+        async fn snapshot(
+            &self,
+            _cancel: CancellationToken,
+        ) -> Result<DeferredPoolSnapshot, String> {
+            #[derive(Debug)]
+            struct DeferredStub;
+            #[async_trait]
+            impl AgentTool for DeferredStub {
+                fn name(&self) -> &'static str {
+                    "mcp__slow__deploy"
+                }
+                fn label(&self) -> &str {
+                    "deploy"
+                }
+                fn description(&self) -> &str {
+                    "deploy a service"
+                }
+                fn parameters_schema(&self) -> Value {
+                    serde_json::json!({"type": "object"})
+                }
+                fn starts_deferred(&self) -> bool {
+                    true
+                }
+                async fn execute(
+                    &self,
+                    _id: &str,
+                    _params: Value,
+                    _cancel: CancellationToken,
+                    _on_update: &(dyn Fn(AgentToolResult) + Send + Sync),
+                ) -> Result<AgentToolResult, String> {
+                    unreachable!()
+                }
+            }
+            Ok(DeferredPoolSnapshot {
+                entries: vec![PoolEntry {
+                    name: "mcp__slow__deploy".to_string(),
+                    description: "deploy a service".to_string(),
+                }],
+                tools: vec![std::sync::Arc::new(DeferredStub)],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_source_waits_and_replaces_shared_pool() {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tool = ToolSearchTool::new_dynamic(
+            Vec::new(),
+            std::sync::Arc::new(StaticSource),
+            shared.clone(),
+        );
+        let result = tool
+            .execute(
+                "1",
+                serde_json::json!({"query": "deploy"}),
+                CancellationToken::new(),
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.added_tool_names.as_deref(),
+            Some(&["mcp__slow__deploy".to_string()][..])
+        );
+        let pool = shared.lock().unwrap();
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].name(), "mcp__slow__deploy");
     }
 
     /// Name hits outrank description-only hits; ties keep pool order; the

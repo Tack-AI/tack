@@ -6,6 +6,41 @@ notice can parse entries (same convention as TS pi).
 
 ## [Unreleased]
 
+### Added
+
+- **Imported context edits now drive model-visible history**: v3
+  `context_edit` entries omit or replace earlier user/assistant/tool-result/
+  custom messages on the active branch without changing raw history. The same
+  projection feeds prompts, compaction, branch summaries, and token estimates;
+  v4 migration preserves target ids and post-compaction retained-tail edits.
+  Tack currently reads these entries but does not yet originate them.
+
+- **Deferred MCP servers no longer block the first prompt**: all enabled
+  servers connect in the background, but only direct servers participate in
+  the bounded 10-second startup wait. `tool_search` waits for deferred servers
+  on demand and merges their tools into the live pool in TUI, print, RPC, and
+  ACP. `--tools`/`--exclude-tools` accept `*` patterns, pure `+name`/`-name`
+  modifiers work for CLI and layered `defaultTools`, non-MCP allowlists retain
+  unnamed MCP tools as search-only, and `--no-mcp` disables configured MCP
+  servers for the run.
+
+- **Current Azure, Kimi, Qwen, Gemini, and Copilot provider support**: Azure
+  Foundry Chat Completions supports normalized endpoints and deployment-name
+  mapping; Qwen Token Plan adds Individual CN and per-plan credential fallback;
+  Gemini 4+/prefixed ids use `thinkingLevel`; Copilot reads top-level reasoning
+  usage. The embedded catalog now contains 1179 models.
+
+### Changed
+
+- **Azure and Kimi Coding provider configuration migrated**: use provider id
+  `azure` in `auth.json`/`models.json` (the Responses API id remains
+  `azure-openai-responses`; the legacy provider id and its stored credentials
+  remain compatible aliases).
+  Kimi Coding now uses OpenAI Completions at
+  `https://api.kimi.com/coding/v1`; custom `baseUrl` overrides must include
+  `/v1`. Qwen Team/Individual gateways moved to the current QwenCloud/Qianwen
+  hosts, with plan-specific API keys taking priority over shared regional keys.
+
 ### Fixed
 
 - **Large streamed tool arguments no longer reparse every accumulated prefix**:

@@ -33,7 +33,7 @@ flowchart TB
         MSG[统一消息模型<br/>types / transform]
         ADAPTERS[API 适配器<br/>Anthropic / OpenAI Completions /<br/>OpenAI Responses / Azure / Codex /<br/>Google / Vertex / Mistral / Bedrock / tack-messages]
         OAUTH[oauth<br/>PKCE / device flow<br/>AuthResolver 主动刷新]
-        REG[providers 注册表<br/>40 providers / 1130 模型目录]
+        REG[providers 注册表<br/>40 providers / 1179 模型目录]
     end
 
     subgraph Infra["基础设施层"]

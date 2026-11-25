@@ -201,7 +201,7 @@ Tack 从四级读取配置，**后加载的层级覆盖先加载的**（部分�
 | `showCacheMissNotices` | bool | `false` | 提示词缓存未命中通知 |
 | `cacheRetention` | `"short"` \| `"long"` \| `"off"` | `"short"` | 提示词缓存保留时长：`short`=5 分钟写入（提供商默认；Kimi Messages 显式发送 `ttl:"5m"`）；`long`=1 小时写入（OpenAI 为 24h，写入费更高；Kimi/Anthropic 协议发 `ttl:"1h"`，Moonshot OpenAI 协议发 `prompt_cache_options`）；`off`=不发缓存标记（支持处只读）。未设置时回退 `TACK_CACHE_RETENTION` 环境变量（`long` 生效），再回退 `short`。注意 Kimi 的缓存 TTL 首次写入后锁定，中途切换需等旧条目过期才生效 |
 | `enableSkillCommands` | bool | `true` | `/skill:<name>` 补全 |
-| `defaultTools` | string[] | `[]`（全部） | 内置工具 allowlist（与 features.* 取交集）。可选的 `powershell` 工具（Windows）默认关闭，仅在此显式列出时注册——如 `["read", "powershell", "edit", "write"]` 替换 bash，或同时列出两者。优先 `pwsh.exe`，回退 `powershell.exe`，启动参数 `-NoProfile -NonInteractive -ExecutionPolicy Bypass`；非 Windows 平台注册后执行会报错。权限规则写法 `PowerShell(...)`，通配语义同 `Bash(...)` |
+| `defaultTools` | string[] | `[]`（全部） | 内置工具 allowlist（与 features.* 取交集），或纯 `+name`/`-name` 修饰符列表，在 settings 层之间修改继承选择。可选的 `powershell` 工具（Windows）默认关闭，仅在此显式列出时注册——如 `["read", "powershell", "edit", "write"]` 替换 bash，`["+powershell"]` 添加它，`["-bash"]` 移除 bash。优先 `pwsh.exe`，回退 `powershell.exe`，启动参数 `-NoProfile -NonInteractive -ExecutionPolicy Bypass`；非 Windows 平台注册后执行会报错。权限规则写法 `PowerShell(...)`，通配语义同 `Bash(...)` |
 | `updateRepo` | string | `"Tack-AI/tack"` | 自更新 GitHub 仓库 |
 | `updateCheck` | bool | `true` | TUI 启动时后台检查新版本（结果缓存 `update-check.json`，24h TTL），有更新在 footer 与聊天区提示。`--offline`/`TACK_OFFLINE` 时跳过；只检查不安装 |
 | `notifications` | bool | `true` | 桌面通知（OSC 9 / OSC 777 escape）：权限弹窗弹出、agent run 完成/出错、后台任务完成时通知（按事件源 5s 节流）。终端不支持则静默无效 |
@@ -253,6 +253,8 @@ Tack 从四级读取配置，**后加载的层级覆盖先加载的**（部分�
 
 连接韧性：工具调用发现连接已断开时先重连（stdio 子进程重启 / HTTP 重拨）再报错；`tools|resources|prompts/list_changed` 通知会就地刷新缓存的能力列表。服务器声明的工具注解（`readOnlyHint` 等）进入权限系统——声明只读的 MCP 工具像内置读工具一样免提示（与 `destructiveHint` 矛盾时按不安全处理）——并作为证据传给审批链插件。
 
+启动连接同样分层：所有 enabled server 都在后台开始连接，但首个 prompt 只等待配置了 direct 工具的服务器（最多 10 秒）。deferred server 在 `tool_search` 真正需要其能力时才等待；新连接的工具加入实时 deferred pool，重连后会用同一代理恢复。即使 deferred server 仍在连接，系统提示也会列出其名称。TUI、print、RPC、ACP 共用这套行为。
+
 settings.json 另有 `mcpDeferThreshold`（number，默认 0=关闭）：工具总数超阈值时 MCP 工具延迟加载，agent 通过 `tool_search` 按需激活（见 features 文档）。只要任一服务器配置了 `exposure`，该兜底规则即失效，以保证按服务器配置的行为可预期。
 
 settings.json 的另外两个 MCP 开关：
@@ -300,7 +302,7 @@ settings.json 的另外两个 MCP 开关：
 | `--agent-dir <DIR>` | 覆盖 agent 目录（设置、凭据、provider 和会话）；优先于 `TACK_AGENT_DIR` |
 | `-c, --continue` / `-r, --resume` / `--session / --session-id / --fork` / `--name` / `--no-session` / `--session-dir` | 会话控制 |
 | `--models a,b,c` | ctrl+p 循环范围 |
-| `-t, --tools` / `--exclude-tools` / `--no-tools` / `--no-builtin-tools` | 工具过滤（与 features.* 取交集） |
+| `-t, --tools` / `--exclude-tools` / `--no-tools` / `--no-builtin-tools` / `--no-mcp` | 工具过滤（与 features.* 取交集）。`--tools` 与 `--exclude-tools` 支持 `*` 通配。纯 `+name`/`-name` 的 `--tools` 列表修改有效工具集而非替换它（混用两种形式，或在修饰符中使用 `*`，会直接报错）。不含 MCP 项的 allowlist 会把未命名 MCP 工具保留为仅搜索可达，而不是全部清空；`--exclude-tools` 对所有工具生效，`--no-mcp` 则禁用本次运行配置的 MCP 服务器 |
 | `--no-skills` / `--no-context-files` / `--no-prompt-templates` / `--no-themes` | 资源开关 |
 | `--skill <dir>` / `--add-dir <dir>` | 额外 skills 目录 / 额外工作目录（可重复） |
 | `--mode text\|json\|rpc` | 输出模式 |

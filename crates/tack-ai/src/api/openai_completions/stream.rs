@@ -40,6 +40,10 @@ fn parse_chunk_usage(raw: &Value, model: &Model) -> crate::types::Usage {
         .get("completion_tokens_details")
         .and_then(|d| d.get("reasoning_tokens"))
         .and_then(Value::as_u64)
+        // Copilot emits top-level usage.reasoning_tokens. Match TS's `||`
+        // fallback when the nested count is absent or zero.
+        .filter(|tokens| *tokens != 0)
+        .or_else(|| raw.get("reasoning_tokens").and_then(Value::as_u64))
         .unwrap_or(0);
 
     let mut usage = crate::types::Usage {
@@ -54,6 +58,32 @@ fn parse_chunk_usage(raw: &Value, model: &Model) -> crate::types::Usage {
     };
     calculate_cost(model, &mut usage);
     usage
+}
+
+fn request_base_url(model: &Model) -> Result<String, String> {
+    if matches!(model.provider.as_str(), "azure" | "azure-openai-responses") {
+        crate::api::openai_responses::resolve_azure_base_url(model)
+    } else {
+        Ok(model.base_url.trim_end_matches('/').to_string())
+    }
+}
+
+fn request_params(
+    model: &Model,
+    context: &Context,
+    options: &StreamOptions,
+    compat: &super::compat::ResolvedCompat,
+    retention: crate::provider::CacheRetention,
+) -> Value {
+    let mut params = build_params(model, context, options, compat, retention);
+    if matches!(model.provider.as_str(), "azure" | "azure-openai-responses") {
+        // Only the wire payload changes: AssistantMessage::pending continues
+        // to use the catalog model id and provider.
+        params["model"] = json!(crate::api::openai_responses::resolve_azure_deployment_name(
+            model
+        ));
+    }
+    params
 }
 
 fn map_stop_reason(reason: &str) -> (StopReason, Option<String>) {
@@ -128,11 +158,18 @@ pub(crate) async fn run(
         .map(|(name, g)| (name, g.input_property))
         .collect::<std::collections::HashMap<_, _>>();
     let retention = resolve_cache_retention(&options);
-    let params = build_params(&model, &context, &options, &compat, retention);
+    let params = request_params(&model, &context, &options, &compat, retention);
+
+    // Azure's provider wrapper resolves its per-user Foundry endpoint lazily,
+    // so configuration failures arrive as terminal stream errors.
+    let base_url = match request_base_url(&model) {
+        Ok(url) => url,
+        Err(e) => fail!(output, sender, e, false),
+    };
 
     // --- request ---
     let client = crate::api::http_client();
-    let url = format!("{}/chat/completions", model.base_url.trim_end_matches('/'));
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
     let build_request = || {
         let mut request = client
@@ -659,8 +696,37 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    #![allow(unsafe_code)] // Azure environment fixtures
     use super::super::generic_model;
     use super::*;
+
+    static AZURE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct RestoreEnv(&'static str, Option<String>);
+
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(value) = &self.1 {
+                    std::env::set_var(self.0, value);
+                } else {
+                    std::env::remove_var(self.0);
+                }
+            }
+        }
+    }
+
+    fn set_env(name: &'static str, value: Option<&str>) -> RestoreEnv {
+        let previous = std::env::var(name).ok();
+        unsafe {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+        RestoreEnv(name, previous)
+    }
 
     /// Kimi reports top-level `usage.cached_tokens` (TS #8075): it must
     /// count as cache reads, not normal input tokens.
@@ -678,6 +744,108 @@ mod tests {
         assert_eq!(usage.cache_read, 40);
         assert_eq!(usage.input, 60);
         assert_eq!(usage.total_tokens, 110);
+    }
+
+    /// Copilot's usage chunk puts reasoning_tokens directly on usage rather
+    /// than under completion_tokens_details.
+    #[test]
+    fn top_level_reasoning_tokens_are_reported() {
+        let model = generic_model("github-copilot", "https://api.individual.githubcopilot.com");
+        let usage = parse_chunk_usage(
+            &json!({
+                "prompt_tokens": 10,
+                "completion_tokens": 40,
+                "prompt_tokens_details": { "cached_tokens": 0 },
+                "reasoning_tokens": 30,
+            }),
+            &model,
+        );
+        assert_eq!(usage.reasoning, Some(30));
+        assert_eq!(usage.output, 40);
+        assert_eq!(usage.total_tokens, 50);
+
+        let nested_zero = parse_chunk_usage(
+            &json!({
+                "completion_tokens": 40,
+                "completion_tokens_details": { "reasoning_tokens": 0 },
+                "reasoning_tokens": 30,
+            }),
+            &model,
+        );
+        assert_eq!(nested_zero.reasoning, Some(30));
+    }
+
+    #[test]
+    fn azure_completions_resolve_endpoint_and_deployment_without_changing_model_id() {
+        let _guard = AZURE_ENV_LOCK.blocking_lock();
+        let _base = set_env(
+            "AZURE_OPENAI_BASE_URL",
+            Some("https://example.openai.azure.com/openai?ignored=1"),
+        );
+        let _resource = set_env("AZURE_OPENAI_RESOURCE_NAME", None);
+        let _map = set_env(
+            "AZURE_OPENAI_DEPLOYMENT_NAME_MAP",
+            Some("other=other-deployment,test-model=foundry-deployment"),
+        );
+        let model = generic_model("azure", "");
+        let context = Context {
+            messages: vec![crate::types::Message::user("Hello")],
+            ..Default::default()
+        };
+        let options = StreamOptions::default();
+        let compat = get_compat(&model);
+        let params = request_params(
+            &model,
+            &context,
+            &options,
+            &compat,
+            crate::provider::CacheRetention::Short,
+        );
+
+        assert_eq!(
+            request_base_url(&model).unwrap(),
+            "https://example.openai.azure.com/openai/v1"
+        );
+        assert_eq!(params["model"], "foundry-deployment");
+        assert_eq!(model.id, "test-model");
+        assert_eq!(model.provider, "azure");
+    }
+
+    #[tokio::test]
+    async fn azure_completions_missing_endpoint_is_an_in_band_stream_error() {
+        let _guard = AZURE_ENV_LOCK.lock().await;
+        let _base = set_env("AZURE_OPENAI_BASE_URL", None);
+        let _resource = set_env("AZURE_OPENAI_RESOURCE_NAME", None);
+        let model = generic_model("azure", "");
+        let context = Context {
+            messages: vec![crate::types::Message::user("Hello")],
+            ..Default::default()
+        };
+        let options = StreamOptions {
+            api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+
+        let result = crate::provider::Provider::stream(
+            &super::super::OpenAiCompletionsProvider,
+            &model,
+            &context,
+            options,
+        )
+        .result()
+        .await;
+
+        assert_eq!(result.stop_reason, StopReason::Error);
+        assert!(
+            result
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("Azure OpenAI base URL is required")),
+            "{:?}",
+            result.error_message
+        );
+        assert_eq!(result.model, "test-model");
+        assert_eq!(result.provider, "azure");
     }
 
     /// Grammar/custom input is plain text. Finalization must preserve it

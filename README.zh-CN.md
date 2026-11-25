@@ -19,7 +19,7 @@ TCP/WebSocket 远程会话。与 TypeScript pi 线上协议和存储格式兼容
   worktree 隔离的子代理、跨会话搜索、cron、OS 沙箱、声明式权限、MCP
   client *和* server、eval 框架等：**[docs/features.zh-CN.md](docs/features.zh-CN.md)**。
 - **内置 42 个 provider** —— 40 个镜像 TS pi 注册表，外加零配置本地
-  **ollama** 和 **llama.cpp** —— 内嵌完整模型目录（1130 个模型：上下文
+  **ollama** 和 **llama.cpp** —— 内嵌完整模型目录（1179 个模型：上下文
   窗口、成本、推理标志、compat 怪癖）。
 - **可扩展** —— 讲 tack-RPC v3 协议的插件，提供 Rust/TypeScript/Python SDK
   （子进程、沙箱化 WASM 或 MCP server 载体），外加兼容 Claude Code 的

@@ -172,6 +172,7 @@ fn make_config(provider: Arc<dyn Provider>) -> AgentLoopConfig {
         cache_retention: None,
         fallback_models: vec![],
         tool_pool: vec![],
+        dynamic_tool_pool: None,
         retry_cancel: None,
     }
 }

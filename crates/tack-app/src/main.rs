@@ -80,6 +80,10 @@ struct Cli {
     #[arg(long = "no-tools")]
     no_tools: bool,
 
+    /// Disable config-file MCP servers for this run
+    #[arg(long = "no-mcp")]
+    no_mcp: bool,
+
     /// Disable the built-in tools (keep MCP tools)
     #[arg(long = "no-builtin-tools")]
     no_builtin_tools: bool,
@@ -673,7 +677,7 @@ async fn async_main() -> Result<()> {
         return Ok(());
     }
 
-    let flags = cli_flags(&cli);
+    let flags = cli_flags(&cli)?;
 
     // --mode rpc is an alias for the rpc subcommand.
     if cli.command.is_none() && cli.mode.as_deref() == Some("rpc") {
@@ -688,6 +692,7 @@ async fn async_main() -> Result<()> {
                 model: cli.model.clone(),
                 api_key: cli.api_key.clone(),
                 thinking: parse_thinking(&cli)?,
+                no_mcp: cli.no_mcp,
             };
             return close_codebuddy_after(tack_app::acp::serve(&overrides)).await;
         }
@@ -999,7 +1004,7 @@ async fn run_rpc(cli: &Cli) -> Result<i32> {
         cwd, model, auth, ..
     } = subcommand_context(cli)?;
     let thinking = parse_thinking(cli)?;
-    tack_app::rpc::run_rpc(model, auth, thinking, cwd, cli.continue_session).await
+    tack_app::rpc::run_rpc(model, auth, thinking, cwd, cli.continue_session, cli.no_mcp).await
 }
 
 /// `tack mcp-serve`: expose the agent as an MCP server over stdio.
@@ -1750,8 +1755,11 @@ async fn close_codebuddy_after<T>(run: impl std::future::Future<Output = Result<
 }
 
 /// Map the clap CLI onto the shared flag bundle.
-fn cli_flags(cli: &Cli) -> tack_app::cli_flags::CliFlags {
-    tack_app::cli_flags::CliFlags {
+fn cli_flags(cli: &Cli) -> Result<tack_app::cli_flags::CliFlags> {
+    if let Some(error) = tack_app::cli_flags::tool_list_error(&cli.tools) {
+        anyhow::bail!("--tools: {error}");
+    }
+    Ok(tack_app::cli_flags::CliFlags {
         resume: cli.resume,
         session: cli.session.clone(),
         session_id: cli.session_id.clone(),
@@ -1762,6 +1770,7 @@ fn cli_flags(cli: &Cli) -> tack_app::cli_flags::CliFlags {
         tools: cli.tools.clone(),
         exclude_tools: cli.exclude_tools.clone(),
         no_tools: cli.no_tools,
+        no_mcp: cli.no_mcp,
         no_builtin_tools: cli.no_builtin_tools,
         no_skills: cli.no_skills,
         no_context_files: cli.no_context_files,
@@ -1782,7 +1791,7 @@ fn cli_flags(cli: &Cli) -> tack_app::cli_flags::CliFlags {
         } else {
             None
         },
-    }
+    })
 }
 
 /// `tack providers` / `--list-providers`: every provider with auth status,

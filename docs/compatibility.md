@@ -74,6 +74,17 @@ binary and its externally observable behavior.
   are preserved as v4 *custom* entries on migration rather than rejected
   or aborted — Tack's no-data-loss principle
   (`crates/tack-session/src/v4/migrate.rs`).
+- Upstream v3 `context_edit` entries are decoded explicitly. They are
+  branch-relative append-only projections: the latest edit on the selected
+  branch omits an earlier user/assistant/tool-result/custom message or
+  replaces only its content, leaving raw history, roles, metadata, usage,
+  and exports unchanged. Compaction, branch summaries, token estimates,
+  and all agent surfaces consume the same projection. Tack does not yet
+  originate these entries; it honors imported ones. On v4 migration they
+  remain payload-compatible `custom` entries with remapped `targetId`s,
+  while rebuilt compaction checkpoints record per-message source ids in
+  implementation-specific `details.tackRetainedTailSourceIds`, so a
+  post-compaction edit still affects the materialized retained tail.
 - Assistant `toolCall` content blocks may carry the optional `argumentsError`
   string when final provider arguments were not a valid JSON object. The field
   records the parse cause and raw text; `arguments` is `{}` in that case. It is

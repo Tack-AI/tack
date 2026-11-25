@@ -204,6 +204,7 @@ fn make_config(provider: Arc<dyn Provider>, hooks: Arc<dyn AgentHooks>) -> Agent
         cache_retention: None,
         fallback_models: Vec::new(),
         tool_pool: Vec::new(),
+        dynamic_tool_pool: None,
         retry_cancel: None,
     }
 }
@@ -1089,6 +1090,36 @@ async fn tool_search_activates_deferred_pool_tools() {
     let mut names: Vec<&str> = replayed.iter().map(|t| t.name.as_str()).collect();
     names.sort_unstable();
     assert_eq!(names, vec!["activator", "deferred_tool"]);
+
+    // Asynchronous MCP startup uses the same activation channel through a
+    // shared pool that can be populated after the run has started.
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let deferred = Arc::new(MockTool {
+        name: "deferred_tool",
+        delay: Duration::ZERO,
+        calls: calls.clone(),
+        terminate: false,
+    });
+    let provider = ScriptedProvider::with_scripts(vec![
+        assistant_with_tool_calls(&[("c1", "activator", json!({}))]),
+        assistant_with_tool_calls(&[("c2", "deferred_tool", json!({}))]),
+        assistant_text("done"),
+    ]);
+    let mut config = make_config(provider, Arc::new(NoopHooks));
+    config.dynamic_tool_pool = Some(Arc::new(Mutex::new(vec![deferred])));
+    let stream = agent_loop(
+        vec![AgentMessage::user("go")],
+        AgentContext {
+            system_prompt: None,
+            messages: vec![],
+            tools: vec![Arc::new(Activator)],
+        },
+        config,
+        CancellationToken::new(),
+    );
+    let (_, messages) = collect_events(stream).await;
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert!(matches!(messages.last(), Some(AgentMessage::Assistant(a)) if a.text() == "done"));
 }
 
 /// The replayed transcript prompt wins over the loop's configured

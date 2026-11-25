@@ -75,6 +75,8 @@ pub(crate) struct RpcState {
     /// id changes (kept on same-provider switches so an explicit --api-key
     /// survives).
     pub(crate) auth: Arc<dyn tack_ai::oauth::AuthResolver>,
+    /// `--no-mcp`: skip config/session MCP servers for this RPC process.
+    pub(crate) no_mcp: bool,
     /// MCP connection pool reused across prompt runs (F08): previously
     /// every prompt reconnected every configured server and
     /// `mem::forget`'ed the connections, so server child processes
@@ -116,7 +118,7 @@ pub(crate) struct RpcState {
 /// rebuilds the pool.
 pub(crate) struct McpConnectionCache {
     pub(crate) fingerprint: String,
-    pub(crate) connections: Vec<Arc<tack_tools::mcp::McpConnection>>,
+    pub(crate) startup: crate::mcp_startup::McpStartupManager,
 }
 
 /// Cache key for the MCP connection pool: the connections are reused
@@ -235,6 +237,7 @@ pub async fn run_rpc(
     thinking: Option<tack_ai::ThinkingLevel>,
     cwd: PathBuf,
     continue_session: bool,
+    no_mcp: bool,
 ) -> Result<i32> {
     let process_shutdown = crate::process_shutdown::ProcessShutdown::new();
     let agent_dir = tack_session::default_agent_dir();
@@ -347,6 +350,7 @@ pub async fn run_rpc(
         sampling_llm: sampling_llm.clone(),
         provider: provider.clone(),
         auth: auth.clone(),
+        no_mcp,
         mcp_connections: None,
         session_mcp_servers: Vec::new(),
         session_hooks: crate::shell_hooks::HookConfig::default(),
@@ -1537,6 +1541,7 @@ mod tests {
             sampling_llm: crate::mcp_sampling::SharedSamplingLlm::default(),
             provider: test_provider(vec![]),
             auth: test_auth(),
+            no_mcp: false,
             mcp_connections: None,
             session_mcp_servers: Vec::new(),
             session_hooks: crate::shell_hooks::HookConfig::default(),

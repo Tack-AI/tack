@@ -19,6 +19,7 @@ pub(crate) struct McpPoolOutcome {
     pub(crate) connections: Vec<Arc<McpConnection>>,
     pub(crate) failures: Vec<(String, String)>,
     pub(crate) specs: Vec<McpServerSpec>,
+    pub(crate) startup: Option<crate::mcp_startup::McpStartupManager>,
 }
 
 /// Effective MCP server set for this session: config files overridden by
@@ -77,9 +78,9 @@ async fn oauth_fingerprint_suffix(
 /// prompt.rs logic (F08): the pool is keyed by a fingerprint of the
 /// effective spec set (+cwd/agent_dir/model); a mismatch or a dead cached
 /// connection rebuilds, and the replaced connections kill their server
-/// processes on drop. Only COMPLETE connection sets are cached: caching a
-/// partial set under the full fingerprint would never retry a temporarily
-/// failed server.
+/// processes on drop. Failed/direct partial pools are never cached; a
+/// pending deferred pool is retained only while it has no failures.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn ensure_mcp_pool(
     state: &Arc<Mutex<RpcState>>,
     settings: &Settings,
@@ -88,11 +89,25 @@ pub(crate) async fn ensure_mcp_pool(
     cwd: &std::path::Path,
     agent_dir: &std::path::Path,
     ext_specs: Vec<McpServerSpec>,
+    untrusted: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> McpPoolOutcome {
-    let (session_specs, cancel) = {
+    let (session_specs, cancel, no_mcp) = {
         let state = state.lock().await;
-        (state.session_mcp_servers.clone(), state.cancel.clone())
+        (
+            state.session_mcp_servers.clone(),
+            state.cancel.clone(),
+            state.no_mcp,
+        )
     };
+    if no_mcp {
+        state.lock().await.mcp_connections = None;
+        return McpPoolOutcome {
+            connections: Vec::new(),
+            failures: Vec::new(),
+            specs: Vec::new(),
+            startup: None,
+        };
+    }
     let specs = effective_specs(&session_specs, ext_specs, cwd, agent_dir);
     if specs.is_empty() {
         // No servers configured (anymore): drop the pool — replacing
@@ -102,13 +117,11 @@ pub(crate) async fn ensure_mcp_pool(
             connections: Vec::new(),
             failures: Vec::new(),
             specs,
+            startup: None,
         };
     }
     let mut fingerprint = super::mcp_cache_fingerprint(cwd, agent_dir, &specs, model);
     fingerprint.push_str(&oauth_fingerprint_suffix(&specs, agent_dir, cancel.clone()).await);
-    // Disabled specs never connect: completeness is measured against the
-    // ENABLED set, or a disabled entry would keep the pool uncacheable.
-    let enabled_count = specs.iter().filter(|s| s.enabled).count();
     let cached = {
         let state_guard = state.lock().await;
         state_guard
@@ -116,19 +129,17 @@ pub(crate) async fn ensure_mcp_pool(
             .as_ref()
             .filter(|cache| {
                 cache.fingerprint == fingerprint
-                    // Liveness: a crashed server child must not
-                    // be reused forever — dead connections fall
-                    // through to a rebuild.
-                    && cache.connections.iter().all(|c| !c.is_closed())
+                    && !cache.startup.has_failures()
+                    && cache
+                        .startup
+                        .ready_connections()
+                        .iter()
+                        .all(|connection| !connection.is_closed())
             })
-            .map(|cache| cache.connections.clone())
+            .map(|cache| cache.startup.clone())
     };
-    match cached {
-        Some(connections) => McpPoolOutcome {
-            connections,
-            failures: Vec::new(),
-            specs,
-        },
+    let manager = match cached {
+        Some(manager) => manager,
         None => {
             let callbacks = crate::mcp_config::client_callbacks(
                 settings,
@@ -137,33 +148,39 @@ pub(crate) async fn ensure_mcp_pool(
                 crate::mcp_elicitation::InteractionMode::Headless,
                 None,
             );
-            let outcomes = crate::mcp_oauth::connect_all_oauth_reporting_cancellable(
+            let manager = crate::mcp_startup::McpStartupManager::start(
                 specs.clone(),
                 agent_dir,
                 false,
                 callbacks,
-                cancel,
-            )
-            .await;
-            let mut connections = Vec::new();
-            let mut failures = Vec::new();
-            for outcome in outcomes {
-                match outcome.result {
-                    Ok(conn) => connections.push(conn),
-                    Err(e) => failures.push((outcome.name, e)),
-                }
-            }
-            state.lock().await.mcp_connections =
-                (connections.len() == enabled_count).then(|| super::McpConnectionCache {
-                    fingerprint,
-                    connections: connections.clone(),
-                });
-            McpPoolOutcome {
-                connections,
-                failures,
-                specs,
-            }
+                cancel.clone(),
+                untrusted,
+            );
+            manager
+                .wait_direct(crate::mcp_startup::DEFAULT_STARTUP_WAIT, cancel.clone())
+                .await;
+            let ready_count = manager.ready_connections().len();
+            let enabled_count = specs.iter().filter(|spec| spec.enabled).count();
+            // Preserve the old partial-pool rule for failed/direct servers.
+            // A pending DEFERRED pool is the sole exception: it has not
+            // failed, and retaining it lets tool_search use the connection
+            // when it settles. Any failure makes the next prompt rebuild.
+            let cacheable = ready_count == enabled_count
+                || (manager.has_deferred_servers() && !manager.has_failures());
+            state.lock().await.mcp_connections = cacheable.then(|| super::McpConnectionCache {
+                fingerprint,
+                startup: manager.clone(),
+            });
+            manager
         }
+    };
+    let connections = manager.ready_connections();
+    let failures = manager.failures();
+    McpPoolOutcome {
+        connections,
+        failures,
+        specs,
+        startup: Some(manager),
     }
 }
 
@@ -213,7 +230,7 @@ pub(crate) async fn mcp_status(
             state_guard
                 .mcp_connections
                 .as_ref()
-                .map(|cache| cache.connections.clone())
+                .map(|cache| cache.startup.ready_connections())
         };
         return specs
             .iter()
@@ -251,8 +268,10 @@ pub(crate) async fn mcp_status(
             })
             .collect();
     }
-    let outcome =
-        ensure_mcp_pool(state, settings, sampling, model, cwd, agent_dir, ext_specs).await;
+    let outcome = ensure_mcp_pool(
+        state, settings, sampling, model, cwd, agent_dir, ext_specs, None,
+    )
+    .await;
     outcome
         .specs
         .iter()

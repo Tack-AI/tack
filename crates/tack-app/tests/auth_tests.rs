@@ -187,6 +187,42 @@ async fn late_refresh_does_not_resurrect_a_logout() {
 }
 
 #[tokio::test]
+async fn azure_legacy_provider_and_credential_ids_remain_compatible() {
+    let agent_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        agent_dir.path().join("settings.json"),
+        r#"{"credentialStore": "file"}"#,
+    )
+    .unwrap();
+    tack_app::auth::login(
+        agent_dir.path(),
+        tack_ai::providers::LEGACY_AZURE_PROVIDER_ID,
+        "legacy-azure-key",
+    )
+    .unwrap();
+
+    assert_eq!(
+        tack_app::model::resolve_api_key("azure", None, agent_dir.path()).as_deref(),
+        Some("legacy-azure-key")
+    );
+    let model = tack_app::model::resolve_model(
+        tack_ai::providers::LEGACY_AZURE_PROVIDER_ID,
+        None,
+        agent_dir.path(),
+    )
+    .unwrap();
+    assert_eq!(model.provider, "azure");
+    assert_eq!(model.api, "azure-openai-responses");
+
+    // A new-id entry takes precedence over the compatibility fallback.
+    tack_app::auth::login(agent_dir.path(), "azure", "new-azure-key").unwrap();
+    assert_eq!(
+        tack_app::model::resolve_api_key("azure", None, agent_dir.path()).as_deref(),
+        Some("new-azure-key")
+    );
+}
+
+#[tokio::test]
 async fn static_auth_passthrough_and_api_key_login() {
     let agent_dir = tempfile::tempdir().unwrap();
     // Pin file storage: otherwise CredentialStore::Auto writes the login to
