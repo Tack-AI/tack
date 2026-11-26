@@ -630,6 +630,12 @@ pub struct TuiApp {
     /// of the outgoing context). Live stats during a run = base + the
     /// streaming message's usage; None when idle.
     run_stats_base: Option<footer::FooterStats>,
+    /// The real session while a run is active: `start_run` parks it in this
+    /// shared handle and leaves an in-memory placeholder in
+    /// `state.session`, so commands like `/session` must read THIS (or
+    /// they'd report the placeholder's fresh id and zero usage). Cleared
+    /// when the run hands the session back (`AppEvent::SessionBack`).
+    run_session: Option<Arc<Mutex<SessionManager>>>,
     /// MCP sampling usage accrued this session (server-initiated LLM calls
     /// run outside the agent loop, so the session's own totals don't see
     /// them). Folded into the footer stats wherever session totals are.
@@ -896,6 +902,7 @@ impl TuiApp {
             last_stats: footer::FooterStats::default(),
             stats_key: None,
             run_stats_base: None,
+            run_session: None,
             mcp_sampling_stats: footer::FooterStats::default(),
             last_esc: None,
         };
@@ -1616,6 +1623,20 @@ impl TuiApp {
         self.handle_app_event(event).await;
     }
 
+    /// Test helper: simulate `start_run`'s session parking — the real
+    /// session moves into the run handle and an in-memory placeholder
+    /// takes its slot. Returns the run handle (like `start_run`'s Arc).
+    #[doc(hidden)]
+    pub fn test_park_session(&mut self) -> Arc<Mutex<SessionManager>> {
+        let real = std::mem::replace(
+            &mut self.state.session,
+            SessionManager::in_memory(&self.cwd),
+        );
+        let handle = Arc::new(Mutex::new(real));
+        self.run_session = Some(handle.clone());
+        handle
+    }
+
     /// Test helper: drop any startup dialog (first-run wizard, trust
     /// prompt, session picker). Tests that route input through
     /// `handle_input` need the editor reachable; parallel tests race on
@@ -1728,6 +1749,7 @@ impl TuiApp {
                 self.handle_branch_summary_done(session_id, from_id, result);
             }
             AppEvent::SessionBack(session) => {
+                self.run_session = None;
                 self.state.session = *session;
             }
             AppEvent::McpElicitation(query) => {
@@ -1943,7 +1965,11 @@ impl TuiApp {
                 // Finalize any running tools (shouldn't happen, but stay robust).
                 for id in self.tool_order.clone() {
                     if let Some(tool) = self.tools.get_mut(&id)
-                        && matches!(tool.state, tool_render::ToolState::Running { .. })
+                        && matches!(
+                            tool.state,
+                            tool_render::ToolState::Running { .. }
+                                | tool_render::ToolState::Pending
+                        )
                     {
                         tool.state = tool_render::ToolState::Done {
                             result: tack_agent_core::AgentToolResult::error("interrupted"),

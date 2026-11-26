@@ -876,6 +876,10 @@ impl TuiApp {
             // Placeholder while moving into the Arc; restored on completion.
             SessionManager::in_memory(&self.cwd),
         )));
+        // `/session` (and any other command needing the real session) reads
+        // the parked session through this handle while the placeholder sits
+        // in `state.session`.
+        self.run_session = Some(state_session.clone());
         let existing = state_session.lock().await.build_session_context().messages;
         let session_id = state_session.lock().await.session_id().to_string();
 
@@ -1536,9 +1540,10 @@ impl TuiApp {
                                 tool_name: name.clone(),
                                 args_fp: tool_render::args_fingerprint(arguments),
                                 args: arguments.clone(),
-                                state: tool_render::ToolState::Running {
-                                    partial_output: String::new(),
-                                },
+                                // Streaming registration only: the tool has
+                                // NOT started (sequential batches run calls
+                                // one at a time, so later calls queue).
+                                state: tool_render::ToolState::Pending,
                                 expanded: false,
                             });
                         } else if let tack_ai::ContentBlock::ToolCall { id, arguments, .. } = block
@@ -1617,6 +1622,13 @@ impl TuiApp {
                 args,
             } => {
                 if let Some(tool) = self.tools.get_mut(&tool_call_id) {
+                    if matches!(tool.state, tool_render::ToolState::Pending) {
+                        // Execution actually started (streaming registration
+                        // had only queued the card).
+                        tool.state = tool_render::ToolState::Running {
+                            partial_output: String::new(),
+                        };
+                    }
                     if tool_render::args_fingerprint(&args) != tool.args_fp {
                         tool.args_fp = tool_render::args_fingerprint(&args);
                         tool.args = args;
@@ -1650,10 +1662,20 @@ impl TuiApp {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                if let Some(tool) = self.tools.get_mut(&tool_call_id)
-                    && let tool_render::ToolState::Running { partial_output } = &mut tool.state
-                {
-                    *partial_output = text;
+                if let Some(tool) = self.tools.get_mut(&tool_call_id) {
+                    match &mut tool.state {
+                        tool_render::ToolState::Running { partial_output } => {
+                            *partial_output = text;
+                        }
+                        // A partial implies execution started even if the
+                        // start event hasn't been processed yet.
+                        tool_render::ToolState::Pending => {
+                            tool.state = tool_render::ToolState::Running {
+                                partial_output: text,
+                            };
+                        }
+                        tool_render::ToolState::Done { .. } => {}
+                    }
                 }
             }
             AgentEvent::ToolExecutionEnd {

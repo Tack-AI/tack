@@ -2355,3 +2355,121 @@ async fn ctrl_s_with_draft_aborts_and_sends_after_run() {
     assert!(frame.contains("urgent"), "prompt missing: {frame:?}");
     app.test_app_event(AppEvent::RunFinished).await;
 }
+
+#[tokio::test]
+async fn streaming_registered_tools_queue_until_execution_start() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut app = test_app(cwd.path()).await;
+
+    let model =
+        tack_app::model::resolve_model("anthropic", Some("k3"), &tack_session::default_agent_dir())
+            .unwrap();
+    let mut partial = tack_ai::AssistantMessage::pending(&model);
+    partial.content = vec![tack_ai::ContentBlock::ToolCall {
+        id: "t1".into(),
+        name: "bash".into(),
+        arguments: serde_json::json!({ "command": "git status" }),
+        arguments_error: None,
+        thought_signature: None,
+        namespace: None,
+    }];
+
+    // Streaming registration: the card exists but the tool has NOT started
+    // (sequential batches run calls one at a time, so later calls queue).
+    app.handle_agent_event(tack_agent_core::AgentEvent::MessageUpdate {
+        assistant_message_event: tack_ai::AssistantMessageEvent::ToolCallDelta {
+            content_index: 0,
+            delta: String::new(),
+            partial: partial.clone(),
+        },
+        message: tack_agent_core::AgentMessage::Assistant(partial.clone()),
+    })
+    .await;
+    let mut out = Vec::new();
+    app.render(&mut out).unwrap();
+    let frame = String::from_utf8_lossy(&out);
+    assert!(frame.contains("○"), "queued marker missing: {frame:?}");
+    assert!(
+        frame.contains("queued — not started yet"),
+        "queued label missing: {frame:?}"
+    );
+    assert!(
+        !frame.contains("●"),
+        "queued card looked running: {frame:?}"
+    );
+
+    // Execution start flips queued → running (and re-renders the card).
+    app.handle_agent_event(tack_agent_core::AgentEvent::ToolExecutionStart {
+        tool_call_id: "t1".into(),
+        tool_name: "bash".into(),
+        args: serde_json::json!({ "command": "git status" }),
+    })
+    .await;
+    let mut out = Vec::new();
+    app.render(&mut out).unwrap();
+    let frame = String::from_utf8_lossy(&out);
+    assert!(frame.contains("●"), "running marker missing: {frame:?}");
+    assert!(
+        !frame.contains("queued — not started yet"),
+        "queued label lingered after start: {frame:?}"
+    );
+
+    // Completion still renders the result.
+    app.handle_agent_event(tack_agent_core::AgentEvent::ToolExecutionEnd {
+        tool_call_id: "t1".into(),
+        tool_name: "bash".into(),
+        result: tack_agent_core::AgentToolResult::text("clean"),
+        is_error: false,
+    })
+    .await;
+    let mut out = Vec::new();
+    app.render(&mut out).unwrap();
+    let frame = String::from_utf8_lossy(&out);
+    assert!(frame.contains("✓"), "done marker missing: {frame:?}");
+    assert!(frame.contains("clean"), "tool output missing: {frame:?}");
+}
+
+#[tokio::test]
+async fn session_command_reports_parked_session_during_run() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut app = test_app(cwd.path()).await;
+
+    // Simulate start_run: the real session is parked in the run handle and
+    // an in-memory placeholder takes its slot. /session must read the
+    // parked session, not the placeholder (fresh id + "(in-memory)").
+    let handle = app.test_park_session();
+    let real_id = handle.lock().await.session_id().to_string();
+    app.on_submit("/session".to_string()).await;
+    let mut out = Vec::new();
+    app.render(&mut out).unwrap();
+    let frame = String::from_utf8_lossy(&out);
+    assert!(
+        frame.contains(&real_id),
+        "parked session id missing from /session: {frame:?}"
+    );
+    assert!(
+        !frame.contains("(in-memory)"),
+        "/session reported the placeholder during a run: {frame:?}"
+    );
+
+    // Hand-back (pump semantics): swap the real session out of the handle,
+    // deliver SessionBack — /session keeps reporting the restored session.
+    let session = std::mem::replace(
+        &mut *handle.lock().await,
+        tack_session::SessionManager::in_memory(cwd.path()),
+    );
+    app.test_app_event(AppEvent::SessionBack(Box::new(session)))
+        .await;
+    app.on_submit("/session".to_string()).await;
+    let mut out = Vec::new();
+    app.render(&mut out).unwrap();
+    let frame = String::from_utf8_lossy(&out);
+    assert!(
+        frame.contains(&real_id),
+        "restored session id missing after hand-back: {frame:?}"
+    );
+    assert!(
+        !frame.contains("(in-memory)"),
+        "/session read the swapped-out handle after hand-back: {frame:?}"
+    );
+}

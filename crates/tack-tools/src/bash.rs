@@ -100,6 +100,12 @@ impl AgentTool for BashTool {
     }
 
     fn execution_mode(&self) -> ToolExecutionMode {
+        // Sequential: concurrent commands can race (git index.lock, cargo
+        // target fingerprints, fmt rewriting sources mid-build), and later
+        // calls may depend on earlier calls' side effects. A foreground
+        // sub-agent is the deliberate exception — the agent loop's mixed
+        // batch spawns it concurrently so quick sibling calls don't queue
+        // behind it (see execute_tool_calls_mixed).
         ToolExecutionMode::Sequential
     }
 

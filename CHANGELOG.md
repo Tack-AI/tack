@@ -43,6 +43,22 @@ notice can parse entries (same convention as TS pi).
 
 ### Fixed
 
+- **Queued tool calls no longer look stuck while a long sibling call runs**:
+  tool cards registered from the streaming assistant message now show a
+  queued state (○ "not started yet") and only flip to running when
+  execution actually starts, instead of appearing to execute for the whole
+  wait. Sequential batches (e.g. those containing `bash`) no longer force a
+  foreground subagent's sibling calls to wait for it: the subagent runs
+  concurrently while the other calls keep their sequential semantics, so
+  quick `bash`/`read` results print immediately instead of after the
+  subagent finishes.
+
+- **`/session` during an active run reports the real session**: the command
+  previously read the in-memory placeholder that parks the live session
+  while a run is active, showing a fresh session id, `(in-memory)` as the
+  file, and zero tokens/cost. It now reads the parked session and keeps
+  reporting the restored session after the run hands it back.
+
 - **Large streamed tool arguments no longer reparse every accumulated prefix**:
   a shared incremental JSON parser feeds every delta once for Anthropic,
   Bedrock, Mistral, OpenAI Completions/Responses, tack-messages, and CodeBuddy,

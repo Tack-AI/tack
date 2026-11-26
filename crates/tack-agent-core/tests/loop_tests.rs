@@ -563,6 +563,158 @@ async fn parallel_execution_order_guarantees() {
     assert_eq!(result_order, vec!["slow", "fast"]);
 }
 
+/// A MockTool that declares sequential execution (like bash).
+#[derive(Debug)]
+struct SequentialMockTool(MockTool);
+
+#[async_trait]
+impl AgentTool for SequentialMockTool {
+    fn name(&self) -> &'static str {
+        self.0.name
+    }
+    fn label(&self) -> &str {
+        self.0.label()
+    }
+    fn description(&self) -> &str {
+        "mock sequential tool"
+    }
+    fn parameters_schema(&self) -> Value {
+        self.0.parameters_schema()
+    }
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        params: Value,
+        cancel: CancellationToken,
+        on_update: &(dyn Fn(AgentToolResult) + Send + Sync),
+    ) -> Result<AgentToolResult, String> {
+        self.0
+            .execute(tool_call_id, params, cancel, on_update)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn mixed_batch_spawns_only_subagent() {
+    let provider = ScriptedProvider::with_scripts(vec![
+        assistant_with_tool_calls(&[
+            ("agent", "subagent", json!({})),
+            ("a", "seq-a", json!({})),
+            ("b", "seq-b", json!({})),
+        ]),
+        assistant_text("done"),
+    ]);
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent: Arc<dyn AgentTool> = Arc::new(MockTool {
+        name: "subagent",
+        delay: Duration::from_millis(250),
+        calls: calls.clone(),
+        terminate: false,
+    });
+    let seq = |name| -> Arc<dyn AgentTool> {
+        Arc::new(SequentialMockTool(MockTool {
+            name,
+            delay: Duration::ZERO,
+            calls: calls.clone(),
+            terminate: false,
+        }))
+    };
+
+    let stream = agent_loop(
+        vec![AgentMessage::user("go")],
+        AgentContext {
+            system_prompt: None,
+            messages: vec![],
+            tools: vec![agent, seq("seq-a"), seq("seq-b")],
+        },
+        make_config(provider, Arc::new(NoopHooks)),
+        CancellationToken::new(),
+    );
+    let (events, _) = collect_events(stream).await;
+
+    // The sequential siblings finish WHILE the sub-agent is still running:
+    // they must not queue behind it, and they keep source order.
+    let end_order: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolExecutionEnd { tool_call_id, .. } => Some(tool_call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(end_order, vec!["a", "b", "agent"]);
+
+    // Result messages still assemble in source order (sub-agent first).
+    let result_order: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::MessageEnd {
+                message: AgentMessage::ToolResult(t),
+            } => Some(t.tool_call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(result_order, vec!["agent", "a", "b"]);
+}
+
+#[tokio::test]
+async fn mixed_batch_sequential_call_before_subagent_runs_first() {
+    let provider = ScriptedProvider::with_scripts(vec![
+        assistant_with_tool_calls(&[("a", "seq-a", json!({})), ("agent", "subagent", json!({}))]),
+        assistant_text("done"),
+    ]);
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let agent: Arc<dyn AgentTool> = Arc::new(MockTool {
+        name: "subagent",
+        delay: Duration::from_millis(50),
+        calls: calls.clone(),
+        terminate: false,
+    });
+    let seq: Arc<dyn AgentTool> = Arc::new(SequentialMockTool(MockTool {
+        name: "seq-a",
+        delay: Duration::ZERO,
+        calls,
+        terminate: false,
+    }));
+
+    let stream = agent_loop(
+        vec![AgentMessage::user("go")],
+        AgentContext {
+            system_prompt: None,
+            messages: vec![],
+            tools: vec![seq, agent],
+        },
+        make_config(provider, Arc::new(NoopHooks)),
+        CancellationToken::new(),
+    );
+    let (events, _) = collect_events(stream).await;
+
+    // A sequential call ahead of the sub-agent still runs to completion
+    // first (source order); the sub-agent spawns afterwards.
+    let end_order: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolExecutionEnd { tool_call_id, .. } => Some(tool_call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(end_order, vec!["a", "agent"]);
+    let result_order: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::MessageEnd {
+                message: AgentMessage::ToolResult(t),
+            } => Some(t.tool_call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(result_order, vec!["a", "agent"]);
+}
+
 #[tokio::test]
 async fn abort_during_streaming() {
     // Provider script that never terminates on its own; we cancel instead.

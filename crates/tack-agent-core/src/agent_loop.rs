@@ -1730,6 +1730,24 @@ async fn execute_tool_calls(
             .find(|t| t.name() == name)
             .is_some_and(|t| t.execution_mode() == ToolExecutionMode::Sequential)
     });
+    // A foreground sub-agent is long-running but independent: even when the
+    // rest of the batch goes sequential (e.g. bash is Sequential), sibling
+    // calls must not queue behind it. Sub-agent calls spawn concurrently;
+    // every other call keeps the sequential semantics.
+    let has_subagent = tool_calls.iter().any(|(_, name, _, _)| name == "subagent");
+    if has_subagent
+        && (config.tool_execution == ToolExecutionMode::Sequential || has_sequential_tool)
+    {
+        return execute_tool_calls_mixed(
+            context,
+            assistant_message,
+            tool_calls,
+            config,
+            cancel,
+            tx,
+        )
+        .await;
+    }
     if config.tool_execution == ToolExecutionMode::Sequential || has_sequential_tool {
         execute_tool_calls_sequential(context, assistant_message, tool_calls, config, cancel, tx)
             .await
@@ -1852,6 +1870,56 @@ async fn execute_tool_calls_parallel(
     cancel: &CancellationToken,
     tx: &AgentEventTx,
 ) -> ExecutedToolCallBatch {
+    execute_tool_calls_spawned(
+        context,
+        assistant_message,
+        tool_calls,
+        config,
+        cancel,
+        tx,
+        &|_| true,
+    )
+    .await
+}
+
+/// Mixed batch: only sub-agent calls spawn concurrently; every other call
+/// executes inline in source order. Used when a sequential tool (e.g. bash)
+/// would otherwise force the whole batch — including a long foreground
+/// sub-agent — to run one at a time. The sub-agent's child commands may
+/// overlap the parent's sequential commands in the same cwd (accepted:
+/// the alternative is sibling calls stalling for the sub-agent's whole run).
+async fn execute_tool_calls_mixed(
+    context: &AgentContext,
+    assistant_message: &AssistantMessage,
+    tool_calls: &[PendingToolCall],
+    config: &AgentLoopConfig,
+    cancel: &CancellationToken,
+    tx: &AgentEventTx,
+) -> ExecutedToolCallBatch {
+    execute_tool_calls_spawned(
+        context,
+        assistant_message,
+        tool_calls,
+        config,
+        cancel,
+        tx,
+        &|name| name == "subagent",
+    )
+    .await
+}
+
+/// Shared batch machinery: preflight in source order, spawn the calls the
+/// predicate selects (completion-order ends), execute the rest inline
+/// (source-order ends), then join + emit result messages in source order.
+async fn execute_tool_calls_spawned(
+    context: &AgentContext,
+    assistant_message: &AssistantMessage,
+    tool_calls: &[PendingToolCall],
+    config: &AgentLoopConfig,
+    cancel: &CancellationToken,
+    tx: &AgentEventTx,
+    spawn: &(dyn Fn(&str) -> bool + Send + Sync),
+) -> ExecutedToolCallBatch {
     // Preflight is sequential and in source order (matches TS).
     #[allow(clippy::large_enum_variant)]
     enum Pending {
@@ -1897,16 +1965,34 @@ async fn execute_tool_calls_parallel(
                 tool,
                 args: prepared_args,
             } => {
-                // Spawn: tool_execution_end fires in completion order.
                 let snapshot = context_snapshot
                     .get_or_insert_with(|| Arc::new(context.messages.clone()))
                     .clone();
-                pending.push(Pending::Running {
-                    tool_call_id: id.clone(),
-                    tool_name: name.clone(),
-                    handle: tokio::spawn(execute_and_finalize(
-                        // Shared snapshot for the after_tool_call hook
-                        // context; parallel tools only read it.
+                if spawn(name) {
+                    // Spawn: tool_execution_end fires in completion order.
+                    pending.push(Pending::Running {
+                        tool_call_id: id.clone(),
+                        tool_name: name.clone(),
+                        handle: tokio::spawn(execute_and_finalize(
+                            // Shared snapshot for the after_tool_call hook
+                            // context; parallel tools only read it.
+                            snapshot,
+                            assistant_message.clone(),
+                            id.clone(),
+                            name.clone(),
+                            args.clone(),
+                            tool,
+                            prepared_args,
+                            config.clone(),
+                            cancel.clone(),
+                            tx.clone(),
+                        )),
+                    });
+                } else {
+                    // Inline: sequential calls keep source order and never
+                    // overlap each other (spawned sub-agent tasks still run
+                    // concurrently in the background).
+                    let f = execute_and_finalize(
                         snapshot,
                         assistant_message.clone(),
                         id.clone(),
@@ -1917,8 +2003,10 @@ async fn execute_tool_calls_parallel(
                         config.clone(),
                         cancel.clone(),
                         tx.clone(),
-                    )),
-                });
+                    )
+                    .await;
+                    pending.push(Pending::Done(f));
+                }
             }
         }
         started += 1;

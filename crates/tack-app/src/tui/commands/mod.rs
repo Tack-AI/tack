@@ -223,7 +223,7 @@ impl TuiApp {
             "trace" => self.command_trace(args),
             "clone" => self.command_clone(),
             "name" => self.command_name(args),
-            "session" => self.command_session(),
+            "session" => self.command_session().await,
             "cost" => self.command_cost(),
             "context" => self.command_context(),
             "todo" => self.command_todo(args).await,

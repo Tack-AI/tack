@@ -231,14 +231,17 @@ impl TuiApp {
 
     /// Render a tool card with caching (B): completed cards are immutable;
     /// running cards are keyed by partial-output length (output only
-    /// appends). Args are NOT part of the key — they stream in before any
-    /// output exists, so mutation sites (run.rs) invalidate the entry
-    /// explicitly. The cache key includes width and the expanded flag.
+    /// appends); queued (Pending) cards get their own sentinel so the
+    /// Pending → Running → Done transitions always re-render. Args are NOT
+    /// part of the key — they stream in before any output exists, so
+    /// mutation sites (run.rs) invalidate the entry explicitly. The cache
+    /// key includes width and the expanded flag.
     fn render_tool_cached(&mut self, id: &str, width: u16) -> (Vec<Line>, bool) {
         let Some(tool) = self.tools.get(id) else {
             return (Vec::new(), true);
         };
         let fingerprint: u64 = match &tool.state {
+            tool_render::ToolState::Pending => u64::MAX - 1,
             tool_render::ToolState::Running { partial_output } => partial_output.len() as u64,
             tool_render::ToolState::Done { .. } => u64::MAX,
         };
@@ -881,6 +884,7 @@ impl TuiApp {
             return 0;
         };
         let fingerprint: u64 = match &tool.state {
+            tool_render::ToolState::Pending => u64::MAX - 1,
             tool_render::ToolState::Running { partial_output } => partial_output.len() as u64,
             tool_render::ToolState::Done { .. } => u64::MAX,
         };

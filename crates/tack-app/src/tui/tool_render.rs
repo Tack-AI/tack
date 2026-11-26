@@ -11,6 +11,13 @@ use super::theme::Theme;
 /// State of one tool call in the transcript.
 #[derive(Clone, Debug)]
 pub enum ToolState {
+    /// Registered from the streaming assistant message, but no
+    /// `tool_execution_start` yet. In a sequential batch this means
+    /// "queued behind an earlier call" (e.g. a long foreground subagent);
+    /// during streaming it means the message itself is still unfinished.
+    /// Either way the tool has NOT started — distinct from `Running`, so a
+    /// queued call doesn't look stuck while it waits.
+    Pending,
     Running {
         partial_output: String,
     },
@@ -211,6 +218,7 @@ impl ToolEntry {
         let w = width as usize;
         let mut lines = Vec::new();
         let (marker, bg) = match &self.state {
+            ToolState::Pending => ("○", theme.tool_pending_bg),
             ToolState::Running { .. } => ("●", theme.tool_pending_bg),
             ToolState::Done { is_error: true, .. } => ("✗", theme.tool_error_bg),
             ToolState::Done {
@@ -244,6 +252,9 @@ impl ToolEntry {
 
         // Body: result/diff/partial output.
         let body_lines = match &self.state {
+            ToolState::Pending => {
+                preview_lines("queued — not started yet", self.expanded, theme.tool_output)
+            }
             ToolState::Running { partial_output } if !partial_output.is_empty() => {
                 preview_lines(partial_output, self.expanded, theme.tool_output)
             }

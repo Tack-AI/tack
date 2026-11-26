@@ -976,22 +976,38 @@ impl TuiApp {
         }
     }
 
-    pub(crate) fn command_session(&mut self) {
-        let totals = self.state.session.session_totals();
-        let context = self.state.session.build_session_context();
+    pub(crate) async fn command_session(&mut self) {
+        // During a run `state.session` is an in-memory placeholder (the real
+        // session is parked in the run's shared handle): report the parked
+        // session, or the output would show a fresh id with zero usage.
+        let text = if let Some(handle) = self.run_session.clone() {
+            let session = handle.lock().await;
+            self.session_report(&session)
+        } else {
+            self.session_report(&self.state.session)
+        };
+        self.items.push(TranscriptItem::Chat(ChatEntry::Assistant {
+            message: assistant_notice(&text),
+            streaming: false,
+            thinking_printed: false,
+        }));
+        self.line_cache.clear();
+    }
+
+    fn session_report(&self, session: &SessionManager) -> String {
+        let totals = session.session_totals();
+        let context = session.build_session_context();
         let tokens = tack_session::estimate_context_tokens(&context.messages);
-        let file = self
-            .state
-            .session
+        let file = session
             .session_file()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(in-memory)".to_string());
-        let text = crate::i18n::t(
+        crate::i18n::t(
             self.lang,
             "session.body",
             &[
                 ("file", &file),
-                ("id", self.state.session.session_id()),
+                ("id", session.session_id()),
                 ("tokens", &tokens.tokens.to_string()),
                 (
                     "pct",
@@ -1012,13 +1028,7 @@ impl TuiApp {
                 ("cw", &totals.cache_write.to_string()),
                 ("cost", &format!("{:.4}", totals.cost.total)),
             ],
-        );
-        self.items.push(TranscriptItem::Chat(ChatEntry::Assistant {
-            message: assistant_notice(&text),
-            streaming: false,
-            thinking_printed: false,
-        }));
-        self.line_cache.clear();
+        )
     }
 
     /// /cost — token usage and cost breakdown by model, plus budget progress.
