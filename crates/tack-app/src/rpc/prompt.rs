@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use futures_util::FutureExt as _;
 use serde_json::{Value, json};
 use tack_agent_core::{
     AgentContext, AgentEvent, AgentHooks, AgentLoopConfig, AgentMessage, HooksChain,
@@ -14,9 +15,15 @@ use crate::settings::Settings;
 use super::RpcState;
 use super::events::event_to_json;
 
-/// Spawn a prompt run; events are written to stdout as JSON lines by a
-/// dedicated forwarder task.
-pub(crate) async fn spawn_prompt(
+pub(crate) enum PromptPreparation {
+    Start(futures_util::future::BoxFuture<'static, ()>),
+    Handled,
+}
+
+/// Prepare a prompt run without starting its event pump. The RPC command loop
+/// writes the `started` response before spawning the returned future, keeping
+/// the upstream `response(started) → agent_start` ordering deterministic.
+pub(crate) async fn prepare_prompt(
     state: &Arc<Mutex<RpcState>>,
     provider: &Arc<dyn Provider>,
     settings: &Settings,
@@ -24,7 +31,7 @@ pub(crate) async fn spawn_prompt(
     prompts: Vec<String>,
     images: Vec<(String, String)>,
     _continue_run: bool,
-) {
+) -> PromptPreparation {
     let (
         model,
         thinking,
@@ -353,11 +360,10 @@ pub(crate) async fn spawn_prompt(
                 "message": reason,
             }))
             .await;
-            // Mirror the panic path: a synthetic terminal event so clients
-            // waiting on this run's agent_end do not hang.
-            emit_hook_notice(&json!({ "type": "agent_end" })).await;
+            // A blocked prompt was consumed by preflight: no run exists, so
+            // the client receives disposition=handled rather than agent_end.
             state.lock().await.is_streaming = false;
-            return;
+            return PromptPreparation::Handled;
         }
         if !verdict.additional_context.is_empty() {
             prompts[0] = format!(
@@ -384,7 +390,7 @@ pub(crate) async fn spawn_prompt(
                 provider: provider.clone(),
                 auth: auth.clone(),
                 reasoning: thinking,
-                settings: settings.compaction,
+                settings: settings.compaction_for_model(&model.provider, &model.id),
                 cancel: cancel.clone(),
                 generation,
             }),
@@ -517,116 +523,141 @@ pub(crate) async fn spawn_prompt(
 
     let run_cancel = cancel.clone();
     let mut stream = agent_loop(prompt_messages, context, config, cancel);
-    let task_state = state.clone();
-    let state = task_state.clone();
-    let task = tokio::spawn(async move {
-        use futures_util::FutureExt as _;
-
-        let pump = async {
-            let mut stdout = tokio::io::stdout();
-            while let Some(event) = stream.next().await {
-                // Persist completed messages — only while this run's session is
-                // still current (new_session/clone/switch_session bump the
-                // generation; a cancelled run must not append to the new file).
-                if let AgentEvent::MessageEnd { message } = &event
-                    && !matches!(message, AgentMessage::Custom(_))
-                {
-                    let mut state = state.lock().await;
-                    if state.generation == generation
-                        && let Err(e) = state.session.append_message(message.clone())
+    let state = state.clone();
+    PromptPreparation::Start(
+        async move {
+            let pump = async {
+                let mut stdout = tokio::io::stdout();
+                while let Some(event) = stream.next().await {
+                    // Persist completed messages — only while this run's session is
+                    // still current (new_session/clone/switch_session bump the
+                    // generation; a cancelled run must not append to the new file).
+                    if let AgentEvent::MessageEnd { message } = &event
+                        && !matches!(message, AgentMessage::Custom(_))
                     {
-                        tracing::warn!("persist failed: {e}");
+                        let mut state = state.lock().await;
+                        if state.generation == generation
+                            && let Err(e) = state.session.append_message(message.clone())
+                        {
+                            tracing::warn!("persist failed: {e}");
+                        }
+                    }
+                    let line = event_to_json(&event);
+                    // One write per record (line + newline together): the command
+                    // loop writes responses concurrently and two write calls could
+                    // interleave mid-record, corrupting the JSONL framing.
+                    if stdout
+                        .write_all(format!("{line}\n").as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    let _ = stdout.flush().await;
+                    if event.is_terminal() {
+                        break;
                     }
                 }
-                let line = event_to_json(&event);
-                // One write per record (line + newline together): the command
-                // loop writes responses concurrently and two write calls could
-                // interleave mid-record, corrupting the JSONL framing.
-                if stdout
-                    .write_all(format!("{line}\n").as_bytes())
-                    .await
-                    .is_err()
+                let _ = stream.result().await;
+                if !run_cancel.is_cancelled()
+                    && let Some((engine, groups, session_id, model_id, cwd)) = stop_plan
                 {
-                    break;
+                    let (last_text, totals, stop_hook_active) = {
+                        let st = state.lock().await;
+                        let last_text = st
+                            .session
+                            .build_session_context()
+                            .messages
+                            .iter()
+                            .rev()
+                            .find_map(|m| match m {
+                                AgentMessage::Assistant(a) => {
+                                    let text = a.text();
+                                    (!text.is_empty()).then_some(text)
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        (last_text, st.session.session_totals(), st.stop_hook_active)
+                    };
+                    let verdict = engine
+                        .run(
+                            &groups,
+                            None,
+                            &json!({
+                                "session_id": session_id,
+                                "transcript_path": serde_json::Value::Null,
+                                "cwd": cwd,
+                                "hook_event_name": "Stop",
+                                "model": model_id,
+                                "permission_mode": "bypass",
+                                "stop_hook_active": stop_hook_active,
+                                "last_assistant_message": last_text,
+                                "totalTokens": totals.total_tokens,
+                                "totalCost": totals.cost.total,
+                            }),
+                        )
+                        .await;
+                    if let Some(reason) = &verdict.blocked {
+                        emit_hook_notice(&json!({
+                            "type": "hook_notice",
+                            "hookEvent": "Stop",
+                            "kind": "block",
+                            "message": reason,
+                        }))
+                        .await;
+                    }
+                    emit_hook_notices("Stop", &verdict).await;
                 }
-                let _ = stdout.flush().await;
-                if event.is_terminal() {
-                    break;
-                }
-            }
-            let _ = stream.result().await;
-            if !run_cancel.is_cancelled()
-                && let Some((engine, groups, session_id, model_id, cwd)) = stop_plan
+            };
+            if std::panic::AssertUnwindSafe(pump)
+                .catch_unwind()
+                .await
+                .is_err()
             {
-                let (last_text, totals, stop_hook_active) = {
-                    let st = state.lock().await;
-                    let last_text = st
-                        .session
-                        .build_session_context()
-                        .messages
-                        .iter()
-                        .rev()
-                        .find_map(|m| match m {
-                            AgentMessage::Assistant(a) => {
-                                let text = a.text();
-                                (!text.is_empty()).then_some(text)
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or_default();
-                    (last_text, st.session.session_totals(), st.stop_hook_active)
-                };
-                let verdict = engine
-                    .run(
-                        &groups,
-                        None,
-                        &json!({
-                            "session_id": session_id,
-                            "transcript_path": serde_json::Value::Null,
-                            "cwd": cwd,
-                            "hook_event_name": "Stop",
-                            "model": model_id,
-                            "permission_mode": "bypass",
-                            "stop_hook_active": stop_hook_active,
-                            "last_assistant_message": last_text,
-                            "totalTokens": totals.total_tokens,
-                            "totalCost": totals.cost.total,
-                        }),
-                    )
-                    .await;
-                if let Some(reason) = &verdict.blocked {
-                    emit_hook_notice(&json!({
-                        "type": "hook_notice",
-                        "hookEvent": "Stop",
-                        "kind": "block",
-                        "message": reason,
-                    }))
-                    .await;
-                }
-                emit_hook_notices("Stop", &verdict).await;
+                // The panic hook logged details. Clients block on this run's
+                // terminal event — emit a synthetic agent_end so they unblock
+                // instead of hanging on the dead stream.
+                tracing::error!("rpc agent pump panicked; details in crash.log");
+                let mut stdout = tokio::io::stdout();
+                let _ = stdout.write_all(b"{\"type\":\"agent_end\"}\n").await;
+                let _ = stdout.flush().await;
             }
-        };
-        if std::panic::AssertUnwindSafe(pump)
-            .catch_unwind()
-            .await
-            .is_err()
-        {
-            // The panic hook logged details. Clients block on this run's
-            // terminal event — emit a synthetic agent_end so they unblock
-            // instead of hanging on the dead stream.
-            tracing::error!("rpc agent pump panicked; details in crash.log");
-            let mut stdout = tokio::io::stdout();
-            let _ = stdout.write_all(b"{\"type\":\"agent_end\"}\n").await;
-            let _ = stdout.flush().await;
+            let mut state = state.lock().await;
+            if state.generation == generation {
+                state.is_streaming = false;
+            }
         }
+        .boxed(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) async fn spawn_prompt(
+    state: &Arc<Mutex<RpcState>>,
+    provider: &Arc<dyn Provider>,
+    settings: &Settings,
+    auth: Arc<dyn tack_ai::oauth::AuthResolver>,
+    prompts: Vec<String>,
+    images: Vec<(String, String)>,
+    continue_run: bool,
+) {
+    if let PromptPreparation::Start(run) = prepare_prompt(
+        state,
+        provider,
+        settings,
+        auth,
+        prompts,
+        images,
+        continue_run,
+    )
+    .await
+    {
+        let task = tokio::spawn(run);
         let mut state = state.lock().await;
-        if state.generation == generation {
-            state.is_streaming = false;
-        }
-    });
-    let mut state = task_state.lock().await;
-    state.prompt_tasks.retain(|task| !task.is_finished());
-    state.prompt_tasks.push(task);
+        state.prompt_tasks.retain(|task| !task.is_finished());
+        state.prompt_tasks.push(task);
+    }
 }
 
 /// Write one out-of-band event line to stdout (same one-write-per-record
@@ -875,7 +906,8 @@ async fn run_compact_inner(
         session_id,
         generation,
     } = snapshot;
-    let Some(preparation) = tack_session::prepare_compaction(&path, &settings.compaction) else {
+    let compaction_settings = settings.compaction_for_model(&model.provider, &model.id);
+    let Some(preparation) = tack_session::prepare_compaction(&path, &compaction_settings) else {
         return Err("nothing to compact".to_string());
     };
     let resolved = auth.resolve().await?;

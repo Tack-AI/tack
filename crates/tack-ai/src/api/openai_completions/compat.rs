@@ -152,6 +152,11 @@ pub struct OpenAiCompat {
     /// Whether the provider supports OpenAI custom tools with Lark/regex
     /// grammar formats (TS compat.supportsOpenAIGrammarTools).
     pub supports_openai_grammar_tools: Option<bool>,
+    /// Whether to send session-affinity data from `options.sessionId`.
+    /// Defaults to true for OpenRouter endpoints, false otherwise.
+    pub send_session_affinity_headers: Option<bool>,
+    /// `"openrouter"`, `"openai"`, or `"openai-nosession"`.
+    pub session_affinity_format: Option<String>,
 }
 
 /// Fully-resolved compat settings (no `Option`s on the hot path).
@@ -181,6 +186,8 @@ pub struct ResolvedCompat {
     pub chat_template_kwargs: Option<Value>,
     pub chat_template_args: Option<Value>,
     pub supports_openai_grammar_tools: bool,
+    pub send_session_affinity_headers: bool,
+    pub session_affinity_format: String,
 }
 
 /// Port of `detectCompat`: auto-detect from provider name and baseUrl.
@@ -304,6 +311,13 @@ fn detect_compat(model: &Model) -> ResolvedCompat {
         // First-party OpenAI supports custom (grammar) tools; everyone else
         // needs an explicit compat override (TS catalog opt-in).
         supports_openai_grammar_tools: provider == "openai",
+        send_session_affinity_headers: is_openrouter,
+        session_affinity_format: if is_openrouter {
+            "openrouter"
+        } else {
+            "openai"
+        }
+        .to_string(),
     }
 }
 
@@ -391,6 +405,12 @@ pub(crate) fn get_compat(model: &Model) -> ResolvedCompat {
         supports_openai_grammar_tools: overrides
             .supports_openai_grammar_tools
             .unwrap_or(detected.supports_openai_grammar_tools),
+        send_session_affinity_headers: overrides
+            .send_session_affinity_headers
+            .unwrap_or(detected.send_session_affinity_headers),
+        session_affinity_format: overrides
+            .session_affinity_format
+            .unwrap_or(detected.session_affinity_format),
     }
 }
 
@@ -416,6 +436,33 @@ mod tests {
             headers: None,
             compat,
         }
+    }
+
+    #[test]
+    fn session_affinity_defaults_and_explicit_override() {
+        let openrouter = test_model("openrouter", "https://openrouter.ai/api/v1", None);
+        let compat = get_compat(&openrouter);
+        assert!(compat.send_session_affinity_headers);
+        assert_eq!(compat.session_affinity_format, "openrouter");
+
+        let opted_out = test_model(
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+            Some(json!({ "sendSessionAffinityHeaders": false })),
+        );
+        assert!(!get_compat(&opted_out).send_session_affinity_headers);
+
+        let baseten = test_model(
+            "baseten",
+            "https://inference.baseten.co/v1",
+            Some(json!({ "sendSessionAffinityHeaders": true })),
+        );
+        let compat = get_compat(&baseten);
+        assert!(compat.send_session_affinity_headers);
+        assert_eq!(compat.session_affinity_format, "openai");
+
+        let ordinary = test_model("groq", "https://api.groq.com/openai/v1", None);
+        assert!(!get_compat(&ordinary).send_session_affinity_headers);
     }
 
     /// TS #9816: OpenAI compatibility alone does not imply strict JSON-schema

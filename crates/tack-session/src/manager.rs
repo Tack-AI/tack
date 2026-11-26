@@ -11,9 +11,12 @@ use tack_ai::Usage;
 
 use crate::context::{
     SessionContext, build_context_entries, build_session_context, build_session_path, generate_id,
-    millis_to_iso, new_session_id, now_iso,
+    is_valid_context_edit, millis_to_iso, new_session_id, now_iso,
 };
-use crate::entry::{CURRENT_SESSION_VERSION, SessionEntry, SessionHeader, SessionLine};
+use crate::entry::{
+    CURRENT_SESSION_VERSION, ContextEditContent, ContextEditReplacement, SessionEntry,
+    SessionHeader, SessionLine,
+};
 use crate::fork_policy::NS_BRANCH_TIP;
 use crate::v4::{
     ForkOptions, V4Header, V4NewWrite, V4Store,
@@ -29,6 +32,10 @@ pub enum SessionError {
     MissingHeader(PathBuf),
     #[error("entry not found: {0}")]
     EntryNotFound(String),
+    #[error("entry is not on the active branch: {0}")]
+    EntryNotOnActiveBranch(String),
+    #[error("invalid context edit: {0}")]
+    InvalidContextEdit(String),
     /// The file carries encrypted entry lines but they cannot be decrypted
     /// (no session key installed, wrong key, or tampered ciphertext).
     /// Opening it anyway would silently drop the encrypted history and
@@ -825,6 +832,62 @@ impl SessionManager {
             message,
         };
         self.push_entry(entry)
+    }
+
+    /// Append a branch-local edit to an earlier model-visible entry.
+    ///
+    /// `None` omits the target from future model projections. A string
+    /// replacement stays a string for user/custom-message targets and is
+    /// normalized to one text block for assistant/tool-result targets before
+    /// it is persisted. The target must be on the active branch; validating
+    /// before `Self::next_id` and `Self::push_entry` makes every rejection
+    /// side-effect free (including the leaf and the backing file/store).
+    pub fn append_context_edit(
+        &mut self,
+        target_id: &str,
+        replacement: Option<ContextEditReplacement>,
+    ) -> Result<String, SessionError> {
+        if !self.has_entry(target_id) {
+            return Err(SessionError::EntryNotFound(target_id.to_string()));
+        }
+        let target = self
+            .build_session_path()
+            .into_iter()
+            .find(|entry| entry.id() == target_id)
+            .ok_or_else(|| SessionError::EntryNotOnActiveBranch(target_id.to_string()))?;
+        if !is_valid_context_edit(&target, replacement.as_ref().map(|r| &r.content)) {
+            return Err(SessionError::InvalidContextEdit(format!(
+                "entry {target_id} and replacement would produce invalid model content"
+            )));
+        }
+
+        let replacement = replacement.map(|replacement| {
+            let content = match (&target, replacement.content) {
+                (
+                    SessionEntry::Message {
+                        message: AgentMessage::Assistant(_),
+                        ..
+                    },
+                    ContextEditContent::Text(text),
+                ) => ContextEditContent::AssistantBlocks(vec![tack_ai::ContentBlock::text(text)]),
+                (
+                    SessionEntry::Message {
+                        message: AgentMessage::ToolResult(_),
+                        ..
+                    },
+                    ContextEditContent::Text(text),
+                ) => ContextEditContent::InputBlocks(vec![tack_ai::InputContentBlock::text(text)]),
+                (_, content) => content,
+            };
+            ContextEditReplacement { content }
+        });
+        self.push_entry(SessionEntry::ContextEdit {
+            id: self.next_id(),
+            parent_id: None,
+            timestamp: now_iso(),
+            target_id: target_id.to_string(),
+            replacement,
+        })
     }
 
     pub fn append_model_change(

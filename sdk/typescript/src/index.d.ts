@@ -130,6 +130,9 @@ export interface PluginBuilder {
   transformContext(
     handler: (params: TransformContextParams, cx: Cx) => Async<TransformContextResult | null>,
   ): this;
+  transformContextWithSystem(
+    handler: (params: TransformContextParams, cx: Cx) => Async<TransformContextResult | null>,
+  ): this;
   approvalReview(
     handler: (params: ApprovalReviewParams, cx: Cx) => Async<ApprovalDecision | null>,
   ): this;

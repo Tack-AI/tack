@@ -131,6 +131,15 @@ impl HostClient {
         self.call(method::HOOKS_TRANSFORM_CONTEXT, params).await
     }
 
+    /// `hooks/transformContextWithSystem`; `None` means "context unchanged".
+    pub async fn transform_context_with_system(
+        &self,
+        params: &TransformContextParams,
+    ) -> Result<Option<TransformContextResult>, PeerError> {
+        self.call(method::HOOKS_TRANSFORM_CONTEXT_WITH_SYSTEM, params)
+            .await
+    }
+
     /// `hooks/afterToolCall`; `None` means "no patch".
     pub async fn after_tool_call(
         &self,
@@ -261,6 +270,14 @@ pub trait PluginConnection: Send + Sync + std::fmt::Debug {
         &self,
         params: &TransformContextParams,
     ) -> Result<Option<TransformContextResult>, PeerError>;
+    /// `hooks/transformContextWithSystem`. Carriers without a meaningful
+    /// full-transcript hook surface remain explicitly unsupported.
+    async fn transform_context_with_system(
+        &self,
+        _params: &TransformContextParams,
+    ) -> Result<Option<TransformContextResult>, PeerError> {
+        Err(unsupported_capability("hooks/transformContextWithSystem"))
+    }
     /// `hooks/afterToolCall`.
     async fn after_tool_call(
         &self,
@@ -338,6 +355,13 @@ impl PluginConnection for HostClient {
         params: &TransformContextParams,
     ) -> Result<Option<TransformContextResult>, PeerError> {
         HostClient::transform_context(self, params).await
+    }
+
+    async fn transform_context_with_system(
+        &self,
+        params: &TransformContextParams,
+    ) -> Result<Option<TransformContextResult>, PeerError> {
+        HostClient::transform_context_with_system(self, params).await
     }
 
     async fn after_tool_call(
@@ -699,6 +723,13 @@ mod tests {
             async fn wait_dead(&self) {}
         }
         let bare = Bare;
+        let err = PluginConnection::transform_context_with_system(
+            &bare,
+            &TransformContextParams { messages: vec![] },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), ERR_CAPABILITY_NOT_GRANTED);
         let err = PluginConnection::provider_stream(&bare, &ProviderStreamParams::default())
             .await
             .unwrap_err();

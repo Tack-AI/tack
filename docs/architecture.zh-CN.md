@@ -69,8 +69,9 @@ flowchart TB
   provider 错误一律**带内**传递（`Error` 事件 + `stop_reason: Error`），不抛出。
 - **工具**：参数边界为 `serde_json::Value` + `schemars` schema；校验失败转为带内
   错误 tool result。`execution_mode()` 控制并行/串行批次；文件修改在共享锁上串行。
-- **Hooks**：单一 `AgentHooks` trait 对象（transform_context / before_tool_call /
-  after_tool_call / steering / follow-up / next-turn）。
+- **Hooks**：单一 `AgentHooks` trait 对象（transform_context /
+  transform_context_with_system / before_tool_call / after_tool_call /
+  steering / follow-up / next-turn）。
 - **取消**：每个 prompt 回合一个 `tokio_util::CancellationToken`；bash 杀整棵进程树。
 - **Windows**：bash 解析 Git Bash（拒绝旧版 WSL bash），与 TS pi 一致。
 
@@ -85,7 +86,7 @@ flowchart TD
     B --> C[hooks.steering_messages<br/>取排队中的用户插话]
     C --> D{内层循环<br/>有 tool call 或<br/>pending 消息?}
     D -- 是 --> E[注入 pending 消息<br/>emit MessageStart/End]
-    E --> F[stream_assistant_response<br/>hooks.transform_context<br/>convert_to_llm → LLM 流式调用]
+    E --> F[stream_assistant_response<br/>普通与 full-system 两阶段上下文转换<br/>convert_to_llm → LLM 流式调用]
     F --> G{stop_reason?}
     G -- Error/Aborted --> H[emit TurnEnd<br/>返回]
     G -- 正常 --> I{有 tool_calls?}

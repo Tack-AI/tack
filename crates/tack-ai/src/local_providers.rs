@@ -201,10 +201,44 @@ pub async fn probe_ollama(host: &str) -> Option<Vec<Model>> {
 }
 
 /// Probe a llama.cpp server: `GET {host}/v1/models`. `None` on any failure.
+/// Only already-loaded models are queried for `/props`: probing an unloaded
+/// preset could load it, and probing a sleeping model could wake it.
 pub async fn probe_llama_cpp(host: &str) -> Option<Vec<Model>> {
     let url = format!("{}/v1/models", host.trim_end_matches('/'));
     let body = get_json(&url).await?;
-    parse_openai_models(&body, LLAMA_CPP)
+    let list: OpenAiModelList = serde_json::from_str(&body).ok()?;
+    let host = host.trim_end_matches('/').to_string();
+    let mut models = futures_util::future::join_all(list.data.into_iter().map(|entry| {
+        let host = host.clone();
+        async move {
+            let mut model = local_model(LLAMA_CPP, entry.id.clone(), entry.id.clone());
+            if entry
+                .status
+                .as_ref()
+                .is_some_and(|status| status.value == "loaded")
+            {
+                let props_url =
+                    reqwest::Url::parse(&format!("{host}/props"))
+                        .ok()
+                        .map(|mut url| {
+                            url.query_pairs_mut()
+                                .append_pair("model", &entry.id)
+                                .append_pair("autoload", "false");
+                            url
+                        });
+                if let Some(url) = props_url
+                    && let Some(body) = get_json(url.as_str()).await
+                    && let Ok(props) = serde_json::from_str::<LlamaServerProps>(&body)
+                {
+                    apply_llama_chat_template(&mut model, &props);
+                }
+            }
+            model
+        }
+    }))
+    .await;
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    Some(models)
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,6 +269,48 @@ struct OpenAiModelList {
 #[derive(Debug, Deserialize)]
 struct OpenAiModelEntry {
     id: String,
+    #[serde(default)]
+    status: Option<LlamaModelStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlamaModelStatus {
+    value: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LlamaServerProps {
+    #[serde(default)]
+    chat_template: Option<String>,
+}
+
+fn apply_llama_chat_template(model: &mut Model, props: &LlamaServerProps) {
+    if !props
+        .chat_template
+        .as_deref()
+        .is_some_and(|template| template.contains("enable_thinking"))
+    {
+        return;
+    }
+    model.reasoning = true;
+    model.thinking_level_map = Some(BTreeMap::from([
+        ("off".into(), Some("off".into())),
+        ("minimal".into(), None),
+        ("low".into(), None),
+        ("medium".into(), Some("medium".into())),
+        ("high".into(), None),
+        ("xhigh".into(), None),
+    ]));
+    if let Some(compat) = model
+        .compat
+        .as_mut()
+        .and_then(|value| value.as_object_mut())
+    {
+        compat.insert(
+            "thinkingFormat".into(),
+            serde_json::Value::String("qwen-chat-template".into()),
+        );
+    }
 }
 
 fn local_model(provider: &str, id: String, name: String) -> Model {
@@ -277,6 +353,7 @@ fn parse_ollama_tags(body: &str) -> Option<Vec<Model>> {
 }
 
 /// Parse an OpenAI `/v1/models` body into catalog models (sorted by id).
+#[cfg(test)]
 fn parse_openai_models(body: &str, provider: &str) -> Option<Vec<Model>> {
     let list: OpenAiModelList = serde_json::from_str(body).ok()?;
     let mut models: Vec<Model> = list

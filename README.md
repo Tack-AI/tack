@@ -362,7 +362,7 @@ Dependency direction is acyclic: `tack-ai ← tack-agent-core ← tack-tools`,
   validation failures become in-band error tool results; file mutations
   serialize on a shared lock.
 - **Hooks**: a single `AgentHooks` trait object (transform_context /
-  before_tool_call / after_tool_call / steering / follow-ups).
+  transform_context_with_system / before_tool_call / after_tool_call / steering / follow-ups).
 - **Cancellation**: one `CancellationToken` per prompt turn; bash kills the
   whole process tree.
 - **Windows**: bash resolves Git Bash like pi's `utils/shell.ts`; an optional

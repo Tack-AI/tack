@@ -28,7 +28,8 @@ plugin.run()  # serves over stdio (asyncio under the hood)
 ```
 
 Handler surface: `tool`, `command`, `before_tool_call`,
-`after_tool_call`, `transform_context`, `approval_review`, `events`,
+`after_tool_call`, `transform_context`, `transform_context_with_system`,
+`approval_review`, `events`,
 `widget` / `on_widget_action`, `autocomplete`, `config_schema`,
 `metrics`. Handlers may be sync or async. The handler context (`cx`)
 exposes the negotiated host environment and the typed host client

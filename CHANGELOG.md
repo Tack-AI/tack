@@ -8,12 +8,54 @@ notice can parse entries (same convention as TS pi).
 
 ### Added
 
+- **RPC prompt dispositions and replacement lifecycle**: successful `prompt`
+  responses now report `started`, `queued`, or `handled`; `steer` and
+  `follow_up` report their queue outcome. Extension commands and blocked
+  `UserPromptSubmit` inputs are handled without a synthetic run, while a
+  started response is flushed before `agent_start`. `new_session`,
+  `switch_session`, `fork`, and `clone` drain the previous run and emit one
+  `sessionShutdown` / `sessionStart` pair with the replacement reason before
+  their success response.
+
+- **Per-model compaction budgets**: `compaction.modelOverrides` accepts exact
+  `provider/modelId` entries with independent `reserveTokens` and
+  `keepRecentTokens` overrides. Manual, automatic, overflow, and `/context`
+  paths resolve the active model; ordinary settings remain the fallback.
+
+- **Provider session routing and llama.cpp thinking discovery**: OpenRouter,
+  Baseten, Fireworks, and Cloudflare affinity flags now emit their protocol-
+  appropriate session headers (disabled by `cacheRetention: "none"`), while
+  OpenCode/OpenCode Go always send `x-opencode-session` when a session id is
+  available. Loaded llama.cpp models are probed with
+  `/props?model=<id>&autoload=false`; `enable_thinking` chat templates enable
+  the Qwen reasoning map without probing sleeping or unloaded models.
+
 - **Imported context edits now drive model-visible history**: v3
   `context_edit` entries omit or replace earlier user/assistant/tool-result/
   custom messages on the active branch without changing raw history. The same
   projection feeds prompts, compaction, branch summaries, and token estimates;
   v4 migration preserves target ids and post-compaction retained-tail edits.
-  Tack currently reads these entries but does not yet originate them.
+  `SessionManager::append_context_edit` now provides the explicit write API;
+  automatic recovery omissions and actionable turn-boundary drafts remain
+  unwired.
+
+- **Two-stage plugin context transforms**: tack-RPC 3.1 adds the optional
+  `transformContextWithSystem` capability. Ordinary `transformContext`
+  handlers edit the non-system projection first; full-system handlers then
+  receive the complete transcript and authoritatively control final prompt
+  and tool replay, including deletion without fallback resurrection. The
+  capability and dispatch are implemented in the Rust, TypeScript, and Python
+  SDKs.
+
+- **Project MCP overlays and provider-backed HTTP auth**: trusted project
+  entries may now override just `enabled`, `exposure`, or `toolExposure` on a
+  global server, inheriting transport and credentials; invalid or unsafe
+  replacements leave the global definition intact. Global and extension
+  Streamable HTTP servers can use `auth.provider` to re-resolve a provider
+  credential on every POST/streaming GET/DELETE, including OAuth refresh and
+  derived API keys, without entering MCP OAuth or persisting tokens in
+  `mcp-tokens.json`. `tack mcp list` uses the same merge/auth path, and
+  login/logout points to the owning provider.
 
 - **Deferred MCP servers no longer block the first prompt**: all enabled
   servers connect in the background, but only direct servers participate in
@@ -42,6 +84,21 @@ notice can parse entries (same convention as TS pi).
   hosts, with plan-specific API keys taking priority over shared regional keys.
 
 ### Fixed
+
+- **Dependency security updates**: `rustix` 1.1.6 addresses zero-length
+  extended-attribute buffer initialization, and `url` 2.5.9 removes recursive
+  `blob:` origin stack exhaustion (also relevant to MCP redirect handling).
+
+- **Google thinking levels honor each model's supported map**: Google
+  Generative AI and Vertex clamp requested and disabled reasoning upward
+  before falling back downward, preserve native `medium`, accept case-
+  insensitive mapping values, and no longer emit a hard-coded unsupported
+  `MINIMAL`/`HIGH` level. Invalid mappings become request errors.
+
+- **Plugin session lifecycle uses the protocol's actual event names**:
+  `sessionStart` and `sessionShutdown` replace the previous snake_case and
+  non-standard `session_end` emissions, which default subscribers could not
+  receive. Startup/resume/replacement/quit reasons are included.
 
 - **Queued tool calls no longer look stuck while a long sibling call runs**:
   tool cards registered from the streaming assistant message now show a

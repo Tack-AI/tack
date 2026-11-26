@@ -1037,6 +1037,32 @@ impl Settings {
         &self.raw
     }
 
+    /// Resolve compaction token budgets through the exact `provider/model`
+    /// override, then the ordinary compaction settings. Other compaction
+    /// behavior remains global, matching pi's `compaction.modelOverrides`.
+    pub fn compaction_for_model(&self, provider: &str, model_id: &str) -> CompactionSettings {
+        let mut resolved = self.compaction;
+        let key = format!("{provider}/{model_id}");
+        let entry = self
+            .raw
+            .get("compaction")
+            .and_then(|c| c.get("modelOverrides"))
+            .and_then(|overrides| overrides.get(&key));
+        if let Some(value) = entry
+            .and_then(|entry| entry.get("reserveTokens"))
+            .and_then(|value| value.as_u64())
+        {
+            resolved.reserve_tokens = value;
+        }
+        if let Some(value) = entry
+            .and_then(|entry| entry.get("keepRecentTokens"))
+            .and_then(|value| value.as_u64())
+        {
+            resolved.keep_recent_tokens = value;
+        }
+        resolved
+    }
+
     /// `cacheRetention` setting as the provider hint for `StreamOptions`.
     /// Unset/unknown values return None, deferring to the provider's own
     /// resolution (`TACK_CACHE_RETENTION` env, then short 5-minute writes).
@@ -1224,6 +1250,45 @@ impl Settings {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn compaction_model_overrides_resolve_per_field() {
+        let settings = Settings::from_raw(serde_json::json!({
+            "compaction": {
+                "enabled": false,
+                "reserveTokens": 8192,
+                "keepRecentTokens": 12000,
+                "goalRecitation": false,
+                "modelOverrides": {
+                    "anthropic/claude": { "reserveTokens": 4096 },
+                    "openai/gpt": { "reserveTokens": 2048, "keepRecentTokens": 3000 },
+                    "zero/model": { "reserveTokens": 0, "keepRecentTokens": 0 }
+                }
+            }
+        }));
+
+        let anthropic = settings.compaction_for_model("anthropic", "claude");
+        assert_eq!(anthropic.reserve_tokens, 4096);
+        assert_eq!(anthropic.keep_recent_tokens, 12000);
+        assert!(!anthropic.enabled);
+        assert!(!anthropic.goal_recitation);
+
+        let openai = settings.compaction_for_model("openai", "gpt");
+        assert_eq!(openai.reserve_tokens, 2048);
+        assert_eq!(openai.keep_recent_tokens, 3000);
+
+        let ordinary = settings.compaction_for_model("other", "model");
+        assert_eq!(ordinary.reserve_tokens, 8192);
+        assert_eq!(ordinary.keep_recent_tokens, 12000);
+
+        let zero = settings.compaction_for_model("zero", "model");
+        assert_eq!(zero.reserve_tokens, 0);
+        assert_eq!(zero.keep_recent_tokens, 0);
+
+        let case_sensitive = settings.compaction_for_model("OpenAI", "gpt");
+        assert_eq!(case_sensitive.reserve_tokens, 8192);
+        assert_eq!(case_sensitive.keep_recent_tokens, 12000);
+    }
 
     #[test]
     fn subagents_inherit_plugins_defaults_and_overrides() {

@@ -198,8 +198,19 @@ pub fn remove(name: &str, local: bool, cwd: &Path, agent_dir: &Path) -> Result<(
     bail!("MCP server {name:?} not found in {}", path.display());
 }
 
-/// `tack mcp logout`: delete the cached OAuth token for a server.
-pub fn logout(name: &str, agent_dir: &Path) -> Result<()> {
+/// `tack mcp logout`: delete the cached OAuth token for a server. Servers
+/// using auth.provider instead direct the user to the provider login store;
+/// their MCP OAuth cache must not be touched.
+pub fn logout(name: &str, cwd: &Path, agent_dir: &Path) -> Result<()> {
+    if let Some(provider) = crate::mcp_config::configured_servers(cwd, agent_dir)
+        .iter()
+        .find(|spec| spec.name == name)
+        .and_then(|spec| spec.auth_provider.as_deref())
+    {
+        bail!(
+            "MCP server {name:?} uses provider {provider:?}; run `tack logout --provider {provider}` instead"
+        );
+    }
     if crate::mcp_oauth::delete_token(agent_dir, name)? {
         println!("Signed out of MCP server {name:?} (token cache entry removed).");
     } else {
@@ -219,6 +230,13 @@ pub async fn login(name: &str, cwd: &Path, agent_dir: &Path, timeout_secs: f64) 
         .iter()
         .find(|s| s.name == name)
         .with_context(|| format!("MCP server {name:?} is not configured (see `tack mcp list`)"))?;
+    if let Some(provider) = spec.auth_provider.as_deref() {
+        // Provider auth is deliberately not an MCP OAuth grant: do not run
+        // discovery, open a browser, refresh, or write an MCP token here.
+        bail!(
+            "MCP server {name:?} uses provider {provider:?}; run `tack login --provider {provider}` instead"
+        );
+    }
     let Some(url) = spec.url() else {
         bail!("MCP server {name:?} is a stdio server; OAuth applies to remote (url) servers");
     };
@@ -274,67 +292,29 @@ struct ListRow {
     invalid: Option<String>,
 }
 
-/// Load both config files preserving provenance (project entries shadow
-/// user entries of the same name). Malformed entries become rows with an
-/// error instead of vanishing — `list` is the diagnostic surface.
-fn list_rows(cwd: &Path, agent_dir: &Path) -> Vec<ListRow> {
-    let mut rows: std::collections::BTreeMap<String, ListRow> = std::collections::BTreeMap::new();
-    let mut load = |path: &Path, source: &'static str| {
-        let Ok(content) = std::fs::read_to_string(path) else {
-            return;
-        };
-        let Ok(Value::Object(doc)) = serde_json::from_str::<Value>(&content) else {
-            rows.insert(
-                path.display().to_string(),
-                ListRow {
-                    name: path.display().to_string(),
-                    source,
-                    spec: None,
-                    invalid: Some("file is not valid JSON".to_string()),
-                },
-            );
-            return;
-        };
-        let Some(servers) = doc.get("mcpServers").and_then(Value::as_object) else {
-            return;
-        };
-        for (name, entry) in servers {
-            match crate::mcp_config::spec_from_entry(name, entry, &path.display().to_string()) {
-                Some(spec) => {
-                    rows.insert(
-                        name.clone(),
-                        ListRow {
-                            name: name.clone(),
-                            source,
-                            spec: Some(spec),
-                            invalid: None,
-                        },
-                    );
-                }
-                None => {
-                    rows.insert(
-                        name.clone(),
-                        ListRow {
-                            name: name.clone(),
-                            source,
-                            spec: None,
-                            invalid: Some(
-                                "invalid entry (needs \"command\" or \"url\"; see warnings above)"
-                                    .to_string(),
-                            ),
-                        },
-                    );
-                }
+/// Load both files through the same raw merge used by sessions. Rejected
+/// project changes remain diagnostics while the preserved global row still
+/// connects normally.
+fn list_rows(cwd: &Path, agent_dir: &Path) -> (Vec<ListRow>, Vec<String>) {
+    let loaded = crate::mcp_config::load_config(cwd, agent_dir);
+    let crate::mcp_config::LoadedMcpConfig { entries, errors } = loaded;
+    let rows = entries
+        .into_iter()
+        .map(|entry| {
+            let source = match entry.scope {
+                crate::mcp_config::McpConfigScope::Global => "user",
+                crate::mcp_config::McpConfigScope::Project => "project",
+                crate::mcp_config::McpConfigScope::ProjectOverride => "user+project",
+            };
+            ListRow {
+                name: entry.name,
+                source,
+                spec: entry.spec,
+                invalid: entry.invalid,
             }
-        }
-    };
-    load(&user_mcp_path(agent_dir), "user");
-    // Project MCP servers can execute arbitrary commands — trust-gated,
-    // same as the session paths.
-    if crate::project_trust::is_trusted(cwd, agent_dir) {
-        load(&project_mcp_path(cwd), "project");
-    }
-    rows.into_values().collect()
+        })
+        .collect();
+    (rows, errors)
 }
 
 fn transport_label(spec: &tack_tools::mcp::McpServerSpec) -> &'static str {
@@ -350,13 +330,20 @@ fn transport_label(spec: &tack_tools::mcp::McpServerSpec) -> &'static str {
 /// tokens only — never an interactive prompt). Exit status 1 when an
 /// entry is invalid or an enabled server is not connected.
 pub async fn list(cwd: &Path, agent_dir: &Path) -> Result<()> {
-    let rows = list_rows(cwd, agent_dir);
+    let (rows, config_errors) = list_rows(cwd, agent_dir);
+    let mut failed = !config_errors.is_empty();
+    for error in config_errors {
+        eprintln!("MCP configuration error: {error}");
+    }
     if rows.is_empty() {
         println!(
             "No MCP servers configured. Add one with `tack mcp add` (user: {}, project: {}).",
             user_mcp_path(agent_dir).display(),
             project_mcp_path(cwd).display(),
         );
+        if failed {
+            std::process::exit(1);
+        }
         return Ok(());
     }
     let enabled: Vec<tack_tools::mcp::McpServerSpec> = rows
@@ -371,7 +358,6 @@ pub async fn list(cwd: &Path, agent_dir: &Path) -> Result<()> {
         Default::default(),
     )
     .await;
-    let mut failed = false;
     for row in &rows {
         if let Some(error) = &row.invalid {
             failed = true;
@@ -440,7 +426,11 @@ pub async fn list(cwd: &Path, agent_dir: &Path) -> Result<()> {
                 Err(e) => {
                     failed = true;
                     let hint = if e.contains("401") || e.to_lowercase().contains("unauthor") {
-                        format!(" (sign in with `tack mcp login {}`)", row.name)
+                        if let Some(provider) = spec.auth_provider.as_deref() {
+                            format!(" (sign in with `tack login --provider {provider}`)")
+                        } else {
+                            format!(" (sign in with `tack mcp login {}`)", row.name)
+                        }
                     } else {
                         String::new()
                     };
@@ -598,6 +588,53 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let agent = tmp.path();
         // No token file at all: a clean no-op.
-        logout("unknown", agent).unwrap();
+        logout("unknown", tmp.path(), agent).unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_login_and_logout_redirect_without_touching_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("mcp.json"),
+            serde_json::json!({"mcpServers": {
+                "remote": {
+                    "url": "https://example.com/mcp",
+                    "auth": {"provider": "radius"}
+                }
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let mcp_tokens = serde_json::json!({
+            "mcp__remote": {"access_token": "must-survive", "refresh_token": "also-survive"}
+        })
+        .to_string();
+        let provider_tokens = serde_json::json!({
+            "radius": {"type": "api_key", "key": "provider-must-survive"}
+        })
+        .to_string();
+        std::fs::write(agent.join("mcp-tokens.json"), &mcp_tokens).unwrap();
+        std::fs::write(agent.join("auth.json"), &provider_tokens).unwrap();
+
+        let error = logout("remote", tmp.path(), &agent).unwrap_err();
+        assert!(
+            error.to_string().contains("tack logout --provider radius"),
+            "{error}"
+        );
+        let error = login("remote", tmp.path(), &agent, 1.0).await.unwrap_err();
+        assert!(
+            error.to_string().contains("tack login --provider radius"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(agent.join("mcp-tokens.json")).unwrap(),
+            mcp_tokens
+        );
+        assert_eq!(
+            std::fs::read_to_string(agent.join("auth.json")).unwrap(),
+            provider_tokens
+        );
     }
 }

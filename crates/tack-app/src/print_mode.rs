@@ -615,13 +615,14 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
         tracing::warn!("failed to record thinking level: {e}");
     }
     let session = Arc::new(Mutex::new(session));
-    // tack-ext: session_start lifecycle event.
+    // tack-ext: sessionStart lifecycle event.
     extensions
         .notify(
-            "session_start",
+            "sessionStart",
             serde_json::json!({
                 "sessionId": session.lock().await.session_id(),
                 "resumed": options.continue_session,
+                "reason": if options.continue_session { "resume" } else { "startup" },
                 "cwd": options.cwd.to_string_lossy(),
             }),
         )
@@ -633,7 +634,7 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
         provider: provider.clone(),
         auth: options.auth.clone(),
         reasoning: options.thinking,
-        settings: settings.compaction,
+        settings: settings.compaction_for_model(&options.model.provider, &options.model.id),
         cancel: tokio_util::sync::CancellationToken::new(),
         on_compaction: None,
         history: settings.history(&agent_dir),
@@ -882,13 +883,16 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
             eprintln!("[session exported to {}]", target.display());
         }
     }
-    // tack-ext: session_end lifecycle event, then stop all plugins.
+    // tack-ext: sessionShutdown lifecycle event, then stop all plugins.
     let session_id = session.lock().await.session_id().to_string();
     // Close this session's codebuddy CLI (provider registry is keyed by
     // session id).
     tack_ai::codebuddy::close_session(&session_id).await;
     extensions
-        .notify("session_end", serde_json::json!({"sessionId": session_id}))
+        .notify(
+            "sessionShutdown",
+            serde_json::json!({ "sessionId": session_id, "reason": "quit" }),
+        )
         .await;
     extensions.shutdown().await;
     Ok(process_shutdown.exit_code().unwrap_or(exit_code))
@@ -925,7 +929,27 @@ pub async fn run_compact(cwd: PathBuf) -> Result<i32> {
         eprintln!("no session to compact");
         return Ok(1);
     }
-    let Some(preparation) = tack_session::prepare_compaction(&path, &settings.compaction) else {
+    // Resolve model from the session's last model change / assistant message,
+    // falling back to settings/built-in default. The exact provider/model key
+    // also selects any compaction.modelOverrides entry.
+    let context = session.build_session_context();
+    let provider_name = context
+        .model
+        .as_ref()
+        .map(|(p, _)| p.clone())
+        .or(settings.default_provider.clone())
+        .unwrap_or_else(|| "anthropic".to_string());
+    let model_id = context
+        .model
+        .as_ref()
+        .map(|(_, m)| m.clone())
+        .or(settings.default_model.clone());
+    let model = crate::model::resolve_model(&provider_name, model_id.as_deref(), &agent_dir)
+        .map_err(anyhow::Error::msg)?;
+    let provider: Arc<dyn Provider> = tack_ai::provider_for(&model)
+        .with_context(|| format!("no adapter for api kind {}", model.api))?;
+    let compaction_settings = settings.compaction_for_model(&model.provider, &model.id);
+    let Some(preparation) = tack_session::prepare_compaction(&path, &compaction_settings) else {
         eprintln!("nothing to compact (session too small or already compacted)");
         return Ok(0);
     };
@@ -956,24 +980,6 @@ pub async fn run_compact(cwd: PathBuf) -> Result<i32> {
         }
     }
 
-    // Resolve model from the session's last model change / assistant message,
-    // falling back to settings/built-in default.
-    let context = session.build_session_context();
-    let provider_name = context
-        .model
-        .as_ref()
-        .map(|(p, _)| p.clone())
-        .or(settings.default_provider.clone())
-        .unwrap_or_else(|| "anthropic".to_string());
-    let model_id = context
-        .model
-        .as_ref()
-        .map(|(_, m)| m.clone())
-        .or(settings.default_model.clone());
-    let model = crate::model::resolve_model(&provider_name, model_id.as_deref(), &agent_dir)
-        .map_err(anyhow::Error::msg)?;
-    let provider: Arc<dyn Provider> = tack_ai::provider_for(&model)
-        .with_context(|| format!("no adapter for api kind {}", model.api))?;
     let auth = crate::model::resolve_auth(&model.provider, None, &agent_dir);
     let resolved = auth.resolve().await.map_err(anyhow::Error::msg)?;
 

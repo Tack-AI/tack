@@ -440,7 +440,8 @@ verdict 拒绝启动（工具返回错误、零 token 消耗，后台子代理�
   拦截的插件在 `tack ext list` 中保持可见。`tack ext enable|disable|upgrade`。
 - **能力面**（`initialize` 时声明，未声明 = 永不被调用）：工具
   （`ext__<plugin>__<tool>`，可返回图片块）、斜杠命令、`beforeToolCall`
-  （allow/deny/**改写**）、`transformContext`、`afterToolCall` 结果修补、
+  （allow/deny/**改写**）、两阶段 `transformContext` +
+  `transformContextWithSystem`、`afterToolCall` 结果修补、
   生命周期事件、UI 对话框/widget、自动补全、`session/get` +
   `session/sendUserMessage`、信任门控的 `exec/run`、运行时 provider 注册，
   以及 **provider bridge**（`capabilities.provider.stream`：插件不经 HTTP
@@ -499,6 +500,15 @@ verdict 拒绝启动（工具返回错误、零 token 消耗，后台子代理�
 mcp.json 的远程（HTTP）server 加 `"oauth": true` 或 `{"clientId": "…", "scopes": […]}` 即启用：元数据发现 → 动态客户端注册（或配置的 clientId）→ PKCE 浏览器授权（loopback 回调，支持手动粘贴）。`clientSecret`、`callbackPort`、`callbackUrl`（回环校验）与 `authServerMetadataUrl` 覆盖预注册客户端、固定重定向 URI，以及发现元数据缺失或错误的服务器。显式 metadata URL 除 loopback 外必须使用 HTTPS；授权响应通过 RFC 9207 `iss` 绑定授权服务器，step-up 保留已授予 scopes，授权 endpoint 仅允许 HTTP(S)，token endpoint 除 loopback 外必须 HTTPS。
 
 令牌缓存 `~/.tack/agent/mcp-tokens.json`（0600），过期或被拒绝时自动用 refresh_token 续期。缓存按 **server 名 + 规范化 URL** 索引，同一 URL 下的不同名称保留独立账号；旧版仅按名称的条目首次读取时原子迁移。每个 server 的跨进程锁合并刷新；已启动的刷新即使调用方取消或 session 正在关闭，也会把轮换后的 token 落盘。TUI 授权可取消；`tack mcp login <name> --timeout <秒>` 限制整个登录流程（默认 300 秒）。print/rpc/serve 只用缓存/续期令牌，绝不弹浏览器。
+
+**Provider-auth 替代路径。** 全局或扩展中的 Streamable HTTP server 也可配置
+`"auth": {"provider": "<id>"}`。每个请求都通过与
+`tack login --provider <id>` 相同的认证栈重新解析 provider（含刷新和
+provider 特定的派生 API key），因此长连接无需重连即可轮换 Bearer token。
+provider token 优先于静态 Authorization；即使同时配置 `oauth` 也始终禁用
+MCP OAuth，且不会写入 `mcp-tokens.json`。除精确 loopback host 外必须使用
+HTTPS；项目/RPC/session 定义不能选择 provider 凭据。项目局部覆盖可以继承
+全局 provider 绑定，但完整替换绝不会继承其中的秘密。
 
 ### MCP sampling 与 elicitation（server 反向请求）
 

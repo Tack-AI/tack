@@ -72,8 +72,9 @@ Key design decisions:
 - **Tools**: the parameter boundary is `serde_json::Value` + `schemars` schema;
   validation failures become in-band error tool results. `execution_mode()`
   controls parallel/serial batches; file modifications serialize on a shared lock.
-- **Hooks**: a single `AgentHooks` trait object (transform_context / before_tool_call /
-  after_tool_call / steering / follow-up / next-turn).
+- **Hooks**: a single `AgentHooks` trait object (transform_context /
+  transform_context_with_system / before_tool_call / after_tool_call /
+  steering / follow-up / next-turn).
 - **Cancellation**: one `tokio_util::CancellationToken` per prompt turn; bash
   kills the whole process tree.
 - **Windows**: bash resolves Git Bash (legacy WSL bash is rejected), same as TS pi.
@@ -90,7 +91,7 @@ flowchart TD
     B --> C[hooks.steering_messages<br/>drain queued user interjections]
     C --> D{inner loop<br/>tool calls or<br/>pending messages?}
     D -- yes --> E[inject pending messages<br/>emit MessageStart/End]
-    E --> F[stream_assistant_response<br/>hooks.transform_context<br/>convert_to_llm → LLM streaming call]
+    E --> F[stream_assistant_response<br/>ordinary then full-system context transforms<br/>convert_to_llm → LLM streaming call]
     F --> G{stop_reason?}
     G -- Error/Aborted --> H[emit TurnEnd<br/>return]
     G -- normal --> I{any tool_calls?}

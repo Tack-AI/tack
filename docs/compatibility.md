@@ -79,9 +79,12 @@ binary and its externally observable behavior.
   branch omits an earlier user/assistant/tool-result/custom message or
   replaces only its content, leaving raw history, roles, metadata, usage,
   and exports unchanged. Compaction, branch summaries, token estimates,
-  and all agent surfaces consume the same projection. Tack does not yet
-  originate these entries; it honors imported ones. On v4 migration they
-  remain payload-compatible `custom` entries with remapped `targetId`s,
+  and all agent surfaces consume the same projection.
+  `SessionManager::append_context_edit` validates the active-branch target and
+  replacement shape, then writes through the same v3/v4/SQLite/in-memory entry
+  path; automatic recovery omissions and actionable turn-boundary drafts are
+  not generated yet. On v4 migration imported edits remain payload-compatible
+  `custom` entries with remapped `targetId`s,
   while rebuilt compaction checkpoints record per-message source ids in
   implementation-specific `details.tackRetainedTailSourceIds`, so a
   post-compaction edit still affects the materialized retained tail.
@@ -182,6 +185,15 @@ binary and its externally observable behavior.
   `abort`, `fork`, `compact`, `bash`, `get_state`, `get_commands`, …);
   unknown commands get a structured `unknown or unsupported command`
   error.
+- Successful `prompt` responses carry `data.disposition` as `started`,
+  `queued`, or `handled`; `steer` / `follow_up` use `queued` or `handled`.
+  A `started` response is flushed before the run's `agent_start` event.
+  Extension commands and a blocked `UserPromptSubmit` are `handled` and do
+  not start a run for that input.
+- RPC session replacement drains the old run, then emits one plugin
+  `sessionShutdown` / `sessionStart` pair (`new`, `resume`, or `fork`) before
+  the replacement command's success response. These are plugin lifecycle
+  notifications, not extra RPC command responses.
 - **There is no protocol version field** in the RPC wire format today;
   clients discover capabilities via `get_commands`.
 
@@ -222,9 +234,13 @@ in `docs/upstream-alignment.md` (§5).
   generated from it by `cargo run -p xtask -- codegen`, freshness-checked
   in CI).
 - **Version handshake**: the host sends `initialize` with a semver
-  `protocolVersion` ("3.0.0"); compatibility requires the same major
+  `protocolVersion` ("3.1.0"); compatibility requires the same major
   version and a minor not newer than the host's
-  (`crates/tack-ext/src/v3/mod.rs`).
+  (`crates/tack-ext/src/v3/mod.rs`). v3.1 adds the optional
+  `transformContextWithSystem` capability: ordinary `transformContext`
+  handlers transform the non-system projection first, then full-system
+  handlers receive the complete transcript and own its final prompt/tools,
+  including deletion.
 - The v1/v2 NDJSON protocol (`{"type":"request|response|event"}`) was
   **removed** in the v3 release: the host no longer speaks it, and the
   lifecycle surface was deliberately reduced (`session/*` is

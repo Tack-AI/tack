@@ -146,6 +146,37 @@ class E2ETest(unittest.IsolatedAsyncioTestCase):
         await host.call("shutdown", None)
         await serve
 
+    async def test_transform_context_with_system_advertises_and_dispatches(self):
+        seen = []
+
+        def transform(params, cx):
+            seen.extend(message["role"] for message in params["messages"])
+            return {
+                "messages": [
+                    message for message in params["messages"] if message["role"] != "system"
+                ]
+            }
+
+        host, serve, _ = await self.spawn(
+            Plugin("ctx-full").transform_context_with_system(transform)
+        )
+        init = await host.call("initialize", init_params())
+        self.assertTrue(init["capabilities"]["hooks"]["transformContextWithSystem"])
+        self.assertNotIn("transformContext", init["capabilities"]["hooks"])
+        result = await host.call(
+            "hooks/transformContextWithSystem",
+            {
+                "messages": [
+                    {"role": "system", "content": "prompt", "timestamp": 0},
+                    {"role": "user", "content": "hello", "timestamp": 1},
+                ]
+            },
+        )
+        self.assertEqual(seen, ["system", "user"])
+        self.assertEqual([message["role"] for message in result["messages"]], ["user"])
+        await host.call("shutdown", None)
+        await serve
+
     async def test_events_and_widget_actions_dispatch(self):
         seen = []
 

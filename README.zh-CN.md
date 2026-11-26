@@ -341,7 +341,7 @@ TypeScript（`@tack/plugin`）和 Python（`tack-plugin`）插件 SDK 位于 Car
 - **工具**：`serde_json::Value` 参数边界 + `schemars` schema；校验失败变为
   带内错误工具结果；文件修改在共享锁上串行化。
 - **Hooks**：单一 `AgentHooks` trait 对象（transform_context /
-  before_tool_call / after_tool_call / steering / follow-ups）。
+  transform_context_with_system / before_tool_call / after_tool_call / steering / follow-ups）。
 - **取消**：每个 prompt 轮一个 `CancellationToken`；bash 杀掉整个进程树。
 - **Windows**：bash 像 pi 的 `utils/shell.ts` 一样解析 Git Bash；可选的
   `powershell` 工具在列入 `defaultTools` 时注册。

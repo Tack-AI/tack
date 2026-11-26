@@ -1076,23 +1076,50 @@ async fn stream_assistant_response(
     // hooks borrow the context and only materialize a rewritten copy when
     // they actually change it, so the common no-op path no longer
     // deep-clones the full history (images included) before every LLM call.
+    // The ordinary chain completes before any full-system extension runs.
+    // Only RPC extension bridges hide system messages in the ordinary
+    // phase; internal compaction/token hooks still receive this full list.
+    let had_transcript_system_state =
+        tack_ai::transcript::get_current_system_message(&context.messages).is_some();
     let transformed = config.hooks.transform_context(&context.messages).await;
-    let messages: &[AgentMessage] = transformed.as_deref().unwrap_or(&context.messages);
+    let ordinary_messages = transformed.as_deref().unwrap_or(&context.messages);
+    let transformed_with_system = config
+        .hooks
+        .transform_context_with_system(ordinary_messages)
+        .await;
+    let messages = transformed_with_system
+        .as_deref()
+        .unwrap_or(ordinary_messages);
     // AgentMessage[] -> Message[] at the LLM boundary.
     let llm_messages = config.hooks.convert_to_llm(messages);
 
-    // Transcript system messages carry the prompt/tool declarations
-    // (upstream #9548). tack providers take the prompt as a separate
-    // Context field, so replay the transcript here: the replayed prompt
-    // wins; system roles never reach provider converters (collapse
-    // semantics for APIs without mid-conversation system messages). When
-    // the transcript declares no system state (old sessions, ad-hoc
-    // callers), the loop's configured system_prompt applies unchanged.
-    let has_system = llm_messages
+    // Transcript system messages carry prompt/tool declarations. Once the
+    // original transcript has such state, the FINAL transformed replay owns
+    // both fields — even if a full-system handler deleted every system
+    // message, in which case prompt/tools stay empty rather than resurrecting
+    // the runtime fallback. A handler can also introduce system state into a
+    // legacy transcript; only transcripts with state neither before nor after
+    // transformation use the old Context fields.
+    let has_system = messages
         .iter()
-        .any(|m| matches!(m, tack_ai::Message::System(_)));
-    let (system_prompt, request_messages) = if has_system {
-        let prompt = tack_ai::transcript::get_current_system_prompt(&llm_messages);
+        .any(|message| matches!(message, AgentMessage::System(_)));
+    let transcript_owns_request = had_transcript_system_state || has_system;
+    let (system_prompt, request_messages, tools) = if transcript_owns_request {
+        let prompt = tack_ai::transcript::get_current_system_prompt(messages);
+        let tools = tack_ai::transcript::get_current_tools(messages)
+            .into_iter()
+            .filter(|declaration| {
+                // Replay owns membership and declarations, but an executable
+                // provider-bound tool must still stay hidden from other
+                // providers. Unknown declarations (added by a full-system
+                // handler) have no such restriction.
+                context
+                    .tools
+                    .iter()
+                    .find(|tool| tool.name() == declaration.name)
+                    .is_none_or(|tool| tool.available_for_provider(&config.model.provider))
+            })
+            .collect();
         let messages = llm_messages
             .into_iter()
             .filter(|m| !matches!(m, tack_ai::Message::System(_)))
@@ -1104,22 +1131,27 @@ async fn stream_assistant_response(
                 Some(prompt)
             },
             messages,
+            tools,
         )
     } else {
-        (context.system_prompt.clone(), llm_messages)
+        (
+            context.system_prompt.clone(),
+            llm_messages,
+            context
+                .tools
+                .iter()
+                // Provider-bound tools (e.g. ask_codebuddy) are only advertised
+                // to their provider's models.
+                .filter(|t| t.available_for_provider(&config.model.provider))
+                .map(|t| tool_definition(t.as_ref()))
+                .collect(),
+        )
     };
 
     let llm_context = Context {
         system_prompt,
         messages: request_messages,
-        tools: context
-            .tools
-            .iter()
-            // Provider-bound tools (e.g. ask_codebuddy) are only advertised
-            // to their provider's models.
-            .filter(|t| t.available_for_provider(&config.model.provider))
-            .map(|t| tool_definition(t.as_ref()))
-            .collect(),
+        tools,
     };
 
     let resolved = match config.auth.resolve().await {

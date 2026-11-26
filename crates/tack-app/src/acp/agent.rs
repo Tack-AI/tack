@@ -356,8 +356,11 @@ impl TackAcpAgent {
                         session.session_id().to_string(),
                     )
                 };
+                let compaction_settings = self
+                    .settings
+                    .compaction_for_model(&turn_model.provider, &turn_model.id);
                 let Some(preparation) =
-                    tack_session::prepare_compaction(&path, &self.settings.compaction)
+                    tack_session::prepare_compaction(&path, &compaction_settings)
                 else {
                     return "Nothing to compact (session too small or already compacted)."
                         .to_string();
@@ -762,16 +765,17 @@ impl Agent for TackAcpAgent {
         self.sessions
             .borrow_mut()
             .insert(session_id.clone(), state.clone());
-        // tack-ext: session_start lifecycle event.
+        // tack-ext: sessionStart lifecycle event.
         state
             .extensions
             .lock()
             .await
             .notify(
-                "session_start",
+                "sessionStart",
                 serde_json::json!({
                     "sessionId": session_id,
                     "resumed": false,
+                    "reason": "startup",
                     "cwd": cwd.to_string_lossy(),
                 }),
             )
@@ -885,10 +889,11 @@ impl Agent for TackAcpAgent {
                     .lock()
                     .await
                     .notify(
-                        "session_start",
+                        "sessionStart",
                         serde_json::json!({
                             "sessionId": session_key,
                             "resumed": true,
+                            "reason": "resume",
                             "cwd": cwd.to_string_lossy(),
                         }),
                     )
@@ -1077,7 +1082,9 @@ impl Agent for TackAcpAgent {
                 provider: self.provider.clone(),
                 auth: self.auth.clone(),
                 reasoning: turn_thinking,
-                settings: self.settings.compaction,
+                settings: self
+                    .settings
+                    .compaction_for_model(&turn_model.provider, &turn_model.id),
                 cancel: cancel.clone(),
                 on_compaction: None,
                 history: self.settings.history(&tack_session::default_agent_dir()),

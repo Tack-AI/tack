@@ -150,8 +150,11 @@ pub mod method {
     /// \[host-to-plugin\] A tool call is about to run; the plugin may allow, deny (reason becomes the error tool result), or rewrite the arguments. Chained plugins observe the previous plugin's rewrite; the first deny short-circuits.
     pub const HOOKS_BEFORE_TOOL_CALL: &str = "hooks/beforeToolCall";
 
-    /// \[host-to-plugin\] COW context pipeline (opt-in via capabilities.hooks.transformContext): a null result means unchanged; a returned {messages: \[...\]} object replaces the messages every later hook sees.
+    /// \[host-to-plugin\] Ordinary COW context pipeline (opt-in via capabilities.hooks.transformContext): input excludes system messages; null means unchanged and preserves their positions; a changed {messages: \[...\]} result receives a replayed leading system head before the next hook.
     pub const HOOKS_TRANSFORM_CONTEXT: &str = "hooks/transformContext";
+
+    /// \[host-to-plugin\] Full-transcript context pipeline (opt-in via capabilities.hooks.transformContextWithSystem), run after every ordinary transformContext handler. Input includes system messages and a returned result is authoritative, including prompt/tool deletion; null means unchanged.
+    pub const HOOKS_TRANSFORM_CONTEXT_WITH_SYSTEM: &str = "hooks/transformContextWithSystem";
 
     /// \[host-to-plugin\] Observe and patch a tool result (opt-in via capabilities.hooks.afterToolCall). Patches merge in chain order; later plugins win per field.
     pub const HOOKS_AFTER_TOOL_CALL: &str = "hooks/afterToolCall";
@@ -447,6 +450,9 @@ pub struct HookCapabilities {
     #[serde(rename = "transformContext")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transform_context: Option<bool>,
+    #[serde(rename = "transformContextWithSystem")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform_context_with_system: Option<bool>,
 }
 
 /// What this host supports in the current mode. Absent boolean means unsupported; a plugin must check before depending on a surface.
@@ -900,7 +906,7 @@ pub struct ToolSpec {
     pub parameters: Value,
 }
 
-/// hooks/transformContext params. Messages are session-entry shaped JSON.
+/// hooks/transformContext and hooks/transformContextWithSystem params. Messages are session-entry shaped JSON.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TransformContextParams {
     #[serde(rename = "messages")]

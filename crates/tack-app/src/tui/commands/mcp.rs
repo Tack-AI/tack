@@ -24,6 +24,14 @@ impl TuiApp {
                 crate::i18n::t(self.lang, "mcp.connecting", &[]),
                 NoticeKind::Info,
             );
+            // This resource browser intentionally uses the lightweight plain
+            // connector, but provider auth still needs its request-time
+            // resolver; without binding it here this path would silently send
+            // no provider credential.
+            let specs = specs
+                .into_iter()
+                .map(|spec| crate::mcp_oauth::bind_provider_auth(spec, &self.agent_dir))
+                .collect();
             self.mcp_connections = tack_tools::mcp::connect_all(specs).await;
             if self.mcp_connections.is_empty() {
                 self.notice(

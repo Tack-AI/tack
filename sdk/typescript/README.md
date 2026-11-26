@@ -24,7 +24,7 @@ plugin({ name: "hello", version: "0.1.0" })
 ```
 
 Handler surface: `tool`, `command`, `beforeToolCall`, `afterToolCall`,
-`transformContext`, `approvalReview`, `events`, `widget` /
+`transformContext`, `transformContextWithSystem`, `approvalReview`, `events`, `widget` /
 `onWidgetAction`, `autocomplete`, `configSchema`, `metrics`. The handler
 context (`cx`) exposes the negotiated host environment and the typed
 host client (`cx.host.select/exec/session/snapshot/config/…`).

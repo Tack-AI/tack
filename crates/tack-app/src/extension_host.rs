@@ -1829,7 +1829,7 @@ impl ExtensionManager {
                         ));
                         continue;
                     }
-                    let Some(mut spec) = crate::mcp_config::spec_from_entry(
+                    let Some(spec) = crate::mcp_config::extension_spec_from_entry(
                         &id_string,
                         server,
                         &format!("extension {id_string}"),
@@ -1842,6 +1842,10 @@ impl ExtensionManager {
                         ));
                         continue;
                     };
+                    // MCP-carrier plugins bypass the ordinary connection pool,
+                    // so bind provider auth here as well; the HTTP backend still
+                    // resolves it per request, not at plugin load time.
+                    let mut spec = crate::mcp_oauth::bind_provider_auth(spec, agent_dir);
                     // A stdio server runs with the extension directory as
                     // cwd so bundled server scripts resolve; a path-like
                     // relative command resolves against it (same rule as
@@ -2194,6 +2198,10 @@ impl ExtensionManager {
                         let declared: Vec<String> = [
                             (hooks.before_tool_call == Some(true), "beforeToolCall"),
                             (hooks.transform_context == Some(true), "transformContext"),
+                            (
+                                hooks.transform_context_with_system == Some(true),
+                                "transformContextWithSystem",
+                            ),
                             (hooks.after_tool_call == Some(true), "afterToolCall"),
                             (hooks.approval_review == Some(true), "approvalReview"),
                         ]
@@ -2376,9 +2384,10 @@ impl ExtensionManager {
                 let path = dir.join(path);
                 match std::fs::read_to_string(&path) {
                     Ok(content) => match serde_json::from_str::<Value>(&content) {
-                        Ok(value) => {
-                            crate::mcp_config::specs_from_value(&value, &path.display().to_string())
-                        }
+                        Ok(value) => crate::mcp_config::extension_specs_from_value(
+                            &value,
+                            &path.display().to_string(),
+                        ),
                         Err(e) => {
                             self.load_warnings.push(format!(
                                 "extension {name}: bad MCP servers file {}: {e}",
@@ -2397,7 +2406,7 @@ impl ExtensionManager {
                 }
             }
             Some(value @ Value::Object(_)) => {
-                crate::mcp_config::specs_from_value(value, &format!("extension {name}"))
+                crate::mcp_config::extension_specs_from_value(value, &format!("extension {name}"))
             }
             Some(_) => {
                 self.load_warnings.push(format!(

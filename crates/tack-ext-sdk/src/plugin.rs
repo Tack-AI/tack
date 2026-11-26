@@ -72,6 +72,7 @@ pub struct PluginBuilder {
     before_tool_call: Option<BeforeHandler>,
     after_tool_call: Option<AfterHandler>,
     transform_context: Option<TransformHandler>,
+    transform_context_with_system: Option<TransformHandler>,
     approval_review: Option<ApprovalHandler>,
     events: Vec<String>,
     event_handler: Option<EventHandler>,
@@ -170,6 +171,19 @@ impl PluginBuilder {
         Fut: Future<Output = Result<Option<TransformContextResult>, Error>> + Send + 'static,
     {
         self.transform_context = Some(Arc::new(move |p, cx| {
+            Box::pin(handler(p, cx)) as BoxFuture<_>
+        }));
+        self
+    }
+
+    /// Rewrite the complete transcript after every ordinary context handler.
+    /// This handler receives system messages and its result is authoritative.
+    pub fn transform_context_with_system<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn(TransformContextParams, Cx) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Option<TransformContextResult>, Error>> + Send + 'static,
+    {
+        self.transform_context_with_system = Some(Arc::new(move |p, cx| {
             Box::pin(handler(p, cx)) as BoxFuture<_>
         }));
         self
@@ -328,6 +342,7 @@ impl Plugin {
             before_tool_call: None,
             after_tool_call: None,
             transform_context: None,
+            transform_context_with_system: None,
             approval_review: None,
             events: Vec::new(),
             event_handler: None,
@@ -406,12 +421,17 @@ impl Dispatch {
         let hooks = HookCapabilities {
             before_tool_call: builder.before_tool_call.as_ref().map(|_| true),
             transform_context: builder.transform_context.as_ref().map(|_| true),
+            transform_context_with_system: builder
+                .transform_context_with_system
+                .as_ref()
+                .map(|_| true),
             after_tool_call: builder.after_tool_call.as_ref().map(|_| true),
             approval_review: builder.approval_review.as_ref().map(|_| true),
         };
         let any_hooks = builder.before_tool_call.is_some()
             || builder.after_tool_call.is_some()
             || builder.transform_context.is_some()
+            || builder.transform_context_with_system.is_some()
             || builder.approval_review.is_some();
         let result = InitializeResult {
             protocol_version: PROTOCOL_VERSION.to_string(),
@@ -532,6 +552,12 @@ impl PeerHandler for Dispatch {
             }
             method::HOOKS_TRANSFORM_CONTEXT => {
                 let Some(handler) = &builder.transform_context else {
+                    return Err(not_granted(rpc_method));
+                };
+                to_value(handler(parse(params)?, self.cx()).await?)
+            }
+            method::HOOKS_TRANSFORM_CONTEXT_WITH_SYSTEM => {
+                let Some(handler) = &builder.transform_context_with_system else {
                     return Err(not_granted(rpc_method));
                 };
                 to_value(handler(parse(params)?, self.cx()).await?)

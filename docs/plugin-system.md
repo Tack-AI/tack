@@ -133,7 +133,7 @@ host answers `ERR_CAPABILITY_NOT_GRANTED` if it must).
 
 | Direction | Methods/notifications |
 |---|---|
-| host → plugin | `tools/execute`, `commands/invoke`, `hooks/beforeToolCall` (allow/deny/**rewrite**), `hooks/transformContext` (full-context replacement), `hooks/afterToolCall` (per-field result patch), `approval/review` (approval chain), `autocomplete/provide`, `events/lifecycle` (subscription-gated), `widgets/action`, `provider/stream` + `provider/streamCancel` (provider bridge) |
+| host → plugin | `tools/execute`, `commands/invoke`, `hooks/beforeToolCall` (allow/deny/**rewrite**), `hooks/transformContext` (non-system projection) + `hooks/transformContextWithSystem` (authoritative full transcript), `hooks/afterToolCall` (per-field result patch), `approval/review` (approval chain), `autocomplete/provide`, `events/lifecycle` (subscription-gated), `widgets/action`, `provider/stream` + `provider/streamCancel` (provider bridge) |
 | plugin → host | `ui/notify/select/confirm/input` (TUI dialogs), `session/get`, `session/sendUserMessage`, `snapshot/get` (read-only digest), `config/get`, `exec/run` (trust-gated), `host/registerProvider` (LLM provider registration), `provider/streamEvent` + `provider/event` (provider bridge), `widgets/update`, `logs/emit`, `warnings/emit` |
 
 SDKs exist for Rust (`tack-ext-sdk`), TypeScript (`@tack/plugin`), and

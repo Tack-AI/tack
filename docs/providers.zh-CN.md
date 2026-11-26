@@ -73,6 +73,8 @@ TS pi 行为一致）。本地 provider 探测到的目录与 models.json 的
 | `supportsDeveloperRole` | 仅 OpenAI 官方 API 为 `true` | 将 system prompt 与会话中途的 system 消息以 `developer` 而不是 `system` 发送。其他 OpenAI-compatible host 默认用 `system`；显式配置覆盖自动探测。 |
 | `requiresNonNullAssistantContent` | `false` | 回放无正文的 assistant 消息（例如只有工具调用）时发送 `""` 而不是 `null`。用于拒绝 null assistant content 的代理。 |
 | `requiresToolsWithToolHistory` | `false` | 工具已禁用但历史含 tool call/result 时发送 `"tools": []`。仅用于要求该字段的旧代理（例如 Anthropic 前的旧版 LiteLLM）；vLLM 等服务会拒绝空数组。 |
+| `sendSessionAffinityHeaders` | OpenRouter 端点为 `true`，其余为 `false` | 让同一会话路由到相同 provider 副本。OpenRouter 使用 `x-session-id`；`openai` 格式发送 `session_id`、`x-client-request-id`、`x-session-affinity`；`openai-nosession` 省略 `session_id`。`cacheRetention: "none"` 时不生成这些头。内嵌 Baseten 模型显式启用，既有 Fireworks/Cloudflare 标志也会生效。 |
+| `sessionAffinityFormat` | OpenRouter 为 `"openrouter"`，其余为 `"openai"` | 选择上述请求头组合。显式请求头按大小写不敏感覆盖生成值。OpenCode/OpenCode Go 另在所有支持的 API 上发送 `x-opencode-session`，即使禁用缓存也不受影响。 |
 
 ## 当前目录与 provider 迁移
 
@@ -156,7 +158,10 @@ TS pi 一致。metadata server 的 base URL 可用 `TACK_GCE_METADATA_URL`
 - **ollama**：默认 `http://localhost:11434/v1`，`OLLAMA_HOST` 覆盖；启动时
   探测 `/api/tags` 注入运行中服务器的模型。
 - **llama.cpp**：默认 `http://localhost:8080/v1`，`LLAMA_CPP_HOST` 覆盖；
-  探测 `/v1/models`。
+  探测 `/v1/models`。对已报告为 `loaded` 的模型，额外查询
+  `/props?model=<id>&autoload=false`；chat template 含 `enable_thinking` 时
+  启用 Qwen chat-template 推理映射。sleeping/unloaded 模型不查询，避免唤醒或
+  自动加载的副作用。
 
 探测约 500ms 超时、失败静默、`--offline` / `TACK_OFFLINE` 时跳过。未知上下文
 窗口默认 32k，可用 models.json 按模型覆盖。无需登录或 API key。

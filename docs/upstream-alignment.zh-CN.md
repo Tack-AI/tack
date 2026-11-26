@@ -90,7 +90,7 @@ scripts/upstream-delta.sh`，失败于 `无法解析基线 commit（得到 ''）
 | 中——provider continuation | `a758f3ae4` + `49fe0a237` | **Anthropic Message Threads。** 有效时只发送新增消息，早先 context/tool 变化后回退完整请求，并清理 per-session 资源。收益是减少重复上传与延迟，不是 token 单价下降。cache warming 和摘要不得触碰主 thread。 | L |
 | 中——协议对齐 | `e473b5cd8` + `beffcde92` + `6aab551a7` + `e03dca7a3` | RPC prompt 以 additive 字段返回 `started`/`queued`/`handled` disposition；session replacement 的生命周期事件恰好一次，并先订阅再执行 startup handler，避免 JSON/RPC 客户端丢失 `session_start` 事件。 | M–L |
 | 中——当前模型 | `a37306d43` + `a3f265b1c` + `139707002` + `3e4f87265` + `1692bba63` + `fe8a6f5dc` + `86918f9ee` | 内置目录刷新要与协议迁移一起：Azure Foundry Chat Completions、Kimi Coding 改 OpenAI Completions、Qwen 新网关与 Individual CN、Gemini 4/带前缀 Gemini 3+、Copilot reasoning metadata。只刷新 JSON 不够；`providers.rs` 仍有旧 Azure ID、Kimi 协议/base URL 和 Qwen host。 | M–L |
-| 中——工具发现 | `ae823bc0b` + `cc44fa216` + `e033f255f` + `79006f061` + `6d3e342b2` | 改进 `tool_search`：完整名称/多 query term 排名、名称高于描述、Unicode 规范化，以及局部 `$ref` 后属性可搜索。Tack 当前只索引小写 name/description 文本。 | M |
+| 中——工具发现 | `ae823bc0b` + `cc44fa216` + `e033f255f` + `79006f061` + `6d3e342b2` | 改进 `tool_search`：名称优先与多 query term 已在 deferred MCP 批次落地；仍待完整名称/排名细化、Unicode 规范化，以及局部 `$ref` 后属性可搜索。 | M |
 | 后期——workbench | p2 command menu/projects；`4839e41d6`、`5a14e69c0` | 用 Cmd/Ctrl+K 统一暴露已有内建/会话/模型/扩展命令；增加按 cwd/project 分组的 sidebar，显示 working/failed/unread/子代理状态。权限与命令可用性由 host 决定，不增加远程任意 CLI 执行接口。 | M–L |
 | 后期——agent 产出 | p2 artifacts；`6f1a96e1d`、`da57c1662` | 增加版本化 Markdown/静态 HTML artifacts，支持 list/read/write/edit/show 与 transcript 引用。使用 session sidecar 或独立 store，不改 v4 格式。首版只做沙箱静态渲染；HTML eval、自由批注、共享插件 pane 后置。 | L |
 | 后期——remote UI 基础 | Chord delta/sync 设计 | 在现有 CBOR 协议上增加单调 progress revision、`afterRevision`、有界操作日志、transcript window、snapshot reset/gap 恢复。只借鉴可恢复 watch 语义，不换成 Chord，也不宣称多 writer CRDT。 | L |
@@ -219,14 +219,29 @@ scripts/upstream-delta.sh`，失败于 `无法解析基线 commit（得到 ''）
 ### 第六批上下文投影、MCP 启动与 provider 迁移落地（未发布）
 
 存储兼容、启动延迟和当前 provider 批次已实现，并配有离线 fixture 与 mock
-provider 请求。context edit 目前只实现读取/投影：Tack 尚不会主动写入
-`context_edit`，也尚未拆分扩展的 `context` 与 `context_with_system` 事件。
+provider 请求。第六批的 context edit 只实现读取/投影；显式写入与 `context` /
+`context_with_system` 拆分见第七批。
 
 | 上游 commit / 来源 | Tack 落地 |
 | --- | --- |
 | `466db0fec` + `d0fe21308` | `context_edit` 在 v3 中是类型化条目，在 v4 中是载荷兼容的 custom 条目。分支内最新的 omit/replace 投影不改原始历史与消息元数据，并兼容导入的 assistant/toolResult 字符串替换。compaction 切点、投影 token 估算、branch summary 及所有 prompt 界面共用该投影。v3→v4 迁移会重映射 target id，并在 `details.tackRetainedTailSourceIds` 中记录重建尾部的源条目 id，因此 compaction 后的编辑仍然有效。测试覆盖 latest-wins、分支相对性、数组型 role、旧 usage 失效、compaction/summary 输入和 checkpoint 迁移。 |
 | `e029c3ed0` + `30a1d1849` + `ddaa0a034` + `04b97ef00` | 所有 enabled MCP server 都在后台连接；只有 direct server 会阻塞首个 prompt（最多 10 秒），`tool_search` 则按需等待 deferred server 并把工具合并进实时池，TUI/print/RPC/ACP 共用该路径。重连会重建代理。`--tools`/`--exclude-tools` 支持 `*` 通配，纯 `+name`/`-name` 修饰符适用于 CLI 和分层 `defaultTools`，非 MCP allowlist 会把未命名 MCP 工具保留为仅搜索可达，`--no-mcp` 禁用配置的 server。覆盖动态池激活、direct 有界等待、CLI 过滤、ACP/RPC 冒烟和 agent-loop 激活路径。 |
 | `a37306d43` + `a3f265b1c` + `139707002` + `3e4f87265` + `1692bba63` + `fe8a6f5dc` + `86918f9ee` | Azure provider 同时覆盖 Responses 与 Foundry Completions，共享端点规范化、部署名载荷映射及旧会话回放兼容。Kimi Coding 改为 `/coding/v1` 的 OpenAI Completions；四个 Qwen 套餐使用新网关与套餐优先的凭据回退；Gemini 4+/带前缀 id 使用 `thinkingLevel`；Copilot reasoning usage 接受顶层 `reasoning_tokens`。内嵌的 1179 模型目录已更新 Azure/Kimi/Qwen/Copilot 切片。由于本地上游 clone 没有物化生成后的 provider-data 文件，离线无法做全量生成式目录刷新；其他 provider 快照保持不变。 |
+
+### 第七批兼容收尾落地（未发布）
+
+本批按上游精确契约完成 Context Edit、RPC、MCP 与 provider 的定点收尾；仍不是
+对 1,684 个增量 commit 的全量审阅，因此不推进正式对齐基线。
+
+| 上游 commit / 来源 | Tack 落地 |
+| --- | --- |
+| `466db0fec` + `aef5fc429` | `SessionManager::append_context_edit` 提供显式写 API：活动分支与 role/content 校验、omit/replace、assistant/toolResult 字符串规范化，复用 v3/v4/SQLite/内存写路径；失败不改 leaf 或文件。tack-RPC 升级 3.1，新增 `transformContextWithSystem`：普通 handler 先处理非 system 投影，full handler 再权威处理完整 transcript，最终 prompt/tools 不因 fallback 复活。Rust/TS/Python SDK 均已接线。**未接**自动 recovery omission 与 actionable turn-boundary drafts；JSON-RPC 以结构相等近似 JS 引用相等。 |
+| `e473b5cd8` + `beffcde92` 的 RPC 部分 | prompt/steer/follow_up 返回 additive `data.disposition`；扩展命令与 UserPromptSubmit block 为 `handled`，`started` 响应先于 `agent_start`。new/switch/fork/clone 先取消并排空旧 run，再各发一次 `sessionShutdown`/`sessionStart`，随后返回成功。顺带修正生命周期事件名为协议既有的 camelCase 并携带 reason。**未覆盖** JSON print 的 entry-event golden trace、`6aab551a7` 与 empty-bind reload（`e03dca7a3`）；Tack 尚无对应的完整扩展 runtime/reload 面。 |
+| `1387af7b4` + `91f9f3b5d` + `4d72d05bc` | session loader 与 `tack mcp list` 共用 raw JSON 合并：无 command/url/type 的项目条目只允许 enabled/exposure/toolExposure 浅覆盖，toolExposure 整棵替换，非法项保留 global；完整项目定义带 auth 拒绝，不带 auth 替换不继承秘密。global/extension Streamable HTTP `auth.provider` 在每次 POST/GET/DELETE 重新经 provider auth resolver 取派生 api_key，覆盖静态 Authorization，永不进入 MCP OAuth；HTTPS/loopback、来源限制、provider login/logout 引导均已落地。本地长连接测试验证 tok1→tok2。 |
+| `bbb61e34a` + `6671c6047` + `561a2e066` | OpenRouter 默认 affinity、Baseten 目录 opt-in、既有 Fireworks/Cloudflare 标志和 OpenCode/OpenCode Go header 均已接线；cacheRetention=none 禁止通用 affinity 但不禁止 OpenCode。显式请求头大小写不敏感优先，覆盖 Chat Completions、Anthropic、Responses 与 Google 的适用路径。 |
+| `16235fd93` | Google/Vertex 按 `thinkingLevelMap` 对请求与 off 做先向上后向下 clamp，保留 native medium、规范化映射大小写、拒绝非法映射；不再硬编码 MINIMAL/HIGH。 |
+| `1e39862f6` | llama.cpp 仅对 loaded 模型请求 `/props?model=<id>&autoload=false`，避免 sleeping/unloaded 的唤醒/加载副作用；`enable_thinking` 模板生成精确 reasoning map 与 `qwen-chat-template` compat。 |
+| `46bde88a1` | `compaction.modelOverrides` 以精确 provider/modelId 逐字段覆盖 reserveTokens/keepRecentTokens，接入手动、阈值、overflow 与 /context，保留后续 `6fcb48670` 的模型输出上限语义。**差异**：非法值仍沿用 Tack 既有 settings 的容错回退，上游逐字段报错校验未单独实现。 |
 
 ## 2026-09-21 对齐批次（基线 4a6ed0194 → 10d1ad621）
 
@@ -286,12 +301,12 @@ provider 请求。context edit 目前只实现读取/投影：Tack 尚不会主�
 - **Pico/Pico5 设计文档流（37 commits）+ chord（operation log）+ durable + `10d1ad621`**：观察中，沿用 v4 fork-policy 口径「借鉴设计、不盲目跟随」。若 Tack 立项持久化 agent 运行时，回读最终收敛的 Pico5 文档（pico→pico3 中间稿已废）；chord 的 operation log 方向优于 delta 快照。
 - **模型目录常规刷新**：本批次已补 508 个显式 `supportsStrictMode`；其余待下次 npm 全量刷新（deepseek/openai-codex/fireworks/google/vercel/kimi-coding、新增 meta/radius、anthropic `promptCache`/`inputLimits`、google thinking levels from models.dev）。
 - **待移植（按优先级）**：
-  1. session affinity headers（`bbb61e34a` OpenRouter 默认开 + `6671c6047` Baseten + `561a2e066` OpenCode 头）——compat 字段 + 头部发射，缓存命中收益。**kimi-coding 已评估排除（2026-09-22）**：Moonshot 缓存是 org 级共享前缀缓存（官方文档明确「同一组织内共享」），不认任何亲和头，服务端无 per-replica 路由问题；其真正缺口是顶层 `cache_control`，见「顺带修复」`5954421`
-  2. `16235fd93` Gemini 关 thinking 改走 thinkingLevelMap clamp
+  1. session affinity headers（`bbb61e34a` OpenRouter 默认开 + `6671c6047` Baseten + `561a2e066` OpenCode 头）——compat 字段 + 头部发射，缓存命中收益。**已落地（第七批）**。**kimi-coding 已评估排除（2026-09-22）**：Moonshot 缓存是 org 级共享前缀缓存（官方文档明确「同一组织内共享」），不认任何亲和头，服务端无 per-replica 路由问题；其真正缺口是顶层 `cache_control`，见「顺带修复」`5954421`
+  2. `16235fd93` Gemini 关 thinking 改走 thinkingLevelMap clamp（已落地第七批）
   3. ~~`f5c946480` image input limits~~ **暂缓（2026-09-22 评估）**：上游该特性本身「数据先行、执行半置」——真正执行的只有 `images.resize` profile 覆盖，且目前上游目录所有模型都是默认 profile（2000x2000/4.5MB/jpeg80），与 Tack 现有固定行为等价；`maxPerMessage`/`maxPerRequest`/`maxRequestBytes` 上游也没有执行层。完整移植需先给 `AgentTool::execute` 加执行上下文（对齐上游 `ExtensionContext` 的 model/cwd），跨 5 crate + 插件协议的 ABI 演进，单独立项。Tack 的 Model 反序列化不拒未知字段，未来 npm 刷新带进 `inputLimits` 数据安全。依赖项落地后再回评
   4. ~~length-stop 恢复接线~~ → 已落地 `a53d3c4`（见「已落地」表）
-  5. `1e39862f6` llama.cpp `/props` thinking 探测
-  6. `46bde88a1` 每模型 compaction 预算（settings `modelOverrides`）
+  5. `1e39862f6` llama.cpp `/props` thinking 探测（已落地第七批）
+  6. `46bde88a1` 每模型 compaction 预算（settings `modelOverrides`，已落地第七批；非法值严格报错校验仍有差异）
   7. `dfbf793b7` 会话选择器后台渐进加载
   8. `b73412a37` Meta provider + Muse OAuth（独立特性）
   9. `4d38031fb` radius 基线目录（小）

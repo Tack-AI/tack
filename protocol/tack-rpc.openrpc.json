@@ -2,7 +2,7 @@
   "openrpc": "1.3.2",
   "info": {
     "title": "tack-RPC",
-    "version": "3.0.0",
+    "version": "3.1.0",
     "description": "tack-RPC v3: the host <-> plugin protocol for tack Level-3 plugins. JSON-RPC 2.0 envelopes over NDJSON stdio (process carrier) or WIT component calls (WASM carrier). This document is the single source of truth; Rust types in crates/tack-ext/src/rpc3.rs are generated from it by `cargo run -p xtask -- codegen`. Method naming follows MCP conventions (<namespace>/<verb>); direction is annotated with x-direction. Design: docs/plugin-roadmap.md."
   },
   "servers": [],
@@ -49,7 +49,15 @@
     },
     {
       "name": "hooks/transformContext",
-      "description": "COW context pipeline (opt-in via capabilities.hooks.transformContext): a null result means unchanged; a returned {messages: [...]} object replaces the messages every later hook sees.",
+      "description": "Ordinary COW context pipeline (opt-in via capabilities.hooks.transformContext): input excludes system messages; null means unchanged and preserves their positions; a changed {messages: [...]} result receives a replayed leading system head before the next hook.",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/TransformContextParams" } }],
+      "result": { "name": "result", "required": true, "schema": { "oneOf": [{ "$ref": "#/components/schemas/TransformContextResult" }, { "type": "null" }] } },
+      "x-direction": "host-to-plugin"
+    },
+    {
+      "name": "hooks/transformContextWithSystem",
+      "description": "Full-transcript context pipeline (opt-in via capabilities.hooks.transformContextWithSystem), run after every ordinary transformContext handler. Input includes system messages and a returned result is authoritative, including prompt/tool deletion; null means unchanged.",
       "paramStructure": "by-name",
       "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/TransformContextParams" } }],
       "result": { "name": "result", "required": true, "schema": { "oneOf": [{ "$ref": "#/components/schemas/TransformContextResult" }, { "type": "null" }] } },
@@ -318,6 +326,7 @@
         "properties": {
           "beforeToolCall": { "type": "boolean" },
           "transformContext": { "type": "boolean" },
+          "transformContextWithSystem": { "type": "boolean" },
           "afterToolCall": { "type": "boolean" },
           "approvalReview": { "type": "boolean" }
         }
@@ -529,7 +538,7 @@
         "required": ["action"]
       },
       "TransformContextParams": {
-        "description": "hooks/transformContext params. Messages are session-entry shaped JSON.",
+        "description": "hooks/transformContext and hooks/transformContextWithSystem params. Messages are session-entry shaped JSON.",
         "type": "object",
         "properties": {
           "messages": { "type": "array", "items": {} }

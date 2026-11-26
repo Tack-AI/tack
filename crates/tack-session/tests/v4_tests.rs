@@ -15,7 +15,9 @@ use tack_agent_core::AgentMessage;
 use tack_session::v4::{
     ForkOptions, LaneConfiguration, LaneModel, LaneState, V4Entry, V4Header, V4NewWrite, V4Store,
 };
-use tack_session::{ForkPosition, SessionBackend, SessionManager};
+use tack_session::{
+    ContextEditContent, ContextEditReplacement, ForkPosition, SessionBackend, SessionManager,
+};
 
 /// One fixed key for the whole test binary: the process-global session
 /// key OnceLock can only ever hold one key, so every encrypted test
@@ -619,6 +621,79 @@ fn v3_context_edit_survives_v4_migration_and_projects_checkpoint_tail() {
             }
         )
     }));
+}
+
+#[test]
+fn explicit_edit_after_v3_migration_updates_materialized_retained_tail() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = concat!(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"ctx-new-edit\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work\"}\n",
+        "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"discarded\",\"timestamp\":1}}\n",
+        "{\"type\":\"message\",\"id\":\"m2\",\"parentId\":\"m1\",\"timestamp\":\"2026-01-01T00:00:02.000Z\",\"message\":{\"role\":\"user\",\"content\":\"original retained\",\"timestamp\":2}}\n",
+        "{\"type\":\"compaction\",\"id\":\"c1\",\"parentId\":\"m2\",\"timestamp\":\"2026-01-01T00:00:03.000Z\",\"summary\":\"summary\",\"firstKeptEntryId\":\"m2\",\"tokensBefore\":100}\n"
+    );
+    let path = write_v3(&tmp, "ctx-new-edit.jsonl", fixture);
+    let mut manager = SessionManager::open(&path, None).unwrap();
+    // v4 migration mints storage IDs. The checkpoint records the mapped ID
+    // behind each retained message; explicit writes target that current ID,
+    // not the discarded legacy spelling.
+    let target_id = manager
+        .entries()
+        .iter()
+        .find_map(|entry| {
+            let tack_session::SessionEntry::Compaction {
+                details: Some(details),
+                ..
+            } = entry
+            else {
+                return None;
+            };
+            details
+                .get("tackRetainedTailSourceIds")?
+                .as_array()?
+                .first()?
+                .as_str()
+                .map(str::to_string)
+        })
+        .expect("migration records retained-tail provenance");
+    manager
+        .append_context_edit(
+            &target_id,
+            Some(ContextEditReplacement {
+                content: ContextEditContent::Text("new post-migration edit".into()),
+            }),
+        )
+        .unwrap();
+
+    let projected = manager.build_session_context();
+    let retained = projected
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            AgentMessage::User(user) => Some(&user.content),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(
+        retained[0],
+        &tack_ai::UserContent::Text("new post-migration edit".into())
+    );
+    assert!(manager.entries().iter().any(|entry| matches!(
+        entry,
+        tack_session::SessionEntry::Message { message: AgentMessage::User(user), .. }
+            if user.content == tack_ai::UserContent::Text("original retained".into())
+    )));
+
+    // The new live write is a real v4 record, not merely an in-memory patch.
+    drop(manager);
+    let reopened = SessionManager::open(&path, None).unwrap();
+    let projected = reopened.build_session_context();
+    assert!(projected.messages.iter().any(|message| matches!(
+        message,
+        AgentMessage::User(user)
+            if user.content == tack_ai::UserContent::Text("new post-migration edit".into())
+    )));
 }
 
 #[test]

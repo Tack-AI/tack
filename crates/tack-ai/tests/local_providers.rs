@@ -76,6 +76,100 @@ async fn llama_cpp_models_discovery() {
     assert_eq!(models[0].provider, "llama.cpp");
 }
 
+#[tokio::test]
+async fn llama_cpp_loaded_model_props_detect_chat_template_thinking() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server_requests = requests.clone();
+    tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 65536];
+            let read = socket.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..read]);
+            let target = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("")
+                .to_string();
+            server_requests.lock().unwrap().push(target.clone());
+            let body = if target.starts_with("/v1/models") {
+                r#"{"data":[
+                    {"id":"models/qwen thinking.gguf","status":{"value":"loaded"}},
+                    {"id":"sleeping","status":{"value":"sleeping"}},
+                    {"id":"unloaded","status":{"value":"unloaded"}}
+                ]}"#
+            } else if target.starts_with("/props?") {
+                r#"{"chat_template":"{% if enable_thinking %}thinking{% endif %}"}"#
+            } else {
+                "{}"
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+
+    let models = probe_llama_cpp(&format!("http://{addr}"))
+        .await
+        .expect("server is up");
+    assert_eq!(models.len(), 3);
+    let loaded = models
+        .iter()
+        .find(|model| model.id == "models/qwen thinking.gguf")
+        .unwrap();
+    assert!(loaded.reasoning);
+    assert_eq!(
+        loaded.thinking_level_map,
+        Some(std::collections::BTreeMap::from([
+            ("off".into(), Some("off".into())),
+            ("minimal".into(), None),
+            ("low".into(), None),
+            ("medium".into(), Some("medium".into())),
+            ("high".into(), None),
+            ("xhigh".into(), None),
+        ]))
+    );
+    assert_eq!(
+        loaded.compat.as_ref().unwrap()["thinkingFormat"],
+        "qwen-chat-template"
+    );
+    assert!(
+        models
+            .iter()
+            .find(|m| m.id == "sleeping")
+            .is_some_and(|m| !m.reasoning)
+    );
+    assert!(
+        models
+            .iter()
+            .find(|m| m.id == "unloaded")
+            .is_some_and(|m| !m.reasoning)
+    );
+
+    let requests = requests.lock().unwrap();
+    let props: Vec<_> = requests
+        .iter()
+        .filter(|target| target.starts_with("/props?"))
+        .collect();
+    assert_eq!(
+        props.len(),
+        1,
+        "only the loaded model is queried: {requests:?}"
+    );
+    let url = reqwest::Url::parse(&format!("http://localhost{}", props[0])).unwrap();
+    let query: std::collections::BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(
+        query.get("model").map(String::as_str),
+        Some("models/qwen thinking.gguf")
+    );
+    assert_eq!(query.get("autoload").map(String::as_str), Some("false"));
+}
+
 /// A server that never answers must not hang the probe: it returns `None`
 /// silently within roughly the 500ms timeout.
 #[tokio::test]

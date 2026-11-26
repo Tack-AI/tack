@@ -819,6 +819,50 @@ pub(crate) fn spec_oauth(spec: &tack_tools::mcp::McpServerSpec) -> McpOAuthSpec 
         .unwrap_or_default()
 }
 
+/// Build the request-time bridge between MCP and the ordinary provider login
+/// store. In particular, do not read OAuthCredential.access directly: the
+/// model resolver handles API keys, refresh, keyring access, and custom
+/// providers consistently with normal LLM requests.
+fn provider_token_resolver(
+    provider: &str,
+    agent_dir: &Path,
+) -> tack_tools::mcp::McpProviderTokenResolver {
+    let provider = provider.to_string();
+    let agent_dir = agent_dir.to_path_buf();
+    tack_tools::mcp::McpProviderTokenResolver::new(move || {
+        let provider = provider.clone();
+        let agent_dir = agent_dir.clone();
+        Box::pin(async move {
+            // Recreate the resolver for each HTTP request so login/logout or
+            // a credential-type change is visible even on a long-lived MCP
+            // transport, then resolve the current api_key just like a model.
+            match crate::model::resolve_auth(&provider, None, &agent_dir)
+                .resolve()
+                .await
+            {
+                Ok(auth) => auth.api_key,
+                Err(error) => {
+                    tracing::warn!("MCP provider auth resolution failed for {provider:?}: {error}");
+                    None
+                }
+            }
+        })
+    })
+}
+
+/// Install dynamic provider auth on an already validated spec. Extension
+/// plugin carriers use this directly; file/bundle servers are bound by
+/// `connect_one_oauth` below.
+pub(crate) fn bind_provider_auth(
+    mut spec: tack_tools::mcp::McpServerSpec,
+    agent_dir: &Path,
+) -> tack_tools::mcp::McpServerSpec {
+    if let Some(provider) = spec.auth_provider.clone() {
+        spec = spec.with_provider_token_resolver(provider_token_resolver(&provider, agent_dir));
+    }
+    spec
+}
+
 /// Connect all configured MCP servers, with OAuth for remote ones: cached
 /// token → refresh → (interactive) browser flow on 401. `interactive=false`
 /// (print/rpc/serve) only uses cached/refreshed tokens, never prompts.
@@ -932,6 +976,19 @@ pub(crate) async fn connect_one_oauth(
     callbacks: &tack_tools::mcp::McpClientCallbacks,
     cancel: &CancellationToken,
 ) -> Result<std::sync::Arc<tack_tools::mcp::McpConnection>, String> {
+    if spec.auth_provider.is_some() {
+        // auth.provider and MCP OAuth are mutually exclusive in behavior even
+        // if a legacy config also contains an oauth key. The dynamic reqwest
+        // backend resolves the provider api_key on every POST/GET/DELETE.
+        let spec = bind_provider_auth(spec.clone(), agent_dir);
+        return match connect_cancellable(&spec, callbacks.clone(), cancel).await {
+            Ok(conn) => Ok(std::sync::Arc::new(conn)),
+            Err(e) => {
+                tracing::warn!("MCP {}: {e}", spec.name);
+                Err(e)
+            }
+        };
+    }
     let url = spec.url().map(str::to_string);
     let wants_oauth = spec.oauth.is_some();
     match (wants_oauth, url) {
@@ -1073,6 +1130,28 @@ pub(crate) async fn connect_one_oauth(
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[tokio::test]
+    async fn provider_token_resolver_re_resolves_model_auth_every_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("settings.json"),
+            r#"{"credentialStore":"file"}"#,
+        )
+        .unwrap();
+        let provider = "tack-test-mcp-provider";
+        crate::auth::login(tmp.path(), provider, "tok1").unwrap();
+        let resolver = provider_token_resolver(provider, tmp.path());
+        assert_eq!(resolver.resolve().await.as_deref(), Some("tok1"));
+        crate::auth::login(tmp.path(), provider, "tok2").unwrap();
+        assert_eq!(
+            resolver.resolve().await.as_deref(),
+            Some("tok2"),
+            "the same resolver must observe a changed provider login"
+        );
+        crate::auth::logout(tmp.path(), provider).unwrap();
+        assert_eq!(resolver.resolve().await, None);
+    }
 
     #[test]
     fn callback_target_validates_loopback() {

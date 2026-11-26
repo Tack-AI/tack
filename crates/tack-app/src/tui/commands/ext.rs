@@ -89,6 +89,9 @@ fn plugin_detail(plugin: &crate::extension_host::LoadedPlugin) -> Option<String>
         if hooks.transform_context == Some(true) {
             names.push("transformContext");
         }
+        if hooks.transform_context_with_system == Some(true) {
+            names.push("transformContextWithSystem");
+        }
         if hooks.approval_review == Some(true) {
             names.push("approvalReview");
         }

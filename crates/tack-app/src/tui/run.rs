@@ -355,11 +355,14 @@ impl TuiApp {
                 self.hook_engine.run(&groups, None, &payload).await;
             }
         }
-        // tack-ext: session_shutdown + graceful plugin shutdown.
+        // tack-ext: sessionShutdown + graceful plugin shutdown.
         self.extensions
             .notify(
-                "session_shutdown",
-                serde_json::json!({ "sessionId": self.state.session.session_id() }),
+                "sessionShutdown",
+                serde_json::json!({
+                    "sessionId": self.state.session.session_id(),
+                    "reason": "quit",
+                }),
             )
             .await;
         self.extensions.shutdown().await;
@@ -928,7 +931,9 @@ impl TuiApp {
                 provider: self.provider.clone(),
                 auth: self.auth.clone(),
                 reasoning: thinking,
-                settings: self.settings.compaction,
+                settings: self
+                    .settings
+                    .compaction_for_model(&model.provider, &model.id),
                 cancel: self.cancel.clone(),
                 on_compaction: Some(self.compaction_tx.clone()),
                 history: self.settings.history(&self.agent_dir),

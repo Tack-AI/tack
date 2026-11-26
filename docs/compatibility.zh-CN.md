@@ -73,8 +73,10 @@ Rust workspace 的各个 crate **不发布到 crates.io**，也不提供 semver
   当前分支上最新的一次编辑可以隐藏较早的 user/assistant/tool-result/custom
   消息，或只替换其内容；原始历史、角色、元数据、usage 和导出保持不变。
   compaction、branch summary、token 估算及所有 agent 界面共用同一投影。
-  Tack 目前不会主动产生这些条目，但会正确执行导入条目。迁移到 v4 时，
-  它们保留为载荷兼容的 `custom` 条目并重映射 `targetId`；重建的
+  `SessionManager::append_context_edit` 校验活动分支 target 与 replacement
+  形状，复用 v3/v4/SQLite/内存条目的统一写路径；自动 recovery omission 与
+  actionable turn-boundary draft 尚未接线。迁移到 v4 时，导入的编辑保留为
+  载荷兼容的 `custom` 条目并重映射 `targetId`；重建的
   compaction checkpoint 还会在实现自定义的
   `details.tackRetainedTailSourceIds` 中记录每条消息的源条目 id，
   因此 compaction 之后的编辑仍能作用于已经物化的保留尾部。
@@ -162,6 +164,13 @@ Rust workspace 的各个 crate **不发布到 crates.io**，也不提供 semver
   `RPC_COMMANDS` 常量中（34 个命令：`prompt`、`steer`、
   `abort`、`fork`、`compact`、`bash`、`get_state`、`get_commands`……）；
   未知命令会得到结构化的 `unknown or unsupported command` 错误。
+- 成功的 `prompt` 响应携带 `data.disposition`，值为 `started`、
+  `queued` 或 `handled`；`steer` / `follow_up` 使用 `queued` 或 `handled`。
+  `started` 响应会先刷新到 stdout，再出现该 run 的 `agent_start` 事件。
+  扩展命令和被 `UserPromptSubmit` 拦截的输入为 `handled`，不会为该输入启动 run。
+- RPC session replacement 会先取消并排空旧 run，再发出恰好一组插件
+  `sessionShutdown` / `sessionStart`（`new`、`resume` 或 `fork`），随后才返回
+  replacement 命令的成功响应。这些是插件生命周期通知，不是额外的 RPC 命令响应。
 - 目前的 RPC 线上格式**没有协议版本字段**；客户端通过
   `get_commands` 发现能力。
 
@@ -199,8 +208,11 @@ ACP 侧的破坏性变更只通过上游 crate 升级进入，会在 CHANGELOG �
   TS/Python SDK 类型由 `cargo run -p xtask -- codegen` 从它生成，
   CI 做新鲜度检查）。
 - **版本握手**：宿主在 `initialize` 中发送 semver
-  `protocolVersion`（"3.0.0"）；兼容要求 major 版本相同且对端
-  minor 不超过宿主（`crates/tack-ext/src/v3/mod.rs`）。
+  `protocolVersion`（"3.1.0"）；兼容要求 major 版本相同且对端
+  minor 不超过宿主（`crates/tack-ext/src/v3/mod.rs`）。v3.1 新增可选
+  `transformContextWithSystem` 能力：普通 `transformContext` 先转换不含
+  system 的投影，随后 full-system handler 接收完整 transcript 并决定最终
+  prompt/tools，包括删除它们。
 - v1/v2 NDJSON 协议（`{"type":"request|response|event"}`）已在 v3
   版本中**移除**：宿主不再说它，且生命周期面被刻意收缩
   （`session/*` 只剩 `session/get` 与 `session/sendUserMessage`；

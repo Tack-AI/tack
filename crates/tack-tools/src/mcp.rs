@@ -65,6 +65,14 @@ pub struct McpServerSpec {
     pub transport: McpTransport,
     /// OAuth config (HTTP/SSE only). `Some(…)` = authorize on 401.
     pub oauth: Option<McpOAuthConfig>,
+    /// Provider login reused as an HTTP bearer credential. The application
+    /// installs a resolver before connecting; keeping the provider id here
+    /// also makes an inherited project override distinct from a replacement.
+    pub auth_provider: Option<String>,
+    /// Resolves the current provider credential for EACH HTTP request. This
+    /// is intentionally not a token value: OAuth refreshes and login/logout
+    /// changes must take effect without rebuilding a long-lived MCP session.
+    provider_token: Option<McpProviderTokenResolver>,
     /// Strip sensitive inherited env vars from the stdio child (see
     /// [`Self::with_credential_stripping`]). Off by default:
     /// user-configured servers keep the host's full environment.
@@ -89,6 +97,38 @@ pub struct McpServerSpec {
 /// Default per-request timeout when the spec does not set one (matches TS
 /// pi's 60 s). `"timeout": 0` in mcp.json disables the limit.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Boxed provider-token lookup result used by [`McpProviderTokenResolver`].
+pub type McpProviderTokenFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>;
+type ProviderTokenResolverFn = dyn Fn() -> McpProviderTokenFuture + Send + Sync;
+
+/// Application-supplied, request-time provider credential lookup. `None`
+/// means that no provider credential is currently available; the configured
+/// static headers are then left intact.
+#[derive(Clone)]
+pub struct McpProviderTokenResolver(Arc<ProviderTokenResolverFn>);
+
+impl McpProviderTokenResolver {
+    pub fn new<F>(resolver: F) -> Self
+    where
+        F: Fn() -> McpProviderTokenFuture + Send + Sync + 'static,
+    {
+        Self(Arc::new(resolver))
+    }
+
+    pub async fn resolve(&self) -> Option<String> {
+        (self.0)().await
+    }
+}
+
+impl std::fmt::Debug for McpProviderTokenResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A resolver may close over credentials. Never include its captures
+        // in spec fingerprints or diagnostics.
+        f.write_str("McpProviderTokenResolver")
+    }
+}
 
 /// How a server's tools reach the model (mcp.json `exposure`; TS pi calls
 /// the middle tier `deferred`).
@@ -195,6 +235,8 @@ impl McpServerSpec {
                 cwd,
             },
             oauth: None,
+            auth_provider: None,
+            provider_token: None,
             strip_credentials: false,
             enabled: true,
             request_timeout: None,
@@ -208,6 +250,8 @@ impl McpServerSpec {
             name,
             transport: McpTransport::Http { url, headers },
             oauth: None,
+            auth_provider: None,
+            provider_token: None,
             strip_credentials: false,
             enabled: true,
             request_timeout: None,
@@ -221,6 +265,8 @@ impl McpServerSpec {
             name,
             transport: McpTransport::Sse { url, headers },
             oauth: None,
+            auth_provider: None,
+            provider_token: None,
             strip_credentials: false,
             enabled: true,
             request_timeout: None,
@@ -232,6 +278,19 @@ impl McpServerSpec {
     /// Attach an OAuth config (HTTP/SSE only).
     pub fn with_oauth(mut self, oauth: McpOAuthConfig) -> Self {
         self.oauth = Some(oauth);
+        self
+    }
+
+    /// Reuse a provider login for HTTP authentication. Configuration parsing
+    /// validates the transport, URL, and provenance before setting this.
+    pub fn with_auth_provider(mut self, provider: String) -> Self {
+        self.auth_provider = Some(provider);
+        self
+    }
+
+    /// Install the request-time credential lookup for `auth.provider`.
+    pub fn with_provider_token_resolver(mut self, resolver: McpProviderTokenResolver) -> Self {
+        self.provider_token = Some(resolver);
         self
     }
 
@@ -877,6 +936,181 @@ fn reconnect_boxed(
     Box::pin(async move { connect_with(&spec, callbacks).await })
 }
 
+/// reqwest backend that refreshes provider authentication immediately before
+/// every rmcp HTTP operation. Decorating `auth_header` at connection setup is
+/// insufficient: rmcp caches that value for its streams and reconnect logic.
+#[derive(Clone)]
+struct ProviderAuthHttpClient {
+    inner: reqwest::Client,
+    resolver: McpProviderTokenResolver,
+}
+
+impl ProviderAuthHttpClient {
+    fn new(resolver: McpProviderTokenResolver) -> Self {
+        tack_ai::tls::ensure_ring_provider();
+        // Match rmcp's built-in backend: idle-pool behavior avoids delayed-ACK
+        // stalls, and only same-origin 307/308 redirects are followed. The
+        // origin check also prevents an HTTPS auth URL from replaying its
+        // provider credential over HTTP or to another host.
+        let redirect = reqwest::redirect::Policy::custom(|attempt| {
+            let preserves_body = matches!(
+                attempt.status(),
+                reqwest::StatusCode::TEMPORARY_REDIRECT | reqwest::StatusCode::PERMANENT_REDIRECT
+            );
+            let same_origin = attempt
+                .previous()
+                .first()
+                .is_some_and(|original| original.origin() == attempt.url().origin());
+            if !preserves_body || !same_origin {
+                attempt.stop()
+            } else if attempt.previous().len() > 10 {
+                attempt.error("exceeded 10 redirects")
+            } else {
+                attempt.follow()
+            }
+        });
+        let inner = reqwest::Client::builder()
+            .pool_max_idle_per_host(0)
+            .redirect(redirect)
+            .build()
+            .expect("failed to build MCP provider-auth HTTP client");
+        Self { inner, resolver }
+    }
+
+    async fn headers(
+        &self,
+        mut headers: std::collections::HashMap<http::HeaderName, http::HeaderValue>,
+    ) -> std::collections::HashMap<http::HeaderName, http::HeaderValue> {
+        let Some(token) = self.resolver.resolve().await else {
+            // A missing provider credential must not trigger MCP OAuth. Keep
+            // any explicitly configured static Authorization header instead.
+            return headers;
+        };
+        match http::HeaderValue::from_str(&format!("Bearer {token}")) {
+            Ok(value) => {
+                headers.insert(http::header::AUTHORIZATION, value);
+            }
+            Err(error) => {
+                // Never fall back to a different credential when the resolved
+                // provider value is malformed; that would surprise a user who
+                // explicitly selected auth.provider.
+                headers.remove(&http::header::AUTHORIZATION);
+                tracing::warn!(
+                    "MCP provider credential is not a valid Authorization value: {error}"
+                );
+            }
+        }
+        headers
+    }
+}
+
+impl rmcp::transport::streamable_http_client::StreamableHttpClient for ProviderAuthHttpClient {
+    type Error = reqwest::Error;
+
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: rmcp::model::ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: std::collections::HashMap<http::HeaderName, http::HeaderValue>,
+    ) -> Result<
+        rmcp::transport::streamable_http_client::StreamableHttpPostResponse,
+        rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>,
+    > {
+        let custom_headers = self.headers(custom_headers).await;
+        self.inner
+            .post_message(uri, message, session_id, auth_header, custom_headers)
+            .await
+    }
+
+    async fn post_message_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        message: rmcp::model::ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: std::collections::HashMap<http::HeaderName, http::HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<
+        rmcp::transport::streamable_http_client::StreamableHttpPostResponse,
+        rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>,
+    > {
+        let custom_headers = self.headers(custom_headers).await;
+        self.inner
+            .post_message_with_max_sse_event_size(
+                uri,
+                message,
+                session_id,
+                auth_header,
+                custom_headers,
+                max_sse_event_size,
+            )
+            .await
+    }
+
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        auth_header: Option<String>,
+        custom_headers: std::collections::HashMap<http::HeaderName, http::HeaderValue>,
+    ) -> Result<(), rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>> {
+        let custom_headers = self.headers(custom_headers).await;
+        self.inner
+            .delete_session(uri, session_id, auth_header, custom_headers)
+            .await
+    }
+
+    async fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: std::collections::HashMap<http::HeaderName, http::HeaderValue>,
+    ) -> Result<
+        futures_util::stream::BoxStream<
+            'static,
+            Result<sse_stream::Sse, rmcp::transport::streamable_http_client::SseError>,
+        >,
+        rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>,
+    > {
+        let custom_headers = self.headers(custom_headers).await;
+        self.inner
+            .get_stream(uri, session_id, last_event_id, auth_header, custom_headers)
+            .await
+    }
+
+    async fn get_stream_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: std::collections::HashMap<http::HeaderName, http::HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<
+        futures_util::stream::BoxStream<
+            'static,
+            Result<sse_stream::Sse, rmcp::transport::streamable_http_client::SseError>,
+        >,
+        rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>,
+    > {
+        let custom_headers = self.headers(custom_headers).await;
+        self.inner
+            .get_stream_with_max_sse_event_size(
+                uri,
+                session_id,
+                last_event_id,
+                auth_header,
+                custom_headers,
+                max_sse_event_size,
+            )
+            .await
+    }
+}
+
 async fn connect_spec_transport(
     spec: &McpServerSpec,
     callbacks: McpClientCallbacks,
@@ -939,8 +1173,17 @@ async fn connect_spec_transport(
                     url.as_str(),
                 );
             config.custom_headers = custom_headers;
-            let transport = StreamableHttpClientTransport::from_config(config);
-            handler.clone().serve(transport).await.map_err(|e| {
+            let service_result = if let Some(resolver) = spec.provider_token.clone() {
+                let transport = StreamableHttpClientTransport::with_client(
+                    ProviderAuthHttpClient::new(resolver),
+                    config,
+                );
+                handler.clone().serve(transport).await
+            } else {
+                let transport = StreamableHttpClientTransport::from_config(config);
+                handler.clone().serve(transport).await
+            };
+            service_result.map_err(|e| {
                 let challenge = e
                     .auth_challenge()
                     .map(|header| format!("; WWW-Authenticate: {header}"))

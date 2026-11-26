@@ -19,6 +19,7 @@ TOOLS_EXECUTE = "tools/execute"
 COMMANDS_INVOKE = "commands/invoke"
 HOOKS_BEFORE_TOOL_CALL = "hooks/beforeToolCall"
 HOOKS_TRANSFORM_CONTEXT = "hooks/transformContext"
+HOOKS_TRANSFORM_CONTEXT_WITH_SYSTEM = "hooks/transformContextWithSystem"
 HOOKS_AFTER_TOOL_CALL = "hooks/afterToolCall"
 APPROVAL_REVIEW = "approval/review"
 AUTOCOMPLETE_PROVIDE = "autocomplete/provide"
@@ -167,6 +168,7 @@ class HookCapabilities(TypedDict):
     approvalReview: NotRequired[bool]
     beforeToolCall: NotRequired[bool]
     transformContext: NotRequired[bool]
+    transformContextWithSystem: NotRequired[bool]
 
 
 class HostCapabilities(TypedDict):
@@ -413,7 +415,7 @@ class ToolSpec(TypedDict):
 
 
 class TransformContextParams(TypedDict):
-    """hooks/transformContext params. Messages are session-entry shaped JSON."""
+    """hooks/transformContext and hooks/transformContextWithSystem params. Messages are session-entry shaped JSON."""
     messages: list[Any]
 
 

@@ -109,10 +109,9 @@ fn command(
     read_response(agent, id)
 }
 
-/// Send a prompt and read until BOTH the command response and the run's
-/// agent_end arrived (either order — a hook-blocked prompt emits its
-/// synthetic agent_end before the response), then wait for the agent to go
-/// fully idle.
+/// Send a prompt and read until the command response and, when a run was
+/// actually started, its agent_end arrived. A `handled` prompt has no run and
+/// therefore no synthetic agent_end.
 fn prompt_and_collect(
     agent: &mut RpcAgent,
     id: &str,
@@ -125,9 +124,11 @@ fn prompt_and_collect(
     let mut response = None;
     let mut events = Vec::new();
     let mut agent_end_seen = false;
-    while response.is_none() || !agent_end_seen {
+    let mut handled = false;
+    while response.is_none() || (!handled && !agent_end_seen) {
         let value = read_line(agent);
         if value["type"] == "response" && value["id"] == id {
+            handled = value["data"]["disposition"] == "handled";
             response = Some(value);
             continue;
         }
@@ -189,6 +190,27 @@ fn wait_for_file_lines(path: &std::path::Path, expected: usize) -> String {
 }
 
 #[test]
+fn rpc_prompt_started_response_precedes_agent_events() {
+    let mut agent = spawn_rpc();
+    send(
+        &mut agent.stdin,
+        serde_json::json!({ "type": "prompt", "id": "ordered", "message": "hello" }),
+    );
+    let response = read_line(&mut agent);
+    assert_eq!(response["type"], "response", "{response}");
+    assert_eq!(response["id"], "ordered", "{response}");
+    assert_eq!(response["data"]["disposition"], "started", "{response}");
+    let first_event = read_line(&mut agent);
+    assert_eq!(first_event["type"], "agent_start", "{first_event}");
+    loop {
+        if read_line(&mut agent)["type"] == "agent_end" {
+            break;
+        }
+    }
+    wait_until_idle(&mut agent);
+}
+
+#[test]
 fn rpc_set_hooks_validates_shape() {
     let mut agent = spawn_rpc();
     let r = command(
@@ -245,6 +267,7 @@ fn rpc_user_prompt_submit_block_drops_prompt() {
 
     let (r, events) = prompt_and_collect(&mut agent, "p-1", "hello");
     assert_eq!(r["success"], true, "{r}");
+    assert_eq!(r["data"]["disposition"], "handled", "{r}");
     let notice = events
         .iter()
         .find(|e| e["type"] == "hook_notice" && e["hookEvent"] == "UserPromptSubmit")

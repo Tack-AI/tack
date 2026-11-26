@@ -51,6 +51,7 @@ async fn oauth_fingerprint_suffix(
     let mut suffix = String::new();
     for spec in specs {
         if spec.oauth.is_some()
+            && spec.auth_provider.is_none()
             && let Some(url) = spec.url()
         {
             let token = crate::mcp_oauth::access_token_with_cancel(

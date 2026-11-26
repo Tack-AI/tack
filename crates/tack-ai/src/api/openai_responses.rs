@@ -56,6 +56,8 @@ pub struct ResponsesCompat {
     pub supports_long_cache_retention: Option<bool>,
     pub supports_strict_mode: Option<bool>,
     pub supports_explicit_prompt_cache_mode: Option<bool>,
+    /// `"openrouter"`, `"openai"`, or `"openai-nosession"`.
+    pub session_affinity_format: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -64,6 +66,7 @@ struct ResolvedResponsesCompat {
     supports_long_cache_retention: bool,
     supports_strict_mode: bool,
     supports_explicit_prompt_cache_mode: bool,
+    session_affinity_format: String,
 }
 
 fn resolve_compat(model: &Model) -> ResolvedResponsesCompat {
@@ -79,6 +82,13 @@ fn resolve_compat(model: &Model) -> ResolvedResponsesCompat {
         supports_explicit_prompt_cache_mode: overrides
             .supports_explicit_prompt_cache_mode
             .unwrap_or(false),
+        session_affinity_format: overrides.session_affinity_format.unwrap_or_else(|| {
+            if model.provider == "openrouter" || model.base_url.contains("openrouter.ai") {
+                "openrouter".to_string()
+            } else {
+                "openai".to_string()
+            }
+        }),
     }
 }
 
@@ -884,6 +894,7 @@ async fn run(
     }
     if !ws_active {
         let client = crate::api::http_client();
+        let compat = resolve_compat(&model);
         let build_request = || {
             let mut request = client
                 .post(&url)
@@ -908,6 +919,26 @@ async fn run(
                 for (k, v) in headers {
                     request = request.header(k, v);
                 }
+            }
+            if let Some(session_id) = &options.session_id {
+                if compat.session_affinity_format == "openrouter" {
+                    if !crate::provider::has_header(&options.headers, "x-session-id") {
+                        request = request.header("x-session-id", session_id);
+                    }
+                } else {
+                    if compat.session_affinity_format == "openai"
+                        && !crate::provider::has_header(&options.headers, "session-id")
+                    {
+                        request = request.header("session-id", session_id);
+                    }
+                    if !crate::provider::has_header(&options.headers, "x-client-request-id") {
+                        request = request.header("x-client-request-id", session_id);
+                    }
+                }
+            }
+            if let Some((name, value)) = crate::provider::opencode_session_header(&model, &options)
+            {
+                request = request.header(name, value);
             }
             for (k, v) in &options.headers {
                 request = request.header(k, v);

@@ -81,6 +81,18 @@ pub trait AgentHooks: Send + Sync {
         None
     }
 
+    /// Second, full-transcript extension phase. Every ordinary
+    /// [`Self::transform_context`] hook has completed before this runs.
+    /// Unlike ordinary RPC context handlers, this phase receives system
+    /// messages and its output is authoritative (including deleting them).
+    /// Internal hooks normally leave this unimplemented.
+    async fn transform_context_with_system(
+        &self,
+        _messages: &[AgentMessage],
+    ) -> Option<Vec<AgentMessage>> {
+        None
+    }
+
     /// Convert agent messages to LLM messages at the call boundary.
     fn convert_to_llm(&self, messages: &[AgentMessage]) -> Vec<Message> {
         AgentMessage::default_convert_to_llm(messages)

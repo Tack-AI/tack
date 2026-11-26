@@ -135,6 +135,44 @@ async fn start_server() -> String {
     format!("http://{addr}/mcp")
 }
 
+async fn start_auth_server() -> (
+    String,
+    Arc<std::sync::Mutex<Vec<(axum::http::Method, Option<String>)>>>,
+) {
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let service = StreamableHttpService::new(
+        || Ok(TestServer),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let observed = requests.clone();
+    let app = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let observed = observed.clone();
+                async move {
+                    let authorization = request
+                        .headers()
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push((request.method().clone(), authorization));
+                    next.run(request).await
+                }
+            },
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}/mcp"), requests)
+}
+
 /// mcp.json `exposure` / `toolExposure` reach the built AgentTools:
 /// deferred tools carry the pool marker (server-level for meta/prompt
 /// tools), hidden tools are never built.
@@ -233,6 +271,124 @@ async fn http_connect_discovers_capabilities() {
         .unwrap();
     let text = text_of(&result);
     assert!(text.contains("Say hi to pi"), "{text}");
+}
+
+/// Provider credentials are request-scoped, not a connect-time header. This
+/// exercises two calls through one live rmcp session and also checks the
+/// documented static-header fallback when provider auth becomes unavailable.
+#[tokio::test]
+async fn provider_token_changes_on_one_live_http_connection() {
+    let (url, requests) = start_auth_server().await;
+    let token = Arc::new(std::sync::Mutex::new(Some("tok1".to_string())));
+    let resolver = tack_tools::mcp::McpProviderTokenResolver::new({
+        let token = token.clone();
+        move || {
+            let token = token.clone();
+            Box::pin(async move { token.lock().unwrap().clone() })
+        }
+    });
+    let spec = McpServerSpec::http(
+        "test".into(),
+        url,
+        vec![("Authorization".into(), "Bearer static".into())],
+    )
+    .with_auth_provider("test-provider".into())
+    .with_provider_token_resolver(resolver);
+    let conn = Arc::new(connect(&spec).await.unwrap());
+    let tools = mcp_tools(std::slice::from_ref(&conn));
+    let echo = tools
+        .iter()
+        .find(|tool| tool.name() == "mcp__test__echo_tool")
+        .unwrap();
+
+    echo.execute(
+        "first",
+        serde_json::json!({"text": "first"}),
+        tokio_util::sync::CancellationToken::new(),
+        &|_| {},
+    )
+    .await
+    .unwrap();
+    let first_count = requests.lock().unwrap().len();
+    assert!(first_count > 0);
+    {
+        let observed = requests.lock().unwrap();
+        assert!(
+            observed
+                .iter()
+                .all(|(_, auth)| auth.as_deref() == Some("Bearer tok1")),
+            "provider auth must override the static header on every initial request"
+        );
+        assert!(
+            observed
+                .iter()
+                .any(|(method, _)| *method == axum::http::Method::POST)
+        );
+        assert!(
+            observed
+                .iter()
+                .any(|(method, _)| *method == axum::http::Method::GET),
+            "the fixture also exercises rmcp's streaming GET path: {observed:?}"
+        );
+    }
+
+    *token.lock().unwrap() = Some("tok2".into());
+    echo.execute(
+        "second",
+        serde_json::json!({"text": "second"}),
+        tokio_util::sync::CancellationToken::new(),
+        &|_| {},
+    )
+    .await
+    .unwrap();
+    assert!(!conn.is_closed(), "the second call reused the MCP session");
+    {
+        let observed = requests.lock().unwrap();
+        assert!(observed.len() > first_count);
+        assert!(
+            observed[first_count..]
+                .iter()
+                .all(|(_, auth)| auth.as_deref() == Some("Bearer tok2")),
+            "requests after the token change: {:?}",
+            &observed[first_count..]
+        );
+    }
+
+    *token.lock().unwrap() = None;
+    echo.execute(
+        "third",
+        serde_json::json!({"text": "third"}),
+        tokio_util::sync::CancellationToken::new(),
+        &|_| {},
+    )
+    .await
+    .unwrap();
+    {
+        let observed = requests.lock().unwrap();
+        assert_eq!(
+            observed.last().unwrap().1.as_deref(),
+            Some("Bearer static"),
+            "a missing provider token leaves the static Authorization header intact"
+        );
+    }
+    conn.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if let Some((_, auth)) = requests
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(method, _)| *method == axum::http::Method::DELETE)
+                .cloned()
+            {
+                assert_eq!(auth.as_deref(), Some("Bearer static"));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("provider-authenticated DELETE session cleanup");
 }
 
 fn text_of(result: &tack_agent_core::AgentToolResult) -> String {

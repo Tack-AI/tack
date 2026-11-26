@@ -33,6 +33,9 @@ nix = "0.31"
 image = { workspace = true, features = ["gif", "webp", "bmp"] }
 http = "1"
 reqwest.workspace = true
+# Direct dependency is required to implement rmcp's StreamableHttpClient:
+# its get_stream signature exposes sse_stream::Sse without re-exporting it.
+sse-stream = "0.2"
 futures-util.workspace = true
 rmcp = { workspace = true, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 

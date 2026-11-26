@@ -357,27 +357,107 @@ fn uses_google_thinking_level(model_id: &str) -> bool {
         || is_gemma4(model_id)
 }
 
-fn thinking_level_for(model: &Model, level: ThinkingLevel) -> &'static str {
-    let mapped = model.thinking_level_value(level).cloned().flatten();
-    let resolved = mapped.unwrap_or_else(|| level.clamped().as_str().to_string());
+const GOOGLE_THINKING_LEVELS: [Option<ThinkingLevel>; 7] = [
+    None,
+    Some(ThinkingLevel::Minimal),
+    Some(ThinkingLevel::Low),
+    Some(ThinkingLevel::Medium),
+    Some(ThinkingLevel::High),
+    Some(ThinkingLevel::Xhigh),
+    Some(ThinkingLevel::Max),
+];
+
+fn thinking_level_key(level: Option<ThinkingLevel>) -> &'static str {
+    level.map_or("off", |level| level.as_str())
+}
+
+fn google_level_supported(model: &Model, level: Option<ThinkingLevel>) -> bool {
+    if !model.reasoning {
+        return level.is_none();
+    }
+    let mapped = model
+        .thinking_level_map
+        .as_ref()
+        .and_then(|map| map.get(thinking_level_key(level)));
+    if mapped.is_some_and(Option::is_none) {
+        return false;
+    }
+    if matches!(level, Some(ThinkingLevel::Xhigh | ThinkingLevel::Max)) {
+        return mapped.is_some_and(Option::is_some);
+    }
+    true
+}
+
+/// Clamp to a model-supported logical level: search upward first so `off`
+/// falls back to the lowest available effort, then downward as a last resort.
+fn clamp_google_thinking_level(
+    model: &Model,
+    requested: Option<ThinkingLevel>,
+) -> Option<ThinkingLevel> {
+    if google_level_supported(model, requested) {
+        return requested;
+    }
+    let requested_index = GOOGLE_THINKING_LEVELS
+        .iter()
+        .position(|level| *level == requested)
+        .unwrap_or(0);
+    GOOGLE_THINKING_LEVELS[requested_index..]
+        .iter()
+        .copied()
+        .find(|level| google_level_supported(model, *level))
+        .flatten()
+        .or_else(|| {
+            GOOGLE_THINKING_LEVELS[..requested_index]
+                .iter()
+                .rev()
+                .copied()
+                .find(|level| google_level_supported(model, *level))
+                .flatten()
+        })
+}
+
+fn resolve_google_thinking_level(
+    model: &Model,
+    level: ThinkingLevel,
+) -> Result<ThinkingLevel, String> {
+    let mapped = model.thinking_level_value(level).and_then(Option::as_ref);
+    let resolved = mapped
+        .map(|value| value.to_lowercase())
+        .unwrap_or_else(|| level.as_str().to_string());
     match resolved.as_str() {
-        "minimal" => {
-            if is_gemini3_pro(model.id.as_str()) {
-                "LOW"
-            } else {
-                "MINIMAL"
-            }
-        }
-        "low" => "LOW",
-        "medium" => {
-            if is_gemini3_pro(model.id.as_str()) || is_gemma4(model.id.as_str()) {
-                "HIGH"
-            } else {
-                "MEDIUM"
-            }
-        }
+        "minimal" => Ok(ThinkingLevel::Minimal),
+        "low" => Ok(ThinkingLevel::Low),
+        "medium" => Ok(ThinkingLevel::Medium),
+        "high" => Ok(ThinkingLevel::High),
+        _ => Err(format!(
+            "Unsupported Google thinking level mapping for {}/{}: {} -> {}",
+            model.provider,
+            model.id,
+            level.as_str(),
+            mapped.map_or("undefined", String::as_str)
+        )),
+    }
+}
+
+fn google_api_level(level: ThinkingLevel) -> &'static str {
+    match level {
+        ThinkingLevel::Minimal => "MINIMAL",
+        ThinkingLevel::Low => "LOW",
+        ThinkingLevel::Medium => "MEDIUM",
         _ => "HIGH",
     }
+}
+
+fn disabled_thinking_config(model: &Model) -> Result<Value, String> {
+    if !uses_google_thinking_level(model.id.as_str()) {
+        return Ok(json!({ "thinkingBudget": 0 }));
+    }
+    let fallback = clamp_google_thinking_level(model, None);
+    let Some(level) = fallback else {
+        return Ok(json!({ "thinkingBudget": 0 }));
+    };
+    let resolved = resolve_google_thinking_level(model, level)?;
+    Ok(json!({ "thinkingLevel": google_api_level(resolved) }))
 }
 
 fn budget_for(model: &Model, level: ThinkingLevel, custom: Option<ThinkingBudgets>) -> i64 {
@@ -405,7 +485,11 @@ fn budget_for(model: &Model, level: ThinkingLevel, custom: Option<ThinkingBudget
     }
 }
 
-pub(crate) fn build_params(model: &Model, context: &Context, options: &StreamOptions) -> Value {
+pub(crate) fn build_params(
+    model: &Model,
+    context: &Context,
+    options: &StreamOptions,
+) -> Result<Value, String> {
     let contents = convert_messages(model, context);
 
     let mut params = json!({ "contents": contents });
@@ -438,31 +522,23 @@ pub(crate) fn build_params(model: &Model, context: &Context, options: &StreamOpt
     }
 
     if model.reasoning {
-        match options.reasoning {
-            Some(level) => {
+        let clamped = options
+            .reasoning
+            .map(|requested| clamp_google_thinking_level(model, Some(requested)));
+        match clamped {
+            Some(Some(requested)) => {
+                let resolved = resolve_google_thinking_level(model, requested)?;
                 let mut thinking = json!({ "includeThoughts": true });
                 if uses_google_thinking_level(model.id.as_str()) {
-                    thinking["thinkingLevel"] = json!(thinking_level_for(model, level));
+                    thinking["thinkingLevel"] = json!(google_api_level(resolved));
                 } else {
                     thinking["thinkingBudget"] =
-                        json!(budget_for(model, level, options.thinking_budgets));
+                        json!(budget_for(model, resolved, options.thinking_budgets));
                 }
                 config["thinkingConfig"] = thinking;
             }
-            None => {
-                // Gemini 3 can't fully disable thinking; use the lowest level
-                // without includeThoughts. Gemini 2.x: budget 0.
-                let level = if is_gemini3_pro(model.id.as_str()) {
-                    Some("LOW")
-                } else if uses_google_thinking_level(model.id.as_str()) {
-                    Some("MINIMAL")
-                } else {
-                    None
-                };
-                config["thinkingConfig"] = match level {
-                    Some(level) => json!({ "thinkingLevel": level }),
-                    None => json!({ "thinkingBudget": 0 }),
-                };
+            Some(None) | None => {
+                config["thinkingConfig"] = disabled_thinking_config(model)?;
             }
         }
     }
@@ -480,7 +556,7 @@ pub(crate) fn build_params(model: &Model, context: &Context, options: &StreamOpt
             root.insert(k.clone(), v.clone());
         }
     }
-    params
+    Ok(params)
 }
 
 pub(crate) fn map_stop_reason(reason: &str) -> StopReason {
@@ -558,7 +634,13 @@ pub(crate) async fn run_with_url(
     let mut output = AssistantMessage::pending(&model);
     let mut coalescer = crate::api::DeltaCoalescer::new();
 
-    let params = build_params(&model, &context, &options);
+    let params = match build_params(&model, &context, &options) {
+        Ok(params) => params,
+        Err(error) => {
+            coalescer.flush_into(&sender, &output);
+            fail!(output, sender, error, false);
+        }
+    };
 
     let client = crate::api::http_client();
     let build_request = || {
@@ -576,6 +658,9 @@ pub(crate) async fn run_with_url(
             for (k, v) in headers {
                 request = request.header(k, v);
             }
+        }
+        if let Some((name, value)) = crate::provider::opencode_session_header(&model, &options) {
+            request = request.header(name, value);
         }
         for (k, v) in &options.headers {
             request = request.header(k, v);
@@ -942,6 +1027,7 @@ mod tests {
     fn gemini4_uses_thinking_level_instead_of_budget() {
         let mut model = model("randomprefix-gemini-4-argon");
         model.reasoning = true;
+        model.thinking_level_map = Some(std::collections::BTreeMap::from([("off".into(), None)]));
         let context = Context {
             messages: vec![Message::user("Hello")],
             ..Default::default()
@@ -953,19 +1039,88 @@ mod tests {
                 reasoning: Some(ThinkingLevel::Medium),
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
         assert_eq!(
             params["thinkingConfig"],
             json!({ "includeThoughts": true, "thinkingLevel": "MEDIUM" })
         );
         assert!(params["thinkingConfig"].get("thinkingBudget").is_none());
 
-        let disabled = build_params(&model, &context, &StreamOptions::default());
+        let disabled = build_params(&model, &context, &StreamOptions::default()).unwrap();
         assert_eq!(
             disabled["thinkingConfig"],
             json!({ "thinkingLevel": "MINIMAL" })
         );
         assert!(disabled["thinkingConfig"].get("thinkingBudget").is_none());
+    }
+
+    #[test]
+    fn google_thinking_level_map_clamps_to_supported_levels() {
+        let context = Context {
+            messages: vec![Message::user("Hello")],
+            ..Default::default()
+        };
+        let map = std::collections::BTreeMap::from([
+            ("off".into(), None),
+            ("minimal".into(), None),
+            ("low".into(), Some("low".into())),
+            ("medium".into(), Some("MEDIUM".into())),
+            ("high".into(), Some("high".into())),
+            ("xhigh".into(), None),
+            ("max".into(), None),
+        ]);
+
+        let mut flash = model("gemini-3.8-flash");
+        flash.reasoning = true;
+        flash.thinking_level_map = Some(map.clone());
+        let disabled = build_params(&flash, &context, &StreamOptions::default()).unwrap();
+        assert_eq!(
+            disabled["thinkingConfig"],
+            json!({ "thinkingLevel": "LOW" })
+        );
+
+        let mut pro = model("gemini-3.1-pro-preview");
+        pro.reasoning = true;
+        pro.thinking_level_map = Some(map);
+        let medium = build_params(
+            &pro,
+            &context,
+            &StreamOptions {
+                reasoning: Some(ThinkingLevel::Medium),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            medium["thinkingConfig"],
+            json!({ "includeThoughts": true, "thinkingLevel": "MEDIUM" })
+        );
+
+        let mut gemini2 = model("gemini-2.5-flash");
+        gemini2.reasoning = true;
+        let disabled = build_params(&gemini2, &context, &StreamOptions::default()).unwrap();
+        assert_eq!(disabled["thinkingConfig"], json!({ "thinkingBudget": 0 }));
+    }
+
+    #[test]
+    fn google_thinking_level_map_rejects_unknown_values() {
+        let mut model = model("gemini-3.8-flash");
+        model.reasoning = true;
+        model.thinking_level_map = Some(std::collections::BTreeMap::from([(
+            "medium".into(),
+            Some("extreme".into()),
+        )]));
+        let error = build_params(
+            &model,
+            &Context::default(),
+            &StreamOptions {
+                reasoning: Some(ThinkingLevel::Medium),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("medium -> extreme"), "{error}");
     }
 
     /// Regression: the output/error payload must be nested under a `response`

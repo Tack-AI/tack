@@ -192,7 +192,8 @@ Python 的 handler 同步异步皆可。
 | `.command(spec, h)` | `.command(spec, h)` | `.command(spec, h)` | `/斜杠` 命令 |
 | `.before_tool_call(h)` | `.beforeToolCall(h)` | `.before_tool_call(h)` | allow / deny / **改写** |
 | `.after_tool_call(h)` | `.afterToolCall(h)` | `.after_tool_call(h)` | 按字段修补结果 |
-| `.transform_context(h)` | `.transformContext(h)` | `.transform_context(h)` | 全量上下文替换 |
+| `.transform_context(h)` | `.transformContext(h)` | `.transform_context(h)` | 非 system 上下文管道 |
+| `.transform_context_with_system(h)` | `.transformContextWithSystem(h)` | `.transform_context_with_system(h)` | 权威的全 transcript 管道 |
 | `.approval_review(h)` | `.approvalReview(h)` | `.approval_review(h)` | 加入审批链 |
 | `.events(&[…], h)` | `.events([…], h)` | `.events([…], h)` | 生命周期事件（camelCase：`agentStart`、`turnEnd`……） |
 | `.widget(spec)` + `.on_widget_action(h)` | `.widget(spec)` + `.onWidgetAction(h)` | `.widget(spec)` + `.on_widget_action(h)` | TUI widget |
@@ -201,6 +202,13 @@ Python 的 handler 同步异步皆可。
 | `.metrics(decl)` | `.metrics(decl)` | `.metrics(decl)` | metrics sidecar schema |
 | `.provider_register(bool)` | `.providerRegister(bool)` | `.provider_register(bool)` | 可注册 HTTP-shim provider |
 | `.provider_stream(h)` + `.on_ready(h)` | `.providerStream(h)` + `.onReady(h)` | `.provider_stream(h)` + `.on_ready(h)` | provider bridge（直接提供推理） |
+
+普通 context handler 先运行，输入不含 system message。返回修改后的列表时，
+当前 system state 会回放为一个 leading head；未修改结果保留会话中途的
+system 位置。随后所有 full-system handler 按注册顺序处理完整 transcript。
+其结果具有最终权威性，包括删除 system prompt 或工具；host 不会从运行时
+fallback 静默恢复。跨 JSON-RPC 时，以结构相等近似 JavaScript 按对象引用
+判断 unchanged 的语义。
 
 未声明的能力永远不会被调用——host 会应答
 `ERR_CAPABILITY_NOT_GRANTED`。

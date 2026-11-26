@@ -21,8 +21,10 @@ export const TOOLS_EXECUTE = "tools/execute";
 export const COMMANDS_INVOKE = "commands/invoke";
 /** [host-to-plugin] A tool call is about to run; the plugin may allow, deny (reason becomes the error tool result), or rewrite the arguments. Chained plugins observe the previous plugin's rewrite; the first deny short-circuits. */
 export const HOOKS_BEFORE_TOOL_CALL = "hooks/beforeToolCall";
-/** [host-to-plugin] COW context pipeline (opt-in via capabilities.hooks.transformContext): a null result means unchanged; a returned {messages: [...]} object replaces the messages every later hook sees. */
+/** [host-to-plugin] Ordinary COW context pipeline (opt-in via capabilities.hooks.transformContext): input excludes system messages; null means unchanged and preserves their positions; a changed {messages: [...]} result receives a replayed leading system head before the next hook. */
 export const HOOKS_TRANSFORM_CONTEXT = "hooks/transformContext";
+/** [host-to-plugin] Full-transcript context pipeline (opt-in via capabilities.hooks.transformContextWithSystem), run after every ordinary transformContext handler. Input includes system messages and a returned result is authoritative, including prompt/tool deletion; null means unchanged. */
+export const HOOKS_TRANSFORM_CONTEXT_WITH_SYSTEM = "hooks/transformContextWithSystem";
 /** [host-to-plugin] Observe and patch a tool result (opt-in via capabilities.hooks.afterToolCall). Patches merge in chain order; later plugins win per field. */
 export const HOOKS_AFTER_TOOL_CALL = "hooks/afterToolCall";
 /** [host-to-plugin] An approval decision is needed (opt-in via capabilities.hooks.approvalReview). A null result passes to the next reviewer in the chain; a returned decision claims the approval (first-claim-wins). */
@@ -197,6 +199,7 @@ export interface HookCapabilities {
   "approvalReview"?: boolean;
   "beforeToolCall"?: boolean;
   "transformContext"?: boolean;
+  "transformContextWithSystem"?: boolean;
 }
 
 /** What this host supports in the current mode. Absent boolean means unsupported; a plugin must check before depending on a surface. */
@@ -447,7 +450,7 @@ export interface ToolSpec {
   "parameters": any;
 }
 
-/** hooks/transformContext params. Messages are session-entry shaped JSON. */
+/** hooks/transformContext and hooks/transformContextWithSystem params. Messages are session-entry shaped JSON. */
 export interface TransformContextParams {
   "messages": Array<any>;
 }

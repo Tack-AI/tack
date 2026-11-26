@@ -237,6 +237,43 @@ fn replacement_tool_result_content(
     }
 }
 
+/// Whether an explicit write can edit this entry without creating an invalid
+/// model projection. Imported edits deliberately do NOT go through this
+/// validation: [`project_context_entry`] keeps their historical fail-open
+/// behavior for compatibility with existing session files.
+pub(crate) fn is_valid_context_edit(
+    target: &SessionEntry,
+    replacement: Option<&ContextEditContent>,
+) -> bool {
+    let Some(replacement) = replacement else {
+        return matches!(
+            target,
+            SessionEntry::Message {
+                message: AgentMessage::User(_)
+                    | AgentMessage::Assistant(_)
+                    | AgentMessage::ToolResult(_),
+                ..
+            } | SessionEntry::CustomMessage { .. }
+        );
+    };
+    match target {
+        SessionEntry::Message {
+            message: AgentMessage::User(_),
+            ..
+        }
+        | SessionEntry::CustomMessage { .. } => replacement_user_content(replacement).is_some(),
+        SessionEntry::Message {
+            message: AgentMessage::Assistant(_),
+            ..
+        } => true,
+        SessionEntry::Message {
+            message: AgentMessage::ToolResult(_),
+            ..
+        } => replacement_tool_result_content(replacement).is_some(),
+        _ => false,
+    }
+}
+
 /// Apply a replacement to one projected message while retaining role and
 /// metadata. Role-incompatible imported blocks leave the message unchanged
 /// rather than producing a provider-invalid projection.

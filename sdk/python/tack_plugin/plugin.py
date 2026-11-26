@@ -22,7 +22,7 @@ from .peer import (
 from .provider import ProviderEvents, ProviderStreamCx
 from .types import ProviderEventKind
 
-PROTOCOL_VERSION = "3.0.0"
+PROTOCOL_VERSION = "3.1.0"
 ERR_INVALID_PARAMS = -32602
 ERR_CAPABILITY_NOT_GRANTED = -32002
 
@@ -193,6 +193,10 @@ class Plugin:
         self._hooks["transformContext"] = handler
         return self
 
+    def transform_context_with_system(self, handler: Callable) -> "Plugin":
+        self._hooks["transformContextWithSystem"] = handler
+        return self
+
     def approval_review(self, handler: Callable) -> "Plugin":
         self._hooks["approvalReview"] = handler
         return self
@@ -286,6 +290,9 @@ class Plugin:
             hooks = {
                 "beforeToolCall": True if "beforeToolCall" in self._hooks else None,
                 "transformContext": True if "transformContext" in self._hooks else None,
+                "transformContextWithSystem": (
+                    True if "transformContextWithSystem" in self._hooks else None
+                ),
                 "afterToolCall": True if "afterToolCall" in self._hooks else None,
                 "approvalReview": True if "approvalReview" in self._hooks else None,
             }
@@ -350,6 +357,8 @@ class Plugin:
                 return await self._call_hook("afterToolCall", method, params, cx)
             if method == "hooks/transformContext":
                 return await self._call_hook("transformContext", method, params, cx)
+            if method == "hooks/transformContextWithSystem":
+                return await self._call_hook("transformContextWithSystem", method, params, cx)
             if method == "approval/review":
                 return await self._call_hook("approvalReview", method, params, cx)
             if method == "autocomplete/provide":

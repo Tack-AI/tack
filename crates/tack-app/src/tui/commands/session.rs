@@ -1109,7 +1109,11 @@ impl TuiApp {
             return;
         }
         let path = self.state.session.build_session_path();
-        let Some(preparation) = tack_session::prepare_compaction(&path, &self.settings.compaction)
+        let model = self.state.model.clone();
+        let compaction_settings = self
+            .settings
+            .compaction_for_model(&model.provider, &model.id);
+        let Some(preparation) = tack_session::prepare_compaction(&path, &compaction_settings)
         else {
             self.notice(
                 crate::i18n::t(self.lang, "msg.nothing_to_compact", &[]),
@@ -1122,7 +1126,6 @@ impl TuiApp {
         let compact_leaf = path.last().map(|e| e.id().to_string());
         self.status = Some(super::super::status::StatusIndicator::compacting());
         let tokens_before = preparation.tokens_before;
-        let model = self.state.model.clone();
         let provider = self.provider.clone();
         let auth = match self.auth.resolve().await {
             Ok(auth) => auth,

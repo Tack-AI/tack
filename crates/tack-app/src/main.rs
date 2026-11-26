@@ -1047,7 +1047,7 @@ async fn cmd_mcp(command: &McpCommand) -> Result<()> {
         McpCommand::Login { name, timeout } => {
             tack_app::mcp_cli::login(name, &cwd, &agent_dir, *timeout).await
         }
-        McpCommand::Logout { name } => tack_app::mcp_cli::logout(name, &agent_dir),
+        McpCommand::Logout { name } => tack_app::mcp_cli::logout(name, &cwd, &agent_dir),
     }
 }
 

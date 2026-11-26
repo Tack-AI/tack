@@ -48,6 +48,12 @@ pub struct AnthropicCompat {
     /// top-level marker always carries an explicit `ttl` (`"5m"`/`"1h"`),
     /// matching Kimi's documented Messages contract.
     pub top_level_cache_control: Option<bool>,
+    /// Send session-affinity headers from `StreamOptions::session_id`.
+    /// Defaults to true for OpenRouter endpoints, false otherwise.
+    pub send_session_affinity_headers: Option<bool>,
+    /// `"openrouter"` selects `x-session-id`; unset/other formats use
+    /// `x-session-affinity` on the Anthropic protocol.
+    pub session_affinity_format: Option<String>,
 }
 
 impl AnthropicCompat {
@@ -749,6 +755,28 @@ async fn run(
             for (k, v) in headers {
                 request = request.header(k, v);
             }
+        }
+        let is_openrouter =
+            model.provider == "openrouter" || model.base_url.contains("openrouter.ai");
+        if compat
+            .send_session_affinity_headers
+            .unwrap_or(is_openrouter)
+            && retention != CacheRetention::None
+            && let Some(session_id) = &options.session_id
+        {
+            let header = if compat.session_affinity_format.as_deref() == Some("openrouter")
+                || (compat.session_affinity_format.is_none() && is_openrouter)
+            {
+                "x-session-id"
+            } else {
+                "x-session-affinity"
+            };
+            if !crate::provider::has_header(&options.headers, header) {
+                request = request.header(header, session_id);
+            }
+        }
+        if let Some((name, value)) = crate::provider::opencode_session_header(&model, &options) {
+            request = request.header(name, value);
         }
         for (k, v) in &options.headers {
             request = request.header(k, v);

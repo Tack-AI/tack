@@ -19,7 +19,7 @@ pub use process::V3Process;
 
 /// The tack-RPC protocol version this crate speaks (semver; the major
 /// version must match on both sides of the handshake).
-pub const PROTOCOL_VERSION: &str = "3.0.0";
+pub const PROTOCOL_VERSION: &str = "3.1.0";
 
 /// Major/minor of a semver-ish `"x.y.z"` string (a missing patch is
 /// tolerated; anything unparseable is None).
@@ -50,9 +50,10 @@ mod tests {
     #[test]
     fn protocol_compatibility_rules() {
         assert!(protocol_compatible("3.0.0"));
+        assert!(protocol_compatible("3.1.0"));
         assert!(!protocol_compatible("2.0.0"), "older major rejected");
         assert!(!protocol_compatible("4.0.0"), "newer major rejected");
-        assert!(!protocol_compatible("3.1.0"), "newer minor rejected");
+        assert!(!protocol_compatible("3.2.0"), "newer minor rejected");
         assert!(!protocol_compatible("garbage"));
     }
 }

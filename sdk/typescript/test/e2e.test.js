@@ -147,6 +147,33 @@ test("transformContext null passes through as null result", async () => {
   b.end();
 });
 
+test("transformContextWithSystem advertises and dispatches independently", async () => {
+  const { a, b } = connect();
+  const host = createPeer({ input: a, output: b });
+  const seen = [];
+  const run = plugin({ name: "ctx-full" })
+    .transformContextWithSystem(async (params) => {
+      seen.push(...params.messages.map((message) => message.role));
+      return { messages: params.messages.filter((message) => message.role !== "system") };
+    })
+    .run({ input: b, output: a });
+  const init = await host.call("initialize", initParams());
+  assert.equal(init.capabilities.hooks.transformContextWithSystem, true);
+  assert.equal(init.capabilities.hooks.transformContext, undefined);
+  const result = await host.call("hooks/transformContextWithSystem", {
+    messages: [
+      { role: "system", content: "prompt", timestamp: 0 },
+      { role: "user", content: "hello", timestamp: 1 },
+    ],
+  });
+  assert.deepEqual(seen, ["system", "user"]);
+  assert.deepEqual(result.messages.map((message) => message.role), ["user"]);
+  await host.call("shutdown");
+  await run;
+  a.end();
+  b.end();
+});
+
 test("events and widget actions dispatch", async () => {
   const { a, b } = connect();
   const host = createPeer({ input: a, output: b });

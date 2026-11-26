@@ -1421,13 +1421,14 @@ impl TuiApp {
                 self.should_quit = true;
             }
         }
-        // tack-ext: session_start lifecycle event.
+        // tack-ext: sessionStart lifecycle event.
         self.extensions
             .notify(
-                "session_start",
+                "sessionStart",
                 serde_json::json!({
                     "sessionId": self.state.session.session_id(),
                     "resumed": continue_session,
+                    "reason": if continue_session { "resume" } else { "startup" },
                     "cwd": self.cwd.to_string_lossy(),
                 }),
             )

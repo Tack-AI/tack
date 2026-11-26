@@ -116,7 +116,7 @@ LLM 评估经独立的 provider 适配器（不经扩展事件通道，不对插
 
 | 方向 | 方法/通知 |
 |---|---|
-| 宿主 → 插件 | `tools/execute`、`commands/invoke`、`hooks/beforeToolCall`（allow/deny/**rewrite**）、`hooks/transformContext`（整体替换上下文）、`hooks/afterToolCall`（按字段结果补丁）、`approval/review`（审批链）、`autocomplete/provide`、`events/lifecycle`（订阅门控）、`widgets/action`、`provider/stream` + `provider/streamCancel`（provider bridge） |
+| 宿主 → 插件 | `tools/execute`、`commands/invoke`、`hooks/beforeToolCall`（allow/deny/**rewrite**）、`hooks/transformContext`（非 system 投影）+ `hooks/transformContextWithSystem`（权威全 transcript）、`hooks/afterToolCall`（按字段结果补丁）、`approval/review`（审批链）、`autocomplete/provide`、`events/lifecycle`（订阅门控）、`widgets/action`、`provider/stream` + `provider/streamCancel`（provider bridge） |
 | 插件 → 宿主 | `ui/notify/select/confirm/input`（TUI 对话框）、`session/get`、`session/sendUserMessage`、`snapshot/get`（只读摘要）、`config/get`、`exec/run`（信任门控）、`host/registerProvider`（LLM provider 注册）、`provider/streamEvent` + `provider/event`（provider bridge）、`widgets/update`、`logs/emit`、`warnings/emit` |
 
 SDK 覆盖 Rust（`tack-ext-sdk`）、TypeScript（`@tack/plugin`）、

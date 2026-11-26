@@ -280,6 +280,39 @@ async fn after_tool_call_patch_and_transform_context_null() {
 }
 
 #[tokio::test]
+async fn transform_context_with_system_dispatches_and_preserves_full_messages() {
+    let plugin = Plugin::builder("ctx-full")
+        .transform_context_with_system(|params: TransformContextParams, _cx| async move {
+            Ok(Some(tack_ext::rpc3::TransformContextResult {
+                messages: params
+                    .messages
+                    .into_iter()
+                    .filter(|message| message["role"] != "system")
+                    .collect(),
+            }))
+        })
+        .build();
+    let fixture = spawn(plugin).await;
+    let initialized = fixture.client.initialize(&init_params()).await.unwrap();
+    let hooks = initialized.capabilities.hooks.unwrap();
+    assert_eq!(hooks.transform_context_with_system, Some(true));
+    assert_eq!(hooks.transform_context, None);
+    let result = fixture
+        .client
+        .transform_context_with_system(&TransformContextParams {
+            messages: vec![
+                json!({"role": "system", "content": "prompt", "timestamp": 0}),
+                json!({"role": "user", "content": "hello", "timestamp": 1}),
+            ],
+        })
+        .await
+        .unwrap()
+        .expect("authoritative full-system result");
+    assert_eq!(result.messages.len(), 1);
+    assert_eq!(result.messages[0]["role"], "user");
+}
+
+#[tokio::test]
 async fn approval_review_passthrough_and_claim() {
     let plugin = Plugin::builder("approver")
         .approval_review(|params: ApprovalReviewParams, _cx| async move {

@@ -77,6 +77,8 @@ For `openai-completions` models, these compatibility overrides are available:
 | `supportsDeveloperRole` | `true` only for OpenAI's own API | Send the system prompt and mid-conversation system messages as `developer` instead of `system`. Other OpenAI-compatible hosts default to `system`; an explicit value overrides detection. |
 | `requiresNonNullAssistantContent` | `false` | Send `""` instead of `null` for replayed assistant messages with no text, such as tool-call-only messages. Enable for proxies that reject null assistant content. |
 | `requiresToolsWithToolHistory` | `false` | Send `"tools": []` when tools are disabled but history contains tool calls/results. Only enable for older proxies (for example, older LiteLLM in front of Anthropic) that require the field; vLLM and other servers reject an empty array. |
+| `sendSessionAffinityHeaders` | `true` for OpenRouter endpoints, otherwise `false` | Route a conversation to the same provider replica. OpenRouter uses `x-session-id`; `openai` format sends `session_id`, `x-client-request-id`, and `x-session-affinity`; `openai-nosession` omits `session_id`. `cacheRetention: "none"` disables these generated headers. Embedded Baseten models opt in, and existing Fireworks/Cloudflare flags are honored. |
+| `sessionAffinityFormat` | `"openrouter"` for OpenRouter, otherwise `"openai"` | Select the header set above. Explicit request headers override generated values case-insensitively. OpenCode/OpenCode Go independently send `x-opencode-session` on every supported API, even with caching disabled. |
 
 ## Current catalog/provider migrations
 
@@ -166,7 +168,10 @@ The metadata server's base URL can be overridden with
   `OLLAMA_HOST`; probes `/api/tags` at startup to inject the models of a
   running server.
 - **llama.cpp**: default `http://localhost:8080/v1`, overridden by
-  `LLAMA_CPP_HOST`; probes `/v1/models`.
+  `LLAMA_CPP_HOST`; probes `/v1/models`. For models already reported as
+  `loaded`, it also queries `/props?model=<id>&autoload=false`; a chat template
+  containing `enable_thinking` enables the Qwen chat-template reasoning map.
+  Sleeping/unloaded models are not queried, avoiding wake/autoload side effects.
 
 Probing has a ~500ms timeout, fails silently, and is skipped under
 `--offline` / `TACK_OFFLINE`. Unknown context windows default to 32k,

@@ -39,6 +39,8 @@ pub trait Extension: Send + Sync {
 /// Compose several hook sets into one. Rules:
 /// - `before_tool_call`: first `Block` wins.
 /// - `transform_context`: applied in order (pipeline).
+/// - `transform_context_with_system`: a second ordered pipeline, started
+///   only after every ordinary transform has completed.
 /// - `after_tool_call`: patches merged in order (later wins per field).
 /// - steering/follow-up: concatenated.
 /// - `should_stop_after_turn`: any true wins.
@@ -71,6 +73,23 @@ impl AgentHooks for HooksChain {
         for hooks in &self.chain {
             let input: &[AgentMessage] = current.as_deref().unwrap_or(messages);
             if let Some(rewritten) = hooks.transform_context(input).await {
+                current = Some(rewritten);
+            }
+        }
+        current
+    }
+
+    /// Run the full-system phase only after the entire ordinary pipeline
+    /// above has finished. This keeps extension ordering consistent even
+    /// when several plugins are composed with internal compaction hooks.
+    async fn transform_context_with_system(
+        &self,
+        messages: &[AgentMessage],
+    ) -> Option<Vec<AgentMessage>> {
+        let mut current: Option<Vec<AgentMessage>> = None;
+        for hooks in &self.chain {
+            let input: &[AgentMessage] = current.as_deref().unwrap_or(messages);
+            if let Some(rewritten) = hooks.transform_context_with_system(input).await {
                 current = Some(rewritten);
             }
         }

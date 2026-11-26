@@ -8,7 +8,7 @@ use super::params::{
     build_params, grammar_constraint_map, has_auth_header, resolve_cache_retention,
 };
 use crate::api::fail;
-use crate::provider::StreamOptions;
+use crate::provider::{CacheRetention, StreamOptions};
 use crate::stream::{AssistantMessageEvent, AssistantMessageEventSender};
 use crate::streaming_json::ToolCallArgumentsStream;
 use crate::types::{AssistantMessage, ContentBlock, Context, Model, StopReason, calculate_cost};
@@ -183,6 +183,31 @@ pub(crate) async fn run(
             for (k, v) in headers {
                 request = request.header(k, v);
             }
+        }
+        if compat.send_session_affinity_headers
+            && retention != CacheRetention::None
+            && let Some(session_id) = &options.session_id
+        {
+            if compat.session_affinity_format == "openrouter" {
+                if !crate::provider::has_header(&options.headers, "x-session-id") {
+                    request = request.header("x-session-id", session_id);
+                }
+            } else {
+                if compat.session_affinity_format == "openai"
+                    && !crate::provider::has_header(&options.headers, "session_id")
+                {
+                    request = request.header("session_id", session_id);
+                }
+                if !crate::provider::has_header(&options.headers, "x-client-request-id") {
+                    request = request.header("x-client-request-id", session_id);
+                }
+                if !crate::provider::has_header(&options.headers, "x-session-affinity") {
+                    request = request.header("x-session-affinity", session_id);
+                }
+            }
+        }
+        if let Some((name, value)) = crate::provider::opencode_session_header(&model, &options) {
+            request = request.header(name, value);
         }
         for (k, v) in &options.headers {
             request = request.header(k, v);

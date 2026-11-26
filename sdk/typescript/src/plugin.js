@@ -3,7 +3,7 @@
 
 import { createPeer, PeerError, ERR_METHOD_NOT_FOUND } from "./peer.js";
 
-export const PROTOCOL_VERSION = "3.0.0";
+export const PROTOCOL_VERSION = "3.1.0";
 const ERR_INVALID_PARAMS = -32602;
 const ERR_CAPABILITY_NOT_GRANTED = -32002;
 
@@ -62,6 +62,10 @@ export function plugin({ name, version, description } = {}) {
     },
     transformContext(handler) {
       state.hooks.transformContext = handler;
+      return builder;
+    },
+    transformContextWithSystem(handler) {
+      state.hooks.transformContextWithSystem = handler;
       return builder;
     },
     approvalReview(handler) {
@@ -153,6 +157,7 @@ export function plugin({ name, version, description } = {}) {
         const hooks = {
           beforeToolCall: state.hooks.beforeToolCall ? true : undefined,
           transformContext: state.hooks.transformContext ? true : undefined,
+          transformContextWithSystem: state.hooks.transformContextWithSystem ? true : undefined,
           afterToolCall: state.hooks.afterToolCall ? true : undefined,
           approvalReview: state.hooks.approvalReview ? true : undefined,
         };
@@ -209,6 +214,9 @@ export function plugin({ name, version, description } = {}) {
           case "hooks/transformContext":
             if (!state.hooks.transformContext) throw notGranted(method);
             return (await state.hooks.transformContext(params, cx())) ?? null;
+          case "hooks/transformContextWithSystem":
+            if (!state.hooks.transformContextWithSystem) throw notGranted(method);
+            return (await state.hooks.transformContextWithSystem(params, cx())) ?? null;
           case "approval/review":
             if (!state.hooks.approvalReview) throw notGranted(method);
             return (await state.hooks.approvalReview(params, cx())) ?? null;

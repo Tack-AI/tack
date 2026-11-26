@@ -682,8 +682,9 @@ managed hooks only. See [hooks.md](hooks.md) for details.
   plugins stay visible in `tack ext list`. `tack ext enable|disable|upgrade`.
 - **Capability surface** (declared at `initialize`, undeclared = never
   called): tools (`ext__<plugin>__<tool>`, may return image blocks), slash
-  commands, `beforeToolCall` (allow/deny/**rewrite**), `transformContext`,
-  `afterToolCall` result patching, lifecycle events, UI dialogs/widgets,
+  commands, `beforeToolCall` (allow/deny/**rewrite**), two-stage
+  `transformContext` + `transformContextWithSystem`, `afterToolCall` result
+  patching, lifecycle events, UI dialogs/widgets,
   autocomplete, `session/get` + `session/sendUserMessage`, trust-gated
   `exec/run`, runtime provider registration, and **provider bridges**
   (`capabilities.provider.stream`: the plugin serves inference directly — no
@@ -767,6 +768,17 @@ tokens even if their caller is cancelled or the session is closing. TUI
 authorization is cancellable; `tack mcp login <name> --timeout <seconds>`
 bounds the whole sign-in (default 300). Print/rpc/serve only use
 cached/renewed tokens and never pop a browser.
+
+**Provider-auth alternative.** A global or extension Streamable HTTP server
+can instead set `"auth": {"provider": "<id>"}`. Each request resolves that
+provider through the same auth stack as `tack login --provider <id>` (including
+refresh and provider-specific derived API keys), so a long-lived connection can
+rotate Bearer tokens without reconnecting. Provider auth takes precedence over
+static Authorization, disables MCP OAuth even when `oauth` is also present,
+and is never persisted in `mcp-tokens.json`. HTTPS is required except on exact
+loopback hosts; project/RPC/session definitions cannot select a provider
+credential. Project partial overrides may inherit a global provider binding,
+but a complete replacement never inherits its secrets.
 
 ### MCP sampling and elicitation (server-initiated requests)
 

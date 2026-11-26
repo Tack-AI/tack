@@ -199,7 +199,8 @@ Python handlers may be sync or async.
 | `.command(spec, h)` | `.command(spec, h)` | `.command(spec, h)` | A `/slash` command |
 | `.before_tool_call(h)` | `.beforeToolCall(h)` | `.before_tool_call(h)` | allow / deny / **rewrite** |
 | `.after_tool_call(h)` | `.afterToolCall(h)` | `.after_tool_call(h)` | Per-field result patch |
-| `.transform_context(h)` | `.transformContext(h)` | `.transform_context(h)` | Full-context replacement |
+| `.transform_context(h)` | `.transformContext(h)` | `.transform_context(h)` | Non-system context pipeline |
+| `.transform_context_with_system(h)` | `.transformContextWithSystem(h)` | `.transform_context_with_system(h)` | Authoritative full-transcript pipeline |
 | `.approval_review(h)` | `.approvalReview(h)` | `.approval_review(h)` | Joins the approval chain |
 | `.events(&[…], h)` | `.events([…], h)` | `.events([…], h)` | Lifecycle events (camelCase: `agentStart`, `turnEnd`, …) |
 | `.widget(spec)` + `.on_widget_action(h)` | `.widget(spec)` + `.onWidgetAction(h)` | `.widget(spec)` + `.on_widget_action(h)` | TUI widget |
@@ -208,6 +209,15 @@ Python handlers may be sync or async.
 | `.metrics(decl)` | `.metrics(decl)` | `.metrics(decl)` | Metrics sidecar schema |
 | `.provider_register(bool)` | `.providerRegister(bool)` | `.provider_register(bool)` | May register HTTP-shim providers |
 | `.provider_stream(h)` + `.on_ready(h)` | `.providerStream(h)` + `.onReady(h)` | `.provider_stream(h)` + `.on_ready(h)` | Provider bridge (serve inference directly) |
+
+Ordinary context handlers run first and never receive system messages. A
+changed result replays the current system state as one leading head;
+unchanged results preserve mid-conversation system positions. All
+full-system handlers then run, in registration order, on that complete
+transcript. Their result is authoritative, including system prompt or tool
+deletion; nothing is silently restored from the runtime fallback. Across
+JSON-RPC, structural equality approximates JavaScript's object-reference
+"unchanged" check.
 
 Undeclared capabilities are never called — the host answers
 `ERR_CAPABILITY_NOT_GRANTED`.

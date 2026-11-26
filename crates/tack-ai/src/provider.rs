@@ -51,6 +51,32 @@ pub struct StreamOptions {
     pub cancel: CancellationToken,
 }
 
+/// Case-insensitive presence check for provider-owned headers. Request
+/// builders append duplicate fields, so generated defaults use this to leave
+/// an explicit caller value as the only value on the wire.
+pub(crate) fn has_header(headers: &BTreeMap<String, String>, name: &str) -> bool {
+    headers.keys().any(|key| key.eq_ignore_ascii_case(name))
+}
+
+/// OpenCode requires its own conversation-routing header on every supported
+/// wire protocol. Explicit caller headers win, case-insensitively.
+pub(crate) fn opencode_session_header<'a>(
+    model: &Model,
+    options: &'a StreamOptions,
+) -> Option<(&'static str, &'a str)> {
+    const HEADER: &str = "x-opencode-session";
+    if !matches!(model.provider.as_str(), "opencode" | "opencode-go") {
+        return None;
+    }
+    if has_header(&options.headers, HEADER) {
+        return None;
+    }
+    options
+        .session_id
+        .as_deref()
+        .map(|session_id| (HEADER, session_id))
+}
+
 /// A provider adapter: one per wire protocol (`anthropic-messages`,
 /// `openai-completions`, ...).
 ///
@@ -217,6 +243,29 @@ mod tests {
             headers: None,
             compat: None,
         }
+    }
+
+    #[test]
+    fn opencode_session_header_is_defaulted_and_caller_override_wins() {
+        let mut model = bare_model("anthropic-messages");
+        model.provider = "opencode".into();
+        let mut options = StreamOptions {
+            session_id: Some("session-1".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            opencode_session_header(&model, &options),
+            Some(("x-opencode-session", "session-1"))
+        );
+
+        options
+            .headers
+            .insert("X-OpenCode-Session".into(), "explicit".into());
+        assert_eq!(opencode_session_header(&model, &options), None);
+
+        model.provider = "openrouter".into();
+        options.headers.clear();
+        assert_eq!(opencode_session_header(&model, &options), None);
     }
 
     #[test]

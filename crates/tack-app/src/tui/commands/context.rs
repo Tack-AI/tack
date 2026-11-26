@@ -172,7 +172,10 @@ impl TuiApp {
 
         let tool_results_total: usize = tool_result_chars.values().sum();
         let window = self.state.model.context_window as u64;
-        let reserve = self.settings.compaction.reserve_tokens;
+        let reserve = self
+            .settings
+            .compaction_for_model(&self.state.model.provider, &self.state.model.id)
+            .reserve_tokens;
 
         let mut rows: Vec<(String, u64)> = vec![
             (

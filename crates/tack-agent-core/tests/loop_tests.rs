@@ -1364,6 +1364,132 @@ async fn transcript_system_messages_carry_prompt_state() {
     );
 }
 
+#[tokio::test]
+async fn full_system_transform_can_delete_prompt_and_tools_without_fallback_or_session_mutation() {
+    struct StripSystem;
+    #[async_trait]
+    impl AgentHooks for StripSystem {
+        async fn transform_context_with_system(
+            &self,
+            _messages: &[AgentMessage],
+        ) -> Option<Vec<AgentMessage>> {
+            Some(vec![AgentMessage::user("request-only")])
+        }
+    }
+
+    let provider = ScriptedProvider::with_scripts(vec![assistant_text("ok")]);
+    let seen = provider.seen_contexts.clone();
+    let initial = AgentMessage::System(SystemMessage {
+        content: UserContent::Text("original prompt".into()),
+        sections: None,
+        tools_added: Some(vec![ToolDefinition {
+            name: "declared".into(),
+            description: "declared tool".into(),
+            parameters: json!({"type": "object"}),
+            defer_loading: false,
+            constrained_sampling: None,
+        }]),
+        tools_removed: None,
+        timestamp: 0,
+    });
+    let executable = Arc::new(MockTool {
+        name: "executable",
+        delay: Duration::ZERO,
+        calls: Arc::new(Mutex::new(Vec::new())),
+        terminate: false,
+    });
+    let stream = agent_loop(
+        vec![AgentMessage::user("canonical prompt")],
+        AgentContext {
+            system_prompt: Some("fallback prompt".into()),
+            messages: vec![initial, AgentMessage::user("existing")],
+            tools: vec![executable],
+        },
+        make_config(provider, Arc::new(StripSystem)),
+        CancellationToken::new(),
+    );
+    let (_, canonical_delta) = collect_events(stream).await;
+
+    let request = seen.lock().unwrap()[0].clone();
+    assert_eq!(
+        request.system_prompt, None,
+        "deleted prompt must not resurrect fallback"
+    );
+    assert!(
+        request.tools.is_empty(),
+        "deleted tools must not resurrect executable tools"
+    );
+    assert_eq!(request.messages.len(), 1);
+    assert!(
+        matches!(&request.messages[0], Message::User(user) if user.content == UserContent::Text("request-only".into()))
+    );
+    assert!(
+        canonical_delta
+            .iter()
+            .any(|message| matches!(message, AgentMessage::System(_)))
+    );
+    assert!(canonical_delta.iter().any(|message| matches!(message, AgentMessage::User(user) if user.content == UserContent::Text("canonical prompt".into()))));
+    assert!(!canonical_delta.iter().any(|message| matches!(message, AgentMessage::User(user) if user.content == UserContent::Text("request-only".into()))));
+}
+
+#[tokio::test]
+async fn full_system_transform_replayed_prompt_and_empty_tools_are_authoritative() {
+    struct ReplaceSystem;
+    #[async_trait]
+    impl AgentHooks for ReplaceSystem {
+        async fn transform_context_with_system(
+            &self,
+            _messages: &[AgentMessage],
+        ) -> Option<Vec<AgentMessage>> {
+            Some(vec![
+                AgentMessage::System(SystemMessage {
+                    content: UserContent::Text("edited prompt".into()),
+                    sections: None,
+                    tools_added: Some(vec![]),
+                    tools_removed: None,
+                    timestamp: 2,
+                }),
+                AgentMessage::user("visible"),
+            ])
+        }
+    }
+
+    let provider = ScriptedProvider::with_scripts(vec![assistant_text("ok")]);
+    let seen = provider.seen_contexts.clone();
+    let executable = Arc::new(MockTool {
+        name: "executable",
+        delay: Duration::ZERO,
+        calls: Arc::new(Mutex::new(Vec::new())),
+        terminate: false,
+    });
+    let stream = agent_loop(
+        vec![AgentMessage::user("canonical")],
+        AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::System(SystemMessage {
+                content: UserContent::Text("old prompt".into()),
+                sections: None,
+                tools_added: None,
+                tools_removed: None,
+                timestamp: 0,
+            })],
+            tools: vec![executable],
+        },
+        make_config(provider, Arc::new(ReplaceSystem)),
+        CancellationToken::new(),
+    );
+    let (_, canonical_delta) = collect_events(stream).await;
+
+    let request = seen.lock().unwrap()[0].clone();
+    assert_eq!(request.system_prompt.as_deref(), Some("edited prompt"));
+    assert!(request.tools.is_empty());
+    assert_eq!(request.messages.len(), 1);
+    assert!(
+        matches!(&request.messages[0], Message::User(user) if user.content == UserContent::Text("visible".into()))
+    );
+    assert!(!canonical_delta.iter().any(|message| matches!(message, AgentMessage::User(user) if user.content == UserContent::Text("visible".into()))));
+}
+
 /// Cancellation mid tool batch (sequential path): the remaining tool
 /// calls must still get (aborted) results. Otherwise the assistant
 /// message in the resumed context has tool calls with no matching result,

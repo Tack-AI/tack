@@ -21,7 +21,9 @@ use tokio::sync::Mutex;
 use crate::settings::Settings;
 use events::save_nested_bool;
 use permission::{EventSink, RpcPermissionState};
-use prompt::{run_bash_command, run_compact_command, spawn_prompt};
+#[cfg(test)]
+use prompt::spawn_prompt;
+use prompt::{PromptPreparation, prepare_prompt, run_bash_command, run_compact_command};
 
 pub use events::event_to_json;
 
@@ -55,6 +57,9 @@ pub(crate) struct RpcState {
     /// Detached prompt pumps, retained so termination can cancel and drain
     /// persistence before session/plugin teardown.
     pub(crate) prompt_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Prepared runs whose `started` responses have not yet been written.
+    /// Drained by the command loop immediately after the response flush.
+    pub(crate) pending_prompt_runs: Vec<futures_util::future::BoxFuture<'static, ()>>,
     /// Background bash tasks persist across prompts in one RPC session.
     pub(crate) background: tack_tools::background::BackgroundTaskManager,
     /// LSP registry (language servers stay warm across prompts).
@@ -326,6 +331,7 @@ pub async fn run_rpc(
         is_compacting: false,
         generation: 0,
         prompt_tasks: Vec::new(),
+        pending_prompt_runs: Vec::new(),
         background: {
             let manager = tack_tools::background::BackgroundTaskManager::new();
             // Background task completion notifications -> out-of-band JSONL.
@@ -369,7 +375,7 @@ pub async fn run_rpc(
             (settings.subagents_budget_tokens > 0).then_some(settings.subagents_budget_tokens),
         ),
     }));
-    // tack-ext: session_start lifecycle event.
+    // tack-ext: sessionStart lifecycle event.
     {
         let state = state.lock().await;
         let session_id = state.session.session_id().to_string();
@@ -378,10 +384,11 @@ pub async fn run_rpc(
             .lock()
             .await
             .notify(
-                "session_start",
+                "sessionStart",
                 json!({
                     "sessionId": session_id,
                     "resumed": continue_session,
+                    "reason": if continue_session { "resume" } else { "startup" },
                     "cwd": cwd.to_string_lossy(),
                 }),
             )
@@ -455,6 +462,7 @@ pub async fn run_rpc(
         }
         stdout.write_all(format!("{response}\n").as_bytes()).await?;
         stdout.flush().await?;
+        start_pending_prompts(&state).await;
     }
     {
         let state = state.lock().await;
@@ -493,7 +501,7 @@ pub async fn run_rpc(
             tracing::warn!(%error, "RPC prompt pump did not settle cleanly");
         }
     }
-    // tack-ext: session_end lifecycle event, then stop all plugins.
+    // tack-ext: sessionShutdown lifecycle event, then stop all plugins.
     {
         let mut state = state.lock().await;
         // Drop cached MCP connections first: this cancels their services
@@ -505,7 +513,10 @@ pub async fn run_rpc(
         tack_ai::codebuddy::close_session(&session_id).await;
         let mut extensions = state.extensions.lock().await;
         extensions
-            .notify("session_end", json!({"sessionId": session_id}))
+            .notify(
+                "sessionShutdown",
+                json!({ "sessionId": session_id, "reason": "quit" }),
+            )
             .await;
         extensions.shutdown().await;
     }
@@ -553,6 +564,78 @@ async fn rebind_provider_after_model_change(
     }
 }
 
+async fn start_pending_prompts(state: &Arc<Mutex<RpcState>>) {
+    let runs = {
+        let mut state = state.lock().await;
+        std::mem::take(&mut state.pending_prompt_runs)
+    };
+    for run in runs {
+        let task = tokio::spawn(run);
+        let mut state = state.lock().await;
+        state.prompt_tasks.retain(|task| !task.is_finished());
+        state.prompt_tasks.push(task);
+    }
+}
+
+/// Stop and drain the old run before replacing its session. Besides avoiding
+/// cross-session writes, this gives lifecycle handlers a strict old-shutdown /
+/// new-start boundary instead of racing trailing provider events.
+async fn drain_for_session_replacement(state: &Arc<Mutex<RpcState>>) -> (bool, String) {
+    let (cancelled, old_session_id, tasks) = {
+        let mut state = state.lock().await;
+        let cancelled = state.is_streaming || !state.pending_prompt_runs.is_empty();
+        if cancelled {
+            state.cancel.cancel();
+        }
+        state.pending_prompt_runs.clear();
+        (
+            cancelled,
+            state.session.session_id().to_string(),
+            std::mem::take(&mut state.prompt_tasks),
+        )
+    };
+    for task in tasks {
+        if let Err(error) = task.await {
+            tracing::warn!(%error, "RPC prompt pump failed during session replacement");
+        }
+    }
+    (cancelled, old_session_id)
+}
+
+async fn notify_session_replacement(
+    state: &Arc<Mutex<RpcState>>,
+    old_session_id: String,
+    reason: &'static str,
+) {
+    let (extensions, session_id, resumed, cwd) = {
+        let state = state.lock().await;
+        (
+            state.extensions.clone(),
+            state.session.session_id().to_string(),
+            reason == "resume",
+            state.session.cwd().to_path_buf(),
+        )
+    };
+    let extensions = extensions.lock().await;
+    extensions
+        .notify(
+            "sessionShutdown",
+            json!({ "sessionId": old_session_id, "reason": reason }),
+        )
+        .await;
+    extensions
+        .notify(
+            "sessionStart",
+            json!({
+                "sessionId": session_id,
+                "resumed": resumed,
+                "reason": reason,
+                "cwd": cwd.to_string_lossy(),
+            }),
+        )
+        .await;
+}
+
 async fn handle_command(
     command_type: &str,
     command: &Value,
@@ -567,6 +650,26 @@ async fn handle_command(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            // Extension commands consume the input without starting an agent
+            // run (upstream disposition=handled). Headless invocation may be
+            // awaited directly; unlike the TUI there is no UI-loop callback
+            // deadlock, and the owned invoker avoids holding the manager lock.
+            if let Some(rest) = message.trim_start().strip_prefix('/') {
+                let mut parts = rest.splitn(2, char::is_whitespace);
+                let name = parts.next().unwrap_or("");
+                let args = parts.next().unwrap_or("").trim_start();
+                let invoker = {
+                    let state = state.lock().await;
+                    let extensions = state.extensions.lock().await;
+                    extensions.command_invoker(name)
+                };
+                if let Some(invoker) = invoker {
+                    return match invoker.invoke(args.to_string()).await {
+                        Ok(_) => success(id, "prompt", Some(json!({ "disposition": "handled" }))),
+                        Err(invoke_error) => error(id, "prompt", invoke_error),
+                    };
+                }
+            }
             // A fresh user prompt resets the Stop-hook continuation guard.
             state.lock().await.stop_hook_active = false;
             // /skill:<name> expansion (TS prompt path).
@@ -624,13 +727,13 @@ async fn handle_command(
                 } else {
                     state.steering.push_back(message);
                 }
-                return success(id, "prompt", None);
+                return success(id, "prompt", Some(json!({ "disposition": "queued" })));
             }
             let (provider, auth) = {
                 let state = state.lock().await;
                 (state.provider.clone(), state.auth.clone())
             };
-            spawn_prompt(
+            match prepare_prompt(
                 state,
                 &provider,
                 settings,
@@ -639,8 +742,16 @@ async fn handle_command(
                 images,
                 false,
             )
-            .await;
-            success(id, "prompt", None)
+            .await
+            {
+                PromptPreparation::Start(run) => {
+                    state.lock().await.pending_prompt_runs.push(run);
+                    success(id, "prompt", Some(json!({ "disposition": "started" })))
+                }
+                PromptPreparation::Handled => {
+                    success(id, "prompt", Some(json!({ "disposition": "handled" })))
+                }
+            }
         }
         "steer" => {
             let message = command
@@ -649,7 +760,7 @@ async fn handle_command(
                 .unwrap_or("")
                 .to_string();
             state.lock().await.steering.push_back(message);
-            success(id, "steer", None)
+            success(id, "steer", Some(json!({ "disposition": "queued" })))
         }
         "follow_up" => {
             let message = command
@@ -658,7 +769,7 @@ async fn handle_command(
                 .unwrap_or("")
                 .to_string();
             state.lock().await.follow_up.push_back(message);
-            success(id, "follow_up", None)
+            success(id, "follow_up", Some(json!({ "disposition": "queued" })))
         }
         "abort" => {
             state.lock().await.cancel.cancel();
@@ -681,12 +792,9 @@ async fn handle_command(
             )
         }
         "new_session" => {
-            let cancelled = {
+            let (cancelled, old_session_id) = drain_for_session_replacement(state).await;
+            {
                 let mut state = state.lock().await;
-                let was_streaming = state.is_streaming;
-                if was_streaming {
-                    state.cancel.cancel();
-                }
                 let cwd = state.session.cwd().to_path_buf();
                 state.session = SessionManager::create(&cwd, None)
                     .unwrap_or_else(|_| SessionManager::in_memory(&cwd));
@@ -694,13 +802,10 @@ async fn handle_command(
                 state.session_start_hook_pending = true;
                 state.session_start_hook_source = "clear".to_string();
                 state.session_hook_context = None;
-                // Invalidate the in-flight run's persistence/streaming guard,
-                // then clear the flag ourselves: the cancelled run's forwarder
-                // will skip it (stale generation).
                 state.generation += 1;
                 state.is_streaming = false;
-                was_streaming
-            };
+            }
+            notify_session_replacement(state, old_session_id, "new").await;
             success(id, "new_session", Some(json!({ "cancelled": cancelled })))
         }
         "get_state" => {
@@ -926,9 +1031,19 @@ async fn handle_command(
                     );
                 }
             }
+            let old_session_id = state.lock().await.session.session_id().to_string();
             let result = state.lock().await.session.branch(entry_id);
             match result {
-                Ok(_) => success(id, "fork", Some(json!({ "text": "", "cancelled": false }))),
+                Ok(_) => {
+                    {
+                        let mut state = state.lock().await;
+                        state.session_start_hook_pending = true;
+                        state.session_start_hook_source = "resume".to_string();
+                        state.session_hook_context = None;
+                    }
+                    notify_session_replacement(state, old_session_id, "fork").await;
+                    success(id, "fork", Some(json!({ "text": "", "cancelled": false })))
+                }
                 Err(e) => error(id, "fork", e),
             }
         }
@@ -995,12 +1110,18 @@ async fn handle_command(
             let Some(file) = file else {
                 return error(id, "clone", "session is not persisted");
             };
+            let (_, old_session_id) = drain_for_session_replacement(state).await;
             match SessionManager::fork_from(&file, &cwd) {
                 Ok(session) => {
-                    let mut state = state.lock().await;
-                    state.session = session;
-                    // Invalidate the in-flight run's persistence guard.
-                    state.generation += 1;
+                    {
+                        let mut state = state.lock().await;
+                        state.session = session;
+                        state.session_start_hook_pending = true;
+                        state.session_start_hook_source = "resume".to_string();
+                        state.session_hook_context = None;
+                        state.generation += 1;
+                    }
+                    notify_session_replacement(state, old_session_id, "fork").await;
                     success(id, "clone", None)
                 }
                 Err(e) => error(id, "clone", e),
@@ -1365,13 +1486,16 @@ async fn handle_command(
                         ),
                         Err(e) => tracing::warn!("failed to repair dangling tool calls: {e}"),
                     }
-                    let mut state = state.lock().await;
-                    state.session = session;
-                    state.session_start_hook_pending = true;
-                    state.session_start_hook_source = "resume".to_string();
-                    state.session_hook_context = None;
-                    // Invalidate the in-flight run's persistence guard.
-                    state.generation += 1;
+                    let (_, old_session_id) = drain_for_session_replacement(state).await;
+                    {
+                        let mut state = state.lock().await;
+                        state.session = session;
+                        state.session_start_hook_pending = true;
+                        state.session_start_hook_source = "resume".to_string();
+                        state.session_hook_context = None;
+                        state.generation += 1;
+                    }
+                    notify_session_replacement(state, old_session_id, "resume").await;
                     success(id, "switch_session", None)
                 }
                 Err(e) => error(id, "switch_session", e),
@@ -1533,6 +1657,7 @@ mod tests {
             is_compacting: false,
             generation: 0,
             prompt_tasks: Vec::new(),
+            pending_prompt_runs: Vec::new(),
             background: tack_tools::background::BackgroundTaskManager::new(),
             lsp: Settings::default().lsp_manager(cwd),
             extensions: Arc::new(Mutex::new(
@@ -1953,6 +2078,60 @@ mod tests {
         assert_eq!(r["data"], json!({ "steering": [], "followUp": [] }), "{r}");
     }
 
+    #[tokio::test]
+    async fn prompt_dispositions_cover_started_and_queued_inputs() {
+        test_agent_dir();
+        let cwd = tempfile::tempdir().unwrap();
+        let state = make_state(cwd.path());
+        let provider = test_provider(vec![assistant_text("done")]);
+        {
+            let mut guard = state.lock().await;
+            guard.provider = provider;
+        }
+        let settings = Settings::default();
+
+        let response = handle_command(
+            "prompt",
+            &json!({ "id": "start", "type": "prompt", "message": "hi" }),
+            &state,
+            &settings,
+        )
+        .await;
+        assert_eq!(response["data"], json!({ "disposition": "started" }));
+        assert_eq!(state.lock().await.pending_prompt_runs.len(), 1);
+        start_pending_prompts(&state).await;
+        wait_for_run_end(&state).await;
+
+        state.lock().await.is_streaming = true;
+        let response = handle_command(
+            "prompt",
+            &json!({
+                "id": "queue", "type": "prompt", "message": "later",
+                "streamingBehavior": "followUp"
+            }),
+            &state,
+            &settings,
+        )
+        .await;
+        assert_eq!(response["data"], json!({ "disposition": "queued" }));
+        assert_eq!(
+            state.lock().await.follow_up.front().map(String::as_str),
+            Some("later")
+        );
+        state.lock().await.is_streaming = false;
+
+        for command in ["steer", "follow_up"] {
+            let response = handle_command(
+                command,
+                &json!({ "type": command, "message": "queued input" }),
+                &state,
+                &settings,
+            )
+            .await;
+            assert_eq!(response["data"], json!({ "disposition": "queued" }));
+        }
+    }
+
     /// Regression: set_model across api kinds must rebind the provider
     /// adapter — the startup adapter used to stream the new model, failing
     /// with "No API key for provider: <model.provider>". Environment-
@@ -2006,6 +2185,7 @@ mod tests {
         )
         .await;
         assert_eq!(r["success"], true, "{r}");
+        start_pending_prompts(&state).await;
         wait_for_run_end(&state).await;
 
         let guard = state.lock().await;

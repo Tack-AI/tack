@@ -968,7 +968,7 @@ impl SessionHost {
                 provider: provider.clone(),
                 auth: auth.clone(),
                 reasoning: thinking,
-                settings: settings.compaction,
+                settings: settings.compaction_for_model(&model.provider, &model.id),
                 cancel: cancel.clone(),
             }));
             hook_list.push(Arc::new(SteerHooks {

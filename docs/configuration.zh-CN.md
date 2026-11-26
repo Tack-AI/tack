@@ -37,7 +37,7 @@ Tack 从四级读取配置，**后加载的层级覆盖先加载的**（部分�
 | `backgroundAutoWake` | bool | `true` | 后台任务在 agent 空闲时完成：自动开一轮让 agent 读输出接着干（与 cron 触发同一模式）。设为 `false` 则只在 transcript 出通知，不自动唤醒 |
 | `httpIdleTimeoutMs` | number | — | HTTP 读空闲超时 |
 | `retry` | object | `{enabled:true, maxRetries:3, baseDelayMs:2000, maxAgentDelayMs:60000}` | 瞬态错误自动重试（`maxAgentDelayMs` 为单次退避上限） |
-| `compaction` | object | `{enabled:true, reserveTokens:…, keepRecentTokens:…, goalRecitation:true, minKeptTurns:2}` | 自动上下文压缩。`reserveTokens` 只控制何时触发 compaction；compaction 与 branch summary 请求使用当前模型的 `maxTokens` 输出上限（仅模型报告 0 时省略）。`goalRecitation`：压缩后把摘要的 Goal/Next Steps 作为尾部用户消息复述进上下文（仅 LLM 侧副本，append-only 不破坏缓存）；`minKeptTurns`：压缩切点优先保留的最少轮数；如果该下限会导致无法压缩，或保留的 token 多于被摘要的 token，则自动放宽 |
+| `compaction` | object | `{enabled:true, reserveTokens:…, keepRecentTokens:…, goalRecitation:true, minKeptTurns:2, modelOverrides:{}}` | 自动上下文压缩。`reserveTokens` 只控制何时触发 compaction；compaction 与 branch summary 请求使用当前模型的 `maxTokens` 输出上限（仅模型报告 0 时省略）。`modelOverrides` 以精确、区分大小写的 `provider/modelId` 为键，分别覆盖 `reserveTokens` / `keepRecentTokens`（0 合法；未写字段继承普通设置）；`enabled` 与其他行为仍是全局配置。`goalRecitation`：压缩后把摘要的 Goal/Next Steps 作为尾部用户消息复述进上下文（仅 LLM 侧副本，append-only 不破坏缓存）；`minKeptTurns`：压缩切点优先保留的最少轮数；如果该下限会导致无法压缩，或保留的 token 多于被摘要的 token，则自动放宽 |
 | `microcompact` | object | `{enabled:true, maxChars:20000, keepRecent:3, minSavingsChars:8000}` | 老超长 tool result 原地裁剪（全文落盘可回读）。`minSavingsChars`：总回收量低于该值不改写历史（保护提示缓存前缀）。`enabled:false` 会连带关闭下面三项历史优化 |
 | `maskDuplicateReads` | bool | `true` | 同一文件被 read 两次且内容逐字节一致时，把较早的结果替换为指针（较新副本仍在上下文中，零信息损失） |
 | `toolResultMaxChars` | number | `60000` | 任意 tool result（含最新几轮）的硬上限，超出截断并把全文落盘 `<id>.full.log`；`0` 关闭 |
@@ -246,6 +246,16 @@ Tack 从四级读取配置，**后加载的层级覆盖先加载的**（部分�
 | `exposure` | 服务器工具到达模型的方式：`"direct"`（默认——像内置工具一样声明）、`"deferred"`（不声明；`tool_search` 按需加载，系统提示的 “Deferred MCP tools” 段会列出这些服务器）、`"hidden"`（完全不可达）。兼容 pi 的 `"codemode"`/`"codemode-deferred"`，映射为 `"deferred"`（tack 没有 codemode 工具） |
 | `toolExposure` | 按工具覆盖 `exposure`：键为精确工具名或 `*` 通配（如 `{"search_code": "direct", "delete_*": "hidden"}`）。精确名优先；多个通配匹配时最长（最具体）者胜——这是对 pi “首个匹配”规则的有意改进（JSON 对象不保序） |
 | `oauth` | `true` 或对象——远程 server 的 OAuth 2.1 授权（PKCE + 动态注册，令牌缓存 `mcp-tokens.json` 并自动续期）。对象键：`clientId`、`clientSecret`（预注册客户端）、`scopes`（数组）、`callbackPort`（固定回环端口，用于重定向 URI 固定的提供商）、`callbackUrl`（完整重定向 URI 覆盖；必须是 `localhost`/`127.0.0.1`/`[::1]` 上的纯 HTTP）、`authServerMetadataUrl`（替代发现流程的 metadata 文档；除 loopback 外必须 HTTPS） |
+| `auth.provider` | 在 Streamable HTTP 上复用模型 provider 凭据。仅允许全局文件或扩展清单（禁止项目/RPC/session 注入）；provider 必须非空且使用 HTTPS，只有精确的 `localhost`/`127.0.0.1`/`[::1]` 可用 HTTP。每个 POST/流式 GET/DELETE 都重新解析 `tack login --provider <id>` 的认证（含 OAuth 刷新和派生 API key）；provider token 覆盖静态 `Authorization`，缺失时保留静态头。配置后始终禁用 MCP OAuth。`tack mcp login/logout` 会引导到 provider 命令，不会误删其他 MCP token。 |
+
+全局与受信任项目文件按以下规则合并：项目条目同时不含 `command`、`url`、
+`type` 三个键时，视为对同名全局 server 的**局部覆盖**。只允许 `enabled`、
+`exposure`、`toolExposure`；transport、headers、OAuth、provider auth 均继承。
+`toolExposure` 整棵替换，不做深合并。override 无 base、含额外键或合并后无效
+时保留全局条目并记录诊断。其他项目条目仍是完整替换。安全边界上，含
+`auth` 的项目完整定义会被拒绝并保留全局条目；不含 `auth` 的完整定义可以
+替换，但不会继承 provider token、OAuth 状态或静态 Authorization。不受信任的
+项目配置完全忽略。
 
 `env`、`headers` 的值（以及 `oauth.clientSecret`）支持 `${VAR}` 环境变量插值——与其他 MCP 客户端相同的语法；未设置的变量展开为空并给出警告。
 
