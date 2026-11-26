@@ -10,7 +10,14 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 
 use tack_tools::shell::shell_quote;
 
+/// These tests spawn full stdio agents (and, for lifecycle traces, another
+/// plugin process). Parallel startup/teardown is flaky in local sandboxes and
+/// CI; holding one guard per agent keeps the process group bounded without
+/// changing production behavior.
+static RPC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct RpcAgent {
+    _serial: std::sync::MutexGuard<'static, ()>,
     child: Child,
     stdin: ChildStdin,
     stdout: Option<BufReader<std::process::ChildStdout>>,
@@ -18,16 +25,58 @@ struct RpcAgent {
     work_dir: std::path::PathBuf,
 }
 
+fn demo_plugin_bin() -> String {
+    let mut path = std::env::current_exe().unwrap();
+    path.pop();
+    path.pop();
+    path.push(format!(
+        "tack-v3-demo-plugin{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    assert!(
+        path.is_file(),
+        "demo plugin bin missing: {}",
+        path.display()
+    );
+    path.to_string_lossy().to_string()
+}
+
 fn spawn_rpc() -> RpcAgent {
+    spawn_rpc_with_markers(false)
+}
+
+fn spawn_rpc_with_markers(markers: bool) -> RpcAgent {
+    let serial = RPC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let agent_dir = tempfile::tempdir().unwrap();
     let work_dir = tempfile::tempdir().unwrap();
+    if markers {
+        let ext_dir = agent_dir.path().join("extensions").join("demo");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(
+            ext_dir.join("extension.json"),
+            serde_json::json!({
+                "name": "demo",
+                "command": demo_plugin_bin(),
+                "args": [],
+                "env": {"TACK_DEMO_SESSION_MARKERS": "1"},
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
     let child = Command::new(env!("CARGO_BIN_EXE_tack"))
         .args(["--mode", "rpc"])
         .env("TACK_AGENT_DIR", agent_dir.path())
         .current_dir(work_dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(if markers {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
         .spawn()
         .unwrap();
     let dir = agent_dir.path().to_path_buf();
@@ -39,6 +88,7 @@ fn spawn_rpc() -> RpcAgent {
     let stdin = child.stdin.take().unwrap();
     let stdout = BufReader::new(child.stdout.take().unwrap());
     RpcAgent {
+        _serial: serial,
         child,
         stdin,
         stdout: Some(stdout),
@@ -85,28 +135,45 @@ fn read_line(agent: &mut RpcAgent) -> serde_json::Value {
         .unwrap_or_else(|e| panic!("stdout line is not valid JSON ({e}): {line:?}"))
 }
 
-fn read_response(agent: &mut RpcAgent, id: &str) -> serde_json::Value {
-    loop {
-        let value = read_line(agent);
-        if value["type"] == "response" && value["id"] == id {
-            return value;
-        }
-    }
-}
-
 fn command(
     agent: &mut RpcAgent,
     id: &str,
     command: &str,
     extra: serde_json::Value,
 ) -> serde_json::Value {
+    command_trace(agent, id, command, extra).0
+}
+
+/// Run one command while retaining every out-of-band event that precedes
+/// its response. Session lifecycle assertions must not hide events the way
+/// the ordinary response-only helper intentionally does.
+fn command_trace(
+    agent: &mut RpcAgent,
+    id: &str,
+    command: &str,
+    extra: serde_json::Value,
+) -> (serde_json::Value, Vec<serde_json::Value>) {
     let mut payload = serde_json::json!({ "type": command, "id": id });
     payload
         .as_object_mut()
         .unwrap()
         .extend(extra.as_object().unwrap().clone());
     send(&mut agent.stdin, payload);
-    read_response(agent, id)
+    let mut events = Vec::new();
+    loop {
+        let value = read_line(agent);
+        if value["type"] == "response" && value["id"] == id {
+            return (value, events);
+        }
+        events.push(value);
+    }
+}
+
+fn assert_start_marker(event: &serde_json::Value, reason: &str) -> String {
+    assert_eq!(event["type"], "entry_appended", "{event}");
+    assert_eq!(event["entry"]["customType"], "start-marker", "{event}");
+    assert_eq!(event["entry"]["data"], reason, "{event}");
+    event["entry"]["id"].as_str().unwrap().to_string()
 }
 
 /// Send a prompt and read until the command response and, when a run was
@@ -208,6 +275,46 @@ fn rpc_prompt_started_response_precedes_agent_events() {
         }
     }
     wait_until_idle(&mut agent);
+}
+
+#[cfg(feature = "ext")]
+#[test]
+fn rpc_session_replacement_start_entries_precede_each_success_response() {
+    let mut agent = spawn_rpc_with_markers(true);
+    let startup = read_line(&mut agent);
+    assert_start_marker(&startup, "startup");
+
+    let (response, events) = command_trace(&mut agent, "new", "new_session", serde_json::json!({}));
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(events.len(), 1, "{events:?}");
+    let target_id = assert_start_marker(&events[0], "new");
+
+    let (response, events) = command_trace(
+        &mut agent,
+        "fork",
+        "fork",
+        serde_json::json!({"entryId": target_id}),
+    );
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_start_marker(&events[0], "fork");
+
+    let (response, events) = command_trace(&mut agent, "clone", "clone", serde_json::json!({}));
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_start_marker(&events[0], "fork");
+
+    let state = command(&mut agent, "state", "get_state", serde_json::json!({}));
+    let path = state["data"]["sessionFile"].as_str().unwrap();
+    let (response, events) = command_trace(
+        &mut agent,
+        "switch",
+        "switch_session",
+        serde_json::json!({"path": path}),
+    );
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_start_marker(&events[0], "resume");
 }
 
 #[test]

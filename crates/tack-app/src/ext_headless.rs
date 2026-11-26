@@ -18,8 +18,9 @@
 //!   mode-independent (it writes the process-global runtime registry that
 //!   every mode's model resolution reads); `bridge: true` additionally
 //!   wires the plugin connection as the serving endpoint;
-//! - `session/*`, `snapshot/get`: not available in headless modes —
-//!   session control needs a live session UI/owner;
+//! - `session/appendEntry`: available in print/RPC after those modes install
+//!   their live session owner; other `session/*` and `snapshot/get` remain
+//!   unavailable without a session owner;
 //! - `exec/run`: honored when the context is trusted, run inline with the
 //!   same shell + timeout semantics as the TUI path (`run_ext_exec` is
 //!   shared).
@@ -37,6 +38,39 @@ fn service_error(code: i64, message: impl Into<String>) -> ErrorObject {
         code,
         message: message.into(),
         data: None,
+    }
+}
+
+/// Session mutation endpoint installed by modes that own a live session.
+/// Keeping the owner behind a trait avoids making the plugin services depend
+/// on a particular mode's state layout (print and RPC synchronize sessions
+/// differently).
+#[async_trait::async_trait]
+pub(crate) trait HeadlessSessionEntryAppender: Send + Sync {
+    async fn append_entry(&self, custom_type: String, data: Option<Value>) -> Result<(), String>;
+}
+
+/// Late-bound session owner. Extensions are loaded before RPC constructs its
+/// shared state, so the endpoint is installed after that state exists but
+/// before the first `sessionStart` notification.
+#[derive(Clone, Default)]
+pub(crate) struct HeadlessSessionControl {
+    appender: Arc<std::sync::RwLock<Option<Arc<dyn HeadlessSessionEntryAppender>>>>,
+}
+
+impl HeadlessSessionControl {
+    pub(crate) fn set_appender(&self, appender: Arc<dyn HeadlessSessionEntryAppender>) {
+        *self
+            .appender
+            .write()
+            .expect("headless session appender lock poisoned") = Some(appender);
+    }
+
+    fn appender(&self) -> Option<Arc<dyn HeadlessSessionEntryAppender>> {
+        self.appender
+            .read()
+            .expect("headless session appender lock poisoned")
+            .clone()
     }
 }
 
@@ -114,6 +148,7 @@ pub(crate) async fn run_ext_exec(
 /// messages.
 pub struct HeadlessExtServices {
     mode: &'static str,
+    session_control: HeadlessSessionControl,
     /// Project trust: `exec/run` is only honored for trusted contexts.
     trusted: bool,
     /// Provider bridge state (connections, stream sinks, registrations).
@@ -141,6 +176,7 @@ impl HeadlessExtServices {
     ) -> Arc<Self> {
         Arc::new(HeadlessExtServices {
             mode,
+            session_control: HeadlessSessionControl::default(),
             trusted,
             bridge_state,
             remote: None,
@@ -157,10 +193,15 @@ impl HeadlessExtServices {
     ) -> Arc<Self> {
         Arc::new(HeadlessExtServices {
             mode,
+            session_control: HeadlessSessionControl::default(),
             trusted,
             bridge_state,
             remote: Some(remote),
         })
+    }
+
+    pub(crate) fn session_control(&self) -> HeadlessSessionControl {
+        self.session_control.clone()
     }
 
     /// Plugin `ui/select`/`ui/confirm`/`ui/input` in remote mode:
@@ -290,6 +331,30 @@ impl PeerHandler for HeadlessExtServices {
                 crate::ext_provider_bridge::handle_register_provider(&self.bridge_state, params)
                     .await
             }
+            "session/appendEntry" => {
+                let Some(appender) = self.session_control.appender() else {
+                    return Err(service_error(
+                        ERR_METHOD_NOT_FOUND,
+                        format!("{method} is not available in {} mode", self.mode),
+                    ));
+                };
+                let custom_type = params
+                    .get("customType")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        service_error(
+                            tack_ext::rpc3::ERR_INVALID_PARAMS,
+                            "session/appendEntry needs a non-empty {customType}",
+                        )
+                    })?;
+                let data = params.get("data").cloned();
+                appender
+                    .append_entry(custom_type.to_string(), data)
+                    .await
+                    .map_err(|e| service_error(tack_ext::rpc3::ERR_INTERNAL, e))?;
+                Ok(Value::Null)
+            }
             other => Err(service_error(
                 ERR_METHOD_NOT_FOUND,
                 format!("{other} is not available in {} mode", self.mode),
@@ -370,6 +435,23 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingAppender {
+        calls: std::sync::Mutex<Vec<(String, Option<Value>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HeadlessSessionEntryAppender for RecordingAppender {
+        async fn append_entry(
+            &self,
+            custom_type: String,
+            data: Option<Value>,
+        ) -> Result<(), String> {
+            self.calls.lock().unwrap().push((custom_type, data));
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn exec_requires_trust() {
@@ -472,6 +554,47 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, ERR_METHOD_NOT_FOUND);
+        let err = services
+            .handle_request(
+                "session/appendEntry",
+                serde_json::json!({"customType": "marker"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ERR_METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn append_entry_uses_the_late_bound_session_owner() {
+        let services = HeadlessExtServices::new(
+            "print",
+            true,
+            crate::ext_provider_bridge::ProviderBridgeState::shared(),
+        );
+        let appender = Arc::new(RecordingAppender::default());
+        services.session_control().set_appender(appender.clone());
+
+        let err = services
+            .handle_request("session/appendEntry", serde_json::json!({"data": 1}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, tack_ext::rpc3::ERR_INVALID_PARAMS);
+
+        let result = services
+            .handle_request(
+                "session/appendEntry",
+                serde_json::json!({"customType": "marker", "data": {"reason": "startup"}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, Value::Null);
+        assert_eq!(
+            *appender.calls.lock().unwrap(),
+            vec![(
+                "marker".to_string(),
+                Some(serde_json::json!({"reason": "startup"}))
+            )]
+        );
     }
 
     /// P7a: provider registration is mode-independent — headless modes

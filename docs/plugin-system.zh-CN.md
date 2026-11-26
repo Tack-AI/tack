@@ -117,7 +117,7 @@ LLM 评估经独立的 provider 适配器（不经扩展事件通道，不对插
 | 方向 | 方法/通知 |
 |---|---|
 | 宿主 → 插件 | `tools/execute`、`commands/invoke`、`hooks/beforeToolCall`（allow/deny/**rewrite**）、`hooks/transformContext`（非 system 投影）+ `hooks/transformContextWithSystem`（权威全 transcript）、`hooks/afterToolCall`（按字段结果补丁）、`approval/review`（审批链）、`autocomplete/provide`、`events/lifecycle`（订阅门控）、`widgets/action`、`provider/stream` + `provider/streamCancel`（provider bridge） |
-| 插件 → 宿主 | `ui/notify/select/confirm/input`（TUI 对话框）、`session/get`、`session/sendUserMessage`、`snapshot/get`（只读摘要）、`config/get`、`exec/run`（信任门控）、`host/registerProvider`（LLM provider 注册）、`provider/streamEvent` + `provider/event`（provider bridge）、`widgets/update`、`logs/emit`、`warnings/emit` |
+| 插件 → 宿主 | `ui/notify/select/confirm/input`（TUI 对话框）、`session/get`、`session/sendUserMessage`、`session/appendEntry`、`snapshot/get`（只读摘要）、`config/get`、`exec/run`（信任门控）、`host/registerProvider`（LLM provider 注册）、`provider/streamEvent` + `provider/event`（provider bridge）、`widgets/update`、`logs/emit`、`warnings/emit` |
 
 SDK 覆盖 Rust（`tack-ext-sdk`）、TypeScript（`@tack/plugin`）、
 Python（`tack-plugin`）；`tack ext new` 生成任一脚手架，
@@ -128,7 +128,11 @@ Python（`tack-plugin`）；`tack ext new` 生成任一脚手架，
 四种运行模式都加载插件（矩阵见 §6）。非 TUI 模式（print/rpc/acp）
 确定性降级：工具、拦截、生命周期事件、`exec/run`（信任门控）照常；
 `ui/select|confirm|input` 返回 `ERR_CAPABILITY_NOT_GRANTED`；
-`session/*` 返回 `ERR_METHOD_NOT_FOUND`；`ui/notify` 进日志。
+`session/appendEntry` 在 print/RPC（以及 TUI）可用，其他没有活动
+session owner 的 session 方法返回 `ERR_METHOD_NOT_FOUND`；
+`ui/notify` 进日志。JSON print 在启动 handler 前先写 session header，
+并把 handler 追加的 entry 以 `entry_appended` 输出；RPC 在触发替换的
+命令成功响应之前写出该事件。
 `host/registerProvider` 在每种模式都被受理——provider 注册与
 模式无关（它写入的是每个模式的模型解析都要读取的进程级运行时
 注册表），桥接 provider 像原生 provider 一样在无头模式下供推理。

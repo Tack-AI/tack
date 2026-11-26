@@ -13,10 +13,10 @@ use super::{PROTOCOL_VERSION, protocol_compatible};
 use crate::rpc3::{
     AfterToolCallParams, AfterToolCallPatch, ApprovalDecision, ApprovalReviewParams,
     AutocompleteProvideParams, AutocompleteProvideResult, BeforeToolCallParams,
-    CommandInvokeParams, ERR_CAPABILITY_NOT_GRANTED, ErrorObject, InitializeParams,
-    InitializeResult, LifecycleEventParams, ProviderStreamCancelParams, ProviderStreamParams,
-    ToolExecuteParams, ToolOutput, TransformContextParams, TransformContextResult, Verdict,
-    WidgetActionParams, method,
+    CommandInvokeParams, ERR_CAPABILITY_NOT_GRANTED, ERR_METHOD_NOT_FOUND, ErrorObject,
+    InitializeParams, InitializeResult, LifecycleEventParams, ProviderStreamCancelParams,
+    ProviderStreamParams, ToolExecuteParams, ToolOutput, TransformContextParams,
+    TransformContextResult, Verdict, WidgetActionParams, method,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -210,6 +210,34 @@ impl HostClient {
         self.peer.notify(method::EVENTS_LIFECYCLE, params).await
     }
 
+    /// Await a lifecycle handler when session ordering depends on its side
+    /// effects. v3.2 SDKs answer the request after the handler completes;
+    /// older peers reject the request and retain the v3.1 notification path.
+    pub async fn lifecycle_event_sync(&self, event: &str, payload: Value) -> Result<(), PeerError> {
+        let params = LifecycleEventParams {
+            event: event.to_string(),
+            payload,
+        };
+        let params =
+            serde_json::to_value(params).map_err(|e| PeerError::Transport(e.to_string()))?;
+        match self
+            .peer
+            .call(method::EVENTS_LIFECYCLE, params.clone())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.code(),
+                    ERR_METHOD_NOT_FOUND | ERR_CAPABILITY_NOT_GRANTED
+                ) =>
+            {
+                self.peer.notify(method::EVENTS_LIFECYCLE, params).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// `widgets/action` notification (owning plugin only).
     pub async fn widget_action(&self, params: &WidgetActionParams) -> Result<(), PeerError> {
         let params =
@@ -295,6 +323,11 @@ pub trait PluginConnection: Send + Sync + std::fmt::Debug {
     ) -> Result<AutocompleteProvideResult, PeerError>;
     /// `events/lifecycle` notification (fire-and-forget).
     async fn lifecycle_event(&self, event: &str, payload: Value) -> Result<(), PeerError>;
+    /// `events/lifecycle` request with a v3.1 notification fallback. The
+    /// default preserves carriers that only implement notifications.
+    async fn lifecycle_event_sync(&self, event: &str, payload: Value) -> Result<(), PeerError> {
+        self.lifecycle_event(event, payload).await
+    }
     /// `widgets/action` notification.
     async fn widget_action(&self, params: &WidgetActionParams) -> Result<(), PeerError>;
     /// `provider/stream` (bridge provider inference). Default: the carrier
@@ -387,6 +420,10 @@ impl PluginConnection for HostClient {
 
     async fn lifecycle_event(&self, event: &str, payload: Value) -> Result<(), PeerError> {
         HostClient::lifecycle_event(self, event, payload).await
+    }
+
+    async fn lifecycle_event_sync(&self, event: &str, payload: Value) -> Result<(), PeerError> {
+        HostClient::lifecycle_event_sync(self, event, payload).await
     }
 
     async fn widget_action(&self, params: &WidgetActionParams) -> Result<(), PeerError> {

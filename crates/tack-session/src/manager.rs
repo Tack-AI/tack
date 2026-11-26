@@ -1111,6 +1111,13 @@ impl SessionManager {
         &self.header.id
     }
 
+    /// Header written at the start of JSON print session streams. For v4
+    /// sessions this is the legacy-shaped projection of the live v4 header,
+    /// retaining the actual format version.
+    pub fn header(&self) -> &SessionHeader {
+        &self.header
+    }
+
     /// Mutation counter: changes on every append, leaf move, and session
     /// reset. Consumers cache derived data (token stats, context estimates)
     /// keyed by this instead of recomputing them — the recompute walks and

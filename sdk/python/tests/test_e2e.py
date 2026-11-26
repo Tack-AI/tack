@@ -192,12 +192,56 @@ class E2ETest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(init["capabilities"]["events"], ["turnStart"])
         self.assertEqual(len(init["capabilities"]["widgets"]), 1)
         await host.notify("events/lifecycle", {"event": "turnStart", "payload": {}})
+        completed = await host.call("events/lifecycle", {"event": "turnStart", "payload": {}})
+        self.assertIsNone(completed)
         await host.notify("widgets/action", {"id": "list", "action": "select", "itemId": "a.rs"})
         for _ in range(50):
-            if len(seen) >= 2:
+            if len(seen) >= 3:
                 break
             await asyncio.sleep(0.02)
-        self.assertEqual(seen, ["turnStart", "select:a.rs"])
+        self.assertEqual(seen.count("turnStart"), 2)
+        self.assertIn("select:a.rs", seen)
+        await host.call("shutdown", None)
+        await serve
+
+    async def test_plugin_appends_custom_session_entries(self):
+        requests = []
+
+        async def host_handler(method, params):
+            requests.append((method, params))
+            if method == "session/appendEntry":
+                return None
+            raise PeerError(ERR_METHOD_NOT_FOUND, f"unknown {method}")
+
+        async def append(params, cx):
+            await cx.host.append_entry("example.custom", {"value": 42})
+            await cx.host.append_entry("example.empty")
+            return text_output("appended")
+
+        plugin = Plugin("entry-writer").tool(
+            {
+                "name": "test.append",
+                "description": "appends custom session entries",
+                "parameters": {"type": "object"},
+            },
+            append,
+        )
+        host, serve, _ = await self.spawn(plugin, host_handler)
+        await host.call("initialize", init_params())
+        output = await host.call(
+            "tools/execute", {"name": "test.append", "toolCallId": "c-1", "arguments": {}}
+        )
+        self.assertEqual(output["content"][0]["text"], "appended")
+        self.assertEqual(
+            requests,
+            [
+                (
+                    "session/appendEntry",
+                    {"customType": "example.custom", "data": {"value": 42}},
+                ),
+                ("session/appendEntry", {"customType": "example.empty"}),
+            ],
+        )
         await host.call("shutdown", None)
         await serve
 

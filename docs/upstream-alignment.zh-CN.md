@@ -243,6 +243,19 @@ provider 请求。第六批的 context edit 只实现读取/投影；显式写�
 | `1e39862f6` | llama.cpp 仅对 loaded 模型请求 `/props?model=<id>&autoload=false`，避免 sleeping/unloaded 的唤醒/加载副作用；`enable_thinking` 模板生成精确 reasoning map 与 `qwen-chat-template` compat。 |
 | `46bde88a1` | `compaction.modelOverrides` 以精确 provider/modelId 逐字段覆盖 reserveTokens/keepRecentTokens，接入手动、阈值、overflow 与 /context，保留后续 `6fcb48670` 的模型输出上限语义。**差异**：非法值仍沿用 Tack 既有 settings 的容错回退，上游逐字段报错校验未单独实现。 |
 
+### 第八批 session-entry 事件流落地（未发布）
+
+本批补上游生命周期回归所需的宿主/API 前置，并用真实 demo 扩展验证客户端可见
+顺序；仍没有实现完整的扩展命令 runtime/reload 面。
+
+| 上游 commit / 来源 | Tack 落地 |
+| --- | --- |
+| `6aab551a7`（startup 部分）+ `beffcde92` | tack-RPC 升级 3.2，Rust/TypeScript/Python SDK 新增 `session/appendEntry`。TUI、print 与 RPC 持久化 custom entry；JSON print 在启动 handler 前输出 session header，随后在 `agent_start` 前输出 `entry_appended`。RPC startup/new/fork/clone/switch 轨迹证明 handler 追加的每个 entry 恰好到达一次，且先于命令成功响应。session 生命周期完成请求会等待 handler 副作用（v3.1 保留通知回退），直接 await 单行写入消除响应/事件队列竞态，生命周期回调期间不持有 session 状态锁。 |
+
+**未覆盖：**由扩展 `/renew`/`ctx.newSession()` 命令驱动的 print replacement，
+以及 empty-bind reload（`e03dca7a3`）。它们需要完整的扩展命令 context 与
+reload/资源重建面；不重建扩展而重复发一次 `sessionStart` 并不等价。
+
 ## 2026-09-21 对齐批次（基线 4a6ed0194 → 10d1ad621）
 
 160 个上游 commit 经逐条审阅（报告由 `scripts/upstream-delta.sh` 生成）。

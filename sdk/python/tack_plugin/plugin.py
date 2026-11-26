@@ -22,7 +22,7 @@ from .peer import (
 from .provider import ProviderEvents, ProviderStreamCx
 from .types import ProviderEventKind
 
-PROTOCOL_VERSION = "3.1.0"
+PROTOCOL_VERSION = "3.2.0"
 ERR_INVALID_PARAMS = -32602
 ERR_CAPABILITY_NOT_GRANTED = -32002
 
@@ -112,6 +112,13 @@ class Host:
 
     async def send_user_message(self, text: str) -> None:
         await self._peer.call("session/sendUserMessage", {"text": text})
+
+    async def append_entry(self, custom_type: str, data: Any = None) -> None:
+        """Append a custom entry to the current session."""
+        params: dict[str, Any] = {"customType": custom_type}
+        if data is not None:
+            params["data"] = data
+        await self._peer.call("session/appendEntry", params)
 
     async def snapshot(self) -> dict:
         return await self._peer.call("snapshot/get", None)
@@ -340,6 +347,13 @@ class Plugin:
                 return on_initialize(params)
             if method == "shutdown":
                 shutdown.set()
+                return None
+            if method == "events/lifecycle":
+                if self._event_handler is None:
+                    raise PluginError(
+                        ERR_CAPABILITY_NOT_GRANTED, f"capability not declared for {method}"
+                    )
+                await _maybe_await(self._event_handler(params, cx()))
                 return None
             if method == "tools/execute":
                 entry = self._tools.get(params.get("name"))

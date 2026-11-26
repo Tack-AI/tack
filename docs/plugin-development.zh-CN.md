@@ -225,13 +225,15 @@ fallback 静默恢复。跨 JSON-RPC 时，以结构相等近似 JavaScript 按�
 | `ui/select` / `ui/confirm` / `ui/input` | `.select(...)` / `.confirm(...)` / `.input(...)` | TUI 对话框；headless → `ERR_CAPABILITY_NOT_GRANTED` |
 | `exec/run` | `.exec(...)` | 信任门控（不受信任的会话会被拒绝） |
 | `session/get` · `session/sendUserMessage` | `.session()` · `.send_user_message(...)` | 会话状态；注入一条用户消息 |
+| `session/appendEntry` | `.append_entry(custom_type, data)` | 追加 custom entry；JSON print/RPC 发出 `entry_appended` |
 | `snapshot/get` | `.snapshot()` | 只读会话摘要 |
 | `config/get` | `.config()` | 本插件合并后的配置 |
 | `logs/emit` · `warnings/emit` | `.log(level, msg)` · `.warn(msg)` | 落在 host tracing |
 
 headless 降级是确定性的（见 [extensions.md §7](extensions.zh-CN.md)）：
 print/rpc/acp 下工具、hooks、事件、`exec/run` 照常；对话框调用应答
-`ERR_CAPABILITY_NOT_GRANTED`；`ui/notify` 进日志。
+`ERR_CAPABILITY_NOT_GRANTED`；`ui/notify` 进日志。`append_entry` 在
+print/RPC 以及 TUI 可用。
 
 ## 4. WASM 载体
 

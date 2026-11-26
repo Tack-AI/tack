@@ -3,7 +3,7 @@
 
 import { createPeer, PeerError, ERR_METHOD_NOT_FOUND } from "./peer.js";
 
-export const PROTOCOL_VERSION = "3.1.0";
+export const PROTOCOL_VERSION = "3.2.0";
 const ERR_INVALID_PARAMS = -32602;
 const ERR_CAPABILITY_NOT_GRANTED = -32002;
 
@@ -195,6 +195,10 @@ export function plugin({ name, version, description } = {}) {
           case "shutdown":
             resolveDone();
             return null;
+          case "events/lifecycle":
+            if (!state.eventHandler) throw notGranted(method);
+            await state.eventHandler(params, cx());
+            return null;
           case "tools/execute": {
             const entry = state.tools.get(params.name);
             if (!entry) throw invalidParams(`unknown tool ${JSON.stringify(params.name)}`);
@@ -381,6 +385,7 @@ function makeHostClient(peer) {
     warn: (message, context) => notify("warnings/emit", { message, context }),
     session: () => call("session/get"),
     sendUserMessage: (text) => call("session/sendUserMessage", { text }),
+    appendEntry: (customType, data) => call("session/appendEntry", { customType, data }),
     snapshot: () => call("snapshot/get"),
     config: () => call("config/get").then((r) => r.config),
     registerProvider: (provider) => call("host/registerProvider", { provider }),

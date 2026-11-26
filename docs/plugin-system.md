@@ -134,7 +134,7 @@ host answers `ERR_CAPABILITY_NOT_GRANTED` if it must).
 | Direction | Methods/notifications |
 |---|---|
 | host → plugin | `tools/execute`, `commands/invoke`, `hooks/beforeToolCall` (allow/deny/**rewrite**), `hooks/transformContext` (non-system projection) + `hooks/transformContextWithSystem` (authoritative full transcript), `hooks/afterToolCall` (per-field result patch), `approval/review` (approval chain), `autocomplete/provide`, `events/lifecycle` (subscription-gated), `widgets/action`, `provider/stream` + `provider/streamCancel` (provider bridge) |
-| plugin → host | `ui/notify/select/confirm/input` (TUI dialogs), `session/get`, `session/sendUserMessage`, `snapshot/get` (read-only digest), `config/get`, `exec/run` (trust-gated), `host/registerProvider` (LLM provider registration), `provider/streamEvent` + `provider/event` (provider bridge), `widgets/update`, `logs/emit`, `warnings/emit` |
+| plugin → host | `ui/notify/select/confirm/input` (TUI dialogs), `session/get`, `session/sendUserMessage`, `session/appendEntry`, `snapshot/get` (read-only digest), `config/get`, `exec/run` (trust-gated), `host/registerProvider` (LLM provider registration), `provider/streamEvent` + `provider/event` (provider bridge), `widgets/update`, `logs/emit`, `warnings/emit` |
 
 SDKs exist for Rust (`tack-ext-sdk`), TypeScript (`@tack/plugin`), and
 Python (`tack-plugin`); `tack ext new` scaffolds any of them, and
@@ -147,7 +147,12 @@ All four run modes load plugins (see the matrix in §6). Non-TUI modes
 (print/rpc/acp) degrade deterministically: tools, interception,
 lifecycle events, and `exec/run` (trust-gated) work as usual;
 `ui/select|confirm|input` answer `ERR_CAPABILITY_NOT_GRANTED`;
-`session/*` answers `ERR_METHOD_NOT_FOUND`; `ui/notify` goes to the log.
+`session/appendEntry` is available in print/RPC (as well as the TUI),
+while session methods without a live owner answer
+`ERR_METHOD_NOT_FOUND`; `ui/notify` goes to the log. JSON print writes
+its session header before startup handlers and streams their appended
+entries as `entry_appended`; RPC writes the event before the triggering
+replacement command's success response.
 `host/registerProvider` is honored in every mode — provider
 registration is mode-independent (it writes the process-global runtime
 registry that every mode's model resolution reads), and bridged

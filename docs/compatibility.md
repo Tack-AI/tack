@@ -234,17 +234,22 @@ in `docs/upstream-alignment.md` (§5).
   generated from it by `cargo run -p xtask -- codegen`, freshness-checked
   in CI).
 - **Version handshake**: the host sends `initialize` with a semver
-  `protocolVersion` ("3.1.0"); compatibility requires the same major
+  `protocolVersion` ("3.2.0"); compatibility requires the same major
   version and a minor not newer than the host's
   (`crates/tack-ext/src/v3/mod.rs`). v3.1 adds the optional
   `transformContextWithSystem` capability: ordinary `transformContext`
   handlers transform the non-system projection first, then full-system
   handlers receive the complete transcript and own its final prompt/tools,
-  including deletion.
+  including deletion. v3.2 adds `session/appendEntry`; TUI, JSON print,
+  and RPC persist the custom entry, and the latter two stream its
+  `entry_appended` event with deterministic lifecycle ordering. Session
+  lifecycle events may use `events/lifecycle` as a completion request;
+  v3.1 peers retain the notification fallback.
 - The v1/v2 NDJSON protocol (`{"type":"request|response|event"}`) was
   **removed** in the v3 release: the host no longer speaks it, and the
   lifecycle surface was deliberately reduced (`session/*` is
-  `session/get` + `session/sendUserMessage`; plugin-registered shortcuts
+  `session/get` + `session/sendUserMessage` + `session/appendEntry`;
+  plugin-registered shortcuts
   and `ui.set_status` were dropped; lifecycle event names are now
   camelCase).
 - Lockfiles: `extensions-lock.json` v1 is upgraded in memory on read

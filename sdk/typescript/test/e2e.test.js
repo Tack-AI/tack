@@ -187,11 +187,62 @@ test("events and widget actions dispatch", async () => {
   assert.deepEqual(init.capabilities.events, ["turnStart"]);
   assert.equal(init.capabilities.widgets.length, 1);
   await host.notify("events/lifecycle", { event: "turnStart", payload: {} });
+  const completed = await host.call("events/lifecycle", { event: "turnStart", payload: {} });
+  assert.equal(completed, null);
   await host.notify("widgets/action", { id: "list", action: "select", itemId: "a.rs" });
-  for (let i = 0; i < 50 && seen.length < 2; i++) {
+  for (let i = 0; i < 50 && seen.length < 3; i++) {
     await new Promise((r) => setTimeout(r, 20));
   }
-  assert.deepEqual(seen, ["turnStart", "select:a.rs"]);
+  assert.equal(seen.filter((event) => event === "turnStart").length, 2);
+  assert.ok(seen.includes("select:a.rs"));
+  await host.call("shutdown");
+  await run;
+  a.end();
+  b.end();
+});
+
+test("plugin appends custom session entries", async () => {
+  const { a, b } = connect();
+  const hostRequests = [];
+  const host = createPeer({
+    input: a,
+    output: b,
+    handler: {
+      async handleRequest(method, params) {
+        hostRequests.push({ method, params });
+        if (method === "session/appendEntry") return null;
+        throw new PeerError(-32601, `unknown ${method}`);
+      },
+    },
+  });
+  const run = plugin({ name: "entry-writer" })
+    .tool(
+      {
+        name: "test.append",
+        description: "appends custom session entries",
+        parameters: { type: "object" },
+      },
+      async (_params, cx) => {
+        await cx.host.appendEntry("example.custom", { value: 42 });
+        await cx.host.appendEntry("example.empty");
+        return textOutput("appended");
+      },
+    )
+    .run({ input: b, output: a });
+  await host.call("initialize", initParams());
+  const output = await host.call("tools/execute", {
+    name: "test.append",
+    toolCallId: "c-1",
+    arguments: {},
+  });
+  assert.equal(output.content[0].text, "appended");
+  assert.deepEqual(hostRequests, [
+    {
+      method: "session/appendEntry",
+      params: { customType: "example.custom", data: { value: 42 } },
+    },
+    { method: "session/appendEntry", params: { customType: "example.empty" } },
+  ]);
   await host.call("shutdown");
   await run;
   a.end();

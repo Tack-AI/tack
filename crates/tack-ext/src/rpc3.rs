@@ -165,7 +165,7 @@ pub mod method {
     /// \[host-to-plugin\] Query an autocomplete provider for input-line suggestions. Timeouts and cancellations degrade to no suggestions.
     pub const AUTOCOMPLETE_PROVIDE: &str = "autocomplete/provide";
 
-    /// \[host-to-plugin\] Lifecycle notification, subscription-gated via capabilities.events. The event name is one of the well-known lifecycle set (sessionStart, sessionShutdown, agentStart, agentEnd, turnStart, turnEnd, messageStart, messageEnd, toolExecutionStart, toolExecutionEnd, modelSelect, thinkingLevelSelect); the payload shape depends on the event.
+    /// \[host-to-plugin\] Lifecycle notification or completion request, subscription-gated via capabilities.events. The event name is one of the well-known lifecycle set (sessionStart, sessionShutdown, agentStart, agentEnd, turnStart, turnEnd, messageStart, messageEnd, toolExecutionStart, toolExecutionEnd, modelSelect, thinkingLevelSelect); the payload shape depends on the event. v3.2 hosts may send session lifecycle events as requests to await handler completion; SDKs answer null after the handler finishes. v3.1 peers that reject the request retain the notification fallback.
     pub const EVENTS_LIFECYCLE: &str = "events/lifecycle";
 
     /// \[host-to-plugin\] User interaction with a declared widget (never produced in headless modes). Sent only to the owning plugin.
@@ -185,6 +185,9 @@ pub mod method {
 
     /// \[plugin-to-host\] Inject a user message into the session (trust/mode gated).
     pub const SESSION_SEND_USER_MESSAGE: &str = "session/sendUserMessage";
+
+    /// \[plugin-to-host\] Append a custom entry to the current session (requires the sessionControl host capability).
+    pub const SESSION_APPEND_ENTRY: &str = "session/appendEntry";
 
     /// \[plugin-to-host\] Versioned read-only session digest. historyVersion and compactionRevision let the plugin detect staleness between calls without re-fetching.
     pub const SNAPSHOT_GET: &str = "snapshot/get";
@@ -254,6 +257,16 @@ pub struct AfterToolCallPatch {
     #[serde(rename = "usage")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Value>,
+}
+
+/// session/appendEntry params: append a custom entry to the current session.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AppendEntryParams {
+    #[serde(rename = "customType")]
+    pub custom_type: String,
+    #[serde(rename = "data")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 /// A claimed approval decision (a null method result passes to the next reviewer).

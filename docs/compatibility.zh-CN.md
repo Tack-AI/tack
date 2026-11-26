@@ -208,15 +208,18 @@ ACP 侧的破坏性变更只通过上游 crate 升级进入，会在 CHANGELOG �
   TS/Python SDK 类型由 `cargo run -p xtask -- codegen` 从它生成，
   CI 做新鲜度检查）。
 - **版本握手**：宿主在 `initialize` 中发送 semver
-  `protocolVersion`（"3.1.0"）；兼容要求 major 版本相同且对端
+  `protocolVersion`（"3.2.0"）；兼容要求 major 版本相同且对端
   minor 不超过宿主（`crates/tack-ext/src/v3/mod.rs`）。v3.1 新增可选
   `transformContextWithSystem` 能力：普通 `transformContext` 先转换不含
   system 的投影，随后 full-system handler 接收完整 transcript 并决定最终
-  prompt/tools，包括删除它们。
+  prompt/tools，包括删除它们。v3.2 新增 `session/appendEntry`：TUI、JSON
+  print 与 RPC 持久化 custom entry，后两者以确定的生命周期顺序输出
+  `entry_appended`。session 生命周期也可将 `events/lifecycle` 用作完成
+  请求；v3.1 对端保留通知回退。
 - v1/v2 NDJSON 协议（`{"type":"request|response|event"}`）已在 v3
   版本中**移除**：宿主不再说它，且生命周期面被刻意收缩
-  （`session/*` 只剩 `session/get` 与 `session/sendUserMessage`；
-  插件注册的快捷键与 `ui.set_status` 被移除；生命周期事件名改为
+  （`session/*` 只剩 `session/get`、`session/sendUserMessage` 与
+  `session/appendEntry`；插件注册的快捷键与 `ui.set_status` 被移除；生命周期事件名改为
   camelCase）。
 - 锁文件：`extensions-lock.json` v1 在读取时于内存中升级（裸名键
   变为 `name@user`、`store: false`），并在下一次安装/升级时改写为

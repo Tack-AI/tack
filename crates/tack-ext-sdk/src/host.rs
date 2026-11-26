@@ -10,9 +10,9 @@ use serde_json::Value;
 
 use crate::{Error, PeerError};
 use tack_ext::rpc3::{
-    ExecRunParams, ExecRunResult, HostCapabilities, InitializeParams, LogLevel, RunMode,
-    SendUserMessageParams, SessionInfo, Snapshot, UiConfirmParams, UiInputParams, UiNotifyParams,
-    UiSelectParams, WarningParams, WidgetUpdateParams, method,
+    AppendEntryParams, ExecRunParams, ExecRunResult, HostCapabilities, InitializeParams, LogLevel,
+    RunMode, SendUserMessageParams, SessionInfo, Snapshot, UiConfirmParams, UiInputParams,
+    UiNotifyParams, UiSelectParams, WarningParams, WidgetUpdateParams, method,
 };
 use tack_ext::v3::JsonRpcPeer;
 
@@ -225,6 +225,23 @@ impl Host {
         self.call_unit(
             method::SESSION_SEND_USER_MESSAGE,
             &SendUserMessageParams { text: text.into() },
+        )
+        .await
+    }
+
+    /// `session/appendEntry` — append a custom entry to the current
+    /// session (requires the `sessionControl` host capability).
+    pub async fn append_entry(
+        &self,
+        custom_type: impl Into<String>,
+        data: Option<Value>,
+    ) -> Result<(), PeerError> {
+        self.call_unit(
+            method::SESSION_APPEND_ENTRY,
+            &AppendEntryParams {
+                custom_type: custom_type.into(),
+                data,
+            },
         )
         .await
     }

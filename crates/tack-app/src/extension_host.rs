@@ -110,7 +110,8 @@ impl PeerHandler for TuiExtServices {
             | "ui/confirm"
             | "ui/input"
             | "session/get"
-            | "session/sendUserMessage" => {
+            | "session/sendUserMessage"
+            | "session/appendEntry" => {
                 let (tx, rx) = oneshot::channel();
                 self.tx
                     .send(crate::tui::AppEvent::ExtUiRequest(ExtUiRequest {
@@ -2570,6 +2571,17 @@ impl ExtensionManager {
 
     /// Fan a lifecycle event out to subscribed plugins (fire-and-forget).
     pub async fn notify(&self, event: &str, payload: Value) {
+        self.notify_inner(event, payload, false).await;
+    }
+
+    /// Fan out a lifecycle event and wait for each subscribed handler.
+    /// Session replacement uses this to order handler-produced entries before
+    /// the triggering command's response.
+    pub async fn notify_sync(&self, event: &str, payload: Value) {
+        self.notify_inner(event, payload, true).await;
+    }
+
+    async fn notify_inner(&self, event: &str, payload: Value, wait_for_handler: bool) {
         for plugin in self.plugins.iter().filter(|p| p.is_active()) {
             let Some(handle) = &plugin.handle else {
                 continue;
@@ -2580,10 +2592,13 @@ impl ExtensionManager {
                 Some(events) => events.iter().any(|s| s == event),
             };
             if subscribed {
-                let _ = handle
-                    .client()
-                    .lifecycle_event(event, payload.clone())
-                    .await;
+                let client = handle.client();
+                let result = if wait_for_handler {
+                    client.lifecycle_event_sync(event, payload.clone()).await
+                } else {
+                    client.lifecycle_event(event, payload.clone()).await
+                };
+                let _ = result;
             }
         }
     }

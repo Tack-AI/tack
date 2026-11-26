@@ -8,6 +8,16 @@ notice can parse entries (same convention as TS pi).
 
 ### Added
 
+- **Plugin session entries and lifecycle wire traces**: tack-RPC 3.2 adds
+  `session/appendEntry` to the Rust, TypeScript, and Python SDKs. JSON print
+  writes the session header first and streams entries appended by startup
+  handlers as `entry_appended` before `agent_start`; RPC startup and
+  new/switch/fork/clone replacement handlers emit each persisted entry event
+  exactly once and before the command's success response. TUI, print, and RPC
+  share the append API without holding session state locks across plugin
+  callbacks. Session lifecycle completion requests await handler side effects,
+  with a v3.1 notification fallback for older plugins.
+
 - **RPC prompt dispositions and replacement lifecycle**: successful `prompt`
   responses now report `started`, `queued`, or `handled`; `steer` and
   `follow_up` report their queue outcome. Extension commands and blocked

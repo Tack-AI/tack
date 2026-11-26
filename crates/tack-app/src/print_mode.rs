@@ -28,6 +28,40 @@ pub struct PrintOptions {
     pub flags: crate::cli_flags::CliFlags,
 }
 
+struct PrintSessionEntryAppender {
+    session: Arc<Mutex<SessionManager>>,
+    json: bool,
+}
+
+#[async_trait::async_trait]
+impl crate::ext_headless::HeadlessSessionEntryAppender for PrintSessionEntryAppender {
+    async fn append_entry(
+        &self,
+        custom_type: String,
+        data: Option<serde_json::Value>,
+    ) -> Result<(), String> {
+        let entry = {
+            let mut session = self.session.lock().await;
+            let id = session
+                .append_custom_entry(&custom_type, data)
+                .map_err(|e| e.to_string())?;
+            session
+                .entries()
+                .into_iter()
+                .find(|entry| entry.id() == id)
+                .ok_or_else(|| "appended session entry disappeared".to_string())?
+        };
+        if self.json {
+            let entry = serde_json::to_value(entry).map_err(|e| e.to_string())?;
+            crate::cli_output::print_out(&format!(
+                "{}\n",
+                serde_json::json!({ "type": "entry_appended", "entry": entry })
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Parse a --thinking value (off maps to None).
 pub fn parse_thinking_level(value: &str) -> Result<Option<tack_ai::ThinkingLevel>> {
     use tack_ai::ThinkingLevel as T;
@@ -415,20 +449,34 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
     } else {
         crate::shell_hooks::HookConfig::default()
     };
+    let bridge_state = crate::ext_provider_bridge::ProviderBridgeState::shared();
+    let sampling_llm = crate::mcp_sampling::SharedSamplingLlm::default();
     // tack-ext plugins (process + wasm carriers) in headless mode: tools,
     // intercepts, lifecycle events and trust-gated exec stay live; UI
     // dialogs degrade (see ext_headless). Bundle resources merge below.
-    let bridge_state = crate::ext_provider_bridge::ProviderBridgeState::shared();
-    let sampling_llm = crate::mcp_sampling::SharedSamplingLlm::default();
+    let session = Arc::new(Mutex::new(session));
+    if flags.mode_json {
+        // The session header precedes every extension/agent event. In
+        // particular, sessionStart handlers may append entries immediately.
+        let header = serde_json::to_value(session.lock().await.header())?;
+        crate::cli_output::print_out(&format!("{header}\n"));
+    }
+    let ext_services = crate::ext_headless::HeadlessExtServices::new(
+        "print",
+        crate::project_trust::is_trusted(&options.cwd, &agent_dir),
+        bridge_state.clone(),
+    );
+    ext_services
+        .session_control()
+        .set_appender(Arc::new(PrintSessionEntryAppender {
+            session: session.clone(),
+            json: flags.mode_json,
+        }));
     let mut extensions = crate::extension_host::ExtensionManager::load(
         &options.cwd,
         &agent_dir,
         "print",
-        crate::ext_headless::HeadlessExtServices::new(
-            "print",
-            crate::project_trust::is_trusted(&options.cwd, &agent_dir),
-            bridge_state.clone(),
-        ),
+        ext_services,
         settings.extension_lock_required,
         crate::mcp_config::plugin_mcp_callbacks(
             &settings,
@@ -600,7 +648,7 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
             .unwrap_or_default(),
     ));
 
-    let existing = session.build_session_context().messages;
+    let existing = session.lock().await.build_session_context().messages;
     // Transcript-declared tool state (upstream #9548): re-activate pool
     // tools the session had activated when it was last written.
     tack_agent_core::agent_loop::restore_tools_from_transcript(
@@ -610,17 +658,20 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
     );
     // Record the thinking level in the session when explicitly set.
     if let Some(level) = options.thinking
-        && let Err(e) = session.append_thinking_level_change(level.as_str())
+        && let Err(e) = session
+            .lock()
+            .await
+            .append_thinking_level_change(level.as_str())
     {
         tracing::warn!("failed to record thinking level: {e}");
     }
-    let session = Arc::new(Mutex::new(session));
     // tack-ext: sessionStart lifecycle event.
+    let session_id = session.lock().await.session_id().to_string();
     extensions
-        .notify(
+        .notify_sync(
             "sessionStart",
             serde_json::json!({
-                "sessionId": session.lock().await.session_id(),
+                "sessionId": session_id,
                 "resumed": options.continue_session,
                 "reason": if options.continue_session { "resume" } else { "startup" },
                 "cwd": options.cwd.to_string_lossy(),
@@ -889,7 +940,7 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
     // session id).
     tack_ai::codebuddy::close_session(&session_id).await;
     extensions
-        .notify(
+        .notify_sync(
             "sessionShutdown",
             serde_json::json!({ "sessionId": session_id, "reason": "quit" }),
         )

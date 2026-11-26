@@ -235,6 +235,7 @@ client:
 | `ui/select` / `ui/confirm` / `ui/input` | `.select(...)` / `.confirm(...)` / `.input(...)` | TUI dialogs; headless → `ERR_CAPABILITY_NOT_GRANTED` |
 | `exec/run` | `.exec(...)` | Trust-gated (untrusted sessions are refused) |
 | `session/get` · `session/sendUserMessage` | `.session()` · `.send_user_message(...)` | Session state; inject a user message |
+| `session/appendEntry` | `.append_entry(custom_type, data)` | Append a custom entry; JSON print/RPC emit `entry_appended` |
 | `snapshot/get` | `.snapshot()` | Read-only session digest |
 | `config/get` | `.config()` | This plugin's merged config |
 | `logs/emit` · `warnings/emit` | `.log(level, msg)` · `.warn(msg)` | Land in host tracing |
@@ -242,7 +243,8 @@ client:
 Headless degradation is deterministic (see
 [extensions.md §7](extensions.md)): print/rpc/acp keep tools, hooks,
 events, and `exec/run`; dialog calls answer `ERR_CAPABILITY_NOT_GRANTED`;
-`ui/notify` goes to the log.
+`ui/notify` goes to the log. `append_entry` is available in print/RPC as
+well as the TUI.
 
 ## 4. WASM carrier
 

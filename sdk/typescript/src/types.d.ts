@@ -31,7 +31,7 @@ export const HOOKS_AFTER_TOOL_CALL = "hooks/afterToolCall";
 export const APPROVAL_REVIEW = "approval/review";
 /** [host-to-plugin] Query an autocomplete provider for input-line suggestions. Timeouts and cancellations degrade to no suggestions. */
 export const AUTOCOMPLETE_PROVIDE = "autocomplete/provide";
-/** [host-to-plugin] Lifecycle notification, subscription-gated via capabilities.events. The event name is one of the well-known lifecycle set (sessionStart, sessionShutdown, agentStart, agentEnd, turnStart, turnEnd, messageStart, messageEnd, toolExecutionStart, toolExecutionEnd, modelSelect, thinkingLevelSelect); the payload shape depends on the event. */
+/** [host-to-plugin] Lifecycle notification or completion request, subscription-gated via capabilities.events. The event name is one of the well-known lifecycle set (sessionStart, sessionShutdown, agentStart, agentEnd, turnStart, turnEnd, messageStart, messageEnd, toolExecutionStart, toolExecutionEnd, modelSelect, thinkingLevelSelect); the payload shape depends on the event. v3.2 hosts may send session lifecycle events as requests to await handler completion; SDKs answer null after the handler finishes. v3.1 peers that reject the request retain the notification fallback. */
 export const EVENTS_LIFECYCLE = "events/lifecycle";
 /** [host-to-plugin] User interaction with a declared widget (never produced in headless modes). Sent only to the owning plugin. */
 export const WIDGETS_ACTION = "widgets/action";
@@ -45,6 +45,8 @@ export const WIDGETS_UPDATE = "widgets/update";
 export const SESSION_GET = "session/get";
 /** [plugin-to-host] Inject a user message into the session (trust/mode gated). */
 export const SESSION_SEND_USER_MESSAGE = "session/sendUserMessage";
+/** [plugin-to-host] Append a custom entry to the current session (requires the sessionControl host capability). */
+export const SESSION_APPEND_ENTRY = "session/appendEntry";
 /** [plugin-to-host] Versioned read-only session digest. historyVersion and compactionRevision let the plugin detect staleness between calls without re-fetching. */
 export const SNAPSHOT_GET = "snapshot/get";
 /** [plugin-to-host] Read the plugin's effective configuration (host-validated against the declared config schema; invalid user config degrades to defaults with a load warning). */
@@ -86,6 +88,12 @@ export interface AfterToolCallPatch {
   "terminate"?: boolean;
   /** Usage accounting override (provider-shaped). */
   "usage"?: any;
+}
+
+/** session/appendEntry params: append a custom entry to the current session. */
+export interface AppendEntryParams {
+  "customType": string;
+  "data"?: any;
 }
 
 /** A claimed approval decision (a null method result passes to the next reviewer). */

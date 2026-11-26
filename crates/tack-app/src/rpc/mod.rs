@@ -118,6 +118,45 @@ pub(crate) struct RpcState {
     pub(crate) subagent_limits: Arc<crate::subagent_tool::SubagentLimits>,
 }
 
+struct RpcSessionEntryAppender {
+    state: std::sync::Weak<Mutex<RpcState>>,
+}
+
+#[async_trait::async_trait]
+impl crate::ext_headless::HeadlessSessionEntryAppender for RpcSessionEntryAppender {
+    async fn append_entry(&self, custom_type: String, data: Option<Value>) -> Result<(), String> {
+        let state = self
+            .state
+            .upgrade()
+            .ok_or_else(|| "RPC session is shutting down".to_string())?;
+        let entry = {
+            let mut state = state.lock().await;
+            let id = state
+                .session
+                .append_custom_entry(&custom_type, data)
+                .map_err(|e| e.to_string())?;
+            let entry = state
+                .session
+                .entries()
+                .into_iter()
+                .find(|entry| entry.id() == id)
+                .ok_or_else(|| "appended session entry disappeared".to_string())?;
+            serde_json::to_value(entry).map_err(|e| e.to_string())?
+        };
+        // Complete the write before answering the plugin. The session command
+        // awaits that answer, so its success response cannot overtake this
+        // event (a fire-and-forget event queue had no such ordering guarantee).
+        let line = json!({ "type": "entry_appended", "entry": entry });
+        let mut stdout = tokio::io::stdout();
+        stdout
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        stdout.flush().await.map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
 /// Live MCP server connections plus the fingerprint of the spec set they
 /// were built from (see `mcp_cache_fingerprint`); a fingerprint mismatch
 /// rebuilds the pool.
@@ -260,15 +299,17 @@ pub async fn run_rpc(
     // and trust-gated exec stay live; UI dialogs degrade (ext_headless).
     let bridge_state = crate::ext_provider_bridge::ProviderBridgeState::shared();
     let sampling_llm = crate::mcp_sampling::SharedSamplingLlm::default();
+    let ext_services = crate::ext_headless::HeadlessExtServices::new(
+        "rpc",
+        crate::project_trust::is_trusted(&cwd, &agent_dir),
+        bridge_state.clone(),
+    );
+    let session_control = ext_services.session_control();
     let extensions = crate::extension_host::ExtensionManager::load(
         &cwd,
         &agent_dir,
         "rpc",
-        crate::ext_headless::HeadlessExtServices::new(
-            "rpc",
-            crate::project_trust::is_trusted(&cwd, &agent_dir),
-            bridge_state.clone(),
-        ),
+        ext_services,
         settings.extension_lock_required,
         crate::mcp_config::plugin_mcp_callbacks(
             &settings,
@@ -376,24 +417,29 @@ pub async fn run_rpc(
         ),
     }));
     // tack-ext: sessionStart lifecycle event.
-    {
+    session_control.set_appender(Arc::new(RpcSessionEntryAppender {
+        state: Arc::downgrade(&state),
+    }));
+    let (extensions, session_id) = {
         let state = state.lock().await;
-        let session_id = state.session.session_id().to_string();
-        state
-            .extensions
-            .lock()
-            .await
-            .notify(
-                "sessionStart",
-                json!({
-                    "sessionId": session_id,
-                    "resumed": continue_session,
-                    "reason": if continue_session { "resume" } else { "startup" },
-                    "cwd": cwd.to_string_lossy(),
-                }),
-            )
-            .await;
-    }
+        (
+            state.extensions.clone(),
+            state.session.session_id().to_string(),
+        )
+    };
+    extensions
+        .lock()
+        .await
+        .notify_sync(
+            "sessionStart",
+            json!({
+                "sessionId": session_id,
+                "resumed": continue_session,
+                "reason": if continue_session { "resume" } else { "startup" },
+                "cwd": cwd.to_string_lossy(),
+            }),
+        )
+        .await;
 
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
@@ -502,7 +548,7 @@ pub async fn run_rpc(
         }
     }
     // tack-ext: sessionShutdown lifecycle event, then stop all plugins.
-    {
+    let (extensions, session_id) = {
         let mut state = state.lock().await;
         // Drop cached MCP connections first: this cancels their services
         // and kills the server child processes instead of orphaning them.
@@ -511,15 +557,17 @@ pub async fn run_rpc(
         // Close this session's codebuddy CLI (provider registry is keyed
         // by session id).
         tack_ai::codebuddy::close_session(&session_id).await;
-        let mut extensions = state.extensions.lock().await;
-        extensions
-            .notify(
-                "sessionShutdown",
-                json!({ "sessionId": session_id, "reason": "quit" }),
-            )
-            .await;
-        extensions.shutdown().await;
-    }
+        (state.extensions.clone(), session_id)
+    };
+    // Do not hold RpcState while a shutdown handler calls appendEntry.
+    let mut extensions = extensions.lock().await;
+    extensions
+        .notify_sync(
+            "sessionShutdown",
+            json!({ "sessionId": session_id, "reason": "quit" }),
+        )
+        .await;
+    extensions.shutdown().await;
     Ok(process_shutdown.exit_code().unwrap_or(0))
 }
 
@@ -618,13 +666,13 @@ async fn notify_session_replacement(
     };
     let extensions = extensions.lock().await;
     extensions
-        .notify(
+        .notify_sync(
             "sessionShutdown",
             json!({ "sessionId": old_session_id, "reason": reason }),
         )
         .await;
     extensions
-        .notify(
+        .notify_sync(
             "sessionStart",
             json!({
                 "sessionId": session_id,

@@ -39,6 +39,7 @@ impl PeerHandler for HostStub {
             method::UI_NOTIFY => Ok(Value::Null),
             method::UI_SELECT => Ok(json!("b")),
             method::UI_CONFIRM => Ok(json!(true)),
+            method::SESSION_APPEND_ENTRY => Ok(Value::Null),
             method::SESSION_GET => Ok(json!({
                 "sessionId": "s-1", "mode": "tui", "cwd": "/tmp", "trusted": true,
                 "messageCount": 3
@@ -403,6 +404,11 @@ async fn lifecycle_events_and_widget_actions_dispatch() {
         .unwrap();
     fixture
         .client
+        .lifecycle_event_sync("turnStart", json!({"turn": 2}))
+        .await
+        .unwrap();
+    fixture
+        .client
         .widget_action(&WidgetActionParams {
             id: "list".to_string(),
             action: "select".to_string(),
@@ -411,7 +417,7 @@ async fn lifecycle_events_and_widget_actions_dispatch() {
         .await
         .unwrap();
     for _ in 0..50 {
-        if seen.lock().unwrap().len() == 2 {
+        if seen.lock().unwrap().len() == 3 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -510,6 +516,55 @@ async fn plugin_calls_host_services_from_a_tool() {
     assert!(
         requests.iter().any(|(m, _)| m == method::EXEC_RUN),
         "{requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn plugin_appends_custom_session_entries() {
+    let plugin = Plugin::builder("entry-writer")
+        .tool(
+            ToolSpec {
+                name: "test.append".to_string(),
+                label: None,
+                description: "appends custom session entries".to_string(),
+                parameters: json!({"type": "object"}),
+            },
+            |_params, cx| async move {
+                let host = cx.host();
+                host.append_entry("example.custom", Some(json!({"value": 42})))
+                    .await
+                    .map_err(tack_ext_sdk::Error::from)?;
+                host.append_entry("example.empty", None)
+                    .await
+                    .map_err(tack_ext_sdk::Error::from)?;
+                Ok(text_output("appended"))
+            },
+        )
+        .build();
+    let fixture = spawn(plugin).await;
+    let output = fixture
+        .client
+        .tool_execute(&ToolExecuteParams {
+            name: "test.append".to_string(),
+            tool_call_id: "c-1".to_string(),
+            arguments: json!({}),
+        })
+        .await
+        .unwrap();
+    assert_eq!(output.content[0].text.as_deref(), Some("appended"));
+
+    let requests = fixture.stub.requests.lock().unwrap();
+    let appended: Vec<_> = requests
+        .iter()
+        .filter(|(rpc_method, _)| rpc_method == method::SESSION_APPEND_ENTRY)
+        .map(|(_, params)| params)
+        .collect();
+    assert_eq!(
+        appended,
+        vec![
+            &json!({"customType": "example.custom", "data": {"value": 42}}),
+            &json!({"customType": "example.empty"}),
+        ]
     );
 }
 

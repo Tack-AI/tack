@@ -2,7 +2,7 @@
   "openrpc": "1.3.2",
   "info": {
     "title": "tack-RPC",
-    "version": "3.1.0",
+    "version": "3.2.0",
     "description": "tack-RPC v3: the host <-> plugin protocol for tack Level-3 plugins. JSON-RPC 2.0 envelopes over NDJSON stdio (process carrier) or WIT component calls (WASM carrier). This document is the single source of truth; Rust types in crates/tack-ext/src/rpc3.rs are generated from it by `cargo run -p xtask -- codegen`. Method naming follows MCP conventions (<namespace>/<verb>); direction is annotated with x-direction. Design: docs/plugin-roadmap.md."
   },
   "servers": [],
@@ -89,9 +89,10 @@
     },
     {
       "name": "events/lifecycle",
-      "description": "Lifecycle notification, subscription-gated via capabilities.events. The event name is one of the well-known lifecycle set (sessionStart, sessionShutdown, agentStart, agentEnd, turnStart, turnEnd, messageStart, messageEnd, toolExecutionStart, toolExecutionEnd, modelSelect, thinkingLevelSelect); the payload shape depends on the event.",
+      "description": "Lifecycle notification or completion request, subscription-gated via capabilities.events. The event name is one of the well-known lifecycle set (sessionStart, sessionShutdown, agentStart, agentEnd, turnStart, turnEnd, messageStart, messageEnd, toolExecutionStart, toolExecutionEnd, modelSelect, thinkingLevelSelect); the payload shape depends on the event. v3.2 hosts may send session lifecycle events as requests to await handler completion; SDKs answer null after the handler finishes. v3.1 peers that reject the request retain the notification fallback.",
       "paramStructure": "by-name",
       "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/LifecycleEventParams" } }],
+      "result": { "name": "result", "schema": { "type": "null" } },
       "x-direction": "host-to-plugin"
     },
     {
@@ -136,6 +137,14 @@
       "description": "Inject a user message into the session (trust/mode gated).",
       "paramStructure": "by-name",
       "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/SendUserMessageParams" } }],
+      "result": { "name": "result", "schema": { "type": "null" } },
+      "x-direction": "plugin-to-host"
+    },
+    {
+      "name": "session/appendEntry",
+      "description": "Append a custom entry to the current session (requires the sessionControl host capability).",
+      "paramStructure": "by-name",
+      "params": [{ "name": "params", "required": true, "schema": { "$ref": "#/components/schemas/AppendEntryParams" } }],
       "result": { "name": "result", "schema": { "type": "null" } },
       "x-direction": "plugin-to-host"
     },
@@ -678,6 +687,15 @@
           "text": { "type": "string" }
         },
         "required": ["text"]
+      },
+      "AppendEntryParams": {
+        "description": "session/appendEntry params: append a custom entry to the current session.",
+        "type": "object",
+        "properties": {
+          "customType": { "type": "string" },
+          "data": {}
+        },
+        "required": ["customType"]
       },
       "TokenUsage": {
         "description": "Token accounting snapshot (provider-shaped totals).",

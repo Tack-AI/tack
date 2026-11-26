@@ -30,6 +30,7 @@ PROVIDER_STREAM_CANCEL = "provider/streamCancel"
 WIDGETS_UPDATE = "widgets/update"
 SESSION_GET = "session/get"
 SESSION_SEND_USER_MESSAGE = "session/sendUserMessage"
+SESSION_APPEND_ENTRY = "session/appendEntry"
 SNAPSHOT_GET = "snapshot/get"
 CONFIG_GET = "config/get"
 UI_NOTIFY = "ui/notify"
@@ -57,6 +58,12 @@ class AfterToolCallPatch(TypedDict):
     isError: NotRequired[bool]
     terminate: NotRequired[bool]
     usage: NotRequired[Any]
+
+
+class AppendEntryParams(TypedDict):
+    """session/appendEntry params: append a custom entry to the current session."""
+    customType: str
+    data: NotRequired[Any]
 
 
 class ApprovalDecision(TypedDict):

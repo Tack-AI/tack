@@ -136,8 +136,8 @@ impl TuiApp {
     }
 
     /// Plugin session methods (tack-RPC v3 `session/*`), executed on the
-    /// TUI main loop. The v3 surface is deliberately small: session/get +
-    /// session/sendUserMessage.
+    /// TUI main loop. The v3 surface is deliberately small: session/get,
+    /// session/sendUserMessage, and session/appendEntry.
     async fn handle_ext_session_method(
         &mut self,
         method: &str,
@@ -176,6 +176,18 @@ impl TuiApp {
                 } else {
                     self.on_submit(text.to_string()).await;
                 }
+                Ok(serde_json::Value::Null)
+            }
+            "session/appendEntry" => {
+                let custom_type = params
+                    .get("customType")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("session/appendEntry needs a non-empty {customType}")?;
+                self.state
+                    .session
+                    .append_custom_entry(custom_type, params.get("data").cloned())
+                    .map_err(|e| e.to_string())?;
                 Ok(serde_json::Value::Null)
             }
             other => Err(format!("unknown session method {other}")),

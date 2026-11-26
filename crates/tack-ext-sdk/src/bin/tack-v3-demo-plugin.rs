@@ -300,8 +300,18 @@ async fn main() -> std::io::Result<()> {
             }
             Ok(allow())
         })
-        .events(&["agentStart"], |params, cx| async move {
-            let _ = params;
+        .events(&["agentStart", "sessionStart"], |params, cx| async move {
+            if params.event == "sessionStart" {
+                if std::env::var_os("TACK_DEMO_SESSION_MARKERS").is_some()
+                    && let Err(error) = cx
+                        .host()
+                        .append_entry("start-marker", Some(params.payload["reason"].clone()))
+                        .await
+                {
+                    eprintln!("demo session marker append failed: {error}");
+                }
+                return;
+            }
             let _ = cx
                 .host()
                 .notify("demo plugin saw agentStart".to_string(), None)

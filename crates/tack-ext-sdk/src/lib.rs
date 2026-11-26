@@ -43,16 +43,17 @@ pub use provider::{ProviderEvents, ProviderStreamCx};
 
 pub use tack_ext::rpc3; // generated protocol types
 pub use tack_ext::rpc3::{
-    AfterToolCallParams, AfterToolCallPatch, ApprovalDecision, ApprovalDecisionAction,
-    ApprovalReviewParams, AutocompleteProvideParams, AutocompleteProvideResult,
-    AutocompleteProviderSpec, AutocompleteSuggestion, BeforeToolCallParams, CommandInvokeParams,
-    CommandSpec, ConfigDeclaration, ContentBlock, ContentBlockKind, ExecRunResult,
-    HookCapabilities, HostCapabilities, InitializeParams, LifecycleEventParams, LogLevel,
-    MetricOperation, MetricsDeclaration, PluginCapabilities, PluginInfo, ProviderCapability,
-    ProviderEventKind, ProviderEventParams, ProviderStreamCancelParams, ProviderStreamEventParams,
-    ProviderStreamParams, RunMode, SessionInfo, Snapshot, ToolCall, ToolExecuteParams, ToolOutput,
-    ToolSpec, TransformContextParams, TransformContextResult, UiInputParams, UiSelectParams,
-    Verdict, VerdictAction, WidgetActionParams, WidgetKind, WidgetSpec, WidgetUpdateParams,
+    AfterToolCallParams, AfterToolCallPatch, AppendEntryParams, ApprovalDecision,
+    ApprovalDecisionAction, ApprovalReviewParams, AutocompleteProvideParams,
+    AutocompleteProvideResult, AutocompleteProviderSpec, AutocompleteSuggestion,
+    BeforeToolCallParams, CommandInvokeParams, CommandSpec, ConfigDeclaration, ContentBlock,
+    ContentBlockKind, ExecRunResult, HookCapabilities, HostCapabilities, InitializeParams,
+    LifecycleEventParams, LogLevel, MetricOperation, MetricsDeclaration, PluginCapabilities,
+    PluginInfo, ProviderCapability, ProviderEventKind, ProviderEventParams,
+    ProviderStreamCancelParams, ProviderStreamEventParams, ProviderStreamParams, RunMode,
+    SessionInfo, Snapshot, ToolCall, ToolExecuteParams, ToolOutput, ToolSpec,
+    TransformContextParams, TransformContextResult, UiInputParams, UiSelectParams, Verdict,
+    VerdictAction, WidgetActionParams, WidgetKind, WidgetSpec, WidgetUpdateParams,
 };
 pub use tack_ext::v3::PeerError;
 

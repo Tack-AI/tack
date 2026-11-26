@@ -509,6 +509,13 @@ impl PeerHandler for Dispatch {
                 self.state.shutdown.notify_one();
                 Ok(Value::Null)
             }
+            method::EVENTS_LIFECYCLE => {
+                let Some(handler) = &builder.event_handler else {
+                    return Err(not_granted(rpc_method));
+                };
+                handler(parse(params)?, self.cx()).await;
+                Ok(Value::Null)
+            }
             method::TOOLS_EXECUTE => {
                 let params: ToolExecuteParams = parse(params)?;
                 let Some((_, handler)) = builder

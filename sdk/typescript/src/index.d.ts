@@ -74,6 +74,7 @@ export interface Host {
   warn(message: string, context?: any): Promise<void>;
   session(): Promise<SessionInfo>;
   sendUserMessage(text: string): Promise<void>;
+  appendEntry(customType: string, data?: any): Promise<void>;
   snapshot(): Promise<Snapshot>;
   config(): Promise<any>;
   registerProvider(provider: any): Promise<void>;
