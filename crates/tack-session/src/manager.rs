@@ -36,6 +36,8 @@ pub enum SessionError {
     EntryNotOnActiveBranch(String),
     #[error("invalid context edit: {0}")]
     InvalidContextEdit(String),
+    #[error("invalid recovery omission: {0}")]
+    InvalidRecoveryOmission(String),
     /// The file carries encrypted entry lines but they cannot be decrypted
     /// (no session key installed, wrong key, or tampered ciphertext).
     /// Opening it anyway would silently drop the encrypted history and

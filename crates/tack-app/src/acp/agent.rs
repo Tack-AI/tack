@@ -20,7 +20,7 @@ use agent_client_protocol::{
 };
 use tack_agent_core::{
     AgentContext, AgentEvent, AgentHooks, AgentLoopConfig, AgentMessage, BeforeToolCallContext,
-    BeforeToolCallOutcome, ToolExecutionMode, agent_loop,
+    BeforeToolCallOutcome, MessageFinalization, ToolExecutionMode, agent_loop,
 };
 use tack_ai::Provider;
 use tack_session::SessionManager;
@@ -356,9 +356,13 @@ impl TackAcpAgent {
                         session.session_id().to_string(),
                     )
                 };
-                let compaction_settings = self
+                let compaction_settings = match self
                     .settings
-                    .compaction_for_model(&turn_model.provider, &turn_model.id);
+                    .compaction_for_model(&turn_model.provider, &turn_model.id)
+                {
+                    Ok(settings) => settings,
+                    Err(e) => return format!("Compaction failed: {e}"),
+                };
                 let Some(preparation) =
                     tack_session::prepare_compaction(&path, &compaction_settings)
                 else {
@@ -463,8 +467,16 @@ struct AcpHooks {
 
 #[async_trait::async_trait]
 impl AgentHooks for AcpHooks {
+    async fn finalize_message(&self, message: &AgentMessage) -> Option<MessageFinalization> {
+        self.inner.finalize_message(message).await
+    }
+
     async fn transform_context(&self, messages: &[AgentMessage]) -> Option<Vec<AgentMessage>> {
         self.inner.transform_context(messages).await
+    }
+
+    async fn omit_recovery_attempt(&self, assistant_entry_id: &str) -> Option<()> {
+        self.inner.omit_recovery_attempt(assistant_entry_id).await
     }
 
     async fn compact_for_overflow(&self) -> Option<Vec<AgentMessage>> {
@@ -1084,7 +1096,8 @@ impl Agent for TackAcpAgent {
                 reasoning: turn_thinking,
                 settings: self
                     .settings
-                    .compaction_for_model(&turn_model.provider, &turn_model.id),
+                    .compaction_for_model(&turn_model.provider, &turn_model.id)
+                    .map_err(|e| Error::internal_error().data(e.to_string()))?,
                 cancel: cancel.clone(),
                 on_compaction: None,
                 history: self.settings.history(&tack_session::default_agent_dir()),
@@ -1229,36 +1242,30 @@ impl Agent for TackAcpAgent {
         let mut error_text: Option<String> = None;
         let mut streamed_any_text = false;
         while let Some(event) = stream.next().await {
-            // Persist completed messages.
-            if let AgentEvent::MessageEnd { message } = &event {
-                if !matches!(message, AgentMessage::Custom(_))
-                    && let Err(e) = state.session.lock().await.append_message(message.clone())
-                {
-                    tracing::warn!("failed to persist message: {e}");
+            if let AgentEvent::MessageEnd {
+                message: AgentMessage::Assistant(a),
+            } = &event
+            {
+                last_stop = a.stop_reason;
+                if a.stop_reason == tack_ai::StopReason::Error {
+                    error_text = a.error_message.clone();
                 }
-                if let AgentMessage::Assistant(a) = message {
-                    last_stop = a.stop_reason;
-                    if a.stop_reason == tack_ai::StopReason::Error {
-                        error_text = a.error_message.clone();
-                    }
-                    // Context usage + cumulative cost for the client UI.
-                    if !matches!(
-                        a.stop_reason,
-                        tack_ai::StopReason::Error | tack_ai::StopReason::Aborted
-                    ) {
-                        let used = tack_session::calculate_context_tokens(&a.usage);
-                        if used > 0 {
-                            let totals = state.session.lock().await.session_totals();
-                            let cost = (totals.cost.total > 0.0)
-                                .then(|| Cost::new(totals.cost.total, "USD"));
-                            self.notify(
-                                &args.session_id,
-                                SessionUpdate::UsageUpdate(
-                                    UsageUpdate::new(used, turn_model.context_window as u64)
-                                        .cost(cost),
-                                ),
-                            );
-                        }
+                // Context usage + cumulative cost for the client UI.
+                if !matches!(
+                    a.stop_reason,
+                    tack_ai::StopReason::Error | tack_ai::StopReason::Aborted
+                ) {
+                    let used = tack_session::calculate_context_tokens(&a.usage);
+                    if used > 0 {
+                        let totals = state.session.lock().await.session_totals();
+                        let cost =
+                            (totals.cost.total > 0.0).then(|| Cost::new(totals.cost.total, "USD"));
+                        self.notify(
+                            &args.session_id,
+                            SessionUpdate::UsageUpdate(
+                                UsageUpdate::new(used, turn_model.context_window as u64).cost(cost),
+                            ),
+                        );
                     }
                 }
             }

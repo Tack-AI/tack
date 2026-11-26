@@ -17,7 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::event::AgentEvent;
 use crate::hooks::{
-    AfterToolCallContext, AgentHooks, BeforeToolCallContext, BeforeToolCallOutcome, TurnContext,
+    AfterToolCallContext, AgentHooks, BeforeToolCallContext, BeforeToolCallOutcome,
+    MessageFinalization, TurnContext,
 };
 use crate::message::AgentMessage;
 use crate::tool::{AgentTool, AgentToolResult, ToolExecutionMode, tool_definition};
@@ -94,6 +95,19 @@ impl std::fmt::Debug for AgentContext {
     }
 }
 
+/// Publish `message_end` only after the session hook has finalized the
+/// message. Returning the finalization keeps source-entry identity available
+/// to recovery without comparing message contents.
+async fn emit_message_end(
+    tx: &AgentEventTx,
+    hooks: &Arc<dyn AgentHooks>,
+    message: AgentMessage,
+) -> Option<MessageFinalization> {
+    let finalized = hooks.finalize_message(&message).await;
+    emit(tx, AgentEvent::MessageEnd { message }).await;
+    finalized
+}
+
 /// Start an agent loop with new prompt messages. Events stream back; the
 /// final result is the list of messages produced by this run.
 pub fn agent_loop(
@@ -125,13 +139,7 @@ pub fn agent_loop(
                 },
             )
             .await;
-            emit(
-                &tx,
-                AgentEvent::MessageEnd {
-                    message: prompt.clone(),
-                },
-            )
-            .await;
+            let _ = emit_message_end(&tx, &config.hooks, prompt.clone()).await;
         }
 
         let messages = run_loop(context, new_messages, config, cancel, &tx).await;
@@ -174,13 +182,7 @@ pub fn agent_loop_continue(
                 },
             )
             .await;
-            emit(
-                &tx,
-                AgentEvent::MessageEnd {
-                    message: message.clone(),
-                },
-            )
-            .await;
+            let _ = emit_message_end(&tx, &config.hooks, message.clone()).await;
         }
         let messages = run_loop(context, initial, config, cancel, &tx).await;
         finish(&tx, result_tx, messages).await;
@@ -735,6 +737,23 @@ pub fn restore_tools_from_transcript(
     }
 }
 
+/// A session-backed finalization carries the source identity needed for
+/// recovery omissions. `None` means a session-less loop whose legacy event
+/// consumer owns persistence; an explicit finalization without an id means
+/// persistence failed, so compacting without the required edit is unsafe.
+async fn recovery_omission_ready(
+    hooks: &Arc<dyn AgentHooks>,
+    finalized: &Option<MessageFinalization>,
+) -> bool {
+    match finalized {
+        None => true,
+        Some(finalized) => match &finalized.entry_id {
+            Some(entry_id) => hooks.omit_recovery_attempt(entry_id).await.is_some(),
+            None => false,
+        },
+    }
+}
+
 /// Main loop. Returns the new messages produced by this run.
 async fn run_loop(
     mut context: AgentContext,
@@ -810,19 +829,14 @@ async fn run_loop(
                     },
                 )
                 .await;
-                emit(
-                    tx,
-                    AgentEvent::MessageEnd {
-                        message: message.clone(),
-                    },
-                )
-                .await;
+                let _ = emit_message_end(tx, &config.hooks, message.clone()).await;
                 context.messages.push(message.clone());
                 new_messages.push(message);
             }
 
             // Stream assistant response.
-            let message = stream_assistant_response(&mut context, &config, &cancel, tx).await;
+            let (message, message_finalization) =
+                stream_assistant_response(&mut context, &config, &cancel, tx).await;
 
             if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
                 // Context overflow recovery (upstream agent-session
@@ -837,6 +851,7 @@ async fn run_loop(
                         &message,
                         Some(u64::from(config.model.context_window)),
                     )
+                    && recovery_omission_ready(&config.hooks, &message_finalization).await
                     && let Some(rebuilt) = config.hooks.compact_for_overflow().await
                 {
                     overflow_recovery_attempted = true;
@@ -920,6 +935,10 @@ async fn run_loop(
             // unrecoverable one (output reached the limit) falls through to
             // the fail-tool-calls path below.
             if message.stop_reason == StopReason::Length
+                && !message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, tack_ai::ContentBlock::ToolCall { .. }))
                 && !overflow_recovery_attempted
                 && tack_ai::overflow::is_recoverable_length(
                     &message,
@@ -929,6 +948,7 @@ async fn run_loop(
                     // limit, not context pressure — don't compact for it.
                     u64::from(config.max_tokens.unwrap_or(config.model.max_tokens)),
                 )
+                && recovery_omission_ready(&config.hooks, &message_finalization).await
                 && let Some(rebuilt) = config.hooks.compact_for_overflow().await
             {
                 overflow_recovery_attempted = true;
@@ -984,7 +1004,7 @@ async fn run_loop(
                 // limit, so every tool call may carry truncated arguments.
                 // Fail them all instead of executing potentially borked calls.
                 let batch = if message.stop_reason == StopReason::Length {
-                    fail_tool_calls_from_truncated_message(&tool_calls, tx).await
+                    fail_tool_calls_from_truncated_message(&tool_calls, &config, tx).await
                 } else {
                     execute_tool_calls(&context, &message, &tool_calls, &config, &cancel, tx).await
                 };
@@ -1066,12 +1086,14 @@ async fn run_loop(
 
 /// Stream an assistant response from the LLM, emitting message events and
 /// maintaining the partial message at the tail of `context.messages`.
+/// The finalization identifies the persisted source entry when the active
+/// hooks own session persistence.
 async fn stream_assistant_response(
     context: &mut AgentContext,
     config: &AgentLoopConfig,
     cancel: &CancellationToken,
     tx: &AgentEventTx,
-) -> AssistantMessage {
+) -> (AssistantMessage, Option<MessageFinalization>) {
     // AgentMessage[] -> AgentMessage[] transform (e.g. compaction). COW:
     // hooks borrow the context and only materialize a rewritten copy when
     // they actually change it, so the common no-op path no longer
@@ -1172,14 +1194,9 @@ async fn stream_assistant_response(
                 },
             )
             .await;
-            emit(
-                tx,
-                AgentEvent::MessageEnd {
-                    message: AgentMessage::Assistant(message.clone()),
-                },
-            )
-            .await;
-            return message;
+            let finalized =
+                emit_message_end(tx, &config.hooks, AgentMessage::Assistant(message.clone())).await;
+            return (message, finalized);
         }
     };
 
@@ -1249,14 +1266,9 @@ async fn stream_assistant_response(
                 )
                 .await;
             }
-            emit(
-                tx,
-                AgentEvent::MessageEnd {
-                    message: AgentMessage::Assistant(message.clone()),
-                },
-            )
-            .await;
-            return message;
+            let finalized =
+                emit_message_end(tx, &config.hooks, AgentMessage::Assistant(message.clone())).await;
+            return (message, finalized);
         };
 
         // The event is consumed by value so the accumulated `partial` can
@@ -1375,14 +1387,13 @@ async fn stream_assistant_response(
                     )
                     .await;
                 }
-                emit(
+                let finalized = emit_message_end(
                     tx,
-                    AgentEvent::MessageEnd {
-                        message: AgentMessage::Assistant(final_message.clone()),
-                    },
+                    &config.hooks,
+                    AgentMessage::Assistant(final_message.clone()),
                 )
                 .await;
-                return final_message;
+                return (final_message, finalized);
             }
         }
     }
@@ -1455,7 +1466,11 @@ async fn emit_tool_execution_end(tx: &AgentEventTx, finalized: &FinalizedToolCal
     .await;
 }
 
-async fn emit_tool_result_message(tx: &AgentEventTx, message: &ToolResultMessage) {
+async fn emit_tool_result_message(
+    tx: &AgentEventTx,
+    config: &AgentLoopConfig,
+    message: &ToolResultMessage,
+) {
     let message = AgentMessage::ToolResult(message.clone());
     emit(
         tx,
@@ -1464,7 +1479,7 @@ async fn emit_tool_result_message(tx: &AgentEventTx, message: &ToolResultMessage
         },
     )
     .await;
-    emit(tx, AgentEvent::MessageEnd { message }).await;
+    let _ = emit_message_end(tx, &config.hooks, message).await;
 }
 
 /// A provider tool call plus its optional final-argument parse failure.
@@ -1476,6 +1491,7 @@ type PendingToolCall = (String, String, Value, Option<String>);
 /// execute.
 async fn fail_tool_calls_from_truncated_message(
     tool_calls: &[PendingToolCall],
+    config: &AgentLoopConfig,
     tx: &AgentEventTx,
 ) -> ExecutedToolCallBatch {
     let mut messages = Vec::new();
@@ -1499,7 +1515,7 @@ async fn fail_tool_calls_from_truncated_message(
         };
         emit_tool_execution_end(tx, &finalized).await;
         let message = create_tool_result_message(&finalized);
-        emit_tool_result_message(tx, &message).await;
+        emit_tool_result_message(tx, config, &message).await;
         messages.push(message);
     }
     ExecutedToolCallBatch {
@@ -1850,7 +1866,7 @@ async fn execute_tool_calls_sequential(
         };
 
         let message = create_tool_result_message(&finalized);
-        emit_tool_result_message(tx, &message).await;
+        emit_tool_result_message(tx, config, &message).await;
         messages.push(message);
         finalized_calls.push(finalized);
         processed += 1;
@@ -1882,7 +1898,7 @@ async fn execute_tool_calls_sequential(
         };
         emit_tool_execution_end(tx, &finalized).await;
         let message = create_tool_result_message(&finalized);
-        emit_tool_result_message(tx, &message).await;
+        emit_tool_result_message(tx, config, &message).await;
         messages.push(message);
         finalized_calls.push(finalized);
     }
@@ -2103,7 +2119,7 @@ async fn execute_tool_calls_spawned(
     let mut messages = Vec::new();
     for finalized in &finalized_calls {
         let message = create_tool_result_message(finalized);
-        emit_tool_result_message(tx, &message).await;
+        emit_tool_result_message(tx, config, &message).await;
         messages.push(message);
     }
 

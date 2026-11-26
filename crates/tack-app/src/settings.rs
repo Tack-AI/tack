@@ -6,6 +6,75 @@ use std::path::{Path, PathBuf};
 
 use tack_session::CompactionSettings;
 
+const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+/// A lazily resolved compaction setting is present but has an invalid shape.
+/// Keeping this as an error type (rather than a String) lets CLI/anyhow and
+/// the RPC surfaces propagate it through their existing error mechanisms.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactionSettingsError {
+    message: String,
+}
+
+impl CompactionSettingsError {
+    fn invalid(path: &str, value: &serde_json::Value, expected: &str) -> Self {
+        Self {
+            message: format!(
+                "Invalid {path} setting: {}. Expected {expected}.",
+                js_value_string(value)
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for CompactionSettingsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CompactionSettingsError {}
+
+/// Match JavaScript's `String(value)` in the upstream diagnostics for JSON
+/// values (notably unquoted strings, `[]`, and `[object Object]`).
+fn js_value_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::String(value) => value.clone(),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(|value| match value {
+                serde_json::Value::Null => String::new(),
+                _ => js_value_string(value),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        serde_json::Value::Object(_) => "[object Object]".to_string(),
+    }
+}
+
+fn non_negative_safe_integer(
+    value: &serde_json::Value,
+    path: &str,
+) -> Result<u64, CompactionSettingsError> {
+    let parsed = value.as_u64().filter(|value| *value <= MAX_SAFE_INTEGER);
+    // JSON settings originate as JavaScript numbers upstream: integral
+    // floats such as 1.0 and 1e3 are safe integers too, unlike as_u64()'s
+    // representation-level check in serde_json.
+    let parsed = parsed.or_else(|| {
+        let value = value.as_f64()?;
+        (value.is_finite()
+            && value >= 0.0
+            && value.fract() == 0.0
+            && value <= MAX_SAFE_INTEGER as f64)
+            .then_some(value as u64)
+    });
+    parsed
+        .ok_or_else(|| CompactionSettingsError::invalid(path, value, "a non-negative safe integer"))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RetrySettings {
     pub enabled: bool,
@@ -1038,29 +1107,67 @@ impl Settings {
     }
 
     /// Resolve compaction token budgets through the exact `provider/model`
-    /// override, then the ordinary compaction settings. Other compaction
-    /// behavior remains global, matching pi's `compaction.modelOverrides`.
-    pub fn compaction_for_model(&self, provider: &str, model_id: &str) -> CompactionSettings {
-        let mut resolved = self.compaction;
+    /// override, then the ordinary compaction settings. Invalid token values
+    /// are rejected lazily when read; other models and unrelated settings keep
+    /// their existing tolerant behavior.
+    pub fn compaction_for_model(
+        &self,
+        provider: &str,
+        model_id: &str,
+    ) -> Result<CompactionSettings, CompactionSettingsError> {
         let key = format!("{provider}/{model_id}");
-        let entry = self
-            .raw
-            .get("compaction")
-            .and_then(|c| c.get("modelOverrides"))
-            .and_then(|overrides| overrides.get(&key));
-        if let Some(value) = entry
-            .and_then(|entry| entry.get("reserveTokens"))
-            .and_then(|value| value.as_u64())
+        let mut resolved = self.compaction;
+        resolved.reserve_tokens = self.compaction_token_setting("reserveTokens", &key)?;
+        resolved.keep_recent_tokens = self.compaction_token_setting("keepRecentTokens", &key)?;
+        Ok(resolved)
+    }
+
+    fn compaction_token_setting(
+        &self,
+        field: &str,
+        model_key: &str,
+    ) -> Result<u64, CompactionSettingsError> {
+        let compaction = self.raw.get("compaction");
+        let ordinary_path = format!("compaction.{field}");
+        let ordinary = match compaction.and_then(|compaction| compaction.get(field)) {
+            Some(value) => non_negative_safe_integer(value, &ordinary_path)?,
+            None => {
+                let value = match field {
+                    "reserveTokens" => self.compaction.reserve_tokens,
+                    "keepRecentTokens" => self.compaction.keep_recent_tokens,
+                    _ => unreachable!("unknown compaction token field"),
+                };
+                // Preserve programmatic Settings changes while applying the
+                // same upper bound as file-backed ordinary values.
+                if value > MAX_SAFE_INTEGER {
+                    return Err(CompactionSettingsError::invalid(
+                        &ordinary_path,
+                        &serde_json::Value::from(value),
+                        "a non-negative safe integer",
+                    ));
+                }
+                value
+            }
+        };
+
+        let entry = compaction
+            .and_then(|compaction| compaction.get("modelOverrides"))
+            .and_then(|overrides| overrides.get(model_key));
+        if let Some(entry) = entry
+            && !entry.is_object()
         {
-            resolved.reserve_tokens = value;
+            return Err(CompactionSettingsError::invalid(
+                &format!("compaction.modelOverrides[\"{model_key}\"]"),
+                entry,
+                "an object",
+            ));
         }
-        if let Some(value) = entry
-            .and_then(|entry| entry.get("keepRecentTokens"))
-            .and_then(|value| value.as_u64())
-        {
-            resolved.keep_recent_tokens = value;
-        }
-        resolved
+        let override_path = format!("compaction.modelOverrides[\"{model_key}\"].{field}");
+        let model_override = entry
+            .and_then(|entry| entry.get(field))
+            .map(|value| non_negative_safe_integer(value, &override_path))
+            .transpose()?;
+        Ok(model_override.unwrap_or(ordinary))
     }
 
     /// `cacheRetention` setting as the provider hint for `StreamOptions`.
@@ -1267,27 +1374,186 @@ mod tests {
             }
         }));
 
-        let anthropic = settings.compaction_for_model("anthropic", "claude");
+        let anthropic = settings
+            .compaction_for_model("anthropic", "claude")
+            .unwrap();
         assert_eq!(anthropic.reserve_tokens, 4096);
         assert_eq!(anthropic.keep_recent_tokens, 12000);
         assert!(!anthropic.enabled);
         assert!(!anthropic.goal_recitation);
 
-        let openai = settings.compaction_for_model("openai", "gpt");
+        let openai = settings.compaction_for_model("openai", "gpt").unwrap();
         assert_eq!(openai.reserve_tokens, 2048);
         assert_eq!(openai.keep_recent_tokens, 3000);
 
-        let ordinary = settings.compaction_for_model("other", "model");
+        let ordinary = settings.compaction_for_model("other", "model").unwrap();
         assert_eq!(ordinary.reserve_tokens, 8192);
         assert_eq!(ordinary.keep_recent_tokens, 12000);
 
-        let zero = settings.compaction_for_model("zero", "model");
+        let zero = settings.compaction_for_model("zero", "model").unwrap();
         assert_eq!(zero.reserve_tokens, 0);
         assert_eq!(zero.keep_recent_tokens, 0);
 
-        let case_sensitive = settings.compaction_for_model("OpenAI", "gpt");
+        let case_sensitive = settings.compaction_for_model("OpenAI", "gpt").unwrap();
         assert_eq!(case_sensitive.reserve_tokens, 8192);
         assert_eq!(case_sensitive.keep_recent_tokens, 12000);
+    }
+
+    #[test]
+    fn compaction_token_settings_reject_invalid_values_lazily() {
+        const MODEL_KEY: &str = "provider/family/model";
+        let invalid_values = [
+            (serde_json::Value::Null, "null"),
+            (serde_json::json!(-1), "-1"),
+            (serde_json::json!(1.5), "1.5"),
+            (serde_json::json!("400000"), "400000"),
+            (serde_json::json!(true), "true"),
+            (serde_json::json!({}), "[object Object]"),
+            (serde_json::json!([]), ""),
+            (
+                serde_json::json!(9_007_199_254_740_992_u64),
+                "9007199254740992",
+            ),
+        ];
+
+        for field in ["reserveTokens", "keepRecentTokens"] {
+            for (value, rendered) in &invalid_values {
+                // Ordinary settings are validated before a valid override.
+                let settings = Settings::from_raw(serde_json::json!({
+                    "compaction": {
+                        (field): value.clone(),
+                        "modelOverrides": { (MODEL_KEY): { (field): 4096 } }
+                    }
+                }));
+                let expected = format!(
+                    "Invalid compaction.{field} setting: {rendered}. Expected a non-negative safe integer."
+                );
+                assert_eq!(
+                    settings
+                        .compaction_for_model("provider", "family/model")
+                        .unwrap_err()
+                        .to_string(),
+                    expected
+                );
+                assert_eq!(
+                    settings
+                        .compaction_for_model("other", "model")
+                        .unwrap_err()
+                        .to_string(),
+                    expected
+                );
+
+                // An invalid override is lazy and only affects its exact model.
+                let settings = Settings::from_raw(serde_json::json!({
+                    "compaction": {
+                        "modelOverrides": { (MODEL_KEY): { (field): value.clone() } }
+                    }
+                }));
+                assert_eq!(
+                    settings
+                        .compaction_for_model("provider", "family/model")
+                        .unwrap_err()
+                        .to_string(),
+                    format!(
+                        "Invalid compaction.modelOverrides[\"{MODEL_KEY}\"].{field} setting: {rendered}. Expected a non-negative safe integer."
+                    )
+                );
+                let other = settings.compaction_for_model("other", "model").unwrap();
+                assert_eq!(
+                    other.reserve_tokens,
+                    tack_session::DEFAULT_COMPACTION_SETTINGS.reserve_tokens
+                );
+                assert_eq!(
+                    other.keep_recent_tokens,
+                    tack_session::DEFAULT_COMPACTION_SETTINGS.keep_recent_tokens
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_model_override_entries_must_be_objects() {
+        const MODEL_KEY: &str = "provider/family/model";
+        let malformed_entries = [
+            (serde_json::Value::Null, "null"),
+            (serde_json::json!(false), "false"),
+            (serde_json::json!(42), "42"),
+            (serde_json::json!("invalid"), "invalid"),
+            (serde_json::json!([]), ""),
+        ];
+        for (entry, rendered) in malformed_entries {
+            let settings = Settings::from_raw(serde_json::json!({
+                "compaction": { "modelOverrides": { (MODEL_KEY): entry } }
+            }));
+            assert_eq!(
+                settings
+                    .compaction_for_model("provider", "family/model")
+                    .unwrap_err()
+                    .to_string(),
+                format!(
+                    "Invalid compaction.modelOverrides[\"{MODEL_KEY}\"] setting: {rendered}. Expected an object."
+                )
+            );
+            assert!(
+                settings.compaction_for_model("other", "model").is_ok(),
+                "an unrelated model must not validate this entry"
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_token_validation_is_scoped_to_the_requested_field() {
+        const MODEL_KEY: &str = "provider/family/model";
+        let settings = Settings::from_raw(serde_json::json!({
+            "compaction": {
+                "keepRecentTokens": -1,
+                "modelOverrides": {
+                    (MODEL_KEY): { "reserveTokens": 64, "keepRecentTokens": "invalid" }
+                }
+            }
+        }));
+        assert_eq!(
+            settings
+                .compaction_token_setting("reserveTokens", MODEL_KEY)
+                .unwrap(),
+            64
+        );
+        assert_eq!(
+            settings
+                .compaction_token_setting("keepRecentTokens", MODEL_KEY)
+                .unwrap_err()
+                .to_string(),
+            "Invalid compaction.keepRecentTokens setting: -1. Expected a non-negative safe integer."
+        );
+    }
+
+    #[test]
+    fn compaction_token_settings_accept_zero_max_and_integral_floats() {
+        let settings = Settings::from_raw(serde_json::json!({
+            "compaction": {
+                "reserveTokens": MAX_SAFE_INTEGER,
+                "keepRecentTokens": 0,
+                "modelOverrides": {
+                    "provider/model": {
+                        "reserveTokens": 0,
+                        "keepRecentTokens": MAX_SAFE_INTEGER
+                    }
+                }
+            }
+        }));
+        let resolved = settings.compaction_for_model("provider", "model").unwrap();
+        assert_eq!(resolved.reserve_tokens, 0);
+        assert_eq!(resolved.keep_recent_tokens, MAX_SAFE_INTEGER);
+        let ordinary = settings.compaction_for_model("other", "model").unwrap();
+        assert_eq!(ordinary.reserve_tokens, MAX_SAFE_INTEGER);
+        assert_eq!(ordinary.keep_recent_tokens, 0);
+
+        let settings = Settings::from_raw(serde_json::json!({
+            "compaction": { "reserveTokens": 1.0, "keepRecentTokens": 1e3 }
+        }));
+        let resolved = settings.compaction_for_model("provider", "model").unwrap();
+        assert_eq!(resolved.reserve_tokens, 1);
+        assert_eq!(resolved.keep_recent_tokens, 1000);
     }
 
     #[test]

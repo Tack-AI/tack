@@ -65,6 +65,15 @@ pub struct NextTurnUpdate {
     pub thinking_level: Option<Option<ThinkingLevel>>,
 }
 
+/// Result of synchronously finalizing a completed message before its
+/// `message_end` event is published. `entry_id` is `None` for message kinds
+/// that intentionally have no session entry (for example custom UI events)
+/// or when persistence failed; recovery must not guess an id in those cases.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MessageFinalization {
+    pub entry_id: Option<String>,
+}
+
 /// Hooks invoked by the agent loop. All methods have defaults; the no-op
 /// implementation is `NoopHooks`.
 #[async_trait]
@@ -113,6 +122,14 @@ pub trait AgentHooks: Send + Sync {
         None
     }
 
+    /// Persist/finalize a completed message before `message_end` becomes
+    /// visible to clients. Session-backed hooks return the source entry id
+    /// needed by recovery and actionable turn boundaries. The default leaves
+    /// persistence to the event consumer (useful for session-less loops).
+    async fn finalize_message(&self, _message: &AgentMessage) -> Option<MessageFinalization> {
+        None
+    }
+
     /// Prepare the next turn (model/thinking switches).
     async fn prepare_next_turn(&self, _ctx: &TurnContext<'_>) -> Option<NextTurnUpdate> {
         None
@@ -131,6 +148,13 @@ pub trait AgentHooks: Send + Sync {
     /// Follow-up messages that keep the agent running after it would stop.
     async fn follow_up_messages(&self) -> Vec<AgentMessage> {
         Vec::new()
+    }
+
+    /// Persist omission edits for a failed assistant attempt before
+    /// compact-and-retry. Session-backed hooks implement this; the default
+    /// declines so session-less/custom loops retain their legacy recovery.
+    async fn omit_recovery_attempt(&self, _assistant_entry_id: &str) -> Option<()> {
+        None
     }
 
     /// Overflow recovery (upstream agent-session `_checkCompaction` cases

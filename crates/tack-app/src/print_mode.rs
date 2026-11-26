@@ -685,7 +685,7 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
         provider: provider.clone(),
         auth: options.auth.clone(),
         reasoning: options.thinking,
-        settings: settings.compaction_for_model(&options.model.provider, &options.model.id),
+        settings: settings.compaction_for_model(&options.model.provider, &options.model.id)?,
         cancel: tokio_util::sync::CancellationToken::new(),
         on_compaction: None,
         history: settings.history(&agent_dir),
@@ -899,18 +899,16 @@ pub async fn run_print(options: PrintOptions) -> Result<i32> {
                 _ => {}
             }
         }
-        // Persist every completed message + unsuccessful exit code (both modes).
-        if let AgentEvent::MessageEnd { message } = &event {
-            let skip = matches!(message, AgentMessage::Custom(_));
-            if !skip && let Err(e) = session.lock().await.append_message(message.clone()) {
-                tracing::warn!("failed to persist message: {e}");
+        // Track unsuccessful exit codes (both modes). SessionHooks has
+        // already persisted the completed message before this event arrived.
+        if let AgentEvent::MessageEnd {
+            message: AgentMessage::Assistant(a),
+        } = &event
+        {
+            if a.stop_reason == tack_ai::StopReason::Length {
+                eprintln!("Response was truncated: the model reached its output token limit.");
             }
-            if let AgentMessage::Assistant(a) = message {
-                if a.stop_reason == tack_ai::StopReason::Length {
-                    eprintln!("Response was truncated: the model reached its output token limit.");
-                }
-                exit_code = exit_code.max(print_stop_exit_code(a.stop_reason));
-            }
+            exit_code = exit_code.max(print_stop_exit_code(a.stop_reason));
         }
         if event.is_terminal() {
             break;
@@ -999,7 +997,7 @@ pub async fn run_compact(cwd: PathBuf) -> Result<i32> {
         .map_err(anyhow::Error::msg)?;
     let provider: Arc<dyn Provider> = tack_ai::provider_for(&model)
         .with_context(|| format!("no adapter for api kind {}", model.api))?;
-    let compaction_settings = settings.compaction_for_model(&model.provider, &model.id);
+    let compaction_settings = settings.compaction_for_model(&model.provider, &model.id)?;
     let Some(preparation) = tack_session::prepare_compaction(&path, &compaction_settings) else {
         eprintln!("nothing to compact (session too small or already compacted)");
         return Ok(0);

@@ -14,7 +14,7 @@ pub use event::AgentEvent;
 pub use extension::{Extension, HooksChain};
 pub use hooks::{
     AfterToolCallContext, AfterToolCallPatch, AgentHooks, BeforeToolCallContext,
-    BeforeToolCallOutcome, NextTurnUpdate, NoopHooks, TurnContext,
+    BeforeToolCallOutcome, MessageFinalization, NextTurnUpdate, NoopHooks, TurnContext,
 };
 pub use message::{
     AgentMessage, BashExecutionMessage, BranchSummaryMessage, CompactionSummaryMessage,

@@ -256,6 +256,18 @@ provider 请求。第六批的 context edit 只实现读取/投影；显式写�
 以及 empty-bind reload（`e03dca7a3`）。它们需要完整的扩展命令 context 与
 reload/资源重建面；不重建扩展而重复发一次 `sessionStart` 并不等价。
 
+### 第九批 recovery 与小型兼容落地（未发布）
+
+本批把 session 持久化移到 `message_end` 之前，overflow recovery 接入持久化
+source id，并关闭独立的 settings/补全差距；不声称完成完整 actionable boundary
+项目。
+
+| 上游 commit / 来源 | Tack 落地 |
+| --- | --- |
+| `466db0fec` + `02726086d` | `SessionHooks`/RPC/ACP/remote 在发布 `message_end` 前持久化消息并返回 source entry id。`tack_session::omit_recovery_attempt` 按 source id 定位 assistant（含 replacement 与 retained-tail provenance），先验证所有目标，再在 compaction 前 omit 匹配的 tool results，raw history 保持不变。agent-loop 测试固定 finalize → omit → compact 顺序；length 截断的 tool call 改为生成失败 result 并自然续行，不写 omission。覆盖 v3/v4 reopen、replacement、重复消息、无关 result 与缺少 provenance。**未覆盖：**provider 内部 transient retry（当前不会持久化这些 attempt）、上游 pre-prompt recovery driver，以及 actionable turn/agent-settle boundary drafts。 |
+| `46bde88a1` | 普通与精确模型的 compaction token 设置改为惰性逐字段校验：仅接受非负 safe integer，先校验普通字段，拒绝非法当前 override entry，其他模型/字段不受影响。错误贯穿 TUI、print、RPC、ACP 与 remote，不再静默回退。 |
+| `d7951ec36` + `36af9dc48` | slash 自动补全移植上游 fuzzy scorer 与最终两段式 skill 行为：裸名命中在前，只有全名命中的 skill 在后，同时保留 `/skill` 列表与 `/skbra` 简写。覆盖 research-idea 对 deep-research、普通命令/template、显式 skill 查询及稳定前缀排序。 |
+
 ## 2026-09-21 对齐批次（基线 4a6ed0194 → 10d1ad621）
 
 160 个上游 commit 经逐条审阅（报告由 `scripts/upstream-delta.sh` 生成）。

@@ -2127,6 +2127,108 @@ async fn overflow_error_compacts_and_retries_turn() {
     assert!(contexts[1].messages.is_empty());
 }
 
+#[derive(Debug, Default)]
+struct SessionRecoveryHooks {
+    steps: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl AgentHooks for SessionRecoveryHooks {
+    async fn finalize_message(&self, message: &AgentMessage) -> Option<MessageFinalization> {
+        if matches!(message, AgentMessage::Assistant(_)) {
+            self.steps.lock().unwrap().push("finalize".to_string());
+        }
+        Some(MessageFinalization {
+            entry_id: matches!(message, AgentMessage::Assistant(_))
+                .then(|| "assistant-source-1".to_string()),
+        })
+    }
+
+    async fn omit_recovery_attempt(&self, assistant_entry_id: &str) -> Option<()> {
+        self.steps
+            .lock()
+            .unwrap()
+            .push(format!("omit:{assistant_entry_id}"));
+        Some(())
+    }
+
+    async fn compact_for_overflow(&self) -> Option<Vec<AgentMessage>> {
+        self.steps.lock().unwrap().push("compact".to_string());
+        Some(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn recovery_finalizes_then_omits_then_compacts_by_source_id() {
+    let provider =
+        ScriptedProvider::with_scripts(vec![overflow_error(), assistant_text("recovered")]);
+    let hooks = Arc::new(SessionRecoveryHooks::default());
+    let stream = agent_loop(
+        vec![AgentMessage::user("hi")],
+        AgentContext {
+            system_prompt: None,
+            messages: vec![],
+            tools: vec![],
+        },
+        make_config(provider, hooks.clone()),
+        CancellationToken::new(),
+    );
+    let (_events, messages) = collect_events(stream).await;
+
+    assert_eq!(
+        hooks.steps.lock().unwrap().as_slice(),
+        ["finalize", "omit:assistant-source-1", "compact", "finalize"]
+    );
+    assert!(
+        without_system(&messages).iter().any(
+            |message| matches!(message, AgentMessage::Assistant(a) if a.text() == "recovered")
+        )
+    );
+}
+
+#[tokio::test]
+async fn truncated_tool_calls_continue_without_recovery_omission() {
+    let mut truncated = assistant_with_tool_calls(&[("call-1", "mock", json!({"x": 1}))]);
+    truncated.stop_reason = StopReason::Length;
+    truncated.usage.output = 100;
+    let provider = ScriptedProvider::with_scripts(vec![truncated, assistant_text("continued")]);
+    let seen = provider.seen_contexts.clone();
+    let hooks = Arc::new(SessionRecoveryHooks::default());
+    let stream = agent_loop(
+        vec![AgentMessage::user("hi")],
+        AgentContext {
+            system_prompt: None,
+            messages: vec![],
+            tools: vec![],
+        },
+        make_config(provider, hooks.clone()),
+        CancellationToken::new(),
+    );
+    let (_events, messages) = collect_events(stream).await;
+
+    assert!(
+        hooks
+            .steps
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|step| step == "finalize"),
+        "unexpected recovery steps: {:?}",
+        hooks.steps.lock().unwrap()
+    );
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert!(
+        without_system(&messages).iter().any(|message| {
+            matches!(message, AgentMessage::ToolResult(result) if result.is_error)
+        })
+    );
+    assert!(
+        without_system(&messages).iter().any(
+            |message| matches!(message, AgentMessage::Assistant(a) if a.text() == "continued")
+        )
+    );
+}
+
 #[tokio::test]
 async fn overflow_recovery_budget_is_one_attempt() {
     // Two consecutive overflows: recovery fires once, then the error ends

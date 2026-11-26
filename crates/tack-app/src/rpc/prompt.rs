@@ -3,14 +3,14 @@ use std::sync::Arc;
 use futures_util::FutureExt as _;
 use serde_json::{Value, json};
 use tack_agent_core::{
-    AgentContext, AgentEvent, AgentHooks, AgentLoopConfig, AgentMessage, HooksChain,
+    AgentContext, AgentHooks, AgentLoopConfig, AgentMessage, HooksChain, MessageFinalization,
     ToolExecutionMode, agent_loop,
 };
 use tack_ai::Provider;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
-use crate::settings::Settings;
+use crate::settings::{CompactionSettingsError, Settings};
 
 use super::RpcState;
 use super::events::event_to_json;
@@ -31,7 +31,7 @@ pub(crate) async fn prepare_prompt(
     prompts: Vec<String>,
     images: Vec<(String, String)>,
     _continue_run: bool,
-) -> PromptPreparation {
+) -> Result<PromptPreparation, CompactionSettingsError> {
     let (
         model,
         thinking,
@@ -43,8 +43,11 @@ pub(crate) async fn prepare_prompt(
         background,
         lsp,
         generation,
+        compaction_settings,
     ) = {
         let mut state = state.lock().await;
+        let compaction_settings =
+            settings.compaction_for_model(&state.model.provider, &state.model.id)?;
         state.is_streaming = true;
         state.cancel = tokio_util::sync::CancellationToken::new();
         state.retry_cancel = tokio_util::sync::CancellationToken::new();
@@ -60,6 +63,7 @@ pub(crate) async fn prepare_prompt(
             state.background.clone(),
             state.lsp.clone(),
             state.generation,
+            compaction_settings,
         )
     };
 
@@ -363,7 +367,7 @@ pub(crate) async fn prepare_prompt(
             // A blocked prompt was consumed by preflight: no run exists, so
             // the client receives disposition=handled rather than agent_end.
             state.lock().await.is_streaming = false;
-            return PromptPreparation::Handled;
+            return Ok(PromptPreparation::Handled);
         }
         if !verdict.additional_context.is_empty() {
             prompts[0] = format!(
@@ -390,7 +394,7 @@ pub(crate) async fn prepare_prompt(
                 provider: provider.clone(),
                 auth: auth.clone(),
                 reasoning: thinking,
-                settings: settings.compaction_for_model(&model.provider, &model.id),
+                settings: compaction_settings,
                 cancel: cancel.clone(),
                 generation,
             }),
@@ -524,24 +528,11 @@ pub(crate) async fn prepare_prompt(
     let run_cancel = cancel.clone();
     let mut stream = agent_loop(prompt_messages, context, config, cancel);
     let state = state.clone();
-    PromptPreparation::Start(
+    Ok(PromptPreparation::Start(
         async move {
             let pump = async {
                 let mut stdout = tokio::io::stdout();
                 while let Some(event) = stream.next().await {
-                    // Persist completed messages — only while this run's session is
-                    // still current (new_session/clone/switch_session bump the
-                    // generation; a cancelled run must not append to the new file).
-                    if let AgentEvent::MessageEnd { message } = &event
-                        && !matches!(message, AgentMessage::Custom(_))
-                    {
-                        let mut state = state.lock().await;
-                        if state.generation == generation
-                            && let Err(e) = state.session.append_message(message.clone())
-                        {
-                            tracing::warn!("persist failed: {e}");
-                        }
-                    }
                     let line = event_to_json(&event);
                     // One write per record (line + newline together): the command
                     // loop writes responses concurrently and two write calls could
@@ -629,7 +620,7 @@ pub(crate) async fn prepare_prompt(
             }
         }
         .boxed(),
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -642,7 +633,7 @@ pub(crate) async fn spawn_prompt(
     images: Vec<(String, String)>,
     continue_run: bool,
 ) {
-    if let PromptPreparation::Start(run) = prepare_prompt(
+    let preparation = prepare_prompt(
         state,
         provider,
         settings,
@@ -652,7 +643,8 @@ pub(crate) async fn spawn_prompt(
         continue_run,
     )
     .await
-    {
+    .expect("test settings must contain valid compaction token budgets");
+    if let PromptPreparation::Start(run) = preparation {
         let task = tokio::spawn(run);
         let mut state = state.lock().await;
         state.prompt_tasks.retain(|task| !task.is_finished());
@@ -818,6 +810,38 @@ impl RpcCompactionHooks {
 
 #[async_trait::async_trait]
 impl AgentHooks for RpcCompactionHooks {
+    async fn finalize_message(&self, message: &AgentMessage) -> Option<MessageFinalization> {
+        if matches!(message, AgentMessage::Custom(_)) {
+            return Some(MessageFinalization::default());
+        }
+        let mut state = self.state.lock().await;
+        if state.generation != self.generation {
+            return Some(MessageFinalization::default());
+        }
+        let entry_id = match state.session.append_message(message.clone()) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                tracing::warn!("persist failed: {error}");
+                None
+            }
+        };
+        Some(MessageFinalization { entry_id })
+    }
+
+    async fn omit_recovery_attempt(&self, assistant_entry_id: &str) -> Option<()> {
+        let mut state = self.state.lock().await;
+        if state.generation != self.generation {
+            return None;
+        }
+        match tack_session::omit_recovery_attempt(&mut state.session, assistant_entry_id) {
+            Ok(_) => Some(()),
+            Err(error) => {
+                tracing::warn!("failed to omit recovery attempt: {error}");
+                None
+            }
+        }
+    }
+
     async fn transform_context(&self, messages: &[AgentMessage]) -> Option<Vec<AgentMessage>> {
         let estimate = tack_session::estimate_context_tokens(messages);
         if !tack_session::should_compact(
@@ -906,7 +930,9 @@ async fn run_compact_inner(
         session_id,
         generation,
     } = snapshot;
-    let compaction_settings = settings.compaction_for_model(&model.provider, &model.id);
+    let compaction_settings = settings
+        .compaction_for_model(&model.provider, &model.id)
+        .map_err(|e| e.to_string())?;
     let Some(preparation) = tack_session::prepare_compaction(&path, &compaction_settings) else {
         return Err("nothing to compact".to_string());
     };

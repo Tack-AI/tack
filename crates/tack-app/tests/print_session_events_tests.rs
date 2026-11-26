@@ -122,4 +122,39 @@ fn json_print_writes_header_before_session_start_entry_and_agent_events() {
         1,
         "duplicate startup marker: {lines:?}"
     );
+
+    // Persistence moved into SessionHooks before message_end. The event
+    // consumer must not append a second copy.
+    let session_dir = tack_session::default_session_dir(
+        &work_dir.path().canonicalize().unwrap(),
+        agent_dir.path(),
+    );
+    let sessions = tack_session::list_sessions(&session_dir);
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    let session = tack_session::SessionManager::open(&sessions[0].path, None).unwrap();
+    let entries = session.entries();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.type_name() == "custom")
+            .count(),
+        1
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.type_name() == "message")
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    tack_session::SessionEntry::Message {
+                        message: tack_agent_core::AgentMessage::Assistant(_),
+                        ..
+                    }
+                )
+            })
+            .count(),
+        1,
+        "assistant was persisted more than once: {entries:?}"
+    );
 }

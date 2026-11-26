@@ -753,6 +753,16 @@ impl TuiApp {
             }
             return;
         }
+        let compaction_settings = match self
+            .settings
+            .compaction_for_model(&self.state.model.provider, &self.state.model.id)
+        {
+            Ok(settings) => settings,
+            Err(e) => {
+                self.notice(e.to_string(), NoticeKind::Error);
+                return;
+            }
+        };
         self.running = true;
         self.cancel = tokio_util::sync::CancellationToken::new();
         self.status = Some(status::StatusIndicator::working());
@@ -931,9 +941,7 @@ impl TuiApp {
                 provider: self.provider.clone(),
                 auth: self.auth.clone(),
                 reasoning: thinking,
-                settings: self
-                    .settings
-                    .compaction_for_model(&model.provider, &model.id),
+                settings: compaction_settings,
                 cancel: self.cancel.clone(),
                 on_compaction: Some(self.compaction_tx.clone()),
                 history: self.settings.history(&self.agent_dir),
@@ -1217,13 +1225,6 @@ impl TuiApp {
 
                 let mut stream = agent_loop(prompt_messages, context, config, cancel);
                 while let Some(event) = stream.next().await {
-                    // Persist completed messages.
-                    if let AgentEvent::MessageEnd { message } = &event
-                        && !matches!(message, AgentMessage::Custom(_))
-                        && let Err(e) = session_handle.lock().await.append_message(message.clone())
-                    {
-                        tracing::warn!("persist failed: {e}");
-                    }
                     if tx_work.send(AppEvent::Agent(Box::new(event))).is_err() {
                         return;
                     }

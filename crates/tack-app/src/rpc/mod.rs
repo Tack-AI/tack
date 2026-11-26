@@ -792,13 +792,14 @@ async fn handle_command(
             )
             .await
             {
-                PromptPreparation::Start(run) => {
+                Ok(PromptPreparation::Start(run)) => {
                     state.lock().await.pending_prompt_runs.push(run);
                     success(id, "prompt", Some(json!({ "disposition": "started" })))
                 }
-                PromptPreparation::Handled => {
+                Ok(PromptPreparation::Handled) => {
                     success(id, "prompt", Some(json!({ "disposition": "handled" })))
                 }
+                Err(e) => error(id, "prompt", e),
             }
         }
         "steer" => {

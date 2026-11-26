@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tack_agent_core::{AgentHooks, AgentMessage};
+use tack_agent_core::{AgentHooks, AgentMessage, MessageFinalization};
 use tack_ai::{Model, Provider, ThinkingLevel};
 use tack_session::{
     CompactionSettings, SessionManager, build_session_context, estimate_context_tokens,
@@ -700,6 +700,32 @@ impl SessionHooks {
 
 #[async_trait]
 impl AgentHooks for SessionHooks {
+    async fn finalize_message(&self, message: &AgentMessage) -> Option<MessageFinalization> {
+        if matches!(message, AgentMessage::Custom(_)) {
+            return Some(MessageFinalization::default());
+        }
+        let entry_id = match self.session.lock().await.append_message(message.clone()) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                tracing::warn!("failed to persist message: {error}");
+                None
+            }
+        };
+        Some(MessageFinalization { entry_id })
+    }
+
+    async fn omit_recovery_attempt(&self, assistant_entry_id: &str) -> Option<()> {
+        let mut session = self.session.lock().await;
+        let result = tack_session::omit_recovery_attempt(&mut session, assistant_entry_id);
+        match result {
+            Ok(_) => Some(()),
+            Err(error) => {
+                tracing::warn!("failed to omit recovery attempt: {error}");
+                None
+            }
+        }
+    }
+
     async fn transform_context(&self, messages: &[AgentMessage]) -> Option<Vec<AgentMessage>> {
         let base = self.transform_inner(messages).await;
         if !self.settings.goal_recitation {

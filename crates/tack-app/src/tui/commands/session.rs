@@ -1110,9 +1110,16 @@ impl TuiApp {
         }
         let path = self.state.session.build_session_path();
         let model = self.state.model.clone();
-        let compaction_settings = self
+        let compaction_settings = match self
             .settings
-            .compaction_for_model(&model.provider, &model.id);
+            .compaction_for_model(&model.provider, &model.id)
+        {
+            Ok(settings) => settings,
+            Err(e) => {
+                self.notice(e.to_string(), NoticeKind::Error);
+                return;
+            }
+        };
         let Some(preparation) = tack_session::prepare_compaction(&path, &compaction_settings)
         else {
             self.notice(

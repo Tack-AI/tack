@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tack_agent_core::{
     AgentContext, AgentEvent, AgentHooks, AgentLoopConfig, AgentMessage, HooksChain,
-    ToolExecutionMode, agent_loop,
+    MessageFinalization, ToolExecutionMode, agent_loop,
 };
 use tack_ai::Provider;
 use tack_protocol::schemas::*;
@@ -695,7 +695,13 @@ impl SessionHost {
         &mut self.extensions
     }
 
-    async fn run_prompt(host: SharedHost, session_id: String, text: String, steer: bool) {
+    async fn run_prompt(
+        host: SharedHost,
+        session_id: String,
+        text: String,
+        steer: bool,
+        compaction_settings: tack_session::CompactionSettings,
+    ) {
         let cancel = {
             let mut host_guard = host.lock().await;
             let Some(session) = host_guard.sessions.get_mut(&session_id) else {
@@ -928,6 +934,39 @@ impl SessionHost {
 
         #[async_trait::async_trait]
         impl AgentHooks for HostCompactionHooks {
+            async fn finalize_message(
+                &self,
+                message: &AgentMessage,
+            ) -> Option<MessageFinalization> {
+                if matches!(message, AgentMessage::Custom(_)) {
+                    return Some(MessageFinalization::default());
+                }
+                let mut host = self.host.lock().await;
+                let session = host.sessions.get_mut(&self.session_id)?;
+                let entry_id = match session.manager.append_message(message.clone()) {
+                    Ok(id) => Some(id),
+                    Err(error) => {
+                        tracing::warn!("persist failed: {error}");
+                        None
+                    }
+                };
+                session.revision += 1;
+                Some(MessageFinalization { entry_id })
+            }
+
+            async fn omit_recovery_attempt(&self, assistant_entry_id: &str) -> Option<()> {
+                let mut host = self.host.lock().await;
+                let session = host.sessions.get_mut(&self.session_id)?;
+                match tack_session::omit_recovery_attempt(&mut session.manager, assistant_entry_id)
+                {
+                    Ok(_) => Some(()),
+                    Err(error) => {
+                        tracing::warn!("failed to omit recovery attempt: {error}");
+                        None
+                    }
+                }
+            }
+
             async fn transform_context(
                 &self,
                 messages: &[AgentMessage],
@@ -968,7 +1007,7 @@ impl SessionHost {
                 provider: provider.clone(),
                 auth: auth.clone(),
                 reasoning: thinking,
-                settings: settings.compaction_for_model(&model.provider, &model.id),
+                settings: compaction_settings,
                 cancel: cancel.clone(),
             }));
             hook_list.push(Arc::new(SteerHooks {
@@ -1122,17 +1161,6 @@ impl SessionHost {
                     },
                 }),
                 AgentEvent::MessageEnd { message } => {
-                    // Persist + finish item.
-                    let mut host_guard = host.lock().await;
-                    if let Some(session) = host_guard.sessions.get_mut(&session_id)
-                        && !matches!(message, AgentMessage::Custom(_))
-                    {
-                        if let Err(e) = session.manager.append_message(message.clone()) {
-                            tracing::warn!("persist failed: {e}");
-                        }
-                        session.revision += 1;
-                    }
-                    drop(host_guard);
                     message_to_transcript(current_message_id.clone(), message)
                         .map(|item| TranscriptProgress::ItemFinished { item })
                 }
@@ -1297,9 +1325,12 @@ impl SessionHost {
                     _ => unreachable!(),
                 };
                 let steer = matches!(&prompt_or_steer, Command::Steer { .. });
-                let (is_turn, snapshot) = {
+                let (snapshot, compaction_settings) = {
                     let mut host_guard = host.lock().await;
-                    let Some(session) = host_guard.sessions.get_mut(&session_id) else {
+                    let SessionHost {
+                        sessions, settings, ..
+                    } = &mut *host_guard;
+                    let Some(session) = sessions.get_mut(&session_id) else {
                         return Err(ProtocolError {
                             code: ProtocolErrorCode::NotFound,
                             message: format!("session not found: {session_id}"),
@@ -1311,8 +1342,15 @@ impl SessionHost {
                     if steer || is_turn {
                         // Queue as steering (one-at-a-time not modeled; all).
                         session.queued_steer.push_back(text.clone());
-                        (true, live_snapshot(session))
+                        (live_snapshot(session), None)
                     } else {
+                        let compaction_settings = settings
+                            .compaction_for_model(&session.model.provider, &session.model.id)
+                            .map_err(|e| ProtocolError {
+                                code: ProtocolErrorCode::InvalidRequest,
+                                message: e.to_string(),
+                                details: None,
+                            })?;
                         // Mark the turn in-progress NOW, under the host lock:
                         // run_prompt is spawned (not awaited), so without this
                         // a second prompt arriving before the spawned task
@@ -1326,15 +1364,16 @@ impl SessionHost {
                         // so that Abort cancelled the previous run's token
                         // and the new run was uncancellable.
                         session.cancel = tokio_util::sync::CancellationToken::new();
-                        (false, live_snapshot(session))
+                        (live_snapshot(session), Some(compaction_settings))
                     }
                 };
-                if !is_turn {
+                if let Some(compaction_settings) = compaction_settings {
                     tokio::spawn(Self::run_prompt(
                         host.clone(),
                         session_id.clone(),
                         text,
                         false,
+                        compaction_settings,
                     ));
                 }
                 Ok(if steer {
@@ -1895,6 +1934,39 @@ mod tests {
                 tack_session::SessionEntry::SessionInfo { name: Some(n), .. } if n == "my-session"
             )),
             "session_info entry with the name must exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_propagates_invalid_compaction_model_override() {
+        let host = test_host(vec![]);
+        let session_id = create_session(&host).await;
+        host.lock().await.settings = Settings::from_raw(serde_json::json!({
+            "compaction": {
+                "modelOverrides": {
+                    "anthropic/mock": { "reserveTokens": -1 }
+                }
+            }
+        }));
+
+        let error = SessionHost::handle_command(
+            &host,
+            Command::Prompt {
+                session_id: session_id.clone(),
+                text: "must not start".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "Invalid compaction.modelOverrides[\"anthropic/mock\"].reserveTokens setting: -1. Expected a non-negative safe integer."
+        );
+        assert_eq!(
+            host.lock().await.sessions[&session_id].phase,
+            SessionPhase::Idle,
+            "a rejected prompt must not leave the session stuck in a turn"
         );
     }
 

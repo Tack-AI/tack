@@ -105,6 +105,19 @@ impl AgentHooks for HooksChain {
         )
     }
 
+    async fn omit_recovery_attempt(&self, assistant_entry_id: &str) -> Option<()> {
+        for hooks in &self.chain {
+            if hooks
+                .omit_recovery_attempt(assistant_entry_id)
+                .await
+                .is_some()
+            {
+                return Some(());
+            }
+        }
+        None
+    }
+
     /// `compact_for_overflow`: first hook able to recover wins (the
     /// compaction-capable session hooks sit early in the chain).
     async fn compact_for_overflow(&self) -> Option<Vec<AgentMessage>> {
@@ -176,6 +189,18 @@ impl AgentHooks for HooksChain {
             }
         }
         merged
+    }
+
+    async fn finalize_message(
+        &self,
+        message: &AgentMessage,
+    ) -> Option<crate::hooks::MessageFinalization> {
+        for hooks in &self.chain {
+            if let Some(finalized) = hooks.finalize_message(message).await {
+                return Some(finalized);
+            }
+        }
+        None
     }
 
     async fn prepare_next_turn(&self, ctx: &TurnContext<'_>) -> Option<NextTurnUpdate> {

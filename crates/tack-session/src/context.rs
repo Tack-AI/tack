@@ -363,14 +363,46 @@ fn retained_tail_source_ids(entry: &SessionEntry) -> Option<Vec<String>> {
     )
 }
 
-/// Project one entry under all edits selected on the active branch. For a
-/// migrated v4 checkpoint compaction, edits can also target the physical
-/// pre-compaction entries that produced each materialized tail message; the
-/// migration records those source ids in implementation-specific details.
-fn project_context_entry_with_edits(
+/// One projected message slot, including its durable source when known.
+///
+/// `message == None` is an omitted contribution. Keeping that slot is
+/// important to recovery omission: a second call can still resolve the
+/// assistant by source id and clean up any results left by an older caller.
+/// Materialized compaction-tail messages without explicit source ids have
+/// `source_entry_id == None`; callers must not infer their identity by
+/// comparing message contents.
+#[derive(Clone, Debug)]
+pub(crate) struct ProjectedMessageSlot {
+    pub(crate) source_entry_id: Option<String>,
+    pub(crate) message: Option<AgentMessage>,
+}
+
+fn project_message_slot(
+    message: AgentMessage,
+    source_entry_id: Option<String>,
+    edit: Option<&SessionEntry>,
+) -> ProjectedMessageSlot {
+    let message = match edit.and_then(edit_target_and_replacement) {
+        Some((_, None)) => None,
+        Some((_, Some(replacement))) => Some(apply_context_edit_to_message(&message, replacement)),
+        None => Some(message),
+    };
+    ProjectedMessageSlot {
+        source_entry_id,
+        message,
+    }
+}
+
+/// Project one entry under all edits selected on the active branch while
+/// retaining per-message source provenance. For a migrated v4 checkpoint
+/// compaction, edits can target the physical pre-compaction entries that
+/// produced each materialized tail message; migration records those source
+/// ids in implementation-specific details.
+fn project_context_entry_slots_with_edits(
     entry: &SessionEntry,
     edits: &HashMap<String, &SessionEntry>,
-) -> Vec<AgentMessage> {
+) -> Vec<ProjectedMessageSlot> {
+    let messages = session_entry_to_context_messages(entry);
     if let SessionEntry::Compaction {
         retained_tail: Some(retained_tail),
         ..
@@ -378,35 +410,77 @@ fn project_context_entry_with_edits(
         && let Some(source_ids) = retained_tail_source_ids(entry)
         && !source_ids.is_empty()
     {
-        let mut messages = session_entry_to_context_messages(entry);
         let retained_start = messages.len().saturating_sub(retained_tail.len());
         let source_offset = retained_tail.len().saturating_sub(source_ids.len());
-        for (source_index, source_id) in source_ids.iter().enumerate() {
-            let retained_index = source_offset + source_index;
-            let message_index = retained_start + retained_index;
-            let Some(edit) = edits.get(source_id) else {
-                continue;
-            };
-            let Some((_, replacement)) = edit_target_and_replacement(edit) else {
-                continue;
-            };
-            match replacement {
-                None => {
-                    if message_index < messages.len() {
-                        messages.remove(message_index);
-                    }
-                }
-                Some(replacement) if message_index < messages.len() => {
-                    messages[message_index] =
-                        apply_context_edit_to_message(&messages[message_index], replacement);
-                }
-                _ => {}
-            }
-        }
-        return messages;
+        return messages
+            .into_iter()
+            .enumerate()
+            .map(|(message_index, message)| {
+                let source_entry_id = if message_index < retained_start {
+                    // The summary and captured system message belong to the
+                    // compaction itself, not to any retained source entry.
+                    Some(entry.id().to_string())
+                } else {
+                    let retained_index = message_index - retained_start;
+                    retained_index
+                        .checked_sub(source_offset)
+                        .and_then(|source_index| source_ids.get(source_index))
+                        .cloned()
+                };
+                // Upstream checkpoint projection edits only materialized
+                // tail messages, never the compaction's own summary/system
+                // contribution through this provenance path.
+                let edit = (message_index >= retained_start)
+                    .then(|| {
+                        source_entry_id
+                            .as_ref()
+                            .and_then(|source_id| edits.get(source_id).copied())
+                    })
+                    .flatten();
+                project_message_slot(message, source_entry_id, edit)
+            })
+            .collect();
     }
 
-    project_context_entry(entry, edits.get(entry.id()).copied())
+    let edit = edits.get(entry.id()).copied();
+    let is_materialized_tail = matches!(
+        entry,
+        SessionEntry::Compaction {
+            retained_tail: Some(_),
+            ..
+        }
+    );
+    let retained_tail_len = match entry {
+        SessionEntry::Compaction {
+            retained_tail: Some(retained_tail),
+            ..
+        } => retained_tail.len(),
+        _ => 0,
+    };
+    let retained_start = messages.len().saturating_sub(retained_tail_len);
+    messages
+        .into_iter()
+        .enumerate()
+        .map(|(index, message)| {
+            // Without migration-recorded tail provenance there is no safe
+            // durable id for a materialized tail message. In particular,
+            // the compaction id is not a substitute: append_context_edit
+            // cannot legally target a compaction as an assistant/result.
+            let source_entry_id =
+                (index < retained_start || !is_materialized_tail).then(|| entry.id().to_string());
+            project_message_slot(message, source_entry_id, edit)
+        })
+        .collect()
+}
+
+fn project_context_entry_with_edits(
+    entry: &SessionEntry,
+    edits: &HashMap<String, &SessionEntry>,
+) -> Vec<AgentMessage> {
+    project_context_entry_slots_with_edits(entry, edits)
+        .into_iter()
+        .filter_map(|slot| slot.message)
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -492,6 +566,33 @@ pub fn build_session_projection(
         thinking_level,
         model,
     }
+}
+
+/// Rehydrate per-message provenance for an existing projection. This uses
+/// the same [`ProjectedSessionEntry::source_entry`] values and edit-selection
+/// rules as [`build_session_projection`], while retaining omitted slots so a
+/// durable recovery operation can be idempotent.
+pub(crate) fn session_projection_message_slots(
+    projection: &SessionProjection,
+) -> Vec<ProjectedMessageSlot> {
+    let mut edits: HashMap<String, &SessionEntry> = HashMap::new();
+    for projected in &projection.entries {
+        if let SessionEntry::ContextEdit { target_id, .. } = &projected.source_entry {
+            edits.insert(target_id.clone(), &projected.source_entry);
+        }
+    }
+    projection
+        .entries
+        .iter()
+        .enumerate()
+        .flat_map(|(index, projected)| {
+            if matches!(projected.source_entry, SessionEntry::Compaction { .. }) && index > 0 {
+                Vec::new()
+            } else {
+                project_context_entry_slots_with_edits(&projected.source_entry, &edits)
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug)]

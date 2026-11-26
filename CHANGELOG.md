@@ -27,10 +27,26 @@ notice can parse entries (same convention as TS pi).
   `sessionShutdown` / `sessionStart` pair with the replacement reason before
   their success response.
 
-- **Per-model compaction budgets**: `compaction.modelOverrides` accepts exact
-  `provider/modelId` entries with independent `reserveTokens` and
-  `keepRecentTokens` overrides. Manual, automatic, overflow, and `/context`
+- **Per-model compaction budgets and validation**: `compaction.modelOverrides`
+  accepts exact `provider/modelId` entries with independent `reserveTokens`
+  and `keepRecentTokens` overrides. Manual, automatic, overflow, and `/context`
   paths resolve the active model; ordinary settings remain the fallback.
+  Ordinary and active override values are lazily validated as non-negative
+  safe integers, and malformed active entries produce errors rather than a
+  silent fallback on TUI, print, RPC, ACP, and remote surfaces.
+
+- **Durable recovery omissions with source-entry finalization**: session-backed
+  hooks persist messages before publishing `message_end`, retaining source
+  entry ids for recovery. Overflow and recoverable-length retries omit the
+  failed assistant and matching tool results from model-visible context before
+  compaction, without deleting raw history. Truncated tool calls instead fail
+  into results and continue naturally without an omission. Actionable
+  turn-boundary drafts remain a separate follow-up.
+
+- **Skill autocomplete ranking**: slash completion now uses upstream fuzzy
+  scoring. Skill bare-name matches rank before full-name-only matches, so
+  `/idea` prefers `research-idea`, while `/skill` and shorthand such as
+  `/skbra` retain the expected completions.
 
 - **Provider session routing and llama.cpp thinking discovery**: OpenRouter,
   Baseten, Fireworks, and Cloudflare affinity flags now emit their protocol-
@@ -46,8 +62,7 @@ notice can parse entries (same convention as TS pi).
   projection feeds prompts, compaction, branch summaries, and token estimates;
   v4 migration preserves target ids and post-compaction retained-tail edits.
   `SessionManager::append_context_edit` now provides the explicit write API;
-  automatic recovery omissions and actionable turn-boundary drafts remain
-  unwired.
+  actionable turn-boundary drafts remain unwired.
 
 - **Two-stage plugin context transforms**: tack-RPC 3.1 adds the optional
   `transformContextWithSystem` capability. Ordinary `transformContext`

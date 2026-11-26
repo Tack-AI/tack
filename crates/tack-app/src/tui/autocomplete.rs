@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use tack_tui::components::select_list::{SelectItem, SelectList, fuzzy_match};
+use tack_tui::components::select_list::{SelectItem, SelectList, fuzzy_filter, fuzzy_match};
 
 use super::commands::SLASH_COMMANDS;
 
@@ -25,6 +25,23 @@ pub enum Kind {
     FilePath,
     /// tack-ext autocomplete provider (v2.2): suggestions came from plugins.
     ExtProvider,
+}
+
+/// Command metadata kept separate from its rendered/inserted `/...` item so
+/// matching follows upstream's unprefixed command names.
+struct SlashCandidate {
+    name: String,
+    item: SelectItem,
+}
+
+impl SlashCandidate {
+    fn is_skill(&self) -> bool {
+        self.name.starts_with("skill:")
+    }
+
+    fn bare_name(&self) -> &str {
+        self.name.strip_prefix("skill:").unwrap_or(&self.name)
+    }
 }
 
 /// Extension-provider trigger match (v2.2): does the last
@@ -53,32 +70,55 @@ pub fn compute(
     // Slash command: text starts with '/', cursor in the first token.
     if let Some(rest) = editor_text.strip_prefix('/') {
         if !rest.contains(char::is_whitespace) {
-            let query = rest.to_lowercase();
-            let mut items: Vec<SelectItem> = SLASH_COMMANDS
-                .iter()
-                .filter(|(name, _)| fuzzy_match(&query, &name.to_lowercase()))
-                .map(|(name, key)| {
-                    SelectItem::new(*name, *name).with_description(crate::i18n::tr(key))
-                })
-                .collect();
+            let mut candidates =
+                Vec::with_capacity(SLASH_COMMANDS.len() + templates.len() + skills.len());
+            for (name, key) in SLASH_COMMANDS {
+                candidates.push(SlashCandidate {
+                    name: name.strip_prefix('/').unwrap_or(name).to_string(),
+                    item: SelectItem::new(*name, *name).with_description(crate::i18n::tr(key)),
+                });
+            }
             for template in templates {
                 let label = format!("/{template}");
-                if fuzzy_match(&query, &label.to_lowercase()) {
-                    items.push(
-                        SelectItem::new(label.clone(), label)
-                            .with_description(crate::i18n::tr("auto.prompt_template")),
-                    );
-                }
+                candidates.push(SlashCandidate {
+                    name: template.clone(),
+                    item: SelectItem::new(label.clone(), label)
+                        .with_description(crate::i18n::tr("auto.prompt_template")),
+                });
             }
             for skill in skills {
                 let label = format!("/skill:{}", skill.name);
-                if fuzzy_match(&query, &label.to_lowercase()) {
-                    items.push(
-                        SelectItem::new(label.clone(), label)
-                            .with_description(skill.description.clone()),
-                    );
-                }
+                candidates.push(SlashCandidate {
+                    name: format!("skill:{}", skill.name),
+                    item: SelectItem::new(label.clone(), label)
+                        .with_description(skill.description.clone()),
+                });
             }
+
+            // Upstream's final two-stage behavior: bare-name matches (ordinary
+            // commands/templates plus skills) are ranked together first. Only
+            // skills absent from that set get a second full-name pass. This
+            // preserves `/skill` and fuzzy `/skbra` without allowing the
+            // `skill:` prefix to distort normal bare-name scoring (`/idea`).
+            let bare_matches = fuzzy_filter((0..candidates.len()).collect(), rest, |index| {
+                candidates[*index].bare_name().to_string()
+            });
+            let mut matched_bare_name = vec![false; candidates.len()];
+            for index in &bare_matches {
+                matched_bare_name[*index] = true;
+            }
+            let full_name_only_matches = fuzzy_filter(
+                (0..candidates.len())
+                    .filter(|index| candidates[*index].is_skill() && !matched_bare_name[*index])
+                    .collect(),
+                rest,
+                |index| candidates[*index].name.clone(),
+            );
+            let items: Vec<SelectItem> = bare_matches
+                .into_iter()
+                .chain(full_name_only_matches)
+                .map(|index| candidates[index].item.clone())
+                .collect();
             if items.is_empty() {
                 return None;
             }
@@ -325,6 +365,34 @@ mod tests {
             .is_some_and(|c| c.paths.iter().any(|(l, _)| l == path))
     }
 
+    fn test_skill(name: &str) -> crate::skills::Skill {
+        crate::skills::Skill {
+            name: name.to_string(),
+            description: format!("{name} description"),
+            file_path: std::path::PathBuf::new(),
+            base_dir: std::path::PathBuf::new(),
+            disable_model_invocation: false,
+            body: String::new(),
+        }
+    }
+
+    fn skill_fixture() -> Vec<crate::skills::Skill> {
+        ["deep-research", "research-idea", "to-sidecar", "brainstorm"]
+            .into_iter()
+            .map(test_skill)
+            .collect()
+    }
+
+    fn slash_values(query: &str, skills: &[crate::skills::Skill]) -> Vec<String> {
+        compute(query, &[], skills, Path::new("."))
+            .unwrap_or_else(|| panic!("expected suggestions for {query:?}"))
+            .list
+            .items
+            .into_iter()
+            .map(|item| item.value)
+            .collect()
+    }
+
     #[test]
     fn slash_command_completion() {
         let auto = compute("/mod", &[], &[], Path::new(".")).unwrap();
@@ -332,6 +400,77 @@ mod tests {
         assert!(compute("/model x", &[], &[], Path::new(".")).is_none());
         assert!(compute("hello", &[], &[], Path::new(".")).is_none());
         assert!(compute("/", &[], &[], Path::new(".")).is_some());
+    }
+
+    #[test]
+    fn slash_templates_keep_normal_matching_and_ranking() {
+        let templates = vec!["modern".to_string(), "mod".to_string()];
+        let auto = compute("/mod", &templates, &[], Path::new(".")).unwrap();
+        let values: Vec<&str> = auto
+            .list
+            .items
+            .iter()
+            .map(|item| item.value.as_str())
+            .collect();
+        assert!(values.contains(&"/model"));
+        assert!(values.contains(&"/modern"));
+        // Exact-match scoring applies uniformly to commands and templates.
+        assert_eq!(values.first(), Some(&"/mod"));
+        let template = auto
+            .list
+            .items
+            .iter()
+            .find(|item| item.value == "/modern")
+            .unwrap();
+        assert!(template.description.is_some());
+    }
+
+    #[test]
+    fn skill_bare_name_scoring_ranks_research_idea_first() {
+        let items = slash_values("/idea", &skill_fixture());
+        assert_eq!(
+            items.first().map(String::as_str),
+            Some("/skill:research-idea")
+        );
+        let research = items
+            .iter()
+            .position(|item| item == "/skill:research-idea")
+            .unwrap();
+        let deep = items
+            .iter()
+            .position(|item| item == "/skill:deep-research")
+            .unwrap();
+        // Final upstream behavior keeps full-name-only matches after all
+        // bare-name matches instead of dropping deep-research entirely.
+        assert!(deep > research, "unexpected ranking: {items:?}");
+    }
+
+    #[test]
+    fn explicit_skill_query_uses_full_name() {
+        let items = slash_values("/skill:side", &skill_fixture());
+        assert!(items.iter().any(|item| item == "/skill:to-sidecar"));
+    }
+
+    #[test]
+    fn skill_prefix_lists_all_skills_in_stable_order() {
+        let skills = skill_fixture();
+        let items = slash_values("/skill", &skills);
+        let skill_items: Vec<&str> = items
+            .iter()
+            .filter(|item| item.starts_with("/skill:"))
+            .map(String::as_str)
+            .collect();
+        let expected: Vec<String> = skills
+            .iter()
+            .map(|skill| format!("/skill:{}", skill.name))
+            .collect();
+        assert_eq!(skill_items, expected);
+    }
+
+    #[test]
+    fn fuzzy_skill_prefix_shorthand_still_matches() {
+        let items = slash_values("/skbra", &skill_fixture());
+        assert!(items.iter().any(|item| item == "/skill:brainstorm"));
     }
 
     #[test]
