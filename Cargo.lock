@@ -4433,7 +4433,7 @@ dependencies = [
 
 [[package]]
 name = "tack-agent-core"
-version = "1.0.21"
+version = "1.0.22"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -4451,7 +4451,7 @@ dependencies = [
 
 [[package]]
 name = "tack-ai"
-version = "1.0.21"
+version = "1.0.22"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4485,7 +4485,7 @@ dependencies = [
 
 [[package]]
 name = "tack-app"
-version = "1.0.21"
+version = "1.0.22"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -4542,7 +4542,7 @@ dependencies = [
 
 [[package]]
 name = "tack-ext"
-version = "1.0.21"
+version = "1.0.22"
 dependencies = [
  "async-trait",
  "serde",
@@ -4558,7 +4558,7 @@ dependencies = [
 
 [[package]]
 name = "tack-ext-sdk"
-version = "1.0.21"
+version = "1.0.22"
 dependencies = [
  "async-trait",
  "serde",
@@ -4570,7 +4570,7 @@ dependencies = [
 
 [[package]]
 name = "tack-ext-wasm"
-version = "1.0.21"
+version = "1.0.22"
 dependencies = [
  "async-trait",
  "serde_json",
@@ -4585,7 +4585,7 @@ dependencies = [
 
 [[package]]
 name = "tack-protocol"
-version = "1.0.21"
+version = "1.0.22"
 dependencies = [
  "ciborium",
  "criterion",
@@ -4598,7 +4598,7 @@ dependencies = [
 
 [[package]]
 name = "tack-session"
-version = "1.0.21"
+version = "1.0.22"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -4624,7 +4624,7 @@ dependencies = [
 
 [[package]]
 name = "tack-tools"
-version = "1.0.21"
+version = "1.0.22"
 dependencies = [
  "async-trait",
  "axum",
@@ -4664,7 +4664,7 @@ dependencies = [
 
 [[package]]
 name = "tack-tui"
-version = "1.0.21"
+version = "1.0.22"
 dependencies = [
  "base64 0.22.1",
  "criterion",
@@ -6223,7 +6223,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "1.0.21"
+version = "1.0.22"
 dependencies = [
  "anyhow",
  "serde_json",
