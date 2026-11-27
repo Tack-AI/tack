@@ -404,12 +404,11 @@ async fn autocomplete_selection_survives_key_release_events() {
     let frame = String::from_utf8_lossy(&out);
     assert!(frame.contains("/model"), "autocomplete missing: {frame:?}");
 
-    // Down arrow moves the selection to the second item ("/scoped-models" in
-    // const order).
+    // Down arrow moves the selection to the second fuzzy-ranked item.
     app.handle_input(InputEvent::Key(KeyEvent::plain(Key::Down)))
         .await;
     app.render(&mut out).unwrap();
-    let selected = strip_ansi(&String::from_utf8_lossy(&out)).contains("→ /scoped-models");
+    let selected = strip_ansi(&String::from_utf8_lossy(&out)).contains("→ /mode ");
     assert!(
         selected,
         "down arrow should select the second item:\n{}",
@@ -424,7 +423,7 @@ async fn autocomplete_selection_survives_key_release_events() {
     };
     app.handle_input(InputEvent::Key(release)).await;
     app.render(&mut out).unwrap();
-    let still = strip_ansi(&String::from_utf8_lossy(&out)).contains("→ /scoped-models");
+    let still = strip_ansi(&String::from_utf8_lossy(&out)).contains("→ /mode ");
     assert!(
         still,
         "release event reset the selection:\n{}",
